@@ -104,11 +104,19 @@ impl Layouter {
     }
 
     fn layout(&mut self, params: OwnedLayoutParams) -> LaidoutText {
-        let font_family = self
+        let font_family = match self
             .loader
             .get_or_load_font_family(params.style.font_family_id)
-            .cloned()
-            .expect("font family should be loaded before layout");
+        {
+            Some(family) => family.clone(),
+            None => {
+                return LaidoutText {
+                    text: params.text,
+                    size_in_lpxs: Size::ZERO,
+                    rows: Vec::new(),
+                };
+            }
+        };
         LayoutContext::new(font_family, params.text, params.style, params.options)
             .layout_multiline()
     }
