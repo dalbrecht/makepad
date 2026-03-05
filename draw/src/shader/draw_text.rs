@@ -2301,6 +2301,10 @@ impl DrawText {
         use crate::text::geom::{Point, Size};
         use crate::turtle;
 
+        if laidout_text.rows.is_empty() {
+            return Rect::default();
+        }
+
         let walk = cx.resolve_walk(walk, ResolveAt::BeforeBegin);
         let size_in_lpxs = laidout_text.size_in_lpxs * self.font_scale;
         let max_size_in_lpxs = Size::new(
@@ -2413,6 +2417,9 @@ impl DrawText {
             self.layout_align,
             text_str,
         );
+        if text.rows.is_empty() {
+            return (0, text.is_truncated);
+        }
 
         // ── Common computations ──
         let last_row = text.rows.last().unwrap();
