@@ -412,7 +412,10 @@ impl Fonts {
     /// The loaded font with this id (loading it from its definition when needed).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn font(&mut self, id: FontId) -> Option<Rc<Font>> {
-        self.layouter.is_font_known(id).then(|| self.layouter.loader.get_or_load_font(id).clone())
+        self.layouter
+            .is_font_known(id)
+            .then(|| self.layouter.loader.get_or_load_font(id).cloned())
+            .flatten()
     }
 
     /// True the first time a resource path fails to load, so the error logs once.
@@ -441,7 +444,7 @@ impl Fonts {
         self.layouter.define_font(id, definition);
     }
 
-    pub fn get_or_load_font_family(&mut self, id: FontFamilyId) -> Rc<FontFamily> {
+    pub fn get_or_load_font_family(&mut self, id: FontFamilyId) -> Option<Rc<FontFamily>> {
         self.layouter.get_or_load_font_family(id)
     }
 
