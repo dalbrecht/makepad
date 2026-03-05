@@ -388,6 +388,10 @@ impl DrawText {
         use crate::text::geom::{Point, Size};
         use crate::turtle;
 
+        if laidout_text.rows.is_empty() {
+            return Rect::default();
+        }
+
         let size_in_lpxs = laidout_text.size_in_lpxs * self.font_scale;
         let max_size_in_lpxs = Size::new(
             cx.turtle()
@@ -458,6 +462,9 @@ impl DrawText {
             Align::default(),
             text_str,
         );
+        if text.rows.is_empty() {
+            return;
+        }
         self.draw_text(cx, origin_in_lpxs, &text);
 
         let last_row = text.rows.last().unwrap();
