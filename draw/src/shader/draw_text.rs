@@ -2343,6 +2343,10 @@ impl DrawText {
         use crate::text::geom::{Point, Size};
         use crate::turtle;
 
+        if laidout_text.rows.is_empty() {
+            return Rect::default();
+        }
+
         let walk = cx.resolve_walk(walk, ResolveAt::BeforeBegin);
         let size_in_lpxs = laidout_text.size_in_lpxs * self.font_scale;
         let max_size_in_lpxs = Size::new(
@@ -2501,6 +2505,11 @@ impl DrawText {
         let origin_in_lpxs = Point::new(turtle_rect.pos.x as f32, turtle_pos.y as f32);
         let first_row_drop = self.first_row_anchor_drop(cx);
         let text = laidout_text.unwrap_or_else(|| self.layout_resumable(cx, text_str));
+        // Font load can fail and leave no rows. The walk below unwraps the last row,
+        // so return the empty layout instead of panicking (WASM fonts may not be ready).
+        if text.rows.is_empty() {
+            return text;
+        }
 
         // ── Common computations ──
         let last_row = text.rows.last().unwrap();
