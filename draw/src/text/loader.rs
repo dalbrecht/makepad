@@ -138,28 +138,24 @@ impl Loader {
         &self.system_fallbacks
     }
 
-    pub fn get_or_load_font_family(&mut self, id: FontFamilyId) -> &Rc<FontFamily> {
+    pub fn get_or_load_font_family(&mut self, id: FontFamilyId) -> Option<&Rc<FontFamily>> {
         if !self.font_family_cache.contains_key(&id) {
-            let font_family = self.load_font_family(id);
+            let font_family = self.load_font_family(id)?;
             self.font_family_cache.insert(id, Rc::new(font_family));
         }
-        self.font_family_cache.get(&id).unwrap()
+        self.font_family_cache.get(&id)
     }
 
-    pub fn get_or_load_font_family_rc(&mut self, id: FontFamilyId) -> Rc<FontFamily> {
-        self.get_or_load_font_family(id).clone()
+    pub fn get_or_load_font_family_rc(&mut self, id: FontFamilyId) -> Option<Rc<FontFamily>> {
+        self.get_or_load_font_family(id).cloned()
     }
 
-    fn load_font_family(&mut self, id: FontFamilyId) -> FontFamily {
-        let definition = self
-            .font_family_definitions
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| panic!("font family {:?} is not defined", id));
+    fn load_font_family(&mut self, id: FontFamilyId) -> Option<FontFamily> {
+        let definition = self.font_family_definitions.get(&id).cloned()?;
         let mut fonts: Vec<Rc<Font>> = definition
             .font_ids
             .into_iter()
-            .map(|font_id| self.get_or_load_font(font_id).clone())
+            .filter_map(|font_id| self.get_or_load_font(font_id).cloned())
             .collect();
         if !self.system_fallbacks.is_empty() && !fonts.is_empty() {
             let bold = font_is_bold(&fonts[0]);
@@ -172,28 +168,34 @@ impl Loader {
                 .filter(|font_id| !fonts.iter().any(|font| font.id() == *font_id))
                 .collect();
             for font_id in system {
-                let font = self.get_or_load_font(font_id).clone();
-                fonts.push(font);
+                if let Some(font) = self.get_or_load_font(font_id).cloned() {
+                    fonts.push(font);
+                }
             }
         }
-        FontFamily::new(id, self.shaper.clone(), fonts.into(), definition.diagnostics)
-    }
-
-    pub fn get_or_load_font(&mut self, id: FontId) -> &Rc<Font> {
-        if !self.font_cache.contains_key(&id) {
-            let font = self.load_font(id);
-            self.font_cache.insert(id, Rc::new(font));
+        if fonts.is_empty() {
+            return None;
         }
-        self.font_cache.get(&id).unwrap()
+        Some(FontFamily::new(
+            id,
+            self.shaper.clone(),
+            fonts.into(),
+            definition.diagnostics,
+        ))
     }
 
-    fn load_font(&mut self, id: FontId) -> Font {
-        let definition = self
-            .font_definitions
-            .remove(&id)
-            .expect("font is not defined");
-        let mut face = FontFace::from_data_and_index(definition.data, definition.index)
-            .expect("failed to load font from definition");
+    pub fn get_or_load_font(&mut self, id: FontId) -> Option<&Rc<Font>> {
+        if !self.font_cache.contains_key(&id) {
+            if let Some(font) = self.load_font(id) {
+                self.font_cache.insert(id, Rc::new(font));
+            }
+        }
+        self.font_cache.get(&id)
+    }
+
+    fn load_font(&mut self, id: FontId) -> Option<Font> {
+        let definition = self.font_definitions.remove(&id)?;
+        let mut face = FontFace::from_data_and_index(definition.data, definition.index)?;
         let mut variations = definition.variations;
         if let Some(weight) = definition.weight {
             const FONT_WEIGHT_AXIS_TAG: u32 = u32::from_be_bytes(*b"wght");
@@ -209,13 +211,13 @@ impl Loader {
         if !variations.is_empty() {
             face.set_variations(&variations);
         }
-        Font::new(
+        Some(Font::new(
             id,
             self.rasterizer.clone(),
             face,
             definition.ascender_fudge_in_ems,
             definition.descender_fudge_in_ems,
-        )
+        ))
     }
 }
 
