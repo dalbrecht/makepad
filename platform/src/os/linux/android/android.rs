@@ -2886,6 +2886,7 @@ impl Cx {
                 CxOsOp::StartDragging(items) => {
                     self.os.internal_drag_items = Some(Arc::new(items));
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
