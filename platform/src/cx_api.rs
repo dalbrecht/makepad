@@ -288,6 +288,7 @@ pub enum CxOsOp {
     FullscreenWindow(WindowId),
     NormalizeWindow(WindowId),
     RestoreWindow(WindowId),
+    SetWindowTitle(WindowId, String),
     HideWindow(WindowId),
     HideWindowButtons(WindowId),
     ShowWindowButtons(WindowId),
@@ -297,7 +298,6 @@ pub enum CxOsOp {
     /// it) so a maximized window reads as a clean fullscreen picture
     /// rather than a decorated window pinned to the work area.
     SetChromelessWhenMaximized(WindowId, bool),
-    SetWindowTitle(WindowId, String),
     SetWindowVisuals(WindowId, WindowVisuals),
     ShowInDock(bool),
     /// FPS-style pointer lock: `true` hides the cursor and freezes it in
@@ -499,12 +499,12 @@ impl std::fmt::Debug for CxOsOp {
             Self::FullscreenWindow(..) => write!(f, "FullscreenWindow"),
             Self::NormalizeWindow(..) => write!(f, "NormalizeWindow"),
             Self::RestoreWindow(..) => write!(f, "RestoreWindow"),
+            Self::SetWindowTitle(..) => write!(f, "SetWindowTitle"),
             Self::HideWindow(..) => write!(f, "HideWindow"),
             Self::HideWindowButtons(..) => write!(f, "HideWindowButtons"),
             Self::ShowWindowButtons(..) => write!(f, "ShowWindowButtons"),
             Self::SetTopmost(..) => write!(f, "SetTopmost"),
             Self::SetChromelessWhenMaximized(..) => write!(f, "SetChromelessWhenMaximized"),
-            Self::SetWindowTitle(..) => write!(f, "SetWindowTitle"),
             Self::SetWindowVisuals(..) => write!(f, "SetWindowVisuals"),
             Self::ShowInDock(..) => write!(f, "ShowInDock"),
             Self::LockMousePointer(..) => write!(f, "LockMousePointer"),
@@ -1275,7 +1275,6 @@ impl Cx {
     pub fn show_in_dock(&mut self, show: bool) {
         self.platform_ops.push_back(CxOsOp::ShowInDock(show));
     }
-
     /// Controls how the system bars (status bar and navigation bar) icons and
     /// text are tinted, on platforms that support it (currently Android only).
     ///
@@ -1306,6 +1305,11 @@ impl Cx {
             .retain(|op| !matches!(op, CxOsOp::DeferSystemGestures(_)));
         self.platform_ops.push_back(CxOsOp::DeferSystemGestures(edges));
     }
+
+    pub fn set_window_title(&mut self, window_id: WindowId, title: &str) {
+        self.push_unique_platform_op(CxOsOp::SetWindowTitle(window_id, title.to_string()));
+    }
+
     pub fn push_unique_platform_op(&mut self, op: CxOsOp) {
         if self.platform_ops.iter().find(|o| **o == op).is_none() {
             self.platform_ops.push_back(op);
