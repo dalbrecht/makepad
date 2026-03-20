@@ -659,6 +659,7 @@ impl Cx {
                         }
                     }
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 CxOsOp::Quit => ret = EventFlow::Exit,
                 CxOsOp::SetTopmost(window_id, is_topmost) => {
                     if d3d11_windows.len() == 0 {
