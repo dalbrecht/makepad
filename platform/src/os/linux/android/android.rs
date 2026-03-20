@@ -3104,6 +3104,7 @@ impl Cx {
                 CxOsOp::SaveFolderDialog(settings) => {
                     android_file_dialog::open_save_folder_dialog(settings);
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
