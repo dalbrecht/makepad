@@ -682,6 +682,7 @@ impl WaylandCx {
                         window.toplevel.unset_fullscreen();
                     }
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 CxOsOp::ResizeWindow(window_id, size) => {}
                 CxOsOp::RepositionWindow(window_id, size) => {}
                 CxOsOp::SetWindowVisuals(_window_id, visuals) => {
