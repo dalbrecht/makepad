@@ -230,11 +230,13 @@ extern "C" {
 pub type CMFormatDescriptionRef = ObjcId;
 pub const kCMPixelFormat_422YpCbCr8: u32 = four_char_as_u32("2vuy");
 pub const kCMPixelFormat_422YpCbCr8_yuvs: u32 = four_char_as_u32("yuvs");
+pub const kCMVideoCodecType_H264: u32 = four_char_as_u32("avc1");
 pub const kCMVideoCodecType_JPEG: u32 = four_char_as_u32("jpeg");
 pub const kCMVideoCodecType_JPEG_OpenDML: u32 = four_char_as_u32("dmb1");
 pub const kCMPixelFormat_8IndexedGray_WhiteIsZero: u32 = 0x00000028;
 pub const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = four_char_as_u32("420v");
 pub const kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: u32 = four_char_as_u32("420f");
+pub const kCVPixelFormatType_420YpCbCr8Planar: u32 = four_char_as_u32("y420");
 pub const kCVPixelFormatType_32BGRA: u32 = four_char_as_u32("BGRA");
 
 #[repr(C)]
@@ -266,7 +268,60 @@ pub struct CMTime {
     pub epoch: CMTimeEpoch,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct CMTimeRange {
+    pub start: CMTime,
+    pub duration: CMTime,
+}
+
+/// Returns the end time of a `CMTimeRange` (start + duration).
+#[inline]
+pub fn CMTimeRangeGetEnd(range: CMTimeRange) -> CMTime {
+    // Inline the semantics of CMTimeAdd — sufficient for non-edge-case values.
+    // Both CMTime values have the same timescale coming from AVFoundation.
+    if range.start.timescale == range.duration.timescale {
+        CMTime {
+            value: range.start.value + range.duration.value,
+            timescale: range.start.timescale,
+            flags: range.start.flags,
+            epoch: range.start.epoch,
+        }
+    } else {
+        // Different timescales: convert to common timescale (start's)
+        let ts = range.start.timescale as i64;
+        let dur_ts = range.duration.timescale as i64;
+        let converted = if dur_ts != 0 {
+            range.duration.value * ts / dur_ts
+        } else {
+            0
+        };
+        CMTime {
+            value: range.start.value + converted,
+            timescale: range.start.timescale,
+            flags: range.start.flags,
+            epoch: range.start.epoch,
+        }
+    }
+}
+
+pub const kCMTimeInvalid: CMTime = CMTime {
+    value: 0,
+    timescale: 0,
+    flags: 0,
+    epoch: 0,
+};
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct CMSampleTimingInfo {
+    pub duration: CMTime,
+    pub presentationTimeStamp: CMTime,
+    pub decodeTimeStamp: CMTime,
+}
+
 pub type CMSampleBufferRef = *mut c_void;
+pub type CMBlockBufferRef = *mut c_void;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -283,11 +338,73 @@ pub type CVMetalTextureRef = *mut c_void;
 
 #[link(name = "CoreMedia", kind = "framework")]
 extern "C" {
+    pub static kCMSampleAttachmentKey_NotSync: CFStringRef;
+
     pub fn CMVideoFormatDescriptionGetDimensions(
         videoDesc: CMFormatDescriptionRef,
     ) -> CMVideoDimensions;
     pub fn CMFormatDescriptionGetMediaSubType(desc: CMFormatDescriptionRef) -> u32;
+
+    pub fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        allocator: *const c_void,
+        parameterSetCount: usize,
+        parameterSetPointers: *const *const u8,
+        parameterSetSizes: *const usize,
+        nalUnitHeaderLength: i32,
+        formatDescriptionOut: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
+
+    pub fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        videoDesc: CMFormatDescriptionRef,
+        parameterSetIndex: usize,
+        parameterSetPointerOut: *mut *const u8,
+        parameterSetSizeOut: *mut usize,
+        parameterSetCountOut: *mut usize,
+        nalUnitHeaderLengthOut: *mut i32,
+    ) -> OSStatus;
+
     pub fn CMSampleBufferGetImageBuffer(sbuf: CMSampleBufferRef) -> CVImageBufferRef;
+    pub fn CMSampleBufferGetFormatDescription(sbuf: CMSampleBufferRef) -> CMFormatDescriptionRef;
+    pub fn CMSampleBufferGetDataBuffer(sbuf: CMSampleBufferRef) -> CMBlockBufferRef;
+    pub fn CMSampleBufferDataIsReady(sbuf: CMSampleBufferRef) -> BOOL;
+    pub fn CMSampleBufferGetSampleAttachmentsArray(
+        sbuf: CMSampleBufferRef,
+        createIfNecessary: BOOL,
+    ) -> CFArrayRef;
+    pub fn CMSampleBufferGetPresentationTimeStamp(sbuf: CMSampleBufferRef) -> CMTime;
+
+    pub fn CMBlockBufferGetDataLength(theBuffer: CMBlockBufferRef) -> i32;
+    pub fn CMBlockBufferCopyDataBytes(
+        theSourceBuffer: CMBlockBufferRef,
+        offsetToData: i32,
+        dataLength: i32,
+        destination: *mut c_void,
+    ) -> OSStatus;
+
+    pub fn CMBlockBufferCreateWithMemoryBlock(
+        structureAllocator: *const c_void,
+        memoryBlock: *mut c_void,
+        blockLength: usize,
+        blockAllocator: *const c_void,
+        customBlockSource: *const c_void,
+        offsetToData: usize,
+        dataLength: usize,
+        flags: u32,
+        blockBufferOut: *mut CMBlockBufferRef,
+    ) -> OSStatus;
+
+    pub fn CMSampleBufferCreateReady(
+        allocator: *const c_void,
+        dataBuffer: CMBlockBufferRef,
+        formatDescription: CMFormatDescriptionRef,
+        numSamples: i32,
+        numSampleTimingEntries: i32,
+        sampleTimingArray: *const CMSampleTimingInfo,
+        numSampleSizeEntries: i32,
+        sampleSizeArray: *const usize,
+        sampleBufferOut: *mut CMSampleBufferRef,
+    ) -> OSStatus;
+
     pub fn CMTimeMakeWithSeconds(seconds: f64, preferredTimescale: i32) -> CMTime;
     pub fn CMTimeGetSeconds(time: CMTime) -> f64;
 }
@@ -321,7 +438,41 @@ extern "C" {
     pub fn CVPixelBufferGetWidth(pixelBuffer: CVPixelBufferRef) -> usize;
     pub fn CVPixelBufferGetHeight(pixelBuffer: CVPixelBufferRef) -> usize;
     pub fn CVPixelBufferGetBytesPerRow(pixelBuffer: CVPixelBufferRef) -> usize;
+    pub fn CVPixelBufferGetPixelFormatType(pixelBuffer: CVPixelBufferRef) -> u32;
     pub fn CVPixelBufferIsPlanar(pixelBuffer: CVPixelBufferRef) -> bool;
+    pub fn CVPixelBufferGetPlaneCount(pixelBuffer: CVPixelBufferRef) -> usize;
+    pub fn CVPixelBufferGetWidthOfPlane(pixelBuffer: CVPixelBufferRef, planeIndex: usize) -> usize;
+    pub fn CVPixelBufferGetHeightOfPlane(pixelBuffer: CVPixelBufferRef, planeIndex: usize)
+        -> usize;
+    pub fn CVPixelBufferGetBytesPerRowOfPlane(
+        pixelBuffer: CVPixelBufferRef,
+        planeIndex: usize,
+    ) -> usize;
+    pub fn CVPixelBufferGetBaseAddressOfPlane(
+        pixelBuffer: CVPixelBufferRef,
+        planeIndex: usize,
+    ) -> *mut c_void;
+    pub fn CVPixelBufferRelease(pixelBuffer: CVPixelBufferRef);
+    pub fn CVPixelBufferRetain(pixelBuffer: CVPixelBufferRef) -> CVPixelBufferRef;
+    pub fn CVPixelBufferCreateWithPlanarBytes(
+        allocator: *const c_void,
+        width: usize,
+        height: usize,
+        pixelFormatType: u32,
+        dataPtr: *mut c_void,
+        dataSize: usize,
+        numberOfPlanes: usize,
+        planeBaseAddress: *mut *mut c_void,
+        planeWidth: *mut usize,
+        planeHeight: *mut usize,
+        planeBytesPerRow: *mut usize,
+        releaseCallback: Option<
+            unsafe extern "C" fn(*mut c_void, *const c_void, usize, usize, *const *const c_void),
+        >,
+        releaseRefCon: *mut c_void,
+        pixelBufferAttributes: *const c_void,
+        pixelBufferOut: *mut CVPixelBufferRef,
+    ) -> CVReturn;
 
     pub fn CVMetalTextureCacheCreate(
         allocator: *mut c_void,
@@ -346,6 +497,114 @@ extern "C" {
     pub fn CVMetalTextureGetTexture(texture: CVMetalTextureRef) -> ObjcId;
 
     pub fn CVMetalTextureCacheFlush(textureCache: CVMetalTextureCacheRef, options: u64);
+}
+
+pub type VTCompressionSessionRef = *mut c_void;
+pub type VTDecompressionSessionRef = *mut c_void;
+pub type VTEncodeInfoFlags = u32;
+pub type VTDecodeInfoFlags = u32;
+
+pub type VTCompressionOutputCallback = Option<
+    unsafe extern "C" fn(
+        outputCallbackRefCon: *mut c_void,
+        sourceFrameRefCon: *mut c_void,
+        status: OSStatus,
+        infoFlags: VTEncodeInfoFlags,
+        sampleBuffer: CMSampleBufferRef,
+    ),
+>;
+
+pub type VTDecompressionOutputCallback = Option<
+    unsafe extern "C" fn(
+        decompressionOutputRefCon: *mut c_void,
+        sourceFrameRefCon: *mut c_void,
+        status: OSStatus,
+        infoFlags: VTDecodeInfoFlags,
+        imageBuffer: CVImageBufferRef,
+        presentationTimeStamp: CMTime,
+        presentationDuration: CMTime,
+    ),
+>;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VTDecompressionOutputCallbackRecord {
+    pub decompressionOutputCallback: VTDecompressionOutputCallback,
+    pub decompressionOutputRefCon: *mut c_void,
+}
+
+#[link(name = "VideoToolbox", kind = "framework")]
+extern "C" {
+    pub static kVTCompressionPropertyKey_RealTime: CFStringRef;
+    pub static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
+    pub static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
+    pub static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
+    pub static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
+
+    pub fn VTCompressionSessionCreate(
+        allocator: *const c_void,
+        width: u32,
+        height: u32,
+        codecType: u32,
+        encoderSpecification: *const c_void,
+        imageBufferAttributes: *const c_void,
+        compressedDataAllocator: *mut c_void,
+        outputCallback: VTCompressionOutputCallback,
+        refcon: *mut c_void,
+        compressionSessionOut: *mut VTCompressionSessionRef,
+    ) -> OSStatus;
+
+    pub fn VTCompressionSessionPrepareToEncodeFrames(session: VTCompressionSessionRef) -> OSStatus;
+
+    pub fn VTCompressionSessionEncodeFrame(
+        session: VTCompressionSessionRef,
+        imageBuffer: CVImageBufferRef,
+        presentationTimeStamp: CMTime,
+        duration: CMTime,
+        frameProperties: *const c_void,
+        sourceFrameRefcon: *mut c_void,
+        infoFlagsOut: *mut VTEncodeInfoFlags,
+    ) -> OSStatus;
+
+    pub fn VTCompressionSessionCompleteFrames(
+        session: VTCompressionSessionRef,
+        completeUntilPresentationTimeStamp: CMTime,
+    ) -> OSStatus;
+
+    pub fn VTCompressionSessionInvalidate(session: VTCompressionSessionRef);
+
+    pub fn VTDecompressionSessionCreate(
+        allocator: *const c_void,
+        videoFormatDescription: CMFormatDescriptionRef,
+        videoDecoderSpecification: *const c_void,
+        destinationImageBufferAttributes: *const c_void,
+        outputCallback: *const VTDecompressionOutputCallbackRecord,
+        decompressionSessionOut: *mut VTDecompressionSessionRef,
+    ) -> OSStatus;
+
+    pub fn VTDecompressionSessionDecodeFrame(
+        session: VTDecompressionSessionRef,
+        sampleBuffer: CMSampleBufferRef,
+        decodeFlags: u32,
+        sourceFrameRefCon: *mut c_void,
+        infoFlagsOut: *mut VTDecodeInfoFlags,
+    ) -> OSStatus;
+
+    pub fn VTDecompressionSessionWaitForAsynchronousFrames(
+        session: VTDecompressionSessionRef,
+    ) -> OSStatus;
+
+    pub fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
+
+    pub fn VTSessionSetProperty(
+        session: *mut c_void,
+        propertyKey: CFStringRef,
+        propertyValue: *const c_void,
+    ) -> OSStatus;
+
+    pub fn VTIsHardwareEncodeSupported(codecType: u32) -> BOOL;
+    pub fn VTIsHardwareDecodeSupported(codecType: u32) -> BOOL;
 }
 
 // Foundation
@@ -548,8 +807,10 @@ pub enum NSWindowStyleMask {
     NSClosableWindowMask = 1 << 1,
     NSMiniaturizableWindowMask = 1 << 2,
     NSResizableWindowMask = 1 << 3,
+    NSUtilityWindowMask = 1 << 4,
 
     NSTexturedBackgroundWindowMask = 1 << 8,
+    NSNonactivatingPanelWindowMask = 1 << 7,
 
     NSUnifiedTitleAndToolbarWindowMask = 1 << 12,
 
@@ -557,6 +818,14 @@ pub enum NSWindowStyleMask {
 
     NSFullSizeContentViewWindowMask = 1 << 15,
 }
+
+pub const NSWindowCollectionBehaviorCanJoinAllSpaces: u64 = 1 << 0;
+pub const NSWindowCollectionBehaviorFullScreenAuxiliary: u64 = 1 << 8;
+
+pub const NSNormalWindowLevel: i64 = 0;
+pub const NSFloatingWindowLevel: i64 = 3;
+pub const NSStatusWindowLevel: i64 = 25;
+pub const NSPopUpMenuWindowLevel: i64 = 101;
 
 #[repr(u64)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -907,6 +1176,18 @@ pub struct __CFString {
     _unused: [u8; 0],
 }
 pub type CFStringRef = *const __CFString;
+pub type CFTypeRef = *const c_void;
+pub type CFArrayRef = *const c_void;
+pub type CFDictionaryRef = *const c_void;
+pub type CFAllocatorRef = *const c_void;
+pub type CFNumberRef = *const c_void;
+pub type CFBooleanRef = *const c_void;
+pub type CFDataRef = *const c_void;
+pub type CFErrorRef = *const c_void;
+pub type CFIndex = isize;
+pub type Boolean = u8;
+
+pub const kCFNumberSInt32Type: i32 = 3;
 
 // CORE AUDIO
 
@@ -1468,13 +1749,51 @@ extern "C" {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
+    pub static kCFBooleanTrue: CFBooleanRef;
+    pub static kCFBooleanFalse: CFBooleanRef;
+
     pub fn CFRelease(cf: *const c_void);
+    pub fn CFArrayCreate(
+        allocator: CFAllocatorRef,
+        values: *const *const c_void,
+        numValues: CFIndex,
+        callBacks: *const c_void,
+    ) -> CFArrayRef;
+    pub fn CFArrayGetCount(theArray: CFArrayRef) -> isize;
+    pub fn CFArrayGetValueAtIndex(theArray: CFArrayRef, idx: isize) -> *const c_void;
+    pub fn CFDictionaryContainsKey(theDict: CFDictionaryRef, key: *const c_void) -> u8;
+    pub fn CFDictionaryGetValue(theDict: CFDictionaryRef, key: *const c_void) -> *const c_void;
+    pub fn CFDictionaryCreate(
+        allocator: CFAllocatorRef,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        numValues: isize,
+        keyCallBacks: *const c_void,
+        valueCallBacks: *const c_void,
+    ) -> CFDictionaryRef;
+    pub fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
+    pub fn CFDataGetLength(theData: CFDataRef) -> CFIndex;
+    pub fn CFDataGetBytePtr(theData: CFDataRef) -> *const u8;
+    pub fn CFNumberCreate(
+        allocator: CFAllocatorRef,
+        theType: i32,
+        valuePtr: *const c_void,
+    ) -> CFNumberRef;
+    pub fn CFStringCreateWithBytes(
+        alloc: CFAllocatorRef,
+        bytes: *const u8,
+        numBytes: CFIndex,
+        encoding: u32,
+        isExternalRepresentation: Boolean,
+    ) -> CFStringRef;
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub type SSLContextRef = *mut c_void;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub type SSLConnectionRef = *mut c_void;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub type SSLProtocol = u32;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub type SSLProtocolSide = u32;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -1483,7 +1802,15 @@ pub type SSLConnectionType = u32;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const kSSLClientSide: SSLProtocolSide = 1;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+pub const kSSLServerSide: SSLProtocolSide = 0;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const kSSLStreamType: SSLConnectionType = 0;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub const kSSLDatagramType: SSLConnectionType = 1;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub const kDTLSProtocol1: SSLProtocol = 9;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub const kDTLSProtocol12: SSLProtocol = 11;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const errSSLWouldBlock: OSStatus = -9803;
@@ -1494,7 +1821,22 @@ pub const errSSLClosedAbort: OSStatus = -9806;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const errSSLServerAuthCompleted: OSStatus = -9841;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub const errSSLPeerAuthCompleted: OSStatus = -9841;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub const errSSLClientAuthCompleted: OSStatus = -9841;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const kSSLSessionOptionBreakOnServerAuth: i32 = 0;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub const kSSLSessionOptionBreakOnClientAuth: i32 = 2;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub type SecIdentityRef = *const c_void;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub type SecCertificateRef = *const c_void;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub type SecKeyRef = *const c_void;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub type SecTrustRef = *const c_void;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub type SSLReadFunc = Option<
@@ -1527,13 +1869,28 @@ extern "C" {
         write_func: SSLWriteFunc,
     ) -> OSStatus;
     pub fn SSLSetConnection(context: SSLContextRef, connection: SSLConnectionRef) -> OSStatus;
+    pub fn SSLSetCertificate(context: SSLContextRef, cert_refs: CFArrayRef) -> OSStatus;
     pub fn SSLSetPeerDomainName(
         context: SSLContextRef,
         peer_name: *const c_void,
         peer_name_len: usize,
     ) -> OSStatus;
+    pub fn SSLSetPeerID(
+        context: SSLContextRef,
+        peer_id: *const c_void,
+        peer_id_len: usize,
+    ) -> OSStatus;
     pub fn SSLSetSessionOption(context: SSLContextRef, option: i32, value: bool) -> OSStatus;
+    pub fn SSLSetProtocolVersionMin(context: SSLContextRef, min_version: SSLProtocol) -> OSStatus;
+    pub fn SSLSetProtocolVersionMax(context: SSLContextRef, max_version: SSLProtocol) -> OSStatus;
     pub fn SSLHandshake(context: SSLContextRef) -> OSStatus;
+    pub fn SSLSetDatagramHelloCookie(
+        context: SSLContextRef,
+        cookie: *const c_void,
+        cookie_len: usize,
+    ) -> OSStatus;
+    pub fn SSLSetMaxDatagramRecordSize(context: SSLContextRef, max_size: usize) -> OSStatus;
+    pub fn SSLGetDatagramWriteSize(context: SSLContextRef, buf_size: *mut usize) -> OSStatus;
     pub fn SSLRead(
         context: SSLContextRef,
         data: *mut c_void,
@@ -1546,7 +1903,33 @@ extern "C" {
         data_len: usize,
         processed: *mut usize,
     ) -> OSStatus;
+    pub fn SSLCopyPeerTrust(context: SSLContextRef, trust: *mut SecTrustRef) -> OSStatus;
     pub fn SSLClose(context: SSLContextRef) -> OSStatus;
+    pub static kSecAttrKeyType: CFStringRef;
+    pub static kSecAttrKeyClass: CFStringRef;
+    pub static kSecAttrKeySizeInBits: CFStringRef;
+    pub static kSecAttrKeyTypeRSA: CFStringRef;
+    pub static kSecAttrKeyClassPrivate: CFStringRef;
+    pub fn SecCertificateCreateWithData(
+        allocator: CFAllocatorRef,
+        data: CFDataRef,
+    ) -> SecCertificateRef;
+    pub fn SecCertificateCopyData(certificate: SecCertificateRef) -> CFDataRef;
+    pub fn SecIdentityCreate(
+        allocator: CFAllocatorRef,
+        certificate: SecCertificateRef,
+        private_key: SecKeyRef,
+    ) -> SecIdentityRef;
+    pub fn SecIdentityCopyCertificate(
+        identity: SecIdentityRef,
+        certificate: *mut SecCertificateRef,
+    ) -> OSStatus;
+    pub fn SecKeyCreateWithData(
+        key_data: CFDataRef,
+        attributes: CFDictionaryRef,
+        error: *mut CFErrorRef,
+    ) -> SecKeyRef;
+    pub fn SecTrustCopyCertificateChain(trust: SecTrustRef) -> CFArrayRef;
 }
 
 #[cfg(target_os = "macos")]

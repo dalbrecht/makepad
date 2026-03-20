@@ -1058,6 +1058,46 @@ impl ShaderFnCompiler {
             return;
         }
 
+        if name == id!(depth_clip) {
+            let mut concrete_args = Vec::new();
+            let mut formatted_args = Vec::new();
+            for (ty, s) in args {
+                concrete_args.push(ty.make_concrete(builtins).unwrap_or(builtins.pod_void));
+                formatted_args.push(s);
+            }
+
+            let mut out = self.stack.new_string();
+            match output.backend {
+                ShaderBackend::Glsl => {
+                    write!(
+                        out,
+                        "depth_clip({}, {}, {})",
+                        formatted_args[0], formatted_args[1], formatted_args[2]
+                    )
+                    .ok();
+                }
+                ShaderBackend::Wgsl => {
+                    write!(
+                        out,
+                        "depth_clip({}, {}, {})",
+                        formatted_args[0], formatted_args[1], formatted_args[2]
+                    )
+                    .ok();
+                }
+                ShaderBackend::Metal | ShaderBackend::Hlsl | ShaderBackend::Rust => {
+                    write!(out, "{}", formatted_args[1]).ok();
+                }
+            }
+
+            for s in formatted_args {
+                self.stack.free_string(s);
+            }
+
+            let ret = type_table_builtin(name, &concrete_args, builtins, self.trap.pass());
+            self.stack.push(self.trap.pass(), ShaderType::Pod(ret), out);
+            return;
+        }
+
         // Check if any arg is a float type - if so, abstract ints should be floats
         let has_float = args.iter().any(|(ty, _)| match ty {
             ShaderType::Pod(pt) => vm.bx.heap.pod_types[pt.index as usize].ty.is_float_type(),
@@ -1327,17 +1367,26 @@ impl ShaderFnCompiler {
                     s,
                 );
             }
-            id!(sample) | id!(sample_as_bgra) => {
+            id!(sample) | id!(sample_as_bgra) | id!(sample_lod) => {
                 // sample(coord) samples the texture at normalized coordinates.
                 // sample_as_bgra(coord) is identical except on WebGL GLSL, where it
                 // applies a BGRA->RGBA swizzle in the sampler helper.
                 let method_name = if method_id == id!(sample_as_bgra) {
                     "sample_as_bgra"
+                } else if method_id == id!(sample_lod) {
+                    "sample_lod"
                 } else {
                     "sample"
                 };
-                if args.len() != 1 {
-                    script_err_invalid_args!(self.trap, "texture.{} requires 1 arg", method_name);
+                let required_args = if method_id == id!(sample_lod) { 2 } else { 1 };
+                if args.len() != required_args {
+                    script_err_invalid_args!(
+                        self.trap,
+                        "texture.{} requires {} arg{}",
+                        method_name,
+                        required_args,
+                        if required_args == 1 { "" } else { "s" }
+                    );
                     let empty = self.stack.new_string();
                     self.stack.push(
                         self.trap.pass(),
@@ -1346,6 +1395,7 @@ impl ShaderFnCompiler {
                     );
                 } else {
                     let coord = &args[0];
+                    let lod = args.get(1);
                     let mut s = self.stack.new_string();
 
                     // Get or create the default sampler (linear, clamp_to_edge, normalized)
@@ -1354,26 +1404,46 @@ impl ShaderFnCompiler {
 
                     match output.backend {
                         ShaderBackend::Metal => {
-                            // Metal: texture.sample(sampler, coord)
-                            write!(s, "{}.sample(_s{}, {})", texture_expr, sampler_idx, coord).ok();
+                            if let Some(lod) = lod {
+                                write!(
+                                    s,
+                                    "{}.sample(_s{}, {}, level({}))",
+                                    texture_expr, sampler_idx, coord, lod
+                                )
+                                .ok();
+                            } else {
+                                // Metal: texture.sample(sampler, coord)
+                                write!(s, "{}.sample(_s{}, {})", texture_expr, sampler_idx, coord)
+                                    .ok();
+                            }
                         }
                         ShaderBackend::Wgsl => {
-                            // WGSL: textureSample(texture, sampler, coord)
-                            write!(
-                                s,
-                                "textureSample({}, _s{}, {})",
-                                texture_expr, sampler_idx, coord
-                            )
-                            .ok();
+                            if let Some(lod) = lod {
+                                write!(
+                                    s,
+                                    "textureSampleLevel({}, _s{}, {}, {})",
+                                    texture_expr, sampler_idx, coord, lod
+                                )
+                                .ok();
+                            } else {
+                                // WGSL: textureSample(texture, sampler, coord)
+                                write!(
+                                    s,
+                                    "textureSample({}, _s{}, {})",
+                                    texture_expr, sampler_idx, coord
+                                )
+                                .ok();
+                            }
                         }
                         ShaderBackend::Hlsl => {
                             // D3D11 uses DXGI_FORMAT_B8G8R8A8_UNORM, so the GPU already
                             // interprets BGRA data as RGBA when sampling. No swizzle needed
                             // for sample_as_bgra (same as Metal).
+                            let lod_expr = lod.map_or("0.0", |lod| lod.as_str());
                             write!(
                                 s,
-                                "{}.SampleLevel(_s{}, {}, 0.0)",
-                                texture_expr, sampler_idx, coord
+                                "{}.SampleLevel(_s{}, {}, {})",
+                                texture_expr, sampler_idx, coord, lod_expr
                             )
                             .ok();
                         }
@@ -1384,7 +1454,14 @@ impl ShaderFnCompiler {
                             output.bind_texture_sampler(&texture_expr, sampler_idx);
                             match tex_type {
                                 TextureType::TextureCube | TextureType::TextureCubeArray => {
-                                    if method_id == id!(sample_as_bgra) {
+                                    if let Some(lod) = lod {
+                                        write!(
+                                            s,
+                                            "samplecube_lod({}, {}, {})",
+                                            texture_expr, coord, lod
+                                        )
+                                        .ok();
+                                    } else if method_id == id!(sample_as_bgra) {
                                         write!(s, "samplecube_bgra({}, {})", texture_expr, coord)
                                             .ok();
                                     } else {
@@ -1392,7 +1469,14 @@ impl ShaderFnCompiler {
                                     }
                                 }
                                 _ => {
-                                    if method_id == id!(sample_as_bgra) {
+                                    if let Some(lod) = lod {
+                                        write!(
+                                            s,
+                                            "sample2d_lod({}, {}, {})",
+                                            texture_expr, coord, lod
+                                        )
+                                        .ok();
+                                    } else if method_id == id!(sample_as_bgra) {
                                         write!(s, "sample2d_bgra({}, {})", texture_expr, coord)
                                             .ok();
                                     } else {
@@ -1404,7 +1488,11 @@ impl ShaderFnCompiler {
                         ShaderBackend::Rust => {
                             // Rust headless backend keeps texture data in logical RGBA,
                             // so sample_as_bgra is a no-op alias of sample.
-                            write!(s, "{}.sample({})", texture_expr, coord).ok();
+                            if let Some(lod) = lod {
+                                write!(s, "{}.sample_lod({}, {})", texture_expr, coord, lod).ok();
+                            } else {
+                                write!(s, "{}.sample({})", texture_expr, coord).ok();
+                            }
                         }
                     }
                     self.stack.push(
@@ -1430,29 +1518,36 @@ impl ShaderFnCompiler {
                     let coord = &args[0];
                     let mut s = self.stack.new_string();
 
-                    let sampler = ShaderSampler::default();
-                    let sampler_idx = output.get_or_create_sampler(sampler);
-
                     match output.backend {
                         ShaderBackend::Glsl => {
+                            let sampler = ShaderSampler::default();
+                            let sampler_idx = output.get_or_create_sampler(sampler);
                             output.bind_texture_sampler(&texture_expr, sampler_idx);
-                            #[cfg(target_os = "android")]
-                            write!(s, "sample2dOES({}, {})", texture_expr, coord).ok();
-                            #[cfg(not(target_os = "android"))]
-                            write!(s, "sample2d({}, {})", texture_expr, coord).ok();
+                            if cfg!(target_os = "android") && !cfg!(use_vulkan) {
+                                write!(s, "sample2dOES({}, {})", texture_expr, coord).ok();
+                            } else {
+                                write!(s, "sample2d({}, {})", texture_expr, coord).ok();
+                            }
                         }
                         ShaderBackend::Metal => {
+                            let sampler = ShaderSampler::video();
+                            let sampler_idx = output.get_or_create_sampler(sampler);
                             write!(s, "{}.sample(_s{}, {})", texture_expr, sampler_idx, coord).ok();
                         }
                         ShaderBackend::Wgsl => {
+                            let sampler = ShaderSampler::default();
+                            let sampler_idx = output.get_or_create_sampler(sampler);
+                            output.bind_texture_sampler(&texture_expr, sampler_idx);
                             write!(
                                 s,
-                                "textureSample({}, _s{}, {})",
+                                "textureSampleLevel({}, _s{}, {}, 0.0)",
                                 texture_expr, sampler_idx, coord
                             )
                             .ok();
                         }
                         ShaderBackend::Hlsl => {
+                            let sampler = ShaderSampler::video();
+                            let sampler_idx = output.get_or_create_sampler(sampler);
                             write!(
                                 s,
                                 "{}.SampleLevel(_s{}, {}, 0.0)",
@@ -1481,6 +1576,7 @@ impl ShaderFnCompiler {
                         &[
                             id!(sample),
                             id!(sample_as_bgra),
+                            id!(sample_lod),
                             id!(sample_video),
                             id!(size)
                         ]

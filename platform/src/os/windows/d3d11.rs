@@ -47,13 +47,14 @@ use crate::{
                     D3D11_COMPARISON_LESS_EQUAL, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_FLAG,
                     D3D11_CULL_NONE, D3D11_DEPTH_STENCILOP_DESC, D3D11_DEPTH_STENCIL_DESC,
                     D3D11_DEPTH_STENCIL_VIEW_DESC, D3D11_DEPTH_WRITE_MASK_ALL,
-                    D3D11_DSV_DIMENSION_TEXTURE2D, D3D11_FILL_SOLID, D3D11_INPUT_ELEMENT_DESC,
-                    D3D11_INPUT_PER_INSTANCE_DATA, D3D11_INPUT_PER_VERTEX_DATA,
-                    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_QUERY_DESC,
-                    D3D11_QUERY_EVENT, D3D11_RASTERIZER_DESC, D3D11_RENDER_TARGET_BLEND_DESC,
-                    D3D11_RESOURCE_MISC_FLAG, D3D11_RESOURCE_MISC_TEXTURECUBE, D3D11_SDK_VERSION,
-                    D3D11_STENCIL_OP_REPLACE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
-                    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
+                    D3D11_DEPTH_WRITE_MASK_ZERO, D3D11_DSV_DIMENSION_TEXTURE2D, D3D11_FILL_SOLID,
+                    D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_INSTANCE_DATA,
+                    D3D11_INPUT_PER_VERTEX_DATA, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD,
+                    D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_RASTERIZER_DESC,
+                    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_RESOURCE_MISC_FLAG,
+                    D3D11_RESOURCE_MISC_TEXTURECUBE, D3D11_SDK_VERSION, D3D11_STENCIL_OP_REPLACE,
+                    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+                    D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
                 },
                 Dxgi::{
                     Common::{
@@ -221,6 +222,28 @@ impl Cx {
                         .IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                     d3d11_cx.context.IASetInputLayout(&shp.input_layout);
 
+                    let depth_stencil_state = if draw_call.options.depth_write {
+                        self.passes[pass_id].os.depth_stencil_state_write.as_ref()
+                    } else {
+                        self.passes[pass_id]
+                            .os
+                            .depth_stencil_state_no_write
+                            .as_ref()
+                    };
+                    if let Some(depth_stencil_state) = depth_stencil_state {
+                        d3d11_cx
+                            .context
+                            .OMSetDepthStencilState(depth_stencil_state, 0);
+                    }
+                    let raster_state = if draw_call.options.backface_culling {
+                        self.passes[pass_id].os.raster_state_backface_cull.as_ref()
+                    } else {
+                        self.passes[pass_id].os.raster_state_no_cull.as_ref()
+                    };
+                    if let Some(raster_state) = raster_state {
+                        d3d11_cx.context.RSSetState(raster_state);
+                    }
+
                     let geom_ibuf = geometry.os.geom_ibuf.buffer.as_ref().unwrap();
                     d3d11_cx
                         .context
@@ -277,6 +300,20 @@ impl Cx {
                         shp.dyn_uniform_buffer_id,
                         &draw_item.os.user_uniforms.buffer,
                     );
+                    for (slot, idx) in shp.custom_uniform_buffer_ids.iter().enumerate() {
+                        if let Some(uniform_buffer) = draw_call.uniform_buffer_slots[slot].as_ref()
+                        {
+                            let cx_uniform_buffer =
+                                &mut self.uniform_buffers[uniform_buffer.uniform_buffer_id()];
+                            cx_uniform_buffer
+                                .os
+                                .buffer
+                                .update_with_constant_bytes(d3d11_cx, &cx_uniform_buffer.data);
+                            buffer_slot(d3d11_cx, *idx, &cx_uniform_buffer.os.buffer.buffer);
+                        } else {
+                            buffer_slot(d3d11_cx, *idx, &None);
+                        }
+                    }
                     buffer_slot_opt(
                         d3d11_cx,
                         shp.draw_call_uniform_buffer_id,
@@ -597,7 +634,9 @@ fn texture_pixel_to_dx11_pixel(pix: &TexturePixel) -> DXGI_FORMAT {
         TexturePixel::RGu8 => DXGI_FORMAT_R8G8_UNORM,
         TexturePixel::Rf32 => DXGI_FORMAT_R32_FLOAT,
         TexturePixel::D32 => DXGI_FORMAT_D32_FLOAT,
-        TexturePixel::VideoRGB => DXGI_FORMAT_B8G8R8A8_UNORM,
+        TexturePixel::VideoYuvPlane => DXGI_FORMAT_R8_UNORM,
+        TexturePixel::VideoExternal => DXGI_FORMAT_B8G8R8A8_UNORM,
+        TexturePixel::VideoRgbaHardwareBuffer => DXGI_FORMAT_R8G8B8A8_UNORM,
     }
 }
 
@@ -627,7 +666,7 @@ impl D3d11Window {
         let mut win32_window =
             Box::new(Win32Window::new(window_id, title, position, is_fullscreen));
         win32_window.init(inner_size);
-
+        win32_window.set_ime_active(false);
         let wg = win32_window.get_window_geom();
 
         let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
@@ -677,6 +716,61 @@ impl D3d11Window {
                 swap_texture: Some(swap_texture),
                 render_target_view: render_target_view,
                 swap_chain: swap_chain,
+            }
+        }
+    }
+
+    pub fn new_popup(
+        window_id: WindowId,
+        d3d11_cx: &D3d11Cx,
+        size: Vec2d,
+        position: Vec2d,
+    ) -> D3d11Window {
+        let mut win32_window = Box::new(Win32Window::new_popup(window_id, position, size));
+        win32_window.init(size);
+
+        let wg = win32_window.get_window_geom();
+
+        let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            BufferCount: 2,
+            Width: (wg.inner_size.x * wg.dpi_factor) as u32,
+            Height: (wg.inner_size.y * wg.dpi_factor) as u32,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Flags: 0,
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Scaling: DXGI_SCALING_NONE,
+            Stereo: FALSE,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+        };
+
+        unsafe {
+            let swap_chain = d3d11_cx
+                .factory
+                .CreateSwapChainForHwnd(&d3d11_cx.device, win32_window.hwnd, &sc_desc, None, None)
+                .unwrap();
+
+            let swap_texture = swap_chain.GetBuffer(0).unwrap();
+            let mut render_target_view = None;
+            d3d11_cx
+                .device
+                .CreateRenderTargetView(&swap_texture, None, Some(&mut render_target_view))
+                .unwrap();
+
+            D3d11Window {
+                first_draw: true,
+                is_in_resize: false,
+                window_id,
+                alloc_size: wg.inner_size,
+                window_geom: wg,
+                win32_window,
+                swap_texture: Some(swap_texture),
+                render_target_view,
+                swap_chain,
             }
         }
     }
@@ -817,6 +911,11 @@ pub struct CxOsDrawCall {
 }
 
 #[derive(Default, Clone)]
+pub struct CxOsUniformBuffer {
+    pub buffer: D3d11Buffer,
+}
+
+#[derive(Default, Clone)]
 pub struct D3d11Buffer {
     pub last_size: usize,
     pub buffer: Option<ID3D11Buffer>,
@@ -932,6 +1031,32 @@ impl D3d11Buffer {
             .as_ptr() as *const _
         };
         self.create_buffer_or_update(d3d11_cx, &buffer_desc, len_slots, data);
+    }
+
+    pub fn update_with_constant_bytes(&mut self, d3d11_cx: &D3d11Cx, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let padded_len = data.len().next_multiple_of(16);
+        let mut padded = Vec::with_capacity(padded_len);
+        padded.extend_from_slice(data);
+        padded.resize(padded_len, 0);
+        let len_slots = padded.len() >> 2;
+
+        let buffer_desc = D3D11_BUFFER_DESC {
+            Usage: D3D11_USAGE_DYNAMIC,
+            ByteWidth: padded.len() as u32,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        self.create_buffer_or_update(
+            d3d11_cx,
+            &buffer_desc,
+            len_slots,
+            padded.as_ptr() as *const _,
+        );
     }
 }
 
@@ -1344,73 +1469,84 @@ impl CxOsPass {
             self.blend_state = blend_state;
         }
 
-        if self.raster_state.is_none() {
-            let raster_desc = D3D11_RASTERIZER_DESC {
-                AntialiasedLineEnable: FALSE,
-                CullMode: D3D11_CULL_NONE,
-                DepthBias: 0,
-                DepthBiasClamp: 0.0,
-                DepthClipEnable: TRUE,
-                FillMode: D3D11_FILL_SOLID,
-                FrontCounterClockwise: FALSE,
-                MultisampleEnable: FALSE,
-                ScissorEnable: FALSE,
-                SlopeScaledDepthBias: 0.0,
+        if self.raster_state_no_cull.is_none() || self.raster_state_backface_cull.is_none() {
+            let make_raster_state = |cull_mode| {
+                let raster_desc = D3D11_RASTERIZER_DESC {
+                    AntialiasedLineEnable: FALSE,
+                    CullMode: cull_mode,
+                    DepthBias: 0,
+                    DepthBiasClamp: 0.0,
+                    DepthClipEnable: TRUE,
+                    FillMode: D3D11_FILL_SOLID,
+                    FrontCounterClockwise: FALSE,
+                    MultisampleEnable: FALSE,
+                    ScissorEnable: FALSE,
+                    SlopeScaledDepthBias: 0.0,
+                };
+                let mut raster_state = None;
+                unsafe {
+                    d3d11_cx
+                        .device
+                        .CreateRasterizerState(&raster_desc, Some(&mut raster_state))
+                        .unwrap()
+                }
+                raster_state
             };
-            let mut raster_state = None;
-            unsafe {
-                d3d11_cx
-                    .device
-                    .CreateRasterizerState(&raster_desc, Some(&mut raster_state))
-                    .unwrap()
-            }
-            self.raster_state = raster_state;
+            self.raster_state_no_cull = make_raster_state(D3D11_CULL_NONE);
+            self.raster_state_backface_cull = make_raster_state(D3D11_CULL_BACK);
         }
 
-        if self.depth_stencil_state.is_none() {
-            let ds_desc = D3D11_DEPTH_STENCIL_DESC {
-                DepthEnable: TRUE,
-                DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ALL,
-                DepthFunc: D3D11_COMPARISON_LESS_EQUAL,
-                StencilEnable: FALSE,
-                StencilReadMask: 0xff,
-                StencilWriteMask: 0xff,
-                FrontFace: D3D11_DEPTH_STENCILOP_DESC {
-                    StencilFailOp: D3D11_STENCIL_OP_REPLACE,
-                    StencilDepthFailOp: D3D11_STENCIL_OP_REPLACE,
-                    StencilPassOp: D3D11_STENCIL_OP_REPLACE,
-                    StencilFunc: D3D11_COMPARISON_ALWAYS,
-                },
-                BackFace: D3D11_DEPTH_STENCILOP_DESC {
-                    StencilFailOp: D3D11_STENCIL_OP_REPLACE,
-                    StencilDepthFailOp: D3D11_STENCIL_OP_REPLACE,
-                    StencilPassOp: D3D11_STENCIL_OP_REPLACE,
-                    StencilFunc: D3D11_COMPARISON_ALWAYS,
-                },
+        if self.depth_stencil_state_write.is_none() {
+            let mut make_depth_stencil_state = |depth_write_mask| {
+                let ds_desc = D3D11_DEPTH_STENCIL_DESC {
+                    DepthEnable: TRUE,
+                    DepthWriteMask: depth_write_mask,
+                    DepthFunc: D3D11_COMPARISON_LESS_EQUAL,
+                    StencilEnable: FALSE,
+                    StencilReadMask: 0xff,
+                    StencilWriteMask: 0xff,
+                    FrontFace: D3D11_DEPTH_STENCILOP_DESC {
+                        StencilFailOp: D3D11_STENCIL_OP_REPLACE,
+                        StencilDepthFailOp: D3D11_STENCIL_OP_REPLACE,
+                        StencilPassOp: D3D11_STENCIL_OP_REPLACE,
+                        StencilFunc: D3D11_COMPARISON_ALWAYS,
+                    },
+                    BackFace: D3D11_DEPTH_STENCILOP_DESC {
+                        StencilFailOp: D3D11_STENCIL_OP_REPLACE,
+                        StencilDepthFailOp: D3D11_STENCIL_OP_REPLACE,
+                        StencilPassOp: D3D11_STENCIL_OP_REPLACE,
+                        StencilFunc: D3D11_COMPARISON_ALWAYS,
+                    },
+                };
+                let mut depth_stencil_state = None;
+                unsafe {
+                    d3d11_cx
+                        .device
+                        .CreateDepthStencilState(&ds_desc, Some(&mut depth_stencil_state))
+                        .unwrap()
+                }
+                depth_stencil_state
             };
-            let mut depth_stencil_state = None;
-            unsafe {
-                d3d11_cx
-                    .device
-                    .CreateDepthStencilState(&ds_desc, Some(&mut depth_stencil_state))
-                    .unwrap()
-            }
-            self.depth_stencil_state = depth_stencil_state;
+            self.depth_stencil_state_write = make_depth_stencil_state(D3D11_DEPTH_WRITE_MASK_ALL);
+            self.depth_stencil_state_no_write =
+                make_depth_stencil_state(D3D11_DEPTH_WRITE_MASK_ZERO);
         }
 
         unsafe {
             d3d11_cx
                 .context
-                .RSSetState(self.raster_state.as_ref().unwrap());
+                .RSSetState(self.raster_state_no_cull.as_ref().unwrap());
             let blend_factor = [0., 0., 0., 0.];
             d3d11_cx.context.OMSetBlendState(
                 self.blend_state.as_ref().unwrap(),
                 Some(&blend_factor),
                 0xffffffff,
             );
-            d3d11_cx
-                .context
-                .OMSetDepthStencilState(self.depth_stencil_state.as_ref().unwrap(), 0);
+            if let Some(depth_stencil_state) = self.depth_stencil_state_write.as_ref() {
+                d3d11_cx
+                    .context
+                    .OMSetDepthStencilState(depth_stencil_state, 0);
+            }
         }
     }
 }
@@ -1419,8 +1555,10 @@ impl CxOsPass {
 pub struct CxOsPass {
     pass_uniforms: D3d11Buffer,
     blend_state: Option<ID3D11BlendState>,
-    raster_state: Option<ID3D11RasterizerState>,
-    depth_stencil_state: Option<ID3D11DepthStencilState>,
+    raster_state_no_cull: Option<ID3D11RasterizerState>,
+    raster_state_backface_cull: Option<ID3D11RasterizerState>,
+    depth_stencil_state_write: Option<ID3D11DepthStencilState>,
+    depth_stencil_state_no_write: Option<ID3D11DepthStencilState>,
 }
 
 #[derive(Default, Clone)]
@@ -1630,6 +1768,7 @@ pub struct CxOsDrawShader {
     pub pass_uniform_buffer_id: Option<u32>,
     pub draw_list_uniform_buffer_id: Option<u32>,
     pub dyn_uniform_buffer_id: Option<u32>,
+    pub custom_uniform_buffer_ids: Vec<u32>,
     pub scope_uniform_buffer_id: Option<u32>,
 }
 
@@ -1927,6 +2066,11 @@ impl CxOsDrawShader {
             .map(|i| i as u32);
         // dyn_uniform_buffer_id uses the IoUniform cbuffer at register b2
         let dyn_uniform_buffer_id = Some(2);
+        let custom_uniform_buffer_ids = mapping
+            .uniform_buffers
+            .iter()
+            .map(|input| input.buffer_index as u32)
+            .collect();
         let scope_uniform_buffer_id = bindings.scope_uniform_buffer_index.map(|i| i as u32);
 
         Some(Self {
@@ -1943,6 +2087,7 @@ impl CxOsDrawShader {
             pass_uniform_buffer_id,
             draw_list_uniform_buffer_id,
             dyn_uniform_buffer_id,
+            custom_uniform_buffer_ids,
             scope_uniform_buffer_id,
         })
     }

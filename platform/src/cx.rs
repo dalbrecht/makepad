@@ -17,8 +17,9 @@ use {
         os::CxOs,
         performance_stats::PerformanceStats,
         script::script::CxScriptData,
-        thread::SignalToUI,
         texture::{CxTexturePool, Texture, TextureFormat, TextureUpdated},
+        thread::{SignalToUI, ToUIReceiver},
+        uniform_buffer::CxUniformBufferPool,
         window::CxWindowPool,
     },
     makepad_futures::{
@@ -26,8 +27,8 @@ use {
         executor::{Executor, Spawner},
     },
     makepad_network::NetworkRuntime,
-    makepad_studio_protocol::ScreenshotRequest,
     makepad_script::*,
+    makepad_studio_protocol::{RunViewFrameData, RunViewFrameRequest, ScreenshotRequest},
     std::{
         any::{Any, TypeId},
         cell::RefCell,
@@ -39,6 +40,17 @@ use {
 
 //pub use makepad_shader_compiler::makepad_derive_live::*;
 //pub use makepad_shader_compiler::makepad_math::*;
+
+pub(crate) struct PendingCameraPlayback {
+    pub permission: crate::permission::Permission,
+    pub video_id: LiveId,
+    pub source: crate::event::VideoSource,
+    pub camera_preview_mode: crate::event::video_playback::CameraPreviewMode,
+    pub external_texture_id: u32,
+    pub texture_id: crate::texture::TextureId,
+    pub autoplay: bool,
+    pub should_loop: bool,
+}
 
 pub struct Cx {
     pub script_vm: Option<Box<ScriptVmBase>>,
@@ -60,6 +72,7 @@ pub struct Cx {
     pub draw_lists: CxDrawListPool,
     pub draw_matrices: CxDrawMatrixPool,
     pub textures: CxTexturePool,
+    pub uniform_buffers: CxUniformBufferPool,
     pub(crate) geometries: CxGeometryPool,
 
     pub draw_shaders: CxDrawShaders,
@@ -81,6 +94,7 @@ pub struct Cx {
     pub(crate) drag_drop: CxDragDrop,
 
     pub(crate) platform_ops: Vec<CxOsOp>,
+    pub(crate) pending_camera_playbacks: Vec<PendingCameraPlayback>,
 
     pub(crate) new_next_frames: HashSet<NextFrame>,
 
@@ -120,6 +134,12 @@ pub struct Cx {
     pub performance_stats: PerformanceStats,
     #[allow(unused)]
     pub(crate) screenshot_requests: Vec<ScreenshotRequest>,
+    #[allow(dead_code)]
+    pub(crate) run_view_frame_requests: Vec<RunViewFrameRequest>,
+    #[allow(dead_code)]
+    pub(crate) run_view_frame_results: ToUIReceiver<Result<RunViewFrameData, String>>,
+    #[allow(dead_code)]
+    pub(crate) run_view_frame_encode_in_flight: bool,
     pub(crate) widget_tree_dump_requests: Vec<u64>,
     /// Event ID that triggered a widget query cache invalidation.
     /// When Some(event_id), indicates that widgets should clear their query caches
@@ -320,13 +340,18 @@ impl Cx {
             SignalToUI::set_ui_signal();
         })));
 
+        let mut script_std = makepad_script_std::ScriptStd::with_network_runtime(net.clone());
+        let mut script_host = 0;
         let mut vm = ScriptVm {
-            host: &mut 0,
+            host: &mut script_host,
+            std: &mut script_std,
             bx: Box::new(ScriptVmBase::new()),
         };
 
         //todo!();
         crate::script::script_mod(&mut vm);
+        let script_vm = std::mem::replace(&mut vm.bx, Box::new(ScriptVmBase::empty()));
+        drop(vm);
 
         Self {
             package_root: None,
@@ -346,6 +371,7 @@ impl Cx {
             draw_matrices: Default::default(),
             geometries: Default::default(),
             textures,
+            uniform_buffers: Default::default(),
 
             draw_shaders: Default::default(),
 
@@ -365,10 +391,14 @@ impl Cx {
             ime_area: Default::default(),
             keyboard_shift: 0.0,
             platform_ops: Default::default(),
+            pending_camera_playbacks: Vec::new(),
             studio_http: "".to_string(),
             new_next_frames: Default::default(),
 
             screenshot_requests: Default::default(),
+            run_view_frame_requests: Default::default(),
+            run_view_frame_results: Default::default(),
+            run_view_frame_encode_in_flight: false,
             widget_tree_dump_requests: Default::default(),
 
             dependencies: Default::default(),
@@ -404,16 +434,15 @@ impl Cx {
             net,
 
             script_data: CxScriptData {
-                crate_manifests: vm.bx.code.crate_manifests.clone(),
+                std: script_std,
+                crate_manifests: script_vm.code.crate_manifests.clone(),
+                live_reload: crate::live_reload::CxLiveReloadState {
+                    script_mod_overrides: script_vm.code.script_mod_overrides.clone(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            script_vm: Some(vm.bx),
+            script_vm: Some(script_vm),
         }
-    }
-}
-
-impl Cx {
-    pub fn handle_live_edit(&mut self) -> bool {
-        false
     }
 }

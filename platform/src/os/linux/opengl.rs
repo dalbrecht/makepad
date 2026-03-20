@@ -221,8 +221,7 @@ impl DrawVars {
                             }
                         }
                         if os_shader_id.is_none() {
-                            let mut os_shader =
-                                CxOsDrawShader::new(cx.os.gl(), &vertex, &fragment, &cx.os_type);
+                            let mut os_shader = CxOsDrawShader::new_vulkan_only(&vertex, &fragment);
                             os_shader.vulkan_shader = Some(vk_shader);
                             os_shader_id = Some(cx.draw_shaders.os_shaders.len());
                             cx.draw_shaders.os_shaders.push(os_shader);
@@ -530,6 +529,17 @@ impl Cx {
                     let instances = (draw_item.instances.as_ref().unwrap().len()
                         / sh.mapping.instances.total_slots)
                         as u64;
+                    (gl.glDepthMask)(if draw_call.options.depth_write {
+                        gl_sys::TRUE
+                    } else {
+                        0 as gl_sys::GLboolean
+                    });
+                    if draw_call.options.backface_culling {
+                        (gl.glEnable)(gl_sys::CULL_FACE);
+                        (gl.glCullFace)(gl_sys::BACK);
+                    } else {
+                        (gl.glDisable)(gl_sys::CULL_FACE);
+                    }
                     // bind all uniform buffers
                     {
                         shgl.uniforms
@@ -544,6 +554,23 @@ impl Cx {
                         shgl.uniforms
                             .user_uniforms_binding
                             .bind_buffer(gl, &draw_item.os.user_uniforms);
+                        for (slot, binding) in
+                            shgl.uniforms.custom_uniforms_bindings.iter().enumerate()
+                        {
+                            if let Some(uniform_buffer) =
+                                draw_call.uniform_buffer_slots[slot].as_ref()
+                            {
+                                let cx_uniform_buffer =
+                                    &mut self.uniform_buffers[uniform_buffer.uniform_buffer_id()];
+                                cx_uniform_buffer
+                                    .os
+                                    .buffer
+                                    .update_uniform_buffer_bytes(gl, &cx_uniform_buffer.data);
+                                binding.bind_buffer(gl, &cx_uniform_buffer.os.buffer);
+                            } else {
+                                binding.bind_buffer(gl, &OpenglBuffer::default());
+                            }
+                        }
                         shgl.uniforms
                             .live_uniforms_binding
                             .bind_buffer(gl, &shgl.uniforms.live_uniforms);
@@ -551,7 +578,7 @@ impl Cx {
 
                     // give openXR a chance to set its depth texture
                     #[cfg(target_os = "android")]
-                    if self.os.in_xr_mode {
+                    if self.os.in_xr_mode && shader_variant == SHADER_VARIANT_XR {
                         self.os.openxr.depth_texture_hook(gl, shgl, &sh.mapping)
                     };
 
@@ -565,7 +592,7 @@ impl Cx {
 
                         if cxtexture.format.is_vec() {
                             cxtexture.update_vec_texture(gl, &self.os_type);
-                        } else if cxtexture.format.is_video() {
+                        } else if cxtexture.format.is_video_external() {
                             let is_initial_setup = cxtexture.setup_video_texture(gl);
                             if is_initial_setup {
                                 let e = Event::TextureHandleReady(TextureHandleReadyEvent {
@@ -575,6 +602,8 @@ impl Cx {
                                 to_dispatch.push(e);
                             }
                         }
+                        // VideoYuvPlane textures are uploaded externally via
+                        // upload_r8_plane_to_gl and need no setup here.
                     }
                     for i in 0..sh.mapping.textures.len() {
                         let gl = self.os.gl();
@@ -594,9 +623,7 @@ impl Cx {
                             let cxtexture = &mut self.textures[texture_id];
                             let bind_target = match cxtexture.format {
                                 #[cfg(target_os = "android")]
-                                TextureFormat::VideoRGB => gl_sys::TEXTURE_EXTERNAL_OES,
-                                #[cfg(not(target_os = "android"))]
-                                TextureFormat::VideoRGB => gl_sys::TEXTURE_2D,
+                                TextureFormat::VideoExternal => gl_sys::TEXTURE_EXTERNAL_OES,
                                 TextureFormat::VecCubeBGRAu8_32 { .. } => gl_sys::TEXTURE_CUBE_MAP,
                                 _ => gl_sys::TEXTURE_2D,
                             };
@@ -653,6 +680,7 @@ impl Cx {
 
                     (gl.glBindVertexArray)(0);
                     (gl.glUseProgram)(0);
+                    (gl.glDepthMask)(gl_sys::TRUE);
                 }
             }
         }
@@ -681,6 +709,7 @@ impl Cx {
         let pass_rect = self.get_pass_rect(draw_pass_id, dpi_factor).unwrap();
         let pass = &mut self.passes[draw_pass_id];
         pass.paint_dirty = false;
+        pass.os.shader_variant = SHADER_VARIANT_WINDOW;
 
         if pass_rect.size.x < 0.5 || pass_rect.size.y < 0.5 {
             return None;
@@ -925,6 +954,8 @@ impl Cx {
     }
 }
 
+pub const SHADER_VARIANT_WINDOW: usize = 0;
+pub const SHADER_VARIANT_XR: usize = 1;
 const NUM_SHADER_VARIANTS: usize = 2;
 
 pub struct CxOsDrawShader {
@@ -944,6 +975,7 @@ pub struct GlShaderUniforms {
     pub draw_list_uniforms_binding: OpenglUniformBlockBinding,
     pub draw_call_uniforms_binding: OpenglUniformBlockBinding,
     pub user_uniforms_binding: OpenglUniformBlockBinding,
+    pub custom_uniforms_bindings: Vec<OpenglUniformBlockBinding>,
     pub live_uniforms_binding: OpenglUniformBlockBinding,
     pub const_table_uniform: OpenglUniform,
     pub live_uniforms: OpenglBuffer,
@@ -974,6 +1006,13 @@ impl GlShaderUniforms {
                 program,
                 "userUniforms",
             ),
+            custom_uniforms_bindings: mapping
+                .uniform_buffers
+                .iter()
+                .map(|input| {
+                    GlShader::opengl_get_uniform_block_binding(gl, program, &input.block_name)
+                })
+                .collect(),
             live_uniforms_binding: GlShader::opengl_get_uniform_block_binding(
                 gl,
                 program,
@@ -1384,7 +1423,7 @@ impl GlShader {
         program: u32,
         prefix: &str,
         slots: usize,
-        inputs: &[crate::draw_shader::DrawShaderInput],
+        _inputs: &[crate::draw_shader::DrawShaderInput],
     ) -> Vec<OpenglAttribute> {
         let mut attribs = Vec::new();
 
@@ -1398,15 +1437,6 @@ impl GlShader {
 
         let stride = (slots * mem::size_of::<f32>()) as i32;
         let num_attr = ceil_div4(slots);
-        let mut chunk_formats = vec![DrawShaderAttrFormat::Float; num_attr];
-        for input in inputs {
-            if input.attr_format == DrawShaderAttrFormat::Float {
-                continue;
-            }
-            for slot in input.offset..(input.offset + input.slots) {
-                chunk_formats[slot / 4] = input.attr_format;
-            }
-        }
         let trace_draw = std::env::var_os("MAKEPAD_GL_DRAW_TRACE").is_some();
         for i in 0..num_attr {
             let mut name0 = prefix.to_string();
@@ -1428,7 +1458,7 @@ impl GlShader {
                         size,
                         stride,
                         (i * 4 * mem::size_of::<f32>()),
-                        chunk_formats[i]
+                        DrawShaderAttrFormat::Float
                     );
                 }
                 attribs.push(OpenglAttribute {
@@ -1437,7 +1467,7 @@ impl GlShader {
                     offset: (i * 4 * mem::size_of::<f32>()) as usize,
                     size: size,
                     stride: stride,
-                    attr_format: chunk_formats[i],
+                    attr_format: DrawShaderAttrFormat::Float,
                 })
             }
         }
@@ -1543,6 +1573,19 @@ impl GlShader {
 }
 
 impl CxOsDrawShader {
+    #[cfg(use_vulkan)]
+    pub fn new_vulkan_only(in_vertex: &str, in_pixel: &str) -> Self {
+        CxOsDrawShader {
+            in_vertex: in_vertex.to_string(),
+            in_pixel: in_pixel.to_string(),
+            vertex: [String::new(), String::new()],
+            pixel: [String::new(), String::new()],
+            gl_shader: [None, None],
+            live_uniforms: Default::default(),
+            vulkan_shader: None,
+        }
+    }
+
     pub fn new(gl: &LibGl, in_vertex: &str, in_pixel: &str, os_type: &OsType) -> Self {
         // Check if GL_OES_EGL_image_external extension is available in the current device, otherwise do not attempt to use in the shaders.
         let available_extensions = get_gl_string(gl, gl_sys::EXTENSIONS);
@@ -1590,12 +1633,15 @@ impl CxOsDrawShader {
         let depth_clip = "
             uniform sampler2DArray xr_depth_texture;
             vec4 depth_clip(vec4 world, vec4 color, float clip){
-                vec4 cube_depth_camera_position = pass.depth_projection[VIEW_ID] * pass.depth_view[VIEW_ID] * world;
+                vec4 cube_depth_camera_position =
+                    unibuf_draw_pass.depth_projection[int(VIEW_ID)]
+                    * unibuf_draw_pass.depth_view[int(VIEW_ID)]
+                    * world;
 
                 vec3 cube_depth_camera_position_hc = cube_depth_camera_position.xyz / cube_depth_camera_position.w;
                 cube_depth_camera_position_hc = cube_depth_camera_position_hc*0.5f + 0.5f;
 
-                vec3 depth_view_coord = vec3(cube_depth_camera_position_hc.xy, VIEW_ID);
+                vec3 depth_view_coord = vec3(cube_depth_camera_position_hc.xy, float(VIEW_ID));
 
                 gl_FragDepth = cube_depth_camera_position_hc.z;
 
@@ -1613,91 +1659,84 @@ impl CxOsDrawShader {
         let sampler_helpers = "
             vec4 depth_clip(vec4 w, vec4 c, float clip);
             vec4 sample2d(sampler2D sampler, vec2 pos){return texture(sampler, vec2(pos.x, pos.y));}
+            vec4 sample2d_lod(sampler2D sampler, vec2 pos, float lod){return textureLod(sampler, vec2(pos.x, pos.y), lod);}
             vec4 sample2d_bgra(sampler2D sampler, vec2 pos){return texture(sampler, vec2(pos.x, pos.y));}
             vec4 sample2d_rt(sampler2D sampler, vec2 pos){return texture(sampler, vec2(pos.x, 1.0 - pos.y));}
             vec4 samplecube(samplerCube sampler, vec3 dir){return texture(sampler, dir);}
-            vec4 samplecube_bgra(samplerCube sampler, vec3 dir){return texture(sampler, dir).zyxw;}
+            vec4 samplecube_lod(samplerCube sampler, vec3 dir, float lod){return textureLod(sampler, dir, lod);}
+            vec4 samplecube_bgra(samplerCube sampler, vec3 dir){return texture(sampler, dir);}
             ";
         #[cfg(not(target_os = "android"))]
         let sampler_helpers = "
             vec4 depth_clip(vec4 w, vec4 c, float clip);
             vec4 sample2d(sampler2D sampler, vec2 pos){return texture(sampler, vec2(pos.x, pos.y));}
+            vec4 sample2d_lod(sampler2D sampler, vec2 pos, float lod){return textureLod(sampler, vec2(pos.x, pos.y), lod);}
             vec4 sample2d_bgra(sampler2D sampler, vec2 pos){return texture(sampler, vec2(pos.x, pos.y));}
             vec4 sample2d_rt(sampler2D sampler, vec2 pos){return texture(sampler, vec2(pos.x, 1.0 - pos.y));}
             vec4 samplecube(samplerCube sampler, vec3 dir){return texture(sampler, dir);}
-            vec4 samplecube_bgra(samplerCube sampler, vec3 dir){return texture(sampler, dir).zyxw;}
+            vec4 samplecube_lod(samplerCube sampler, vec3 dir, float lod){return textureLod(sampler, dir, lod);}
+            vec4 samplecube_bgra(samplerCube sampler, vec3 dir){return texture(sampler, dir);}
             ";
 
-        let (version, vertex_exts, pixel_exts, vertex_defs, pixel_defs, sampler) =
-            if os_type.has_xr_mode() {
-                (
-                    "#version 300 es",
-                    // Vertex shader
-                    "
+        let vertex_window = format!(
+            "#version 300 es
             #define VIEW_ID 0
-            #extension GL_OVR_multiview2 : require
-            layout(num_views=2) in;
-            ",
-                    // Pixel shader
-                    "
-            #define VIEW_ID 0
-            #extension GL_OVR_multiview2 : require
-            ",
-                    "",
-                    "",
-                    sampler_helpers,
-                )
-            } else {
-                ("#version 300 es", "", "", "", "", sampler_helpers)
-            };
-
-        /*
-        let transpose_impl = "
-        mat4 transpose(mat4 m){{return mat4(m[0][0],m[1][0],m[2][0],m[3][0],m[0][1],m[1][1],m[2][1],m[3][1],m[0][2],m[1][2],m[2][2],m[3][3], m[3][0], m[3][1], m[3][2], m[3][3]);}}
-        mat3 transpose(mat3 m){{return mat3(m[0][0],m[1][0],m[2][0],m[0][1],m[1][1],m[2][1],m[0][2],m[1][2],m[2][2]);}}
-        mat2 transpose(mat2 m){{return mat2(m[0][0],m[1][0],m[0][1],m[1][1]);}}
-        ";
-        */
-        let vertex = format!(
-            "{version}
-            {vertex_exts}
             {tex_ext_import}
             precision highp float;
             precision highp int;
-            {sampler}
+            {sampler_helpers}
             {tex_ext_sampler}
-            {vertex_defs}
             {in_vertex}\0",
         );
-        //crate::log!("{}", vertex.replace("int mvo = 0;","int mvo = gl_ViewID_OVR==0?0:16;"));
-        let pixel = format!(
-            "{version}
-            {pixel_exts}
+        let pixel_window = format!(
+            "#version 300 es
+            #define VIEW_ID 0
             {tex_ext_import}
             #extension GL_OES_standard_derivatives : enable
             precision highp float;
             precision highp int;
-            {sampler}
+            {sampler_helpers}
             {tex_ext_sampler}
-            {pixel_defs}
             {in_pixel}
             {nop_depth_clip}
+            \0",
+        );
+        let vertex_xr = format!(
+            "#version 300 es
+            #define VIEW_ID gl_ViewID_OVR
+            #extension GL_OVR_multiview2 : require
+            layout(num_views=2) in;
+            {tex_ext_import}
+            precision highp float;
+            precision highp int;
+            {sampler_helpers}
+            {tex_ext_sampler}
+            {in_vertex}\0",
+        );
+        #[cfg(all(target_os = "android", not(use_vulkan)))]
+        let xr_depth_clip = nop_depth_clip;
+        #[cfg(not(all(target_os = "android", not(use_vulkan))))]
+        let xr_depth_clip = depth_clip;
+        let pixel_xr = format!(
+            "#version 300 es
+            #define VIEW_ID gl_ViewID_OVR
+            #extension GL_OVR_multiview2 : require
+            {tex_ext_import}
+            #extension GL_OES_standard_derivatives : enable
+            precision highp float;
+            precision highp int;
+            {sampler_helpers}
+            {tex_ext_sampler}
+            {in_pixel}
+            {xr_depth_clip}
             \0",
         );
         // lets fetch the uniform positions for our uniforms
         CxOsDrawShader {
             in_vertex: in_vertex.to_string(),
             in_pixel: in_pixel.to_string(),
-            vertex: [
-                vertex.clone(),
-                vertex.replace("#define VIEW_ID 0", "#define VIEW_ID gl_ViewID_OVR"),
-            ],
-            pixel: [
-                pixel.clone(),
-                pixel
-                    .replace("#define VIEW_ID 0", "#define VIEW_ID gl_ViewID_OVR")
-                    .replace(nop_depth_clip, depth_clip),
-            ],
+            vertex: [vertex_window, vertex_xr],
+            pixel: [pixel_window, pixel_xr],
             gl_shader: [None, None],
             //const_table_uniforms: Default::default(),
             live_uniforms: Default::default(),
@@ -1754,10 +1793,9 @@ pub struct OpenglUniformBlockBinding {
 impl OpenglUniformBlockBinding {
     #[allow(unused)]
     fn bind_buffer(&self, gl: &LibGl, buf: &OpenglBuffer) {
-        if let Some(gl_buf) = buf.gl_buffer {
-            if let Some(index) = self.index {
-                unsafe { (gl.glBindBufferBase)(gl_sys::UNIFORM_BUFFER, index, gl_buf) };
-            }
+        if let Some(index) = self.index {
+            let gl_buf = buf.gl_buffer.unwrap_or(0);
+            unsafe { (gl.glBindBufferBase)(gl_sys::UNIFORM_BUFFER, index, gl_buf) };
         }
     }
 }
@@ -1822,10 +1860,27 @@ impl CxOsDrawCall {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default, Clone)]
+pub struct CxOsUniformBuffer {
+    pub buffer: OpenglBuffer,
+}
+
+#[derive(Clone)]
 pub struct CxOsTexture {
     pub gl_texture: Option<u32>,
+    /// True when Makepad owns the GL texture object and must delete it.
+    pub gl_texture_owned: bool,
     pub gl_renderbuffer: Option<u32>,
+}
+
+impl Default for CxOsTexture {
+    fn default() -> Self {
+        Self {
+            gl_texture: None,
+            gl_texture_owned: true,
+            gl_renderbuffer: None,
+        }
+    }
 }
 
 impl CxTexture {
@@ -1855,6 +1910,7 @@ impl CxTexture {
                     let mut gl_texture = std::mem::MaybeUninit::uninit();
                     (gl.glGenTextures)(1, gl_texture.as_mut_ptr());
                     self.os.gl_texture = Some(gl_texture.assume_init());
+                    self.os.gl_texture_owned = true;
                 }
             }
             needs_realloc = true;
@@ -1923,11 +1979,11 @@ impl CxTexture {
                     (gl.glTexImage2D)(
                         *target,
                         0,
-                        gl_sys::RGBA as i32,
+                        gl_sys::BGRA as i32,
                         *width as i32,
                         *height as i32,
                         0,
-                        gl_sys::RGBA,
+                        gl_sys::BGRA,
                         gl_sys::UNSIGNED_BYTE,
                         face_ptr,
                     );
@@ -2172,6 +2228,7 @@ impl CxTexture {
                     let mut gl_texture = std::mem::MaybeUninit::uninit();
                     (gl.glGenTextures)(1, gl_texture.as_mut_ptr());
                     self.os.gl_texture = Some(gl_texture.assume_init());
+                    self.os.gl_texture_owned = true;
                 }
             }
 
@@ -2267,6 +2324,7 @@ impl CxTexture {
                 unsafe {
                     (gl.glGenTextures)(1, gl_texture.as_mut_ptr());
                     self.os.gl_texture = Some(gl_texture.assume_init());
+                    self.os.gl_texture_owned = true;
                 }
             }
             unsafe { (gl.glBindTexture)(gl_sys::TEXTURE_2D, self.os.gl_texture.unwrap()) };
@@ -2383,8 +2441,10 @@ impl CxTexture {
     pub fn free_previous_resources(&mut self, gl: &LibGl) {
         if let Some(mut old_os) = self.previous_platform_resource.take() {
             if let Some(gl_texture) = old_os.gl_texture.take() {
-                unsafe { (gl.glDeleteTextures)(1, &gl_texture) };
-                crate::log!("Deleted texture: {}", gl_texture);
+                if old_os.gl_texture_owned {
+                    unsafe { (gl.glDeleteTextures)(1, &gl_texture) };
+                    crate::log!("Deleted texture: {}", gl_texture);
+                }
             }
             if let Some(gl_renderbuffer) = old_os.gl_renderbuffer.take() {
                 unsafe { (gl.glDeleteRenderbuffers)(1, &gl_renderbuffer) };
@@ -2439,6 +2499,12 @@ impl OpenglBuffer {
     }
 
     pub fn update_uniform_buffer(&mut self, gl: &LibGl, data: &[f32]) {
+        self.update_uniform_buffer_bytes(gl, unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        });
+    }
+
+    pub fn update_uniform_buffer_bytes(&mut self, gl: &LibGl, data: &[u8]) {
         if data.is_empty() {
             return;
         }
@@ -2449,7 +2515,7 @@ impl OpenglBuffer {
             (gl.glBindBuffer)(gl_sys::UNIFORM_BUFFER, self.gl_buffer.unwrap());
             (gl.glBufferData)(
                 gl_sys::UNIFORM_BUFFER,
-                (data.len() * mem::size_of::<f32>()) as gl_sys::GLsizeiptr,
+                data.len() as gl_sys::GLsizeiptr,
                 data.as_ptr() as *const _,
                 gl_sys::STATIC_DRAW,
             );

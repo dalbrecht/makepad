@@ -12,8 +12,9 @@ use {
         makepad_network::NetworkResponse,
     },
     makepad_studio_protocol::{
-        AppToStudio, EventSample, ScreenshotResponse, StudioToApp, WidgetQueryResponse,
-        WidgetTreeDumpResponse,
+        hub_protocol::FrameCodec, AppToStudio, EventSample, RunViewFrameData,
+        RunViewFrameRequest, RunViewKeyFocusRect, ScreenshotResponse, StudioToApp,
+        WidgetQueryResponse, WidgetTreeDumpResponse,
     },
     std::cell::{Cell, RefCell},
     std::collections::{HashMap, HashSet},
@@ -110,8 +111,19 @@ impl Cx {
     }
 
     pub(crate) fn dispatch_network_runtime_events(&mut self) {
+        use crate::makepad_math::dvec2;
+        use crate::window::CxWindowPool;
+
         let mut responses = Vec::new();
         while let Some(response) = self.net.try_recv() {
+            if let Some(msgs) = crate::web_socket::consume_studio_socket_response(&response) {
+                let window_id = CxWindowPool::id_zero();
+                let pos = dvec2(0.0, 0.0);
+                for msg in msgs {
+                    let _ = self.dispatch_studio_msg(msg, window_id, pos);
+                }
+                continue;
+            }
             match &response {
                 NetworkResponse::WsOpened { .. }
                 | NetworkResponse::WsMessage { .. }
@@ -165,9 +177,122 @@ impl Cx {
         }));
     }
 
+    pub(crate) fn queue_studio_run_view_frame_request(&mut self, request: RunViewFrameRequest) {
+        self.run_view_frame_requests
+            .retain(|existing| existing.window_id != request.window_id);
+        self.run_view_frame_requests.push(request);
+        self.redraw_all();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn take_studio_run_view_frame_request(
+        &mut self,
+        window_id: usize,
+    ) -> Option<RunViewFrameRequest> {
+        if self.run_view_frame_encode_in_flight {
+            return None;
+        }
+        let index = self
+            .run_view_frame_requests
+            .iter()
+            .rposition(|request| request.window_id == window_id)?;
+        Some(self.run_view_frame_requests.swap_remove(index))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn encode_studio_run_view_frame_async(
+        &mut self,
+        request: RunViewFrameRequest,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) {
+        if self.run_view_frame_encode_in_flight {
+            return;
+        }
+        self.run_view_frame_encode_in_flight = true;
+        let sender = self.run_view_frame_results.sender();
+        self.spawn_thread(move || {
+            let result = Cx::prepare_studio_run_view_rgba(&request, width, height, rgba)
+                .and_then(|(width, height, rgba)| {
+                    Cx::encode_rgba_as_png(width, height, &rgba).map(|png| RunViewFrameData {
+                        window_id: request.window_id,
+                        frame_id: request.frame_id,
+                        width,
+                        height,
+                        codec: Some(FrameCodec::Png),
+                        data: png,
+                    })
+                });
+            let _ = sender.send(result);
+        });
+    }
+
+    fn prepare_studio_run_view_rgba(
+        request: &RunViewFrameRequest,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        let expected_len = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if rgba.len() != expected_len {
+            return Err(format!(
+                "runview frame rgba size mismatch: got {} bytes for {}x{}",
+                rgba.len(),
+                width,
+                height
+            ));
+        }
+
+        let target_width = request.width.max(1);
+        let target_height = request.height.max(1);
+
+        let out = if width == target_width && height == target_height {
+            rgba
+        } else {
+            let mut resized = vec![
+                0u8;
+                (target_width as usize)
+                    .saturating_mul(target_height as usize)
+                    .saturating_mul(4)
+            ];
+            for y in 0..target_height as usize {
+                let src_y = ((y as u64) * (height as u64) / (target_height as u64)) as usize;
+                for x in 0..target_width as usize {
+                    let src_x = ((x as u64) * (width as u64) / (target_width as u64)) as usize;
+                    let src = (src_y * width as usize + src_x) * 4;
+                    let dst = (y * target_width as usize + x) * 4;
+                    resized[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                }
+            }
+            resized
+        };
+
+        Ok((target_width, target_height, out))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn flush_studio_run_view_frame_results(&mut self) {
+        loop {
+            let Ok(result) = self.run_view_frame_results.try_recv() else {
+                break;
+            };
+            self.run_view_frame_encode_in_flight = false;
+            match result {
+                Ok(frame) => Cx::send_studio_message(AppToStudio::RunViewFrame(frame)),
+                Err(err) => crate::error!("runview frame encode failed: {}", err),
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn send_studio_widget_tree_dump_response(&mut self, request_id: u64) {
         self.widget_tree_dump_requests.push(request_id);
+        if self.in_draw_event || self.need_redrawing() {
+            return;
+        }
         self.try_send_studio_widget_tree_dump_responses();
     }
 
@@ -183,6 +308,29 @@ impl Cx {
             query,
             rects,
         }));
+    }
+
+    fn studio_key_focus_rect_response(&self) -> RunViewKeyFocusRect {
+        let area = self.key_focus();
+        if !area.is_valid(self) {
+            return RunViewKeyFocusRect::default();
+        }
+        let rect = area.rect(self);
+        if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+            return RunViewKeyFocusRect::default();
+        }
+        RunViewKeyFocusRect {
+            x: Some(rect.pos.x),
+            y: Some(rect.pos.y),
+            width: Some(rect.size.x),
+            height: Some(rect.size.y),
+        }
+    }
+
+    fn send_studio_key_focus_rect_response(&self) {
+        Cx::send_studio_message(AppToStudio::RunViewKeyFocusRect(
+            self.studio_key_focus_rect_response(),
+        ));
     }
 
     fn widget_tree_dump_ready(dump: &str) -> bool {
@@ -216,6 +364,9 @@ impl Cx {
 
     pub(crate) fn try_send_studio_widget_tree_dump_responses(&mut self) {
         if self.widget_tree_dump_requests.is_empty() {
+            return;
+        }
+        if self.in_draw_event || self.need_redrawing() {
             return;
         }
         let dump = if let Some(callback) = self.widget_tree_dump_callback {
@@ -282,6 +433,7 @@ impl Cx {
                 self.call_event_handler(&Event::MouseUp(event));
                 self.fingers.mouse_up(button);
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
+                self.send_studio_key_focus_rect_response();
             }
             StudioToApp::Scroll(e) => {
                 self.call_event_handler(&Event::Scroll(crate::event::ScrollEvent {
@@ -330,6 +482,9 @@ impl Cx {
                 self.screenshot_requests.push(request);
                 self.redraw_all();
             }
+            StudioToApp::RunViewFrameRequest(request) => {
+                self.queue_studio_run_view_frame_request(request);
+            }
             StudioToApp::WidgetTreeDump(request) => {
                 self.send_studio_widget_tree_dump_response(request.request_id);
             }
@@ -344,8 +499,10 @@ impl Cx {
                 self.call_event_handler(&Event::Custom(data));
             }
             StudioToApp::KeepAlive | StudioToApp::None => {}
-            other @ StudioToApp::LiveChange { .. } => {
-                self.action(other);
+            StudioToApp::LiveChange { file_name, content } => {
+                self.script_data
+                    .live_reload
+                    .queue_file_change(file_name, content);
             }
             // Stdin-specific: Tick, Swapchain, WindowGeomChange are handled
             // by callers before delegating here. In windowed mode they are
@@ -379,6 +536,14 @@ impl Cx {
         }
     }
 
+    pub(crate) fn run_live_edit_if_needed(&mut self, _backend: &str) {
+        if self.handle_live_edit() {
+            self.draw_shaders.reset_for_live_reload();
+            self.call_event_handler(&Event::LiveEdit);
+            self.redraw_all();
+        }
+    }
+
     // Same logic as headless::raster::encode_png_rgba which is behind
     // cfg(headless) and unavailable to the windowed backend.
     #[allow(dead_code)]
@@ -406,7 +571,10 @@ impl Cx {
 
     pub(crate) fn inner_call_event_handler(&mut self, event: &Event) {
         self.event_id += 1;
-        if Cx::has_studio_web_socket() || Cx::local_profile_capture_enabled() {
+        if (Cx::has_studio_web_socket()
+            && !crate::web_socket::STUDIO_STDOUT_MODE.load(std::sync::atomic::Ordering::SeqCst))
+            || Cx::local_profile_capture_enabled()
+        {
             let start = self.seconds_since_app_start();
             let mut event_handler = self.event_handler.take().unwrap();
             event_handler(self, event);
@@ -483,6 +651,9 @@ impl Cx {
     }
 
     pub(crate) fn call_event_handler(&mut self, event: &Event) {
+        if let Event::PermissionResult(result) = event {
+            self.handle_camera_permission_result(result);
+        }
         self.inner_call_event_handler(event);
         self.inner_key_focus_change();
         self.handle_triggers();
@@ -514,6 +685,10 @@ impl Cx {
 
         self.call_event_handler(&Event::Draw(draw_event));
         self.in_draw_event = false;
+
+        if Cx::has_studio_web_socket() {
+            self.try_send_studio_widget_tree_dump_responses();
+        }
     }
 
     pub(crate) fn call_next_frame_event(&mut self, time: f64) {

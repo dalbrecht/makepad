@@ -17,6 +17,7 @@ use {
         borrow::Borrow,
         cell::RefCell,
         collections::{HashMap, VecDeque},
+        env,
         hash::{Hash, Hasher},
         mem,
         rc::Rc,
@@ -80,6 +81,9 @@ impl Layouter {
     }
 
     pub fn get_or_layout(&mut self, params: impl LayoutParams) -> Rc<LaidoutText> {
+        if self.cache_size == 0 {
+            return Rc::new(self.layout(params.to_owned()));
+        }
         if let Some(result) = self.cached_results.get(&params as &dyn LayoutParams) {
             return result.clone();
         }
@@ -88,9 +92,10 @@ impl Layouter {
             self.cached_results.remove(&params);
         }
         let params = params.to_owned();
-        let result = Rc::new(self.layout(params.clone()));
-        self.cached_params.push_back(params.clone());
-        self.cached_results.insert(params, result.clone());
+        let cache_key = params.clone();
+        let result = Rc::new(self.layout(params));
+        self.cached_params.push_back(cache_key.clone());
+        self.cached_results.insert(cache_key, result.clone());
         result
     }
 
@@ -121,6 +126,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        let atlas_size = default_text_atlas_size();
         Self {
             loader: loader::Settings {
                 shaper: shaper::Settings { cache_size: 4096 },
@@ -150,12 +156,43 @@ impl Default for Settings {
                         max_estimated_segments: 1000,
                     },
                     outline_rasterization_mode: rasterizer::OutlineRasterizationMode::Msdf,
-                    atlas_size: Size::new(4096, 4096),
+                    atlas_size,
                 },
             },
             cache_size: 4096,
         }
     }
+}
+
+fn default_text_atlas_size() -> Size<usize> {
+    atlas_size_override_from_env().unwrap_or_else(|| Size::new(2048, 2048))
+}
+
+fn atlas_size_override_from_env() -> Option<Size<usize>> {
+    let raw = env::var("MAKEPAD_TEXT_ATLAS_SIZE").ok()?;
+    parse_text_atlas_size_value(raw.trim())
+}
+
+fn parse_text_atlas_size_value(value: &str) -> Option<Size<usize>> {
+    if value.is_empty() {
+        return None;
+    }
+
+    fn parse_dim(dim: &str) -> Option<usize> {
+        let parsed = dim.trim().parse::<usize>().ok()?;
+        if (256..=8192).contains(&parsed) {
+            Some(parsed)
+        } else {
+            None
+        }
+    }
+
+    if let Some((w, h)) = value.split_once('x').or_else(|| value.split_once('X')) {
+        return Some(Size::new(parse_dim(w)?, parse_dim(h)?));
+    }
+
+    let dim = parse_dim(value)?;
+    Some(Size::new(dim, dim))
 }
 
 #[derive(Debug)]
@@ -321,7 +358,7 @@ impl LayoutContext {
     }
 
     fn finish_current_row(&mut self, newline: bool) {
-        let font = self.font_family.fonts().get(0);
+        let font = self.font_family.fonts().first();
         let font_size_in_lpxs = self.style.font_size_in_lpxs();
         let ascender_in_lpxs = font.map_or(0.0, |font| font.ascender_in_ems()) * font_size_in_lpxs;
         let descender_in_lpxs =
@@ -710,10 +747,9 @@ impl LaidoutText {
             if cursor.index < row.text.end_in_parent() {
                 return row_index;
             }
-            if cursor.index == row.text.end_in_parent() {
-                if row.newline || !cursor.prefer_next_row {
-                    return row_index;
-                }
+            if cursor.index == row.text.end_in_parent() && (row.newline || !cursor.prefer_next_row)
+            {
+                return row_index;
             }
         }
         self.rows.len() - 1
@@ -748,7 +784,7 @@ impl LaidoutText {
         let index = row.x_in_lpxs_to_index(position.x_in_lpxs);
         Cursor {
             index: row.text.start_in_parent() + index,
-            prefer_next_row: if index == 0 { true } else { false },
+            prefer_next_row: index == 0,
         }
     }
 
@@ -948,5 +984,29 @@ impl LaidoutGlyph {
 
     pub fn rasterize(&self, dpx_per_em: f32) -> Option<RasterizedGlyph> {
         self.font.rasterize_glyph(self.id, dpx_per_em)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_text_atlas_size_value, Size};
+
+    #[test]
+    fn parses_text_atlas_size_from_env_value() {
+        assert_eq!(
+            parse_text_atlas_size_value("1024"),
+            Some(Size::new(1024, 1024))
+        );
+        assert_eq!(
+            parse_text_atlas_size_value("1024x2048"),
+            Some(Size::new(1024, 2048))
+        );
+        assert_eq!(
+            parse_text_atlas_size_value("1024X2048"),
+            Some(Size::new(1024, 2048))
+        );
+        assert_eq!(parse_text_atlas_size_value(""), None);
+        assert_eq!(parse_text_atlas_size_value("64"), None);
+        assert_eq!(parse_text_atlas_size_value("bogus"), None);
     }
 }

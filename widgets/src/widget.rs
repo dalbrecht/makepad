@@ -25,9 +25,7 @@ impl WidgetUid {
 }
 
 pub trait WidgetNode: ScriptApply {
-    fn widget_uid(&self) -> WidgetUid {
-        WidgetUid(0)
-    }
+    fn widget_uid(&self) -> WidgetUid;
     /// Enumerate direct children for widget-tree indexing.
     fn children(&self, _visit: &mut dyn FnMut(LiveId, WidgetRef)) {}
 
@@ -133,7 +131,7 @@ pub trait WidgetNode: ScriptApply {
         });
         found
     }
-    
+
     /// If true, global widget-tree search/flood will not traverse this node's descendants.
     /// The node is still indexed and can still be matched directly by name/path.
     fn skip_widget_tree_search(&self) -> bool {
@@ -189,7 +187,7 @@ pub trait WidgetNode: ScriptApply {
     fn selection_get_full_text(&self) -> String {
         String::new()
     }
-    
+
     fn script_call_live(
         &mut self,
         _vm: &mut ScriptVm,
@@ -198,8 +196,9 @@ pub trait WidgetNode: ScriptApply {
     ) -> ScriptAsyncResult {
         ScriptAsyncResult::MethodNotFound
     }
-    
-    fn script_result_live(&mut self, _vm: &mut ScriptVm, _id: ScriptAsyncId, _result: ScriptValue) {}
+
+    fn script_result_live(&mut self, _vm: &mut ScriptVm, _id: ScriptAsyncId, _result: ScriptValue) {
+    }
 }
 
 pub trait Widget: WidgetNode {

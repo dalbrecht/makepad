@@ -1,12 +1,12 @@
 use makepad_live_id::LiveId;
 use makepad_micro_serde::{DeBin, SerBin};
-use makepad_network::{
+use makepad_script_std::makepad_network::{
     HttpMethod, HttpRequest, NetworkConfig, NetworkResponse, NetworkRuntime, WsMessage, WsSend,
 };
 use makepad_studio_hub::{HubConfig, MountConfig, StudioHub};
 use makepad_studio_protocol::hub_protocol::{
-    BuildBoxToHub, BuildBoxToHubVec, ClientId, QueryId, HubToBuildBox,
-    HubToBuildBoxVec, HubToClient, ClientToHub, ClientToHubEnvelope,
+    BuildBoxToHub, BuildBoxToHubVec, ClientId, ClientToHub, ClientToHubEnvelope, HubToBuildBox,
+    HubToBuildBoxVec, HubToClient, QueryId,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -92,7 +92,7 @@ fn wait_for_buildbox_message(
 
 #[test]
 fn websocket_buildbox_remote_build_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
 

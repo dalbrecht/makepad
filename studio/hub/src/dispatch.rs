@@ -1,7 +1,7 @@
 use crate::log_store::{
     query_log_entries, AppendLogEntry, LogQuery, LogStore, ProfilerQuery, ProfilerStore,
 };
-use crate::process_manager::ProcessManager;
+use crate::process_manager::{ProcessManager, MAKEPAD_SPLASH_RUNNABLE};
 use crate::terminal_manager::TerminalManager;
 use crate::virtual_fs::VirtualFs;
 use crate::worker_pool::WorkerPool;
@@ -9,14 +9,14 @@ use backend_proto::{
     BuildBoxInfo, BuildBoxStatus, BuildBoxToHub, BuildBoxToHubVec, BuildInfo, ClientId,
     ClientToHub, ClientToHubEnvelope, EventSample as HubEventSample, GCSample as StudioGCSample,
     GPUSample as StudioGPUSample, HubToBuildBox, HubToBuildBoxVec, HubToClient, LogEntry,
-    LogSource, QueryId, RunViewInputVizKind, RunnableBuild, SaveResult, SearchResult,
+    LogSource, QueryId, RunItem, RunViewInputVizKind, SaveResult, SearchResult,
     TerminalFramebuffer,
 };
 use makepad_filesystem_watcher::{FileSystemWatcher, WatchRoot};
 use makepad_git::{FileStatus as GitFileStatus, Repository as GitRepository};
 use makepad_live_id::LiveId;
 use makepad_micro_serde::*;
-use makepad_network::ToUISender;
+use makepad_script_std::makepad_network::ToUISender;
 use makepad_studio_protocol::hub_protocol as backend_proto;
 use makepad_studio_protocol::{
     AppToStudio, AppToStudioVec, EventSample, GCSample, GPUSample, KeyCode, KeyEvent, KeyModifiers,
@@ -25,9 +25,9 @@ use makepad_studio_protocol::{
 };
 use makepad_terminal_core::{StyleFlags, Terminal};
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,6 +92,19 @@ pub enum HubEvent {
         build_id: QueryId,
         exit_code: Option<i32>,
     },
+    RunItemsUpdated {
+        mount: String,
+        items: Vec<RunItem>,
+    },
+    ScriptRunRequest {
+        build_id: Option<QueryId>,
+        mount: String,
+        cwd: PathBuf,
+        program: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        package: Option<String>,
+    },
     TerminalOutput {
         path: String,
         data: Vec<u8>,
@@ -148,6 +161,10 @@ const FS_SELF_SAVE_SUPPRESS: Duration = Duration::from_millis(300);
 const GIT_STATUS_CACHE_TTL: Duration = Duration::from_millis(250);
 const IN_PROCESS_UI_WEB_SOCKET_ID: u64 = 0;
 const MAX_UI_CLIENT_IDS: usize = backend_proto::QUERY_ID_CLIENT_LANES as usize;
+
+fn studio_hub_debug_enabled() -> bool {
+    env::var_os("MAKEPAD_STUDIO_HUB_DEBUG").is_some()
+}
 
 struct UiClient {
     sender: ToUISender<Vec<u8>>,
@@ -218,6 +235,7 @@ pub struct HubCore {
     event_tx: Sender<HubEvent>,
     pub vfs: VirtualFs,
     studio_addr: Option<String>,
+    studio_ext_addr: Option<String>,
     client_id_in_use: [bool; MAX_UI_CLIENT_IDS],
     next_build_id: u64,
     client_by_web_socket: HashMap<u64, ClientId>,
@@ -226,6 +244,7 @@ pub struct HubCore {
     buildbox_sockets: HashMap<u64, BuildBoxSocket>,
     buildbox_by_name: HashMap<String, u64>,
     build_mount_by_id: HashMap<QueryId, String>,
+    run_items_by_mount: HashMap<String, Vec<RunItem>>,
     primary_ui_by_mount: HashMap<String, ClientId>,
     remote_builds: HashMap<QueryId, BuildInfo>,
     remote_build_owner: HashMap<QueryId, String>,
@@ -245,6 +264,7 @@ pub struct HubCore {
     fs_event_last_by_path: HashMap<String, Instant>,
     fs_pending_diffs: HashMap<String, Vec<backend_proto::FileTreeChange>>,
     fs_pending_reload_mounts: HashSet<String>,
+    pending_mount_root_splash_restarts: HashSet<String>,
     file_tree_load_waiters: HashMap<String, HashSet<ClientId>>,
     fs_diff_flush_scheduled: bool,
     fs_event_last_prune: Instant,
@@ -259,6 +279,7 @@ impl HubCore {
         event_tx: Sender<HubEvent>,
         vfs: VirtualFs,
         studio_addr: Option<String>,
+        studio_ext_addr: Option<String>,
     ) -> Self {
         let worker_count = std::thread::available_parallelism()
             .map(|v| v.get())
@@ -270,6 +291,7 @@ impl HubCore {
             event_tx,
             vfs,
             studio_addr,
+            studio_ext_addr,
             client_id_in_use: [false; MAX_UI_CLIENT_IDS],
             next_build_id: 1,
             client_by_web_socket: HashMap::new(),
@@ -278,6 +300,7 @@ impl HubCore {
             buildbox_sockets: HashMap::new(),
             buildbox_by_name: HashMap::new(),
             build_mount_by_id: HashMap::new(),
+            run_items_by_mount: HashMap::new(),
             primary_ui_by_mount: HashMap::new(),
             remote_builds: HashMap::new(),
             remote_build_owner: HashMap::new(),
@@ -297,6 +320,7 @@ impl HubCore {
             fs_event_last_by_path: HashMap::new(),
             fs_pending_diffs: HashMap::new(),
             fs_pending_reload_mounts: HashSet::new(),
+            pending_mount_root_splash_restarts: HashSet::new(),
             file_tree_load_waiters: HashMap::new(),
             fs_diff_flush_scheduled: false,
             fs_event_last_prune: Instant::now(),
@@ -325,6 +349,12 @@ impl HubCore {
             } => self.on_ui_connected(web_socket_id, sender, typed_sender),
             HubEvent::ClientDisconnected { web_socket_id } => {
                 if let Some(client_id) = self.client_by_web_socket.remove(&web_socket_id) {
+                    if studio_hub_debug_enabled() {
+                        eprintln!(
+                            "studio hub debug: ui disconnect web_socket_id={} client_id={:?}",
+                            web_socket_id, client_id
+                        );
+                    }
                     self.ui_clients.remove(&client_id);
                     self.release_client_id(client_id);
                     for session in self.terminal_sessions.values_mut() {
@@ -420,6 +450,16 @@ impl HubCore {
                 build_id,
                 exit_code,
             } => self.on_process_exited(build_id, exit_code),
+            HubEvent::RunItemsUpdated { mount, items } => self.on_run_items_updated(mount, items),
+            HubEvent::ScriptRunRequest {
+                build_id,
+                mount,
+                cwd,
+                program,
+                args,
+                env,
+                package,
+            } => self.on_script_run_request(build_id, mount, cwd, program, args, env, package),
             HubEvent::TerminalOutput { path, data } => self.on_terminal_output(path, data),
             HubEvent::TerminalResized { path, cols, rows } => {
                 self.on_terminal_resized(path, cols, rows)
@@ -498,9 +538,25 @@ impl HubCore {
         sender: ToUISender<Vec<u8>>,
         typed_sender: Option<ToUISender<HubToClient>>,
     ) {
+        if studio_hub_debug_enabled() {
+            let used_lanes = self.client_id_in_use.iter().copied().filter(|used| *used).count();
+            eprintln!(
+                "studio hub debug: on_ui_connected web_socket_id={} typed_sender={} used_lanes={} ui_clients={}",
+                web_socket_id,
+                typed_sender.is_some(),
+                used_lanes,
+                self.ui_clients.len()
+            );
+        }
         let client_id = if web_socket_id == IN_PROCESS_UI_WEB_SOCKET_ID {
             let reserved = ClientId(0);
             if !self.reserve_client_id(reserved) {
+                if studio_hub_debug_enabled() {
+                    eprintln!(
+                        "studio hub debug: ui connect failed web_socket_id={} reason=in_process_client_id_0_in_use",
+                        web_socket_id
+                    );
+                }
                 if let Some(typed_sender) = &typed_sender {
                     let _ = typed_sender.send(HubToClient::Error {
                         message: "client id 0 already in use".to_string(),
@@ -518,7 +574,19 @@ impl HubCore {
             reserved
         } else {
             let Some(client_id) = self.alloc_client_id() else {
-                // Refuse the websocket when we cannot allocate a client lane.
+                if studio_hub_debug_enabled() {
+                    let active_client_ids: Vec<u16> = self.ui_clients.keys().map(|id| id.0).collect();
+                    eprintln!(
+                        "studio hub debug: ui connect failed web_socket_id={} reason=no_client_lane active_client_ids={:?}",
+                        web_socket_id, active_client_ids
+                    );
+                }
+                let _ = sender.send(
+                    HubToClient::Error {
+                        message: "client id space exhausted".to_string(),
+                    }
+                    .serialize_bin(),
+                );
                 let _ = sender.send(Vec::new());
                 return;
             };
@@ -526,6 +594,12 @@ impl HubCore {
         };
 
         if self.ui_clients.contains_key(&client_id) {
+            if studio_hub_debug_enabled() {
+                eprintln!(
+                    "studio hub debug: ui connect failed web_socket_id={} reason=duplicate_client_id client_id={:?}",
+                    web_socket_id, client_id
+                );
+            }
             self.release_client_id(client_id);
             if let Some(typed_sender) = &typed_sender {
                 let _ = typed_sender.send(HubToClient::Error {
@@ -552,11 +626,25 @@ impl HubCore {
                 format: WireFormat::Binary,
             },
         );
+        if studio_hub_debug_enabled() {
+            eprintln!(
+                "studio hub debug: ui connected web_socket_id={} client_id={:?} ui_clients={}",
+                web_socket_id,
+                client_id,
+                self.ui_clients.len()
+            );
+        }
         self.send_ui_message(
             client_id,
             HubToClient::Hello { client_id },
             WireFormat::Binary,
         );
+        if studio_hub_debug_enabled() {
+            eprintln!(
+                "studio hub debug: ui hello sent web_socket_id={} client_id={:?}",
+                web_socket_id, client_id
+            );
+        }
     }
 
     fn on_ui_envelope(&mut self, client_id: ClientId, envelope: ClientToHubEnvelope) {
@@ -630,7 +718,9 @@ impl HubCore {
                 self.vfs.unmount(&name);
                 self.reset_fs_watcher();
                 self.primary_ui_by_mount.remove(&name);
+                self.pending_mount_root_splash_restarts.remove(&name);
                 self.build_mount_by_id.retain(|_, mount| mount != &name);
+                self.run_items_by_mount.remove(&name);
                 self.send_ui_reply(
                     client_id,
                     HubToClient::FileTree {
@@ -647,10 +737,17 @@ impl HubCore {
                 );
             }
             ClientToHub::ObserveMount { mount, primary } => {
-                if primary.unwrap_or(true) {
-                    self.primary_ui_by_mount.insert(mount, client_id);
+                let primary = primary.unwrap_or(true);
+                if primary {
+                    self.primary_ui_by_mount.insert(mount.clone(), client_id);
+                    if let Err(err) = self.ensure_mount_root_splash_running(&mount) {
+                        self.send_ui_error(client_id, err);
+                    }
                 } else if self.primary_ui_by_mount.get(&mount) == Some(&client_id) {
                     self.primary_ui_by_mount.remove(&mount);
+                }
+                if let Some(items) = self.run_items_by_mount.get(&mount).cloned() {
+                    self.send_ui_reply(client_id, HubToClient::RunItems { mount, items });
                 }
             }
             ClientToHub::LoadFileTree { mount } => {
@@ -704,6 +801,24 @@ impl HubCore {
                     },
                 );
                 if save_ok {
+                    if path.ends_with(".rs") {
+                        if let Ok(disk_path) = self.vfs.resolve_path(&path) {
+                            let disk_path = disk_path
+                                .canonicalize()
+                                .unwrap_or_else(|_| disk_path.clone());
+                            self.forward_live_change_to_builds(
+                                "save",
+                                &path,
+                                disk_path.to_string_lossy().replace('\\', "/"),
+                                content.clone(),
+                            );
+                        }
+                    }
+                    if let Some((mount, rest)) = path.split_once('/') {
+                        if rest == MAKEPAD_SPLASH_RUNNABLE {
+                            self.request_mount_root_splash_reload(mount);
+                        }
+                    }
                     self.self_save_suppress_until_by_path
                         .insert(path.clone(), Instant::now() + FS_SELF_SAVE_SUPPRESS);
                     self.broadcast_ui_message_except(
@@ -812,23 +927,20 @@ impl HubCore {
                 self.send_ui_reply(
                     client_id,
                     HubToClient::Builds {
-                        builds: self.list_all_builds(),
+                        builds: self.list_all_builds()
+                            .into_iter()
+                            .filter(|build| build.package != MAKEPAD_SPLASH_RUNNABLE)
+                            .collect(),
                     },
                 );
             }
-            ClientToHub::LoadRunnableBuilds { mount } => {
-                let cwd = match self.vfs.resolve_mount(&mount) {
-                    Ok(cwd) => cwd,
-                    Err(err) => {
-                        self.send_ui_error(client_id, err.to_string());
-                        return;
-                    }
-                };
-                match discover_runnable_builds(&cwd) {
-                    Ok(builds) => {
-                        self.send_ui_reply(client_id, HubToClient::RunnableBuilds { mount, builds })
-                    }
-                    Err(err) => self.send_ui_error(client_id, err),
+            ClientToHub::RunItem { mount, name } => {
+                let build_id = self.alloc_build_id();
+                if let Err(err) = self
+                    .process_manager
+                    .invoke_script_run_item(&mount, &name, build_id)
+                {
+                    self.send_ui_error(client_id, err);
                 }
             }
             ClientToHub::Cargo {
@@ -909,6 +1021,66 @@ impl HubCore {
                 env,
                 buildbox,
             } => {
+                if process == MAKEPAD_SPLASH_RUNNABLE {
+                    if buildbox.is_some() {
+                        self.send_ui_error(
+                            client_id,
+                            "makepad.splash runs are not supported on buildboxes yet".to_string(),
+                        );
+                        return;
+                    }
+                    if env.as_ref().is_some_and(|env| !env.is_empty()) {
+                        self.send_ui_error(
+                            client_id,
+                            "makepad.splash env overrides are not supported yet".to_string(),
+                        );
+                        return;
+                    }
+                    if standalone.unwrap_or(false) {
+                        self.send_ui_error(
+                            client_id,
+                            "makepad.splash does not use standalone mode".to_string(),
+                        );
+                        return;
+                    }
+                    if !app_args.is_empty() {
+                        self.send_ui_error(
+                            client_id,
+                            "makepad.splash args are not supported yet".to_string(),
+                        );
+                        return;
+                    }
+
+                    let build_id = self.alloc_build_id();
+                    let cwd = match self.vfs.resolve_mount(&mount) {
+                        Ok(cwd) => cwd,
+                        Err(err) => {
+                            self.send_ui_error(client_id, err.to_string());
+                            return;
+                        }
+                    };
+                    match self.process_manager.start_script_run(
+                        build_id,
+                        mount.clone(),
+                        &cwd,
+                        self.studio_addr.clone(),
+                        self.studio_ext_addr.clone(),
+                        self.event_tx.clone(),
+                    ) {
+                        Ok(info) => {
+                            self.build_mount_by_id
+                                .insert(info.build_id, info.mount.clone());
+                            self.broadcast_ui_message(HubToClient::BuildStarted {
+                                build_id: info.build_id,
+                                mount: info.mount,
+                                package: info.package,
+                            });
+                        }
+                        Err(err) => self.send_ui_error(client_id, err),
+                    }
+                    return;
+                }
+
                 let cargo_args =
                     build_run_cargo_args(&process, app_args, standalone.unwrap_or(false));
                 let build_id = self.alloc_build_id();
@@ -986,19 +1158,33 @@ impl HubCore {
                     self.send_ui_error(client_id, err);
                 }
             }
+            ClientToHub::ClearBuild { build_id } => {
+                if self.process_manager.stop_build(build_id).is_ok() {
+                    self.send_build_cleanup_message(build_id);
+                    return;
+                }
+                let Some(buildbox_name) = self.remote_build_owner.get(&build_id).cloned() else {
+                    self.send_ui_error(client_id, format!("unknown build: {}", build_id.0));
+                    return;
+                };
+                if let Err(err) = self
+                    .send_to_buildbox_name(&buildbox_name, HubToBuildBox::StopBuild { build_id })
+                {
+                    self.send_ui_error(client_id, err);
+                } else {
+                    self.send_build_cleanup_message(build_id);
+                }
+            }
             ClientToHub::ForwardToApp { build_id, msg_bin } => {
-                let is_bootstrap =
-                    StudioToAppVec::deserialize_bin(&msg_bin)
-                        .ok()
-                        .is_some_and(|msgs| {
-                            msgs.0.iter().any(|msg| {
-                                matches!(
-                                    msg,
-                                    StudioToApp::WindowGeomChange { .. }
-                                        | StudioToApp::Swapchain(_)
-                                )
-                            })
-                        });
+                let parsed_msgs = StudioToAppVec::deserialize_bin(&msg_bin).ok().map(|msgs| msgs.0);
+                let is_bootstrap = parsed_msgs.as_ref().is_some_and(|msgs| {
+                    msgs.iter().any(|msg| {
+                        matches!(
+                            msg,
+                            StudioToApp::WindowGeomChange { .. } | StudioToApp::Swapchain(_)
+                        )
+                    })
+                });
                 match self.send_to_app_with_socket(build_id, msg_bin.clone()) {
                     Ok(_) => {}
                     Err(err) if err.starts_with("no app socket for build") => {
@@ -1481,6 +1667,11 @@ impl HubCore {
             self.reload_mount_file_tree_broadcast(&mount);
             return;
         };
+        if self.is_git_status_watch_virtual_path(&mount, &virtual_path) {
+            self.invalidate_git_status_cache_for_mount(&mount);
+            self.reload_mount_file_tree_broadcast(&mount);
+            return;
+        }
         if self.should_ignore_fs_watch_virtual_path(&mount, &virtual_path) {
             return;
         }
@@ -1500,18 +1691,34 @@ impl HubCore {
             self.broadcast_ui_message(HubToClient::FileChanged {
                 path: mount.clone(),
             });
+            self.maybe_revive_mount_root_splash_from_fs_fallback(&mount);
             self.reload_mount_file_tree_broadcast(&mount);
             return;
         }
         if self.should_suppress_self_save_event(&virtual_path, now) {
             return;
         }
+        if Self::is_mount_root_splash_virtual_path(&mount, &virtual_path) {
+            self.request_mount_root_splash_reload(&mount);
+        }
         if path_is_file && !self.should_ignore_virtual_path(&mount, &virtual_path) {
             self.broadcast_ui_message(HubToClient::FileChanged {
                 path: virtual_path.clone(),
             });
+            if virtual_path.ends_with(".rs") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let file_name = path.canonicalize().unwrap_or_else(|_| path.clone());
+                    self.forward_live_change_to_builds(
+                        "watch",
+                        &virtual_path,
+                        file_name.to_string_lossy().replace('\\', "/"),
+                        content,
+                    );
+                }
+            }
         }
         if path_is_dir {
+            self.maybe_revive_mount_root_splash_from_fs_fallback(&mount);
             self.reload_mount_file_tree_broadcast(&mount);
             return;
         }
@@ -1642,6 +1849,25 @@ impl HubCore {
                 compute_filetree_change_for_path(&git_status_cache, &disk_path, virtual_path);
             let _ = event_tx.send(HubEvent::WorkerFileTreeDeltaDone { mount, change });
         });
+    }
+
+    fn invalidate_git_status_cache_for_mount(&mut self, mount: &str) {
+        let Ok(root) = self.vfs.resolve_mount(mount) else {
+            return;
+        };
+        if let Ok(mut cache_guard) = self.git_status_cache.lock() {
+            cache_guard
+                .entries
+                .retain(|path, _| !path.starts_with(&root));
+        }
+    }
+
+    fn is_git_status_watch_virtual_path(&self, mount: &str, virtual_path: &str) -> bool {
+        let prefix = format!("{}/", mount);
+        let Some(rest) = virtual_path.strip_prefix(&prefix) else {
+            return false;
+        };
+        rest == ".git" || rest.starts_with(".git/")
     }
 
     fn should_ignore_fs_watch_virtual_path(&self, mount: &str, virtual_path: &str) -> bool {
@@ -1910,8 +2136,50 @@ impl HubCore {
             .pending_forward_to_app_by_build
             .entry(build_id)
             .or_default();
+        if let Some(existing) = queue.first() {
+            if let Some(merged) = Self::merge_pending_bootstrap_msgs(existing, &msg_bin) {
+                queue.clear();
+                queue.push(merged);
+                return;
+            }
+        }
         queue.clear();
         queue.push(msg_bin);
+    }
+
+    fn merge_pending_bootstrap_msgs(existing: &[u8], incoming: &[u8]) -> Option<Vec<u8>> {
+        let existing = StudioToAppVec::deserialize_bin(existing).ok()?.0;
+        let incoming = StudioToAppVec::deserialize_bin(incoming).ok()?.0;
+
+        let mut window_geom = None;
+        let mut swapchain = None;
+        let mut frame_request = None;
+        let mut saw_tick = false;
+
+        for msg in existing.into_iter().chain(incoming.into_iter()) {
+            match msg {
+                StudioToApp::WindowGeomChange { .. } => window_geom = Some(msg),
+                StudioToApp::Swapchain(_) => swapchain = Some(msg),
+                StudioToApp::RunViewFrameRequest(request) => frame_request = Some(request),
+                StudioToApp::Tick => saw_tick = true,
+                _ => {}
+            }
+        }
+
+        let mut merged = Vec::new();
+        if let Some(msg) = window_geom {
+            merged.push(msg);
+        }
+        if let Some(msg) = swapchain {
+            merged.push(msg);
+        }
+        if let Some(request) = frame_request {
+            merged.push(StudioToApp::RunViewFrameRequest(request));
+        }
+        if saw_tick {
+            merged.push(StudioToApp::Tick);
+        }
+        (!merged.is_empty()).then_some(StudioToAppVec(merged).serialize_bin())
     }
 
     fn flush_pending_forward_to_app(&mut self, build_id: QueryId) {
@@ -1934,6 +2202,68 @@ impl HubCore {
 
     fn send_to_app(&self, build_id: QueryId, msg_bin: Vec<u8>) -> Result<(), String> {
         self.send_to_app_with_socket(build_id, msg_bin).map(|_| ())
+    }
+
+    fn build_ids_for_virtual_path(&self, virtual_path: &str) -> Vec<QueryId> {
+        let mut build_ids = HashSet::new();
+        for (build_id, mount) in &self.build_mount_by_id {
+            if Self::virtual_path_matches_build_mount(virtual_path, mount) {
+                build_ids.insert(*build_id);
+            }
+        }
+        let mut build_ids: Vec<QueryId> = build_ids.into_iter().collect();
+        build_ids.sort_by_key(|build_id| build_id.0);
+        build_ids
+    }
+
+    fn virtual_path_matches_build_mount(virtual_path: &str, build_mount: &str) -> bool {
+        if virtual_path == build_mount {
+            return true;
+        }
+        let Some(rest) = virtual_path.strip_prefix(build_mount) else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix('/') else {
+            return false;
+        };
+        let build_is_branch = build_mount
+            .split('/')
+            .nth(1)
+            .is_some_and(|segment| segment.starts_with('@'));
+        if !build_is_branch && rest.starts_with('@') {
+            return false;
+        }
+        true
+    }
+
+    fn forward_live_change_to_builds(
+        &self,
+        _source: &str,
+        virtual_path: &str,
+        file_name: String,
+        content: String,
+    ) {
+        let build_ids = self.build_ids_for_virtual_path(virtual_path);
+        if build_ids.is_empty() {
+            return;
+        }
+        for build_id in build_ids {
+            if let Err(err) = self.send_app_msg(
+                build_id,
+                StudioToApp::LiveChange {
+                    file_name: file_name.clone(),
+                    content: content.clone(),
+                },
+            ) {
+                if err.starts_with("no app socket for build ") {
+                    continue;
+                }
+                eprintln!(
+                    "[studio-hotreload] failed build={} virtual_path={} error={}",
+                    build_id.0, virtual_path, err
+                );
+            }
+        }
     }
 
     fn send_app_msg(&self, build_id: QueryId, msg: StudioToApp) -> Result<(), String> {
@@ -1974,6 +2304,133 @@ impl HubCore {
         builds
     }
 
+    fn mount_has_root_splash(&self, mount: &str) -> bool {
+        self.vfs
+            .resolve_mount(mount)
+            .map(|cwd| cwd.join(MAKEPAD_SPLASH_RUNNABLE).is_file())
+            .unwrap_or(false)
+    }
+
+    fn is_mount_root_splash_virtual_path(mount: &str, virtual_path: &str) -> bool {
+        virtual_path == format!("{}/{}", mount, MAKEPAD_SPLASH_RUNNABLE)
+    }
+
+    fn mount_root_splash_build_ids(&self, mount: &str) -> Vec<QueryId> {
+        let mut build_ids: Vec<QueryId> = self
+            .process_manager
+            .list_builds()
+            .into_iter()
+            .filter_map(|build| {
+                (build.active && build.mount == mount && build.package == MAKEPAD_SPLASH_RUNNABLE)
+                    .then_some(build.build_id)
+            })
+            .collect();
+        build_ids.sort_by_key(|build_id| build_id.0);
+        build_ids
+    }
+
+    fn mount_root_splash_running(&self, mount: &str) -> bool {
+        !self.mount_root_splash_build_ids(mount).is_empty()
+    }
+
+    fn ensure_mount_root_splash_running(
+        &mut self,
+        mount: &str,
+    ) -> Result<Option<BuildInfo>, String> {
+        if !self.mount_has_root_splash(mount) || self.mount_root_splash_running(mount) {
+            return Ok(None);
+        }
+
+        let build_id = self.alloc_build_id();
+        let cwd = self
+            .vfs
+            .resolve_mount(mount)
+            .map_err(|err| err.to_string())?;
+        let info = self.process_manager.start_script_run(
+            build_id,
+            mount.to_string(),
+            &cwd,
+            self.studio_addr.clone(),
+            self.studio_ext_addr.clone(),
+            self.event_tx.clone(),
+        )?;
+        self.build_mount_by_id
+            .insert(info.build_id, info.mount.clone());
+        self.broadcast_ui_message(HubToClient::BuildStarted {
+            build_id: info.build_id,
+            mount: info.mount.clone(),
+            package: info.package.clone(),
+        });
+        Ok(Some(info))
+    }
+
+    fn start_mount_root_splash_with_reporting(&mut self, mount: &str) {
+        if let Err(err) = self.ensure_mount_root_splash_running(mount) {
+            if let Some(client_id) = self.primary_ui_for_mount(mount) {
+                self.send_ui_error(client_id, err);
+            } else {
+                eprintln!(
+                    "[studio2-backend] failed to start {} for mount {}: {}",
+                    MAKEPAD_SPLASH_RUNNABLE, mount, err
+                );
+            }
+        }
+    }
+
+    fn maybe_revive_mount_root_splash_from_fs_fallback(&mut self, mount: &str) {
+        if self.mount_root_splash_running(mount) {
+            return;
+        }
+        if self.primary_ui_for_mount(mount).is_none() || !self.mount_has_root_splash(mount) {
+            return;
+        }
+        self.start_mount_root_splash_with_reporting(mount);
+    }
+
+    fn request_mount_root_splash_reload(&mut self, mount: &str) {
+        let build_ids = self.mount_root_splash_build_ids(mount);
+        if build_ids.is_empty() {
+            if self.primary_ui_for_mount(mount).is_some() && self.mount_has_root_splash(mount) {
+                self.start_mount_root_splash_with_reporting(mount);
+            }
+            return;
+        }
+
+        if self.mount_has_root_splash(mount) {
+            self.pending_mount_root_splash_restarts
+                .insert(mount.to_string());
+        } else {
+            self.pending_mount_root_splash_restarts.remove(mount);
+        }
+
+        for build_id in build_ids {
+            if let Err(err) = self.process_manager.stop_build(build_id) {
+                if let Some(client_id) = self.primary_ui_for_mount(mount) {
+                    self.send_ui_error(client_id, err);
+                } else {
+                    eprintln!(
+                        "[studio2-backend] failed to stop {} build {} for mount {}: {}",
+                        MAKEPAD_SPLASH_RUNNABLE, build_id.0, mount, err
+                    );
+                }
+            }
+        }
+    }
+
+    fn maybe_restart_pending_mount_root_splash(&mut self, mount: &str) {
+        if !self.pending_mount_root_splash_restarts.remove(mount) {
+            return;
+        }
+        if self.mount_root_splash_running(mount) || !self.mount_has_root_splash(mount) {
+            if self.mount_has_root_splash(mount) {
+                self.pending_mount_root_splash_restarts
+                    .insert(mount.to_string());
+            }
+            return;
+        }
+        self.start_mount_root_splash_with_reporting(mount);
+    }
+
     fn primary_ui_for_mount(&self, mount: &str) -> Option<ClientId> {
         let client_id = self.primary_ui_by_mount.get(mount).copied()?;
         self.ui_clients
@@ -1991,6 +2448,66 @@ impl HubCore {
             self.send_ui_message(client_id, msg, self.ui_format(client_id));
         } else {
             self.broadcast_ui_message(msg);
+        }
+    }
+
+    fn send_build_cleanup_message(&self, build_id: QueryId) {
+        let msg = HubToClient::BuildCleared { build_id };
+        if let Some(client_id) = self.primary_ui_for_build(build_id) {
+            self.send_ui_reply(client_id, msg);
+        } else {
+            self.broadcast_ui_message(msg);
+        }
+    }
+
+    fn on_run_items_updated(&mut self, mount: String, items: Vec<RunItem>) {
+        self.run_items_by_mount.insert(mount.clone(), items.clone());
+        self.broadcast_ui_message(HubToClient::RunItems { mount, items });
+    }
+
+    fn on_script_run_request(
+        &mut self,
+        build_id: Option<QueryId>,
+        mount: String,
+        cwd: PathBuf,
+        program: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        package: Option<String>,
+    ) {
+        let build_id = build_id.unwrap_or_else(|| self.alloc_build_id());
+        let package = package.unwrap_or_else(|| display_name_from_command(&program, &args));
+        match self.process_manager.start_command_run(
+            build_id,
+            mount.clone(),
+            package.clone(),
+            &cwd,
+            program,
+            args,
+            env,
+            false,
+            self.studio_addr.clone(),
+            self.event_tx.clone(),
+        ) {
+            Ok(info) => {
+                self.build_mount_by_id
+                    .insert(info.build_id, info.mount.clone());
+                self.broadcast_ui_message(HubToClient::BuildStarted {
+                    build_id: info.build_id,
+                    mount: info.mount,
+                    package: info.package,
+                });
+            }
+            Err(err) => {
+                if let Some(client_id) = self.primary_ui_for_mount(&mount) {
+                    self.send_ui_error(client_id, err);
+                } else {
+                    eprintln!(
+                        "[studio2-backend] failed to start scripted run for mount {}: {}",
+                        mount, err
+                    );
+                }
+            }
         }
     }
 
@@ -2229,6 +2746,32 @@ impl HubCore {
                     }
                 }
             }
+            AppToStudio::RunViewFrame(frame) => {
+                self.send_runview_message(
+                    build_id,
+                    HubToClient::RunViewFrame {
+                        build_id,
+                        window_id: frame.window_id,
+                        frame_id: frame.frame_id,
+                        width: frame.width,
+                        height: frame.height,
+                        codec: frame.codec.unwrap_or(backend_proto::FrameCodec::Png),
+                        data: frame.data,
+                    },
+                );
+            }
+            AppToStudio::RunViewKeyFocusRect(rect) => {
+                self.send_runview_message(
+                    build_id,
+                    HubToClient::RunViewKeyFocusRect {
+                        build_id,
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                );
+            }
             AppToStudio::WidgetTreeDump(response) => {
                 let query_id = QueryId(response.request_id);
                 self.send_to_query_owner(
@@ -2315,6 +2858,24 @@ impl HubCore {
         if line.is_empty() {
             return;
         }
+        if self.process_manager.package_for_build(build_id) == Some(MAKEPAD_SPLASH_RUNNABLE) {
+            let (index, entry) = self.log_store.append(AppendLogEntry {
+                build_id: Some(build_id),
+                level: if is_stderr {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Log
+                },
+                source: LogSource::Studio,
+                message: line,
+                file_name: None,
+                line: None,
+                column: None,
+                timestamp: None,
+            });
+            self.broadcast_live_log_entry(index, entry);
+            return;
+        }
         match parse_cargo_output_line(&line) {
             ParsedCargoOutputLine::Structured(parsed) => {
                 let (index, entry) = self.log_store.append(AppendLogEntry {
@@ -2349,18 +2910,23 @@ impl HubCore {
         }
     }
     fn on_process_exited(&mut self, build_id: QueryId, exit_code: Option<i32>) {
-        if self
-            .process_manager
-            .mark_exited(build_id, exit_code)
-            .is_none()
-        {
+        let Some(info) = self.process_manager.mark_exited(build_id, exit_code) else {
             return;
-        }
+        };
         self.build_mount_by_id.remove(&build_id);
         self.broadcast_ui_message(HubToClient::BuildStopped {
             build_id,
             exit_code,
         });
+        if info.package == MAKEPAD_SPLASH_RUNNABLE {
+            self.run_items_by_mount
+                .insert(info.mount.clone(), Vec::new());
+            self.broadcast_ui_message(HubToClient::RunItems {
+                mount: info.mount.clone(),
+                items: Vec::new(),
+            });
+            self.maybe_restart_pending_mount_root_splash(&info.mount);
+        }
     }
 
     fn on_terminal_output(&mut self, path: String, data: Vec<u8>) {
@@ -2694,22 +3260,6 @@ impl HubCore {
 }
 
 #[derive(Clone, Debug, Default, DeJson)]
-struct CargoMetadata {
-    packages: Vec<CargoMetadataPackage>,
-}
-
-#[derive(Clone, Debug, Default, DeJson)]
-struct CargoMetadataPackage {
-    name: String,
-    targets: Vec<CargoMetadataTarget>,
-}
-
-#[derive(Clone, Debug, Default, DeJson)]
-struct CargoMetadataTarget {
-    kind: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, DeJson)]
 struct RustcCompilerMessage {
     reason: String,
     message: Option<RustcMessage>,
@@ -2745,48 +3295,18 @@ struct ParsedCargoLogEntry {
     column: Option<usize>,
 }
 
-fn discover_runnable_builds(root_path: &Path) -> Result<Vec<RunnableBuild>, String> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version=1"])
-        .current_dir(root_path)
-        .output()
-        .map_err(|err| {
-            format!(
-                "failed to run cargo metadata in {}: {}",
-                root_path.display(),
-                err
-            )
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        return Err(format!(
-            "cargo metadata failed in {}\n{}\n{}",
-            root_path.display(),
-            stderr.trim(),
-            stdout.trim()
-        ));
-    }
-
-    let metadata = CargoMetadata::deserialize_json_lenient(&stdout)
-        .map_err(|err| format!("failed to parse cargo metadata json: {err:?}"))?;
-
-    let mut builds = Vec::new();
-    let mut seen = HashSet::new();
-    for package in metadata.packages {
-        let has_bin_target = package
-            .targets
-            .iter()
-            .any(|target| target.kind.iter().any(|kind| kind == "bin"));
-        if has_bin_target && seen.insert(package.name.clone()) {
-            builds.push(RunnableBuild {
-                package: package.name,
-            });
+fn display_name_from_command(program: &str, args: &[String]) -> String {
+    if program == "cargo" {
+        if let Some(package) = parse_package_name(args) {
+            return package;
         }
     }
-    builds.sort_by(|a, b| a.package.cmp(&b.package));
-    Ok(builds)
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(program)
+        .to_string()
 }
 
 fn terminal_framebuffer_from_terminal(
@@ -3378,7 +3898,7 @@ fn file_tree_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use makepad_network::ToUIReceiver;
+    use makepad_script_std::makepad_network::ToUIReceiver;
     use std::sync::mpsc;
 
     #[test]
@@ -3517,7 +4037,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel::<HubEvent>();
         let mut vfs = VirtualFs::new();
         vfs.mount("repo", root.to_path_buf()).expect("mount repo");
-        let mut core = HubCore::new(event_rx, event_tx, vfs, None);
+        let mut core = HubCore::new(event_rx, event_tx, vfs, None, None);
 
         let ui_rx = ToUIReceiver::<Vec<u8>>::default();
         core.handle_event(HubEvent::ClientConnected {
@@ -3702,7 +4222,7 @@ mod tests {
 
     #[test]
     fn ui_envelope_uses_typed_channel_for_in_process_clients() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -3710,7 +4230,7 @@ mod tests {
         let mut vfs = VirtualFs::new();
         vfs.mount("repo", dir.path().to_path_buf())
             .expect("mount repo");
-        let mut core = HubCore::new(event_rx, event_tx, vfs, None);
+        let mut core = HubCore::new(event_rx, event_tx, vfs, None, None);
 
         let ui_rx_bin = ToUIReceiver::<Vec<u8>>::default();
         let ui_rx_typed = ToUIReceiver::<HubToClient>::default();
@@ -3758,7 +4278,7 @@ mod tests {
 
     #[test]
     fn ui_envelope_rejects_mismatched_client_id() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -3766,7 +4286,7 @@ mod tests {
         let mut vfs = VirtualFs::new();
         vfs.mount("repo", dir.path().to_path_buf())
             .expect("mount repo");
-        let mut core = HubCore::new(event_rx, event_tx, vfs, None);
+        let mut core = HubCore::new(event_rx, event_tx, vfs, None, None);
 
         let ui_rx = ToUIReceiver::<Vec<u8>>::default();
         core.handle_event(HubEvent::ClientConnected {
@@ -3809,7 +4329,7 @@ mod tests {
 
     #[test]
     fn ui_binary_rejects_mismatched_client_id() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -3817,7 +4337,7 @@ mod tests {
         let mut vfs = VirtualFs::new();
         vfs.mount("repo", dir.path().to_path_buf())
             .expect("mount repo");
-        let mut core = HubCore::new(event_rx, event_tx, vfs, None);
+        let mut core = HubCore::new(event_rx, event_tx, vfs, None, None);
 
         let ui_rx = ToUIReceiver::<Vec<u8>>::default();
         core.handle_event(HubEvent::ClientConnected {
@@ -3862,7 +4382,7 @@ mod tests {
 
     #[test]
     fn secondary_ui_click_is_accepted_and_visualized_for_primary_observer() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -3870,7 +4390,7 @@ mod tests {
         let mut vfs = VirtualFs::new();
         vfs.mount("repo", dir.path().to_path_buf())
             .expect("mount repo");
-        let mut core = HubCore::new(event_rx, event_tx, vfs, None);
+        let mut core = HubCore::new(event_rx, event_tx, vfs, None, None);
 
         let primary_ui = ToUIReceiver::<Vec<u8>>::default();
         core.handle_event(HubEvent::ClientConnected {
@@ -3985,7 +4505,7 @@ mod tests {
 
     #[test]
     fn mount_fs_changed_file_path_emits_added_diff() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -4019,7 +4539,7 @@ mod tests {
 
     #[test]
     fn mount_fs_changed_file_path_ignores_mount_root_suppress_window() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -4055,7 +4575,7 @@ mod tests {
 
     #[test]
     fn mount_fs_changed_mount_root_still_honors_suppress_window() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -4082,7 +4602,7 @@ mod tests {
 
     #[test]
     fn mount_fs_changed_directory_path_triggers_full_tree_reload() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -4112,8 +4632,32 @@ mod tests {
     }
 
     #[test]
+    fn mount_fs_changed_git_metadata_path_triggers_full_tree_reload() {
+        let dir = crate::test_support::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
+        fs::write(dir.path().join(".git/index"), "").unwrap();
+
+        let (mut core, ui_rx) = test_core_with_ui(dir.path());
+        core.handle_event(HubEvent::MountFsChanged {
+            mount: "repo".to_string(),
+            path: dir.path().join(".git/index"),
+        });
+
+        pump_core(&mut core, Duration::from_millis(400));
+        let messages = recv_ui_messages(&ui_rx, Duration::from_millis(350));
+        assert!(
+            messages
+                .iter()
+                .any(|msg| matches!(msg, HubToClient::FileTree { mount, .. } if mount == "repo")),
+            "expected .git metadata fs event to trigger a full FileTree reload"
+        );
+    }
+
+    #[test]
     fn full_file_tree_reload_payload_is_much_larger_than_single_file_diff() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         let src_dir = dir.path().join("src");
         fs::create_dir_all(&src_dir).unwrap();
         for i in 0..1200usize {
@@ -4184,7 +4728,7 @@ mod tests {
 
     #[test]
     fn mount_fs_changed_removed_directory_emits_removed_diff() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src/nested")).unwrap();
         fs::write(dir.path().join("src/nested/mod.rs"), "pub fn nested() {}\n").unwrap();
 
@@ -4218,7 +4762,7 @@ mod tests {
 
     #[test]
     fn worker_deltas_batch_and_coalesce_removed_descendants() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src/nested")).unwrap();
         let (mut core, ui_rx) = test_core_with_ui(dir.path());
 
@@ -4271,7 +4815,7 @@ mod tests {
 
     #[test]
     fn worker_remove_then_add_same_path_keeps_added_state() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         let (mut core, ui_rx) = test_core_with_ui(dir.path());
 
@@ -4309,7 +4853,7 @@ mod tests {
 
     #[test]
     fn worker_delta_storm_falls_back_to_single_tree_reload() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 

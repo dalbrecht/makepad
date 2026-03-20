@@ -1,13 +1,16 @@
 use crate::dispatch::HubEvent;
-use makepad_studio_protocol::hub_protocol::QueryId;
-use makepad_network::{
+use makepad_micro_serde::SerBin;
+use makepad_script_std::makepad_network::{
     start_http_server, HttpServer, HttpServerRequest, HttpServerResponse, ToUISender,
 };
+use makepad_studio_protocol::hub_protocol::{HubToClient, QueryId};
 use std::collections::HashMap;
+use std::env;
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
+#[derive(Clone, Copy)]
 enum SocketRole {
     Client,
     App,
@@ -18,6 +21,10 @@ pub struct GatewayHandle {
     pub listen_address: SocketAddr,
     pub request_thread: JoinHandle<()>,
     pub http_thread: JoinHandle<()>,
+}
+
+fn studio_hub_debug_enabled() -> bool {
+    env::var_os("MAKEPAD_STUDIO_HUB_DEBUG").is_some()
 }
 
 pub fn start_http_gateway(
@@ -42,7 +49,19 @@ pub fn start_http_gateway(
                     headers,
                     response_sender,
                 } => {
-                    if headers.path == "/$studio_ui" {
+                    if studio_hub_debug_enabled() {
+                        eprintln!(
+                            "studio hub debug: websocket connect id={} path={}",
+                            web_socket_id, headers.path
+                        );
+                    }
+                    if headers.path == "/ui" {
+                        if studio_hub_debug_enabled() {
+                            eprintln!(
+                                "studio hub debug: websocket id={} accepted as ui client",
+                                web_socket_id
+                            );
+                        }
                         socket_roles.insert(web_socket_id, SocketRole::Client);
                         let _ = event_tx.send(HubEvent::ClientConnected {
                             web_socket_id: web_socket_id,
@@ -52,6 +71,12 @@ pub fn start_http_gateway(
                         continue;
                     }
                     if let Some(build_id) = parse_app_path(&headers.path) {
+                        if studio_hub_debug_enabled() {
+                            eprintln!(
+                                "studio hub debug: websocket id={} accepted as app build={}",
+                                web_socket_id, build_id.0
+                            );
+                        }
                         socket_roles.insert(web_socket_id, SocketRole::App);
                         let _ = event_tx.send(HubEvent::AppConnected {
                             build_id,
@@ -61,6 +86,12 @@ pub fn start_http_gateway(
                         continue;
                     }
                     if headers.path == "/$studio_buildbox" {
+                        if studio_hub_debug_enabled() {
+                            eprintln!(
+                                "studio hub debug: websocket id={} accepted as buildbox",
+                                web_socket_id
+                            );
+                        }
                         socket_roles.insert(web_socket_id, SocketRole::BuildBox);
                         let _ = event_tx.send(HubEvent::BuildBoxConnected {
                             web_socket_id: web_socket_id,
@@ -68,22 +99,48 @@ pub fn start_http_gateway(
                         });
                         continue;
                     }
+                    if studio_hub_debug_enabled() {
+                        eprintln!(
+                            "studio hub debug: websocket id={} rejected path={}",
+                            web_socket_id, headers.path
+                        );
+                    }
+                    let _ = response_sender.send(
+                        HubToClient::Error {
+                            message: format!("invalid websocket path: {}", headers.path),
+                        }
+                        .serialize_bin(),
+                    );
                     let _ = response_sender.send(Vec::new());
                 }
                 HttpServerRequest::DisconnectWebSocket { web_socket_id } => {
                     if let Some(role) = socket_roles.remove(&web_socket_id) {
+                        if studio_hub_debug_enabled() {
+                            let role_name = match role {
+                                SocketRole::Client => "ui client",
+                                SocketRole::App => "app",
+                                SocketRole::BuildBox => "buildbox",
+                            };
+                            eprintln!(
+                                "studio hub debug: websocket disconnect id={} role={}",
+                                web_socket_id, role_name
+                            );
+                        }
                         match role {
                             SocketRole::Client => {
-                                let _ =
-                                    event_tx.send(HubEvent::ClientDisconnected { web_socket_id: web_socket_id });
+                                let _ = event_tx.send(HubEvent::ClientDisconnected {
+                                    web_socket_id: web_socket_id,
+                                });
                             }
                             SocketRole::App => {
-                                let _ =
-                                    event_tx.send(HubEvent::AppDisconnected { web_socket_id: web_socket_id });
+                                let _ = event_tx.send(HubEvent::AppDisconnected {
+                                    web_socket_id: web_socket_id,
+                                });
                             }
                             SocketRole::BuildBox => {
-                                let _ = event_tx
-                                    .send(HubEvent::BuildBoxDisconnected { web_socket_id: web_socket_id });
+                                let _ = event_tx.send(HubEvent::BuildBoxDisconnected {
+                                    web_socket_id: web_socket_id,
+                                });
                             }
                         }
                     }
@@ -151,16 +208,14 @@ pub fn start_http_gateway(
 }
 
 fn parse_app_path(path: &str) -> Option<QueryId> {
-    for prefix in ["/$studio_app/", "/$studio_web_socket/"] {
-        let Some(rest) = path.strip_prefix(prefix) else {
-            continue;
-        };
-        if rest.is_empty() {
-            return None;
-        }
-        if let Ok(id) = rest.parse::<u64>() {
-            return Some(QueryId(id));
-        }
+    let Some(rest) = path.strip_prefix("/app/") else {
+        return None;
+    };
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    if let Ok(id) = rest.parse::<u64>() {
+        return Some(QueryId(id));
     }
     None
 }
@@ -170,20 +225,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_legacy_studio_app_path() {
-        assert_eq!(parse_app_path("/$studio_app/42"), Some(QueryId(42)));
-    }
-
-    #[test]
-    fn parse_current_studio_web_socket_path() {
-        assert_eq!(parse_app_path("/$studio_web_socket/99"), Some(QueryId(99)));
+    fn parse_clean_app_path() {
+        assert_eq!(parse_app_path("/app/42"), Some(QueryId(42)));
     }
 
     #[test]
     fn reject_missing_or_invalid_build_id() {
-        assert_eq!(parse_app_path("/$studio_app/"), None);
-        assert_eq!(parse_app_path("/$studio_web_socket/not-a-number"), None);
-        assert_eq!(parse_app_path("/$studio_ui"), None);
+        assert_eq!(parse_app_path("/app/"), None);
+        assert_eq!(parse_app_path("/app/not-a-number"), None);
+        assert_eq!(parse_app_path("/app/77/extra"), None);
+        assert_eq!(parse_app_path("/ui"), None);
     }
 }
 

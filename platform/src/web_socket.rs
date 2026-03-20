@@ -1,18 +1,21 @@
+pub use crate::makepad_network::WebSocketMessage;
 #[allow(unused_imports)]
 use crate::{
     cx_api::*,
     event::Event,
+    makepad_live_id::LiveId,
     makepad_micro_serde::*,
     makepad_network::{
         HttpMethod, HttpRequest, NetworkResponse, NetworkRuntime, WebSocketTransport, WsMessage,
         WsSend,
     },
     thread::SignalToUI,
-    makepad_live_id::LiveId,
     Cx,
 };
-use makepad_studio_protocol::{AppToStudio, AppToStudioVec, LocalProfileSample, StudioToApp};
-pub use crate::makepad_network::WebSocketMessage;
+use makepad_studio_protocol::{
+    hub_protocol::HubToClient, AppToStudio, AppToStudioVec, LocalProfileSample, StudioToApp,
+    StudioToAppVec,
+};
 #[allow(unused_imports)]
 use std::{
     sync::Arc,
@@ -28,9 +31,7 @@ pub type WebSocket = u64;
 
 #[derive(Debug)]
 enum StudioWebSocketThreadMsg {
-    AppToStudio {
-        message: AppToStudio,
-    },
+    AppToStudio { message: AppToStudio },
     Terminate,
 }
 
@@ -38,13 +39,75 @@ static STUDIO_WEB_SOCKET_THREAD_SENDER: Mutex<Option<Sender<StudioWebSocketThrea
     Mutex::new(None);
 static STUDIO_NET_RUNTIME: Mutex<Option<Arc<NetworkRuntime>>> = Mutex::new(None);
 pub(crate) static HAS_STUDIO_WEB_SOCKET: AtomicBool = AtomicBool::new(false);
+pub(crate) static STUDIO_WEB_SOCKET_CONNECTED: AtomicBool = AtomicBool::new(false);
 pub(crate) static STUDIO_STDOUT_MODE: AtomicBool = AtomicBool::new(false);
 pub(crate) static LOCAL_PROFILE_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
-pub(crate) static CONTROL_CHANNEL: Mutex<Option<Receiver<StudioToApp>>> =
-    Mutex::new(None);
+pub(crate) static CONTROL_CHANNEL: Mutex<Option<Receiver<StudioToApp>>> = Mutex::new(None);
 pub(crate) static LOCAL_PROFILE_SAMPLES: Mutex<Vec<LocalProfileSample>> = Mutex::new(Vec::new());
 const LOCAL_PROFILE_SAMPLE_BUFFER_LIMIT: usize = 16_384;
 const STUDIO_SOCKET_ID: u64 = 0;
+
+pub(crate) fn consume_studio_socket_response(
+    response: &NetworkResponse,
+) -> Option<Vec<StudioToApp>> {
+    match response {
+        NetworkResponse::WsOpened { socket_id } if socket_id.0 == STUDIO_SOCKET_ID => {
+            STUDIO_WEB_SOCKET_CONNECTED.store(true, Ordering::SeqCst);
+            Some(Vec::new())
+        }
+        NetworkResponse::WsClosed { socket_id } if socket_id.0 == STUDIO_SOCKET_ID => {
+            STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
+            crate::warning!("studio websocket closed");
+            Some(Vec::new())
+        }
+        NetworkResponse::WsError {
+            socket_id,
+            message,
+        } if socket_id.0 == STUDIO_SOCKET_ID => {
+            STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
+            crate::error!("studio websocket error: {}", message);
+            Some(Vec::new())
+        }
+        NetworkResponse::WsMessage { socket_id, message } if socket_id.0 == STUDIO_SOCKET_ID => {
+            let msgs = match message {
+                WsMessage::Binary(data) => match StudioToAppVec::deserialize_bin(data) {
+                    Ok(msgs) => msgs.0,
+                    Err(err) => match HubToClient::deserialize_bin(data) {
+                        Ok(HubToClient::Hello { .. }) => Vec::new(),
+                        Ok(_) => {
+                            crate::warning!(
+                                "Ignoring unexpected HubToClient payload on studio app websocket"
+                            );
+                            Vec::new()
+                        }
+                        Err(_) => {
+                            crate::error!(
+                                "Cant parse studio websocket binary payload in windowed mode: {:?}",
+                                err
+                            );
+                            Vec::new()
+                        }
+                    },
+                },
+                WsMessage::Text(text) => {
+                    if text.trim().is_empty() {
+                        Vec::new()
+                    } else if let Ok(msg) = StudioToApp::deserialize_json(text) {
+                        vec![msg]
+                    } else {
+                        crate::warning!(
+                            "Ignoring unexpected studio websocket text: {}",
+                            text.trim()
+                        );
+                        Vec::new()
+                    }
+                }
+            };
+            Some(msgs)
+        }
+        _ => None,
+    }
+}
 
 fn recv_studio_thread_msg(
     rx: &Receiver<StudioWebSocketThreadMsg>,
@@ -93,6 +156,10 @@ impl Cx {
         HAS_STUDIO_WEB_SOCKET.load(Ordering::SeqCst)
     }
 
+    pub fn has_studio_web_socket_connected() -> bool {
+        STUDIO_WEB_SOCKET_CONNECTED.load(Ordering::SeqCst)
+    }
+
     /// Enable stdout mode for studio messages. When enabled,
     /// `send_studio_message` writes JSON lines to stdout instead of
     /// the websocket. Also sets `HAS_STUDIO_WEB_SOCKET` so that
@@ -101,6 +168,7 @@ impl Cx {
     pub fn set_studio_stdout_mode(enabled: bool) {
         STUDIO_STDOUT_MODE.store(enabled, Ordering::SeqCst);
         HAS_STUDIO_WEB_SOCKET.store(enabled, Ordering::SeqCst);
+        STUDIO_WEB_SOCKET_CONNECTED.store(enabled, Ordering::SeqCst);
     }
 
     /// Set a control channel for receiving StudioToApp messages.
@@ -196,7 +264,7 @@ impl Cx {
                 if let Some(first_time) = first_message_time {
                     if (Cx::time_now() - first_time) >= collect_time.as_secs_f64() {
                         if studio_ws_send_binary(app_to_studio.serialize_bin()).is_err() {
-                            println!("Studio websocket disconnected!");
+                            STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
                             break;
                         }
                         app_to_studio.0.clear();
@@ -212,6 +280,7 @@ impl Cx {
 
     fn start_studio_websocket(&mut self, studio_http: &str) {
         if studio_http.is_empty() {
+            crate::log!("studio websocket disabled: empty studio_http");
             return;
         }
         self.studio_http = studio_http.into();
@@ -219,12 +288,14 @@ impl Cx {
         #[cfg(all(not(target_os = "tvos"), not(target_os = "ios")))]
         {
             HAS_STUDIO_WEB_SOCKET.store(true, Ordering::SeqCst);
+            STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
             let mut request = HttpRequest::new(studio_http.to_string(), HttpMethod::GET);
             request.set_websocket_transport(WebSocketTransport::PlainTcp);
             *STUDIO_NET_RUNTIME.lock().unwrap() = Some(self.net.clone());
             if let Err(err) = self.net.ws_open(LiveId(STUDIO_SOCKET_ID), request) {
                 crate::error!("could not open studio websocket: {err}");
                 HAS_STUDIO_WEB_SOCKET.store(false, Ordering::SeqCst);
+                STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
                 *STUDIO_NET_RUNTIME.lock().unwrap() = None;
             }
         }
@@ -234,6 +305,7 @@ impl Cx {
         let _ = self.net.ws_close(LiveId(STUDIO_SOCKET_ID));
         *STUDIO_NET_RUNTIME.lock().unwrap() = None;
         HAS_STUDIO_WEB_SOCKET.store(false, Ordering::SeqCst);
+        STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
         let sender = STUDIO_WEB_SOCKET_THREAD_SENDER.lock().unwrap();
         if let Some(sender) = &*sender {
             let _ = sender.send(StudioWebSocketThreadMsg::Terminate);
@@ -243,12 +315,14 @@ impl Cx {
     #[cfg(any(target_os = "tvos", target_os = "ios"))]
     pub fn start_studio_websocket_delayed(&mut self) {
         HAS_STUDIO_WEB_SOCKET.store(true, Ordering::SeqCst);
+        STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
         let mut request = HttpRequest::new(self.studio_http.clone(), HttpMethod::GET);
         request.set_websocket_transport(WebSocketTransport::PlainTcp);
         *STUDIO_NET_RUNTIME.lock().unwrap() = Some(self.net.clone());
         if let Err(err) = self.net.ws_open(LiveId(STUDIO_SOCKET_ID), request) {
             crate::error!("could not open delayed studio websocket: {err}");
             HAS_STUDIO_WEB_SOCKET.store(false, Ordering::SeqCst);
+            STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
             *STUDIO_NET_RUNTIME.lock().unwrap() = None;
         }
     }
@@ -265,14 +339,17 @@ impl Cx {
             let response = self.net.recv().ok()?;
             match response {
                 NetworkResponse::WsOpened { socket_id } if socket_id.0 == STUDIO_SOCKET_ID => {
+                    STUDIO_WEB_SOCKET_CONNECTED.store(true, Ordering::SeqCst);
                     return Some(WebSocketMessage::Opened);
                 }
                 NetworkResponse::WsClosed { socket_id } if socket_id.0 == STUDIO_SOCKET_ID => {
+                    STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
                     return Some(WebSocketMessage::Closed);
                 }
                 NetworkResponse::WsError { socket_id, message }
                     if socket_id.0 == STUDIO_SOCKET_ID =>
                 {
+                    STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
                     return Some(WebSocketMessage::Error(message));
                 }
                 NetworkResponse::WsMessage { socket_id, message }
@@ -305,6 +382,7 @@ impl Cx {
         if STUDIO_STDOUT_MODE.load(Ordering::SeqCst) {
             use std::io::Write;
             let _ = std::io::stdout().write_all(msg.to_json().as_bytes());
+            let _ = std::io::stdout().write_all(b"\n");
             let _ = std::io::stdout().flush();
             return;
         }

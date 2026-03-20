@@ -141,7 +141,7 @@ script_mod! {
         }
 
         fragment: fn() {
-            self.fb0 = self.pixel();
+            self.fb0 = depth_clip(self.world, self.pixel(), self.depth_clip);
         }
 
         sample_text_pixel: fn() {
@@ -187,7 +187,7 @@ pub struct DrawText {
     pub text_style: TextStyle,
     #[live(1.0)]
     pub font_scale: f32,
-    #[live(1.0)]
+    #[live(0.0)]
     pub draw_depth: f32,
     #[live]
     pub debug: bool,
@@ -422,7 +422,7 @@ impl DrawText {
         }
 
         let origin_in_lpxs = Point::new(turtle_rect.pos.x as f32, turtle_rect.pos.y as f32);
-        self.draw_text(cx, origin_in_lpxs, &laidout_text);
+        self.draw_text(cx, origin_in_lpxs, laidout_text);
 
         rect(
             origin_in_lpxs.x as f64,
@@ -476,12 +476,23 @@ impl DrawText {
                 last_row.origin_in_lpxs.y - last_row.ascender_in_lpxs,
             ) * self.font_scale;
         let used_size_in_lpxs = text.size_in_lpxs * self.font_scale;
+        // Account for temp_y_shift in the allocated height so that shifted
+        // glyphs (e.g., from top_drop) don't get clipped by their container.
+        let shift_extra_height = if self.temp_y_shift != 0.0 {
+            let fs = text.rows.first()
+                .and_then(|r| r.glyphs.first())
+                .map(|g| g.font_size_in_lpxs)
+                .unwrap_or(0.0);
+            (self.temp_y_shift * fs * self.font_scale).abs() as f64
+        } else {
+            0.0
+        };
         let new_turtle_pos = dvec2(new_turtle_pos.x as f64, new_turtle_pos.y as f64);
         let turtle = cx.turtle_mut();
 
         turtle.move_to(dvec2(origin_in_lpxs.x as f64, origin_in_lpxs.y as f64));
         turtle.allocate_width(used_size_in_lpxs.width as f64);
-        turtle.allocate_height(used_size_in_lpxs.height as f64);
+        turtle.allocate_height(used_size_in_lpxs.height as f64 + shift_extra_height);
         turtle.move_to(new_turtle_pos);
 
         turtle.set_wrap_spacing(
@@ -493,12 +504,12 @@ impl DrawText {
             pos: new_turtle_pos,
             size: dvec2(
                 used_size_in_lpxs.width as f64,
-                used_size_in_lpxs.height as f64,
+                used_size_in_lpxs.height as f64 + shift_extra_height,
             ),
         });
 
-        let shift = if let Some(row) = text.rows.get(0) {
-            if let Some(glyph) = row.glyphs.get(0) {
+        let shift = if let Some(row) = text.rows.first() {
+            if let Some(glyph) = row.glyphs.first() {
                 glyph.font_size_in_lpxs * self.temp_y_shift
             } else {
                 0.0
@@ -537,6 +548,7 @@ impl DrawText {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn layout(
         &self,
         cx: &mut Cx,
@@ -547,7 +559,9 @@ impl DrawText {
         align: Align,
         text: &str,
     ) -> Rc<LaidoutText> {
-        self.text_style.font_family.ensure_fonts_loaded(cx);
+        self.text_style
+            .font_family
+            .ensure_fonts_loaded_for_text(cx, Some(text));
         let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
         let mut fonts = fonts.borrow_mut();
 
@@ -564,7 +578,7 @@ impl DrawText {
                 max_width_in_lpxs,
                 wrap,
                 align: align.x as f32,
-                line_spacing_scale: self.text_style.line_spacing as f32,
+                line_spacing_scale: self.text_style.line_spacing,
             },
         })
     }
@@ -797,6 +811,11 @@ pub struct TextStyle {
     pub font_size: f32,
     #[live(1.0)]
     pub line_spacing: f32,
+    /// A vertical offset applied when drawing text, as a fraction of the font size.
+    /// Positive values shift text downward, useful for aligning baselines when
+    /// mixing fonts with different vertical metrics (e.g., code font with regular text).
+    #[live(0.0)]
+    pub top_drop: f32,
 }
 
 #[derive(Debug, Clone, Script, ScriptHook)]
@@ -829,14 +848,19 @@ impl FontFamily {
         (self.id.0).into()
     }
 
-    fn update_font_definitions(&self, cx: &mut Cx, fonts: &mut Fonts) {
+    fn update_font_definitions(&self, cx: &mut Cx, fonts: &mut Fonts, text: Option<&str>) {
         let mut font_ids = Vec::new();
 
         for member in &self.members {
+            if !font_member_is_needed_for_text(cx, member.handle, text) {
+                continue;
+            }
             let font_id: FontId = (member.handle.index() as u64).into();
 
             if !fonts.is_font_known(font_id) {
-                if let Some(data) = cx.get_resource(member.handle) {
+                let font_data = cx.get_resource_font_bytes(member.handle);
+
+                if let Some(data) = font_data {
                     fonts.define_font(
                         font_id,
                         FontDefinition {
@@ -864,7 +888,7 @@ impl FontFamily {
         );
     }
 
-    fn ensure_fonts_loaded(&self, cx: &mut Cx) {
+    fn ensure_fonts_loaded_for_text(&self, cx: &mut Cx, text: Option<&str>) {
         CxDraw::lazy_construct_fonts(cx);
 
         let family_id = self.to_font_family_id();
@@ -877,8 +901,13 @@ impl FontFamily {
             }
         }
 
-        // Slow path: attempt to progress pending resource loads, then re-check.
-        cx.load_all_script_resources();
+        // Slow path: request only the resources needed by this family, then re-check.
+        for member in &self.members {
+            if !font_member_is_needed_for_text(cx, member.handle, text) {
+                continue;
+            }
+            cx.load_script_resource(member.handle);
+        }
         {
             let fonts_ref = fonts.borrow();
             if fonts_ref.is_font_family_complete(family_id) {
@@ -887,8 +916,85 @@ impl FontFamily {
         }
 
         let mut fonts_ref = fonts.borrow_mut();
-        self.update_font_definitions(cx, &mut fonts_ref);
+        self.update_font_definitions(cx, &mut fonts_ref, text);
     }
+
+    fn ensure_fonts_loaded(&self, cx: &mut Cx) {
+        self.ensure_fonts_loaded_for_text(cx, None);
+    }
+}
+
+fn font_member_is_needed_for_text(cx: &Cx, handle: ScriptHandle, text: Option<&str>) -> bool {
+    let Some(text) = text else {
+        return true;
+    };
+    let Some(path) = cx.get_resource_abs_path(handle) else {
+        return true;
+    };
+
+    if is_cjk_fallback_font_path(&path) {
+        return text_has_cjk(text);
+    }
+    if is_emoji_fallback_font_path(&path) {
+        return text_has_emoji(text);
+    }
+    true
+}
+
+fn is_cjk_fallback_font_path(path: &str) -> bool {
+    matches!(
+        resource_basename(path),
+        Some(name)
+            if name.eq_ignore_ascii_case("LXGWWenKaiRegular.ttf")
+                || name.eq_ignore_ascii_case("LXGWWenKaiBold.ttf")
+    )
+}
+
+fn is_emoji_fallback_font_path(path: &str) -> bool {
+    matches!(
+        resource_basename(path),
+        Some(name) if name.eq_ignore_ascii_case("NotoColorEmoji.ttf")
+    )
+}
+
+fn resource_basename(path: &str) -> Option<&str> {
+    path.rsplit(['/', '\\']).next()
+}
+
+fn text_has_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk_char)
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2E80..=0x2FFF
+            | 0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x3100..=0x312F
+            | 0x31A0..=0x31EF
+            | 0x1100..=0x11FF
+            | 0x3130..=0x318F
+            | 0xAC00..=0xD7AF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFFEF
+            | 0x20000..=0x2EE5F
+            | 0x2F800..=0x2FA1F
+    )
+}
+
+fn text_has_emoji(text: &str) -> bool {
+    text.chars().any(is_emoji_char)
+}
+
+fn is_emoji_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2600..=0x27BF | 0x200D | 0xFE0F | 0x1F000..=0x1FAFF | 0x1FB00..=0x1FBFF
+    )
 }
 
 impl TextStyle {
@@ -898,6 +1004,11 @@ impl TextStyle {
 
     pub fn ensure_fonts_loaded(&self, cx: &mut Cx) {
         self.font_family.ensure_fonts_loaded(cx);
+    }
+
+    pub fn ensure_fonts_loaded_for_text(&self, cx: &mut Cx, text: &str) {
+        self.font_family
+            .ensure_fonts_loaded_for_text(cx, Some(text));
     }
 }
 

@@ -7,9 +7,9 @@ mod virtual_gpu;
 use crate::os::shared_framebuf::PollTimers;
 use crate::{
     audio::{AudioDeviceId, AudioInputFn, AudioOutputFn},
-    media_api::CxMediaApi,
     makepad_network::HttpRequest,
     makepad_network::WebSocketMessage,
+    media_api::CxMediaApi,
     midi::{MidiData, MidiInput, MidiOutput, MidiPortId},
     thread::MessageThreadPool,
     video::{VideoFormatId, VideoInputFn, VideoInputId},
@@ -33,6 +33,9 @@ pub struct CxOsGeometry {}
 
 #[derive(Default, Clone)]
 pub struct CxOsTexture {}
+
+#[derive(Default, Clone)]
+pub struct CxOsUniformBuffer {}
 
 #[derive(Default)]
 pub struct CxOsDrawShader {

@@ -12,6 +12,14 @@ pub struct Texture(Rc<PoolId>);
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub struct TextureId(pub(crate) usize, u64);
 
+impl Default for TextureId {
+    /// Returns a sentinel `TextureId` that does not correspond to any allocated texture.
+    /// Used for audio-only players that carry no video output.
+    fn default() -> Self {
+        TextureId(usize::MAX, 0)
+    }
+}
+
 impl Texture {
     pub fn texture_id(&self) -> TextureId {
         TextureId(self.0.id, self.0.generation)
@@ -126,6 +134,13 @@ pub enum TextureFormat {
         max_level: Option<usize>,
         updated: TextureUpdated,
     },
+    VecMipRGBAf32 {
+        width: usize,
+        height: usize,
+        data: Option<Vec<f32>>,
+        max_level: Option<usize>,
+        updated: TextureUpdated,
+    },
     VecRGBAf32 {
         width: usize,
         height: usize,
@@ -175,7 +190,17 @@ pub enum TextureFormat {
         id: crate::shared_framebuf::PresentableImageId,
         initial: bool,
     },
-    VideoRGB,
+    /// A single YUV plane texture (Y, U, or V). Backend-managed — the render
+    /// backend or platform layer creates/uploads the GPU texture directly.
+    /// Used for both I420 (three R8 planes) and NV12 (R8 luma + RG8 chroma).
+    VideoYuvPlane,
+    /// An opaque external video texture whose contents are managed outside the
+    /// normal texture upload path (e.g. Android SurfaceTexture/OES, or
+    /// platform-native composited video output).
+    VideoExternal,
+    /// Android/Vulkan camera texture backed by an imported RGBA
+    /// `AHardwareBuffer`.
+    VideoRgbaHardwareBuffer,
 }
 
 impl std::fmt::Debug for TextureFormat {
@@ -193,6 +218,10 @@ impl std::fmt::Debug for TextureFormat {
             TextureFormat::VecMipBGRAu8_32 { width, height, .. } => write!(
                 f,
                 "TextureFormat::VecMipBGRAu8_32(width:{width},height:{height})"
+            ),
+            TextureFormat::VecMipRGBAf32 { width, height, .. } => write!(
+                f,
+                "TextureFormat::VecMipRGBAf32(width:{width},height:{height})"
             ),
             TextureFormat::VecRGBAf32 { width, height, .. } => write!(
                 f,
@@ -223,7 +252,11 @@ impl std::fmt::Debug for TextureFormat {
                 f,
                 "TextureFormat::SharedBGRAu8(width:{width},height:{height})"
             ),
-            TextureFormat::VideoRGB => write!(f, "TextureFormat::VideoRGB"),
+            TextureFormat::VideoYuvPlane => write!(f, "TextureFormat::VideoYuvPlane"),
+            TextureFormat::VideoExternal => write!(f, "TextureFormat::VideoExternal"),
+            TextureFormat::VideoRgbaHardwareBuffer => {
+                write!(f, "TextureFormat::VideoRgbaHardwareBuffer")
+            }
         }
     }
 }
@@ -247,6 +280,7 @@ pub(crate) struct TextureAlloc {
 #[derive(Clone, Debug)]
 pub enum TextureCategory {
     Vec,
+    VecMip,
     VecCube,
     Render,
     DepthBuffer,
@@ -259,6 +293,13 @@ impl PartialEq for TextureCategory {
         match self {
             Self::Vec { .. } => {
                 if let Self::Vec { .. } = other {
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::VecMip { .. } => {
+                if let Self::VecMip { .. } = other {
                     true
                 } else {
                     false
@@ -346,7 +387,13 @@ pub(crate) enum TexturePixel {
     RGu8,
     Rf32,
     D32,
-    VideoRGB,
+    /// YUV plane pixel type. Individual planes are R8 (luma, I420 chroma) or
+    /// RG8 (NV12 chroma); the actual GPU format is set at upload/wrap time.
+    VideoYuvPlane,
+    /// Opaque external video pixel type (e.g. Android OES, composited RGBA).
+    VideoExternal,
+    /// Android/Vulkan imported RGBA hardware buffer.
+    VideoRgbaHardwareBuffer,
 }
 
 impl CxTexture {
@@ -356,6 +403,7 @@ impl CxTexture {
             TextureFormat::VecBGRAu8_32 { updated, .. } => updated,
             TextureFormat::VecCubeBGRAu8_32 { updated, .. } => updated,
             TextureFormat::VecMipBGRAu8_32 { updated, .. } => updated,
+            TextureFormat::VecMipRGBAf32 { updated, .. } => updated,
             TextureFormat::VecRGBAf32 { updated, .. } => updated,
             TextureFormat::VecRu8 { updated, .. } => updated,
             TextureFormat::VecRGu8 { updated, .. } => updated,
@@ -382,6 +430,7 @@ impl CxTexture {
             TextureFormat::VecBGRAu8_32 { updated, .. } => updated,
             TextureFormat::VecCubeBGRAu8_32 { updated, .. } => updated,
             TextureFormat::VecMipBGRAu8_32 { updated, .. } => updated,
+            TextureFormat::VecMipRGBAf32 { updated, .. } => updated,
             TextureFormat::VecRGBAf32 { updated, .. } => updated,
             TextureFormat::VecRu8 { updated, .. } => updated,
             TextureFormat::VecRGu8 { updated, .. } => updated,
@@ -482,6 +531,7 @@ impl TextureFormat {
             Self::VecBGRAu8_32 { .. } => true,
             Self::VecCubeBGRAu8_32 { .. } => true,
             Self::VecMipBGRAu8_32 { .. } => true,
+            Self::VecMipRGBAf32 { .. } => true,
             Self::VecRGBAf32 { .. } => true,
             Self::VecRu8 { .. } => true,
             Self::VecRGu8 { .. } => true,
@@ -507,10 +557,18 @@ impl TextureFormat {
     }
 
     pub fn is_video(&self) -> bool {
-        if let Self::VideoRGB = self {
-            return true;
-        }
-        false
+        matches!(
+            self,
+            Self::VideoYuvPlane | Self::VideoExternal | Self::VideoRgbaHardwareBuffer
+        )
+    }
+
+    pub fn is_video_external(&self) -> bool {
+        matches!(self, Self::VideoExternal)
+    }
+
+    pub fn is_video_rgba_hardware_buffer(&self) -> bool {
+        matches!(self, Self::VideoRgbaHardwareBuffer)
     }
 
     pub fn vec_width_height(&self) -> Option<(usize, usize)> {
@@ -518,6 +576,7 @@ impl TextureFormat {
             Self::VecBGRAu8_32 { width, height, .. } => Some((*width, *height)),
             Self::VecCubeBGRAu8_32 { width, height, .. } => Some((*width, *height)),
             Self::VecMipBGRAu8_32 { width, height, .. } => Some((*width, *height)),
+            Self::VecMipRGBAf32 { width, height, .. } => Some((*width, *height)),
             Self::VecRGBAf32 { width, height, .. } => Some((*width, *height)),
             Self::VecRu8 { width, height, .. } => Some((*width, *height)),
             Self::VecRGu8 { width, height, .. } => Some((*width, *height)),
@@ -545,7 +604,13 @@ impl TextureFormat {
                 width: *width,
                 height: *height,
                 pixel: TexturePixel::BGRAu8,
-                category: TextureCategory::Vec,
+                category: TextureCategory::VecMip,
+            }),
+            Self::VecMipRGBAf32 { width, height, .. } => Some(TextureAlloc {
+                width: *width,
+                height: *height,
+                pixel: TexturePixel::RGBAf32,
+                category: TextureCategory::VecMip,
             }),
             Self::VecRGBAf32 { width, height, .. } => Some(TextureAlloc {
                 width: *width,
@@ -627,10 +692,22 @@ impl TextureFormat {
     #[allow(unused)]
     pub(crate) fn as_video_alloc(&self) -> Option<TextureAlloc> {
         match self {
-            Self::VideoRGB => Some(TextureAlloc {
+            Self::VideoYuvPlane => Some(TextureAlloc {
                 width: 0,
                 height: 0,
-                pixel: TexturePixel::VideoRGB,
+                pixel: TexturePixel::VideoYuvPlane,
+                category: TextureCategory::Video,
+            }),
+            Self::VideoExternal => Some(TextureAlloc {
+                width: 0,
+                height: 0,
+                pixel: TexturePixel::VideoExternal,
+                category: TextureCategory::Video,
+            }),
+            Self::VideoRgbaHardwareBuffer => Some(TextureAlloc {
+                width: 0,
+                height: 0,
+                pixel: TexturePixel::VideoRgbaHardwareBuffer,
                 category: TextureCategory::Video,
             }),
             _ => None,
@@ -721,10 +798,21 @@ impl Texture {
     /// making it safe for image sources that change resolution (e.g.
     /// animated images with varying frame sizes, or lazily-loaded images
     /// replacing a placeholder).
-    pub fn set_data_u32(&self, cx: &mut Cx, new_width: usize, new_height: usize, new_data: Vec<u32>) {
+    pub fn set_data_u32(
+        &self,
+        cx: &mut Cx,
+        new_width: usize,
+        new_height: usize,
+        new_data: Vec<u32>,
+    ) {
         let cx_texture = &mut cx.textures[self.texture_id()];
         let (width, height, data, updated) = match &mut cx_texture.format {
-            TextureFormat::VecBGRAu8_32 { width, height, data, updated } => (width, height, data, updated),
+            TextureFormat::VecBGRAu8_32 {
+                width,
+                height,
+                data,
+                updated,
+            } => (width, height, data, updated),
             _ => panic!("incorrect texture format for u32 image data"),
         };
         *width = new_width;
@@ -770,6 +858,7 @@ impl Texture {
         let cx_texture = &mut cx.textures[self.texture_id()];
         let data = match &mut cx_texture.format {
             TextureFormat::VecRf32 { data, .. } => data,
+            TextureFormat::VecMipRGBAf32 { data, .. } => data,
             TextureFormat::VecRGBAf32 { data, .. } => data,
             _ => panic!("Not the correct texture desc for f32 image data"),
         };
@@ -780,6 +869,7 @@ impl Texture {
         let cx_texture = &mut cx.textures[self.texture_id()];
         let (data, updated) = match &mut cx_texture.format {
             TextureFormat::VecRf32 { data, updated, .. } => (data, updated),
+            TextureFormat::VecMipRGBAf32 { data, updated, .. } => (data, updated),
             TextureFormat::VecRGBAf32 { data, updated, .. } => (data, updated),
             _ => panic!("incorrect texture format for f32 image data"),
         };

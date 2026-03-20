@@ -33,11 +33,13 @@ pub use crate::{
     nav::{NavItem, NavOrder, NavRole, NavScrollIndex, NavStop},
     overlay::Overlay,
     shader::{
-        draw_glyph::DrawGlyph, draw_pbr::DrawPbr, draw_pbr::DrawPbrMaterialState,
-        draw_pbr::DrawPbrTextureSet, draw_quad::DrawColor, draw_quad::DrawQuad,
-        draw_rotated_text::DrawRotatedText, draw_rotated_text::PathGlyphInstance,
-        draw_rotated_text::PathTextPlacement, draw_svg_glyph::DrawSvgGlyph, draw_text::DrawText,
-        draw_text::TextStyle, draw_text_3d::DrawText3d, draw_vector::DrawVector,
+        draw_cube::DrawCube, draw_glyph::DrawGlyph, draw_pbr::DrawPbr,
+        draw_pbr::DrawPbrMaterialState, draw_pbr::DrawPbrRefractive,
+        draw_pbr::DrawPbrTextureSet, draw_quad::DrawColor,
+        draw_quad::DrawQuad, draw_rotated_text::DrawRotatedText,
+        draw_rotated_text::PathGlyphInstance, draw_rotated_text::PathTextPlacement,
+        draw_svg_glyph::DrawSvgGlyph, draw_text::DrawText, draw_text::TextStyle,
+        draw_text_3d::DrawText3d, draw_vector::DrawVector,
     },
     /*
     geometry::{
@@ -55,6 +57,7 @@ pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     crate::shader::sdf::script_mod(vm);
     crate::geometry::script_mod(vm);
     crate::shader::draw_quad::script_mod(vm);
+    crate::shader::draw_cube::script_mod(vm);
     crate::shader::draw_glyph::script_mod(vm);
     crate::shader::draw_text::script_mod(vm);
     crate::shader::draw_rotated_text::script_mod(vm);

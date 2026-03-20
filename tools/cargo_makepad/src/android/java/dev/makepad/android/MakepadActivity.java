@@ -14,8 +14,13 @@ import android.Manifest;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Rect;
+import android.graphics.drawable.GradientDrawable;
 import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.media.MediaFormat;
 import android.media.midi.MidiDevice;
 import android.media.midi.MidiDeviceInfo;
 import android.media.midi.MidiManager;
@@ -37,6 +42,7 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowInsets;
@@ -52,6 +58,7 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.Selection;
 import android.text.SpannableStringBuilder;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 
 import java.io.BufferedReader;
@@ -163,7 +170,6 @@ class MakepadSurface
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        Log.i("SAPP", "surfaceCreated");
         Surface surface = holder.getSurface();
         //surface.setFrameRate(120f,0);
         MakepadNative.surfaceOnSurfaceCreated(surface);
@@ -171,7 +177,6 @@ class MakepadSurface
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        Log.i("SAPP", "surfaceDestroyed");
         Surface surface = holder.getSurface();
         MakepadNative.surfaceOnSurfaceDestroyed(surface);
     }
@@ -181,7 +186,6 @@ class MakepadSurface
                                int format,
                                int width,
                                int height) {
-        Log.i("SAPP", "surfaceChanged");
         Surface surface = holder.getSurface();
         //surface.setFrameRate(120f,0);
         MakepadNative.surfaceOnSurfaceChanged(surface, width, height);
@@ -553,6 +557,51 @@ class MakepadSurface
     }
 }
 
+class CameraPreviewSurface extends SurfaceView implements SurfaceHolder.Callback {
+    private final long mVideoId;
+
+    public CameraPreviewSurface(Context context, long videoId) {
+        super(context);
+        mVideoId = videoId;
+        getHolder().addCallback(this);
+        setZOrderMediaOverlay(true);
+    }
+
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
+        Surface surface = holder.getSurface();
+        if (surface != null) {
+            MakepadNative.onCameraPreviewSurfaceReady(mVideoId, surface, getWidth(), getHeight());
+        }
+    }
+
+    @Override
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        Surface surface = holder.getSurface();
+        if (surface != null) {
+            MakepadNative.onCameraPreviewSurfaceReady(mVideoId, surface, width, height);
+        }
+    }
+
+    @Override
+    public void surfaceDestroyed(SurfaceHolder holder) {
+        MakepadNative.onCameraPreviewSurfaceDestroyed(mVideoId);
+    }
+}
+
+class SelectionHandleView extends View {
+    public SelectionHandleView(Context context, int color, int sizePx) {
+        super(context);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(color);
+        setBackground(bg);
+        setClickable(true);
+        setFocusable(false);
+        setLayoutParams(new FrameLayout.LayoutParams(sizePx, sizePx));
+    }
+}
+
 class ResizingLayout
     extends
         LinearLayout
@@ -579,6 +628,7 @@ public class MakepadActivity
     extends Activity
     implements MidiManager.OnDeviceOpenedListener
 {
+    private static final String LOG_TAG = "Makepad";
     //% MAIN_ACTIVITY_BODY
 
     private MakepadSurface view;
@@ -586,13 +636,16 @@ public class MakepadActivity
 
     // video playback
     Handler mVideoPlaybackHandler;
+    HandlerThread mVideoPlaybackThread;
     HashMap<Long, VideoPlayerRunnable> mVideoPlayerRunnables;
 
     // networking, make these static because of activity switching
+    static HandlerThread mWebSocketsThread;
     static Handler mWebSocketsHandler;
     static HashMap<Long, MakepadWebSocket> mActiveWebsockets = new HashMap<>();
     static HashMap<Long, MakepadWebSocketReader> mActiveWebsocketsReaders = new HashMap<>();
     static HashMap<Long, MakepadSocketStream> mActiveSocketStreams = new HashMap<>();
+    private boolean mIsSwitchingActivity = false;
 
     // clipboard actions (ActionMode for copy/paste/cut)
     private ActionMode mActionMode;
@@ -600,16 +653,37 @@ public class MakepadActivity
     private int[] mSelectionBounds = new int[4]; // left, top, right, bottom
     private int mKeyboardShift = 0; // keyboard shift amount from Rust
 
+    // native camera preview overlays
+    private FrameLayout mRootLayout;
+    private FrameLayout mCameraPreviewOverlay;
+    private HashMap<Long, CameraPreviewSurface> mCameraPreviewViews = new HashMap<>();
+
+    // selection handles overlay
+    private static final int SELECTION_HANDLE_START = 0;
+    private static final int SELECTION_HANDLE_END = 1;
+    private static final int SELECTION_DRAG_BEGIN = 0;
+    private static final int SELECTION_DRAG_MOVE = 1;
+    private static final int SELECTION_DRAG_END = 2;
+    private FrameLayout mSelectionHandleOverlay;
+    private SelectionHandleView mSelectionHandleStart;
+    private SelectionHandleView mSelectionHandleEnd;
+    private int mSelectionHandleSizePx;
+
     static {
         System.loadLibrary("makepad");
     }
 
+    private void logLifecycle(String message) {
+    }
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
-        
-        HandlerThread webSocketsThreadHandler = new HandlerThread("WebSocketsThread");
-        webSocketsThreadHandler.start();
-        mWebSocketsHandler = new Handler(webSocketsThreadHandler.getLooper());
+        logLifecycle("onCreate begin");
+        if (mWebSocketsThread == null || !mWebSocketsThread.isAlive()) {
+            mWebSocketsThread = new HandlerThread("WebSocketsThread");
+            mWebSocketsThread.start();
+            mWebSocketsHandler = new Handler(mWebSocketsThread.getLooper());
+        }
 
         // On API 30+, Theme.NoTitleBar.Fullscreen sets FLAG_FULLSCREEN which positions
         // the window below the status bar, conflicting with the modern WindowInsetsController.
@@ -619,6 +693,7 @@ public class MakepadActivity
         }
         
         super.onCreate(savedInstanceState);
+        logLifecycle("onCreate after super");
         
         this.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
@@ -630,13 +705,40 @@ public class MakepadActivity
         // Put it inside a parent layout which can resize it using padding
         ResizingLayout layout = new ResizingLayout(this);
         layout.addView(view);
-        setContentView(layout);
 
+        mRootLayout = new FrameLayout(this);
+        mRootLayout.addView(layout);
+
+        mCameraPreviewOverlay = new FrameLayout(this);
+        mRootLayout.addView(mCameraPreviewOverlay);
+
+        mSelectionHandleOverlay = new FrameLayout(this);
+        mSelectionHandleOverlay.setLayoutParams(new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+        mSelectionHandleOverlay.setClickable(false);
+        mSelectionHandleOverlay.setFocusable(false);
+        mSelectionHandleOverlay.setVisibility(View.GONE);
+        mRootLayout.addView(mSelectionHandleOverlay);
+
+        mSelectionHandleSizePx = Math.max(24, (int) (getResources().getDisplayMetrics().density * 24.0f));
+        mSelectionHandleStart = new SelectionHandleView(this, 0xFF4A90E2, mSelectionHandleSizePx);
+        mSelectionHandleEnd = new SelectionHandleView(this, 0xFF4A90E2, mSelectionHandleSizePx);
+        mSelectionHandleStart.setOnTouchListener(createSelectionHandleDragListener(SELECTION_HANDLE_START));
+        mSelectionHandleEnd.setOnTouchListener(createSelectionHandleDragListener(SELECTION_HANDLE_END));
+        mSelectionHandleOverlay.addView(mSelectionHandleStart);
+        mSelectionHandleOverlay.addView(mSelectionHandleEnd);
+
+        setContentView(mRootLayout);
+
+        logLifecycle("calling MakepadNative.activityOnCreate");
         MakepadNative.activityOnCreate(this);
+        logLifecycle("returned from MakepadNative.activityOnCreate");
 
-        HandlerThread decoderThreadHandler = new HandlerThread("VideoPlayerThread");
-        decoderThreadHandler.start(); // TODO: only start this if its needed.
-        mVideoPlaybackHandler = new Handler(decoderThreadHandler.getLooper());
+        mVideoPlaybackThread = new HandlerThread("VideoPlayerThread");
+        mVideoPlaybackThread.start(); // TODO: only start this if its needed.
+        mVideoPlaybackHandler = new Handler(mVideoPlaybackThread.getLooper());
         mVideoPlayerRunnables = new HashMap<Long, VideoPlayerRunnable>();
 
 
@@ -657,6 +759,7 @@ public class MakepadActivity
 
         float refreshRate = getDeviceRefreshRate();
         MakepadNative.initChoreographer(refreshRate, sdkVersion);
+        logLifecycle("onCreate complete");
         //% MAIN_ACTIVITY_ON_CREATE
         
     }
@@ -664,12 +767,14 @@ public class MakepadActivity
     @Override
     protected void onStart() {
         super.onStart();
+        logLifecycle("onStart");
         MakepadNative.activityOnStart();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        logLifecycle("onResume");
         MakepadNative.activityOnResume();
 
         //% MAIN_ACTIVITY_ON_RESUME
@@ -677,6 +782,7 @@ public class MakepadActivity
     @Override
     protected void onPause() {
         super.onPause();
+        logLifecycle("onPause");
         MakepadNative.activityOnPause();
 
         //% MAIN_ACTIVITY_ON_PAUSE
@@ -685,13 +791,35 @@ public class MakepadActivity
     @Override
     protected void onStop() {
         super.onStop();
+        logLifecycle("onStop");
         MakepadNative.activityOnStop();
     }
 
     @Override
     protected void onDestroy() {
+        logLifecycle("onDestroy begin switching=" + mIsSwitchingActivity);
+        if (mCameraPreviewOverlay != null) {
+            for (Long videoId : mCameraPreviewViews.keySet()) {
+                MakepadNative.onCameraPreviewSurfaceDestroyed(videoId);
+            }
+            mCameraPreviewViews.clear();
+            mCameraPreviewOverlay.removeAllViews();
+        }
+        if (mSelectionHandleOverlay != null) {
+            mSelectionHandleOverlay.removeAllViews();
+            mSelectionHandleOverlay = null;
+            mSelectionHandleStart = null;
+            mSelectionHandleEnd = null;
+        }
+        cleanupVideoPlaybackState();
+        shutdownVideoPlaybackThread();
+        if (!mIsSwitchingActivity) {
+            cleanupNetworkState();
+            shutdownWebSocketsThread();
+        }
         super.onDestroy();
         MakepadNative.activityOnDestroy();
+        logLifecycle("onDestroy complete");
     }
 
     @Override
@@ -825,9 +953,78 @@ public class MakepadActivity
     }
     
     public void switchActivityClass(Class c){
+        mIsSwitchingActivity = true;
         Intent intent = new Intent(getApplicationContext(), c);
+        Intent currentIntent = getIntent();
+        if (currentIntent != null && currentIntent.getExtras() != null) {
+            intent.putExtras(currentIntent.getExtras());
+        }
         startActivity(intent);
         finish();
+    }
+
+    private void cleanupVideoPlaybackState() {
+        if (mVideoPlayerRunnables != null) {
+            ArrayList<Long> videoIds = new ArrayList<>(mVideoPlayerRunnables.keySet());
+            for (Long videoId : videoIds) {
+                cleanupVideoPlaybackResources(videoId);
+            }
+            mVideoPlayerRunnables.clear();
+        }
+        if (mVideoPlaybackHandler != null) {
+            mVideoPlaybackHandler.removeCallbacksAndMessages(null);
+        }
+    }
+
+    private void shutdownVideoPlaybackThread() {
+        if (mVideoPlaybackThread == null) {
+            mVideoPlaybackHandler = null;
+            return;
+        }
+        mVideoPlaybackThread.quitSafely();
+        try {
+            mVideoPlaybackThread.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        mVideoPlaybackThread = null;
+        mVideoPlaybackHandler = null;
+    }
+
+    private static void cleanupNetworkState() {
+        for (MakepadWebSocket socket : new ArrayList<>(mActiveWebsockets.values())) {
+            if (socket != null) {
+                socket.closeSocketAndClearCallback();
+            }
+        }
+        mActiveWebsockets.clear();
+        mActiveWebsocketsReaders.clear();
+
+        for (MakepadSocketStream socket : new ArrayList<>(mActiveSocketStreams.values())) {
+            if (socket != null) {
+                socket.close();
+            }
+        }
+        mActiveSocketStreams.clear();
+
+        if (mWebSocketsHandler != null) {
+            mWebSocketsHandler.removeCallbacksAndMessages(null);
+        }
+    }
+
+    private static void shutdownWebSocketsThread() {
+        if (mWebSocketsThread == null) {
+            mWebSocketsHandler = null;
+            return;
+        }
+        mWebSocketsThread.quitSafely();
+        try {
+            mWebSocketsThread.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        mWebSocketsThread = null;
+        mWebSocketsHandler = null;
     }
     
     // Configure keyboard settings before showing - called from Rust
@@ -1064,6 +1261,95 @@ public class MakepadActivity
         mHasSelection = false;
     }
 
+    private View.OnTouchListener createSelectionHandleDragListener(final int handleKind) {
+        return new View.OnTouchListener() {
+            private final int[] rootLocation = new int[2];
+
+            @Override
+            public boolean onTouch(View v, MotionEvent event) {
+                if (mRootLayout == null) {
+                    return false;
+                }
+                mRootLayout.getLocationOnScreen(rootLocation);
+                float absX = event.getRawX() - rootLocation[0];
+                float absY = event.getRawY() - rootLocation[1];
+                int action = event.getActionMasked();
+
+                if (action == MotionEvent.ACTION_DOWN) {
+                    setSelectionHandlePosition(v, absX, absY);
+                    MakepadNative.onSelectionHandleDrag(handleKind, SELECTION_DRAG_BEGIN, absX, absY, event.getEventTime());
+                    return true;
+                }
+                if (action == MotionEvent.ACTION_MOVE) {
+                    setSelectionHandlePosition(v, absX, absY);
+                    MakepadNative.onSelectionHandleDrag(handleKind, SELECTION_DRAG_MOVE, absX, absY, event.getEventTime());
+                    return true;
+                }
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    setSelectionHandlePosition(v, absX, absY);
+                    MakepadNative.onSelectionHandleDrag(handleKind, SELECTION_DRAG_END, absX, absY, event.getEventTime());
+                    return true;
+                }
+                return false;
+            }
+        };
+    }
+
+    private void setSelectionHandlePosition(View handle, float x, float y) {
+        if (handle == null) {
+            return;
+        }
+        handle.setX(x - (mSelectionHandleSizePx * 0.5f));
+        handle.setY(y - (mSelectionHandleSizePx * 0.5f));
+    }
+
+    public void showSelectionHandles(final float startX, final float startY, final float endX, final float endY) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mSelectionHandleOverlay == null || mSelectionHandleStart == null || mSelectionHandleEnd == null) {
+                    return;
+                }
+                mSelectionHandleOverlay.setVisibility(View.VISIBLE);
+                setSelectionHandlePosition(mSelectionHandleStart, startX, startY);
+                setSelectionHandlePosition(mSelectionHandleEnd, endX, endY);
+                mSelectionHandleStart.setVisibility(View.VISIBLE);
+                mSelectionHandleEnd.setVisibility(View.VISIBLE);
+                mSelectionHandleOverlay.bringToFront();
+            }
+        });
+    }
+
+    public void updateSelectionHandles(final float startX, final float startY, final float endX, final float endY) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mSelectionHandleOverlay == null || mSelectionHandleStart == null || mSelectionHandleEnd == null) {
+                    return;
+                }
+                mSelectionHandleOverlay.setVisibility(View.VISIBLE);
+                setSelectionHandlePosition(mSelectionHandleStart, startX, startY);
+                setSelectionHandlePosition(mSelectionHandleEnd, endX, endY);
+                mSelectionHandleStart.setVisibility(View.VISIBLE);
+                mSelectionHandleEnd.setVisibility(View.VISIBLE);
+            }
+        });
+    }
+
+    public void hideSelectionHandles() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mSelectionHandleOverlay == null || mSelectionHandleStart == null || mSelectionHandleEnd == null) {
+                    return;
+                }
+                mSelectionHandleStart.setVisibility(View.GONE);
+                mSelectionHandleEnd.setVisibility(View.GONE);
+                mSelectionHandleOverlay.setVisibility(View.GONE);
+            }
+        });
+    }
+
     public void requestHttp(long id, long metadataId, String url, String method, String headers, byte[] body) {
         try {
             MakepadNetwork network = new MakepadNetwork();
@@ -1082,7 +1368,6 @@ public class MakepadActivity
     }
 
     public void openWebSocket(long id, String url, long callback) {
-        
         MakepadWebSocket webSocket = new MakepadWebSocket(id, url, callback);
         mActiveWebsockets.put(id, webSocket);
         webSocket.connect();
@@ -1091,6 +1376,8 @@ public class MakepadActivity
             MakepadWebSocketReader reader = new MakepadWebSocketReader(this, webSocket);
             mWebSocketsHandler.post(reader);
             mActiveWebsocketsReaders.put(id, reader);
+        } else {
+            Log.e("Makepad", "openWebSocket failed id=" + id + " url=" + url);
         }
     }
 
@@ -1257,6 +1544,166 @@ public class MakepadActivity
         }
     }
 
+    public void attachCameraNativePreview(final long videoId, final int left, final int top, final int right, final int bottom) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mCameraPreviewOverlay == null) {
+                    return;
+                }
+                CameraPreviewSurface preview = mCameraPreviewViews.get(videoId);
+                if (preview == null) {
+                    preview = new CameraPreviewSurface(MakepadActivity.this, videoId);
+                    mCameraPreviewViews.put(videoId, preview);
+                    mCameraPreviewOverlay.addView(preview);
+                }
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    Math.max(1, right - left),
+                    Math.max(1, bottom - top)
+                );
+                lp.leftMargin = left;
+                lp.topMargin = top;
+                preview.setLayoutParams(lp);
+                preview.setVisibility(View.VISIBLE);
+            }
+        });
+    }
+
+    public void updateCameraNativePreview(final long videoId, final int left, final int top, final int right, final int bottom, final boolean visible) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                CameraPreviewSurface preview = mCameraPreviewViews.get(videoId);
+                if (preview == null) {
+                    if (visible) {
+                        attachCameraNativePreview(videoId, left, top, right, bottom);
+                    }
+                    return;
+                }
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    Math.max(1, right - left),
+                    Math.max(1, bottom - top)
+                );
+                lp.leftMargin = left;
+                lp.topMargin = top;
+                preview.setLayoutParams(lp);
+                preview.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+            }
+        });
+    }
+
+    public void detachCameraNativePreview(final long videoId) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                CameraPreviewSurface preview = mCameraPreviewViews.remove(videoId);
+                if (preview != null && mCameraPreviewOverlay != null) {
+                    mCameraPreviewOverlay.removeView(preview);
+                }
+            }
+        });
+    }
+
+    private static boolean codecLooksSoftware(MediaCodecInfo info) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            if (info.isSoftwareOnly()) return true;
+            if (info.isHardwareAccelerated()) return false;
+        }
+        String name = info.getName().toLowerCase();
+        return name.startsWith("omx.google.") || name.startsWith("c2.android.") || name.contains("sw");
+    }
+
+    private static boolean codecLooksHardware(MediaCodecInfo info) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            if (info.isHardwareAccelerated()) return true;
+            if (info.isSoftwareOnly()) return false;
+        }
+        return !codecLooksSoftware(info);
+    }
+
+    public int[] queryH264CodecSupport() {
+        boolean encHw = false;
+        boolean encSw = false;
+        boolean decHw = false;
+        boolean decSw = false;
+        int maxWidth = 0;
+        int maxHeight = 0;
+        int maxFps = 0;
+        int maxBitrate = 0;
+        int widthAlign = 2;
+        int heightAlign = 2;
+
+        try {
+            MediaCodecList list = new MediaCodecList(MediaCodecList.ALL_CODECS);
+            for (MediaCodecInfo info : list.getCodecInfos()) {
+                String[] types = info.getSupportedTypes();
+                boolean supportsAvc = false;
+                for (String t : types) {
+                    if ("video/avc".equalsIgnoreCase(t)) {
+                        supportsAvc = true;
+                        break;
+                    }
+                }
+                if (!supportsAvc) {
+                    continue;
+                }
+
+                boolean hw = codecLooksHardware(info);
+                boolean sw = codecLooksSoftware(info);
+
+                boolean probeOk = false;
+                MediaCodec codec = null;
+                try {
+                    codec = MediaCodec.createByCodecName(info.getName());
+                    probeOk = codec != null;
+                } catch (Throwable ignored) {
+                    probeOk = false;
+                } finally {
+                    if (codec != null) {
+                        try { codec.release(); } catch (Throwable ignored) {}
+                    }
+                }
+                if (!probeOk) {
+                    continue;
+                }
+
+                try {
+                    MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType("video/avc");
+                    if (caps != null && caps.getVideoCapabilities() != null) {
+                        MediaCodecInfo.VideoCapabilities vc = caps.getVideoCapabilities();
+                        maxWidth = Math.max(maxWidth, vc.getSupportedWidths().getUpper().intValue());
+                        maxHeight = Math.max(maxHeight, vc.getSupportedHeights().getUpper().intValue());
+                        maxBitrate = Math.max(maxBitrate, vc.getBitrateRange().getUpper().intValue());
+                        maxFps = Math.max(maxFps, vc.getSupportedFrameRates().getUpper().intValue());
+                        widthAlign = Math.max(widthAlign, vc.getWidthAlignment());
+                        heightAlign = Math.max(heightAlign, vc.getHeightAlignment());
+                    }
+                } catch (Throwable ignored) {}
+
+                if (info.isEncoder()) {
+                    if (hw) encHw = true;
+                    if (sw) encSw = true;
+                } else {
+                    if (hw) decHw = true;
+                    if (sw) decSw = true;
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        return new int[] {
+            encHw ? 1 : 0,
+            encSw ? 1 : 0,
+            decHw ? 1 : 0,
+            decSw ? 1 : 0,
+            maxWidth,
+            maxHeight,
+            maxFps,
+            maxBitrate,
+            widthAlign,
+            heightAlign,
+        };
+    }
+
     public void prepareVideoPlayback(long videoId, Object source, int externalTextureHandle, boolean autoplay, boolean shouldLoop) {
         VideoPlayer VideoPlayer = new VideoPlayer(this, videoId);
         VideoPlayer.setSource(source);
@@ -1325,6 +1772,7 @@ public class MakepadActivity
             runnable.cleanupVideoPlaybackResources();
             runnable = null;
         }
+        detachCameraNativePreview(videoId);
     }
     
                 

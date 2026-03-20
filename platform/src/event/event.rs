@@ -136,6 +136,7 @@ pub enum Event {
     WindowDragQuery(WindowDragQueryEvent),
     WindowCloseRequested(WindowCloseRequestedEvent),
     WindowClosed(WindowClosedEvent),
+    PopupDismissed(PopupDismissedEvent),
     WindowGeomChange(WindowGeomChangeEvent),
     VirtualKeyboard(VirtualKeyboardEvent),
     ClearAtlasses,
@@ -194,6 +195,7 @@ pub enum Event {
     TextCopy(TextClipboardEvent),
     TextCut(TextClipboardEvent),
     ImeAction(ImeActionEvent),
+    SelectionHandleDrag(SelectionHandleDragEvent),
 
     Drag(DragEvent),
     Drop(DropEvent),
@@ -215,6 +217,9 @@ pub enum Event {
     VideoPlaybackResourcesReleased(VideoPlaybackResourcesReleasedEvent),
     VideoDecodingError(VideoDecodingErrorEvent),
     TextureHandleReady(TextureHandleReadyEvent),
+    VideoYuvTexturesReady(VideoYuvTexturesReady),
+    VideoSeekableRanges(VideoSeekableRangesEvent),
+    VideoBufferedRanges(VideoBufferedRangesEvent),
 
     /// The "go back" navigational button or gesture was performed.
     ///
@@ -302,6 +307,9 @@ impl Event {
             48 => "VideoDecodingError",
             49 => "VideoPlaybackResourcesReleased",
             50 => "TextureHandleReady",
+            63 => "VideoSeekableRanges",
+            64 => "VideoBufferedRanges",
+            65 => "VideoYuvTexturesReady",
             51 => "MouseLeave",
             52 => "Actions",
             53 => "BackPressed",
@@ -312,6 +320,9 @@ impl Event {
 
             57 => "XrLocal",
             58 => "ImeAction",
+            60 => "Custom",
+            61 => "PopupDismissed",
+            62 => "SelectionHandleDrag",
             _ => panic!(),
         }
     }
@@ -341,6 +352,7 @@ impl Event {
             Self::WindowGeomChange(_) => 17,
             Self::VirtualKeyboard(_) => 18,
             Self::ClearAtlasses => 19,
+            Self::PopupDismissed(_) => 61,
 
             Self::MouseDown(_) => 20,
             Self::MouseMove(_) => 21,
@@ -364,6 +376,7 @@ impl Event {
             Self::TextCopy(_) => 36,
             Self::TextCut(_) => 37,
             Self::ImeAction(_) => 58,
+            Self::SelectionHandleDrag(_) => 62,
 
             Self::Drag(_) => 38,
             Self::Drop(_) => 39,
@@ -380,6 +393,9 @@ impl Event {
             Self::VideoDecodingError(_) => 48,
             Self::VideoPlaybackResourcesReleased(_) => 49,
             Self::TextureHandleReady(_) => 50,
+            Self::VideoSeekableRanges(_) => 63,
+            Self::VideoBufferedRanges(_) => 64,
+            Self::VideoYuvTexturesReady(_) => 65,
             Self::MouseLeave(_) => 51,
             Self::Actions(_) => 52,
             Self::BackPressed { .. } => 53,
@@ -429,6 +445,7 @@ pub enum Hit {
     FingerHoverOut(FingerHoverEvent),
     FingerUp(FingerUpEvent),
     FingerLongPress(FingerLongPressEvent),
+    SelectionHandleDrag(SelectionHandleDragEvent),
 
     Nothing,
 }
@@ -1029,6 +1046,31 @@ use crate::makepad_wasm_bridge::ToWasmMsg;
 
 #[cfg(target_arch = "wasm32")]
 use crate::makepad_wasm_bridge::ToWasmMsgRef;
+
+// ---------------------------------------------------------------------------
+// Selection handle drag (mobile)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionHandleKind {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionHandlePhase {
+    Begin,
+    Move,
+    End,
+}
+
+#[derive(Clone, Debug)]
+pub struct SelectionHandleDragEvent {
+    pub handle: SelectionHandleKind,
+    pub phase: SelectionHandlePhase,
+    pub abs: crate::makepad_math::Vec2d,
+    pub time: f64,
+}
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Debug)]

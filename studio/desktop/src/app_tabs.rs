@@ -46,7 +46,7 @@ impl App {
         let Some(anchor_tab_id) = self.find_editor_anchor_tab(&dock, mount) else {
             return None;
         };
-        let (tab_bar, pos) = dock.find_tab_bar_of_tab(anchor_tab_id)?;
+        let (tab_bar, pos) = Self::reachable_tab_bar_of_tab(&dock, anchor_tab_id)?;
         let tab_id = dock.unique_id(LiveId::from_str(path).0);
         let created = if select {
             dock.create_and_select_tab(
@@ -255,6 +255,31 @@ impl App {
         self.set_status(cx, "saving...");
     }
 
+    pub(super) fn reachable_tab_bar_of_tab(
+        dock: &DockRef,
+        tab_id: LiveId,
+    ) -> Option<(LiveId, usize)> {
+        let dock_items = dock.clone_state()?;
+        let mut stack = vec![id!(root)];
+        while let Some(item_id) = stack.pop() {
+            match dock_items.get(&item_id)? {
+                DockItem::Splitter { a, b, .. } => {
+                    stack.push(*b);
+                    stack.push(*a);
+                }
+                // Anchor insertion against the live reachable dock tree, not stale runtime
+                // items that may still linger in the raw dock state map.
+                DockItem::Tabs { tabs, .. } => {
+                    if let Some(pos) = tabs.iter().position(|candidate| *candidate == tab_id) {
+                        return Some((item_id, pos));
+                    }
+                }
+                DockItem::Tab { .. } => {}
+            }
+        }
+        None
+    }
+
     fn create_dock_tab(
         dock: &DockRef,
         cx: &mut Cx,
@@ -264,7 +289,7 @@ impl App {
         title: String,
         select: bool,
     ) -> Option<()> {
-        let (tab_bar, pos) = dock.find_tab_bar_of_tab(anchor)?;
+        let (tab_bar, pos) = Self::reachable_tab_bar_of_tab(dock, anchor)?;
         let created = if select {
             dock.create_and_select_tab(
                 cx,
@@ -322,9 +347,10 @@ impl App {
                     .run_tab_state
                     .get(&tab_id)
                     .and_then(|state| state.window_id);
+                let addr = self.studio_addr();
                 dock.item(tab_id)
                     .desktop_run_view(cx, ids!(run_view))
-                    .set_run_target(cx, build_id, window_id);
+                    .set_run_target(cx, build_id, window_id, addr.as_deref());
                 if select {
                     dock.select_tab(cx, tab_id);
                 }
@@ -366,9 +392,10 @@ impl App {
             },
         );
         dock.set_tab_title(cx, tab_id, package.to_string());
+        let addr = self.studio_addr();
         dock.item(tab_id)
             .desktop_run_view(cx, ids!(run_view))
-            .set_run_target(cx, build_id, None);
+            .set_run_target(cx, build_id, None, addr.as_deref());
         Some(tab_id)
     }
 
@@ -391,11 +418,12 @@ impl App {
             })
             .collect();
 
+        let addr = self.studio_addr();
         for (tab_id, mount, build_id, window_id) in targets {
             if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
                 dock.item(tab_id)
                     .desktop_run_view(cx, ids!(run_view))
-                    .set_run_target(cx, build_id, window_id);
+                    .set_run_target(cx, build_id, window_id, addr.as_deref());
             }
         }
     }
@@ -814,45 +842,63 @@ impl App {
         }
     }
 
-    pub(super) fn run_package(
-        &mut self,
-        cx: &mut Cx,
-        mount: &str,
-        package: &str,
-        outside_studio: bool,
-    ) {
+    pub(super) fn clear_build_tabs(&mut self, cx: &mut Cx, build_id: QueryId) {
+        let run_tab_id = self.data.run_tab_by_build.remove(&build_id);
+        let log_tab_id = self.data.log_tab_by_build.remove(&build_id);
+        let profiler_tab_id = self.data.profiler_tab_by_build.remove(&build_id);
+
+        if let Some(tab_id) = run_tab_id {
+            if let Some(state) = self.data.run_tab_state.remove(&tab_id) {
+                if let Some(dock) = self.mount_workspace_dock(cx, &state.mount) {
+                    dock.close_tab(cx, tab_id);
+                }
+            }
+        }
+
+        if let Some(tab_id) = log_tab_id {
+            if let Some(state) = self.data.log_tab_state.remove(&tab_id) {
+                if self.data.active_log_build_by_mount.get(&state.mount) == Some(&build_id) {
+                    self.data.active_log_build_by_mount.remove(&state.mount);
+                }
+                if let Some(dock) = self.mount_workspace_dock(cx, &state.mount) {
+                    dock.close_tab(cx, tab_id);
+                }
+            }
+        }
+
+        if let Some(tab_id) = profiler_tab_id {
+            if let Some(state) = self.data.profiler_tab_state.remove(&tab_id) {
+                if self.data.active_log_build_by_mount.get(&state.mount) == Some(&build_id) {
+                    self.data.active_log_build_by_mount.remove(&state.mount);
+                }
+                if let Some(dock) = self.mount_workspace_dock(cx, &state.mount) {
+                    dock.close_tab(cx, tab_id);
+                }
+            }
+        }
+
+        self.stop_profiler_query_for_build(build_id);
+        self.data.profiler_running_by_build.remove(&build_id);
+        self.data.profiler_time_start_by_build.remove(&build_id);
+        self.data.profiler_samples_by_build.remove(&build_id);
+        self.data.build_log_entries.remove(&build_id);
+        self.data.build_to_mount.remove(&build_id);
+        self.data.build_package.remove(&build_id);
+    }
+
+    pub(super) fn run_item(&mut self, cx: &mut Cx, mount: &str, name: &str) {
         if self.data.active_mount.as_deref() != Some(mount) {
             self.select_mount(cx, mount);
         }
-        if !outside_studio {
-            self.close_mount_run_and_log_tabs(cx, mount);
-        }
-        let Some(build_id) = self.send_studio(ClientToHub::Run {
+        let Some(_query_id) = self.send_studio(ClientToHub::RunItem {
             mount: mount.to_string(),
-            process: package.to_string(),
-            args: Vec::new(),
-            standalone: Some(outside_studio),
-            env: None,
-            buildbox: None,
+            name: name.to_string(),
         }) else {
             self.set_status(cx, "backend not connected");
             return;
         };
-        self.data.build_to_mount.insert(build_id, mount.to_string());
-        self.data
-            .build_package
-            .insert(build_id, package.to_string());
-        self.data
-            .active_log_build_by_mount
-            .insert(mount.to_string(), build_id);
-        if outside_studio {
-            self.set_status(
-                cx,
-                &format!("starting {} on {} (external window)", package, mount),
-            );
-        } else {
-            self.set_status(cx, &format!("starting {} on {}", package, mount));
-        }
+        self.close_mount_run_and_log_tabs(cx, mount);
+        self.set_status(cx, &format!("running {} on {}", name, mount));
     }
 
     pub(super) fn handle_run_view_actions(&mut self, actions: &Actions) {

@@ -634,6 +634,9 @@ pub struct TextFlow {
     list_item_layout: Layout,
     #[live]
     list_item_walk: Walk,
+    /// The spacing (in pixels) between the list item marker and the content text.
+    #[live(5.0)]
+    list_item_marker_pad: f64,
     #[live]
     pub inline_code_padding: Inset,
     #[live]
@@ -929,8 +932,14 @@ impl Widget for TextFlow {
             Hit::FingerHoverIn(_) => {
                 cx.set_cursor(MouseCursor::Text);
             }
+            Hit::FingerHoverOut(_) => {
+                cx.set_cursor(MouseCursor::Default);
+            }
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
                 cx.set_key_focus(self.area);
+                if fe.device.is_touch() {
+                    cx.hide_clipboard_actions();
+                }
                 if let Some(idx) = self.selection_tracker.point_to_index(cx, fe.abs) {
                     self.selection_anchor = idx;
                     self.selection_cursor = idx;
@@ -948,14 +957,30 @@ impl Widget for TextFlow {
                     }
                 }
             }
-            Hit::FingerUp(_) => {
+            Hit::FingerUp(fe) => {
                 self.is_selecting = false;
+                if fe.device.is_touch() {
+                    let has_selection = self.has_selection();
+                    if has_selection {
+                        let selection_rect = self.selection_clipboard_rect(cx);
+                        cx.show_clipboard_actions(true, selection_rect, cx.keyboard_shift);
+                    } else {
+                        cx.hide_clipboard_actions();
+                    }
+                }
             }
             Hit::KeyFocusLost(_) => {
                 self.clear_selection();
+                cx.hide_clipboard_actions();
                 self.redraw(cx);
             }
             Hit::TextCopy(event) => {
+                let text = self.selected_text();
+                if !text.is_empty() {
+                    *event.response.borrow_mut() = Some(text);
+                }
+            }
+            Hit::TextCut(event) => {
                 let text = self.selected_text();
                 if !text.is_empty() {
                     *event.response.borrow_mut() = Some(text);
@@ -1140,6 +1165,31 @@ impl TextFlow {
         self.selectable && self.selection_anchor != self.selection_cursor
     }
 
+    /// Selection anchor rect for clipboard/action popups.
+    fn selection_clipboard_rect(&self, cx: &Cx) -> Rect {
+        let start = self.selection_anchor.min(self.selection_cursor);
+        let end = self.selection_anchor.max(self.selection_cursor);
+        let rects = self.selection_tracker.selection_rects(start, end);
+
+        let mut out: Option<Rect> = None;
+        for rect in rects {
+            out = Some(if let Some(acc) = out {
+                let x0 = acc.pos.x.min(rect.pos.x);
+                let y0 = acc.pos.y.min(rect.pos.y);
+                let x1 = (acc.pos.x + acc.size.x).max(rect.pos.x + rect.size.x);
+                let y1 = (acc.pos.y + acc.size.y).max(rect.pos.y + rect.size.y);
+                Rect {
+                    pos: dvec2(x0, y0),
+                    size: dvec2((x1 - x0).max(1.0), (y1 - y0).max(1.0)),
+                }
+            } else {
+                rect
+            });
+        }
+
+        out.unwrap_or_else(|| self.area.rect(cx))
+    }
+
     /// Set selection range (for external control, e.g., cross-TextFlow selection).
     /// Propagates sub-ranges to child WidgetText widgets so they draw their own selection.
     pub fn set_selection(&mut self, anchor: usize, cursor: usize) {
@@ -1243,7 +1293,13 @@ impl TextFlow {
             .move_right_down(dvec2(-font_based_padding, 0.0));
 
         self.draw_text(cx, dot);
-        self.draw_text(cx, " ");
+        TextFlow::walk_margin(cx, self.list_item_marker_pad);
+
+        // Adjust the left padding to match the actual cursor position after the
+        // bullet marker and its trailing pad, so that wrapped lines align with
+        // the text after the marker rather than being over-indented.
+        let actual_indent = cx.turtle().pos().x - cx.turtle().origin().x;
+        cx.turtle_mut().set_padding_left(actual_indent);
 
         self.area_stack.push(self.draw_block.draw_vars.area);
     }
@@ -1258,6 +1314,18 @@ impl TextFlow {
 
     pub fn new_line_collapsed(&mut self, cx: &mut Cx2d) {
         cx.turtle_new_line();
+        self.first_thing_on_a_line = true;
+        if self.selectable {
+            self.selection_tracker.push_newline();
+        }
+    }
+
+    /// Starts a new line using the current wrap spacing, so that the vertical
+    /// gap matches the line spacing of the most recently drawn text.
+    /// This is intended for `<br>` tags in HTML rendering.
+    pub fn new_line_with_wrap_spacing(&mut self, cx: &mut Cx2d) {
+        let spacing = cx.turtle().wrap_spacing();
+        cx.turtle_new_line_with_spacing(spacing);
         self.first_thing_on_a_line = true;
         if self.selectable {
             self.selection_tracker.push_newline();
@@ -1507,11 +1575,13 @@ impl TextFlow {
             };
 
             // Apply the text style to the single draw_text instance
+            let top_drop = text_style.top_drop;
             self.draw_text.text_style = text_style;
             let font_size = self.font_sizes.last().unwrap_or(&self.font_size);
             let font_color = self.font_colors.last().unwrap_or(&self.font_color);
             self.draw_text.text_style.font_size = *font_size as _;
             self.draw_text.color = *font_color;
+            self.draw_text.temp_y_shift = top_drop;
 
             let dt = &mut self.draw_text;
 

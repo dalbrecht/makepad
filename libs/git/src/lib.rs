@@ -11,6 +11,8 @@ pub mod pack;
 pub mod refs;
 pub mod repo;
 mod sha1;
+#[doc(hidden)]
+pub mod test_support;
 pub mod tree;
 pub mod worktree;
 

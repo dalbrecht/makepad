@@ -1,11 +1,11 @@
 #![allow(dead_code)]
-use {
-    crate::{cx::Cx, event::TimerEvent},
-    std::collections::HashMap,
-};
 pub use makepad_studio_protocol::{
     AppToStudio, PresentableDraw, PresentableImageId, SharedPresentableImage, SharedSwapchain,
     StudioToApp, SWAPCHAIN_IMAGE_COUNT,
+};
+use {
+    crate::{cx::Cx, event::TimerEvent},
+    std::collections::HashMap,
 };
 
 // HACK(eddyb) more or less `<[T; N]>::each_ref`, which is still unstable.
@@ -204,7 +204,10 @@ impl HostSwapchain {
 // macOS: IOSurface-based swapchain (for serialization)
 // ============================================================================
 #[cfg(target_os = "macos")]
-pub fn shared_swapchain_from_host_swapchain(host: &HostSwapchain, cx: &mut crate::cx::Cx) -> SharedSwapchain {
+pub fn shared_swapchain_from_host_swapchain(
+    host: &HostSwapchain,
+    cx: &mut crate::cx::Cx,
+) -> SharedSwapchain {
     SharedSwapchain {
         window_id: host.window_id,
         alloc_width: host.alloc_width,
@@ -221,7 +224,10 @@ pub fn shared_swapchain_from_host_swapchain(host: &HostSwapchain, cx: &mut crate
 // Windows: HANDLE-based swapchain
 // ============================================================================
 #[cfg(target_os = "windows")]
-pub fn shared_swapchain_from_host_swapchain(host: &HostSwapchain, cx: &mut crate::cx::Cx) -> SharedSwapchain {
+pub fn shared_swapchain_from_host_swapchain(
+    host: &HostSwapchain,
+    cx: &mut crate::cx::Cx,
+) -> SharedSwapchain {
     SharedSwapchain {
         window_id: host.window_id,
         alloc_width: host.alloc_width,
@@ -364,7 +370,9 @@ pub fn shared_swapchain_from_host_swapchain(
         std::array::from_fn(|_| None);
     let mut use_software_fallback = false;
     for i in 0..SWAPCHAIN_IMAGE_COUNT {
-        if let Some(image) = cx.share_texture_for_presentable_image(&host.presentable_images[i].texture) {
+        if let Some(image) =
+            cx.share_texture_for_presentable_image(&host.presentable_images[i].texture)
+        {
             owned_images[i] = Some(image);
         } else {
             use_software_fallback = true;
@@ -393,7 +401,8 @@ pub fn shared_swapchain_from_host_swapchain(
         }
     }
 
-    let mut presentable_images: [Option<SharedPresentableImage>; SWAPCHAIN_IMAGE_COUNT] = [None; SWAPCHAIN_IMAGE_COUNT];
+    let mut presentable_images: [Option<SharedPresentableImage>; SWAPCHAIN_IMAGE_COUNT] =
+        [None; SWAPCHAIN_IMAGE_COUNT];
     for i in 0..SWAPCHAIN_IMAGE_COUNT {
         let id = host.presentable_images[i].id;
         let image = owned_images[i].take().expect("image exported");
@@ -419,7 +428,10 @@ pub fn shared_swapchain_from_host_swapchain(
     target_os = "macos",
     target_os = "windows"
 )))]
-pub fn shared_swapchain_from_host_swapchain(host: &HostSwapchain, _cx: &mut crate::cx::Cx) -> SharedSwapchain {
+pub fn shared_swapchain_from_host_swapchain(
+    host: &HostSwapchain,
+    _cx: &mut crate::cx::Cx,
+) -> SharedSwapchain {
     SharedSwapchain {
         window_id: host.window_id,
         alloc_width: host.alloc_width,
@@ -450,7 +462,7 @@ pub mod aux_chan {
         io::Error::new(io::ErrorKind::Other, error)
     }
 
-    fn path_for_studio(studio: &str, studio_build_id: &str) -> io::Result<PathBuf> {
+    fn path_for_studio(studio: &str, studio_build_id: Option<&str>) -> io::Result<PathBuf> {
         let without_scheme = studio
             .split_once("://")
             .map(|(_, rest)| rest)
@@ -466,12 +478,17 @@ pub mod aux_chan {
             .rsplit_once(':')
             .map(|(_, port)| port)
             .unwrap_or("80");
-        if studio_build_id.trim().is_empty() {
-            return Err(io_error_other("missing STUDIO_BUILD_ID"));
-        }
+        let studio_build_id = studio_build_id
+            .map(str::trim)
+            .filter(|build_id| !build_id.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| crate::app_main::extract_studio_build_id(studio));
+        let Some(studio_build_id) = studio_build_id else {
+            return Err(io_error_other("missing app id in STUDIO"));
+        };
         Ok(PathBuf::from(format!(
             "/tmp/makepad-stdin-aux-{port}-{}.sock",
-            studio_build_id.trim()
+            studio_build_id
         )))
     }
 
@@ -482,7 +499,7 @@ pub mod aux_chan {
 
     impl ExternalEndpointListener {
         pub fn new_for_studio(studio: &str, studio_build_id: &str) -> io::Result<Self> {
-            let path = path_for_studio(studio, studio_build_id)?;
+            let path = path_for_studio(studio, Some(studio_build_id))?;
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -493,8 +510,8 @@ pub mod aux_chan {
             Ok(Self { path, listener })
         }
 
-        pub fn accept_host_endpoint(self) -> io::Result<HostEndpoint> {
-            let deadline = Instant::now() + Duration::from_secs(10);
+        pub fn accept_host_endpoint(&self) -> io::Result<HostEndpoint> {
+            let deadline = Instant::now() + Duration::from_secs(120);
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
@@ -547,8 +564,7 @@ pub mod aux_chan {
     impl ClientEndpoint {
         pub fn connect_from_studio_env() -> io::Result<Self> {
             let studio = std::env::var("STUDIO").map_err(io_error_other)?;
-            let studio_build_id = std::env::var("STUDIO_BUILD_ID").map_err(io_error_other)?;
-            let path = path_for_studio(&studio, &studio_build_id)?;
+            let path = path_for_studio(&studio, None)?;
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 match UnixStream::connect(&path) {
@@ -602,16 +618,25 @@ pub mod aux_chan {
         client_endpoint: &ClientEndpoint,
     ) -> io::Result<LinuxOwnedImage> {
         let makepad_studio_protocol::LinuxSharedImage { drm_format, plane } = image;
-        let dma_buf_fd = client_endpoint.recv().and_then(|(recv_id, recv_fd)| {
-            if recv_id != id {
-                Err(io_error_other(format!(
-                    "recv_fds_from_aux_chan: ID mismatch \
-                     (expected {id:?}, got {recv_id:?}",
-                )))
-            } else {
-                Ok(recv_fd)
+        let mut mismatches = 0usize;
+        let dma_buf_fd = loop {
+            let (recv_id, recv_fd) = client_endpoint.recv()?;
+            if recv_id == id {
+                break recv_fd;
             }
-        })?;
+            mismatches += 1;
+            if mismatches >= 64 {
+                return Err(io_error_other(format!(
+                    "recv_fds_from_aux_chan: ID mismatch \
+                     (expected {id:?}, last got {recv_id:?}, dropped {mismatches} stale images)",
+                )));
+            }
+        };
+        if mismatches != 0 {
+            crate::warning!(
+                "recv_fds_from_aux_chan: dropped {mismatches} stale swapchain images before {id:?}"
+            );
+        }
         Ok(LinuxOwnedImage {
             drm_format: crate::os::linux::dma_buf::DrmFormat {
                 fourcc: drm_format.fourcc,

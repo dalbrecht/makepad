@@ -15,6 +15,12 @@ pub enum AndroidVariant {
     Default,
     Quest,
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AndroidConfig {
+    pub small_fonts: bool,
+}
+
 impl AndroidVariant {
     fn from_str(opt: &str) -> Result<Self, String> {
         for opt in opt.split(",") {
@@ -111,6 +117,7 @@ impl AndroidVariant {
                 <uses-feature android:glEsVersion="0x00030001" android:required="true"/>
                 <uses-feature android:name="android.hardware.vr.headtracking" android:required="false"/>
                 <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="true"/>
+                <uses-feature android:name="com.oculus.feature.CONTEXTUAL_BOUNDARYLESS_APP" android:required="false"/>
                 <uses-permission android:name="com.oculus.permission.USE_SCENE" />
                 <!-- Request hand and keyboard tracking for keyboard hand presence testing -->
                 <uses-feature android:name="oculus.software.handtracking" android:required="false"/>
@@ -118,6 +125,7 @@ impl AndroidVariant {
                 <uses-permission android:name="android.permission.INTERNET" />
                 <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
                 <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+                <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
                 <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
                 <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
                 <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
@@ -134,6 +142,10 @@ impl AndroidVariant {
                     android:debuggable="true"
                     android:largeHeap="true"
                     tools:targetApi="{sdk_version}">
+                    <!-- Quest 3-only CPU/GPU trade: prefer one extra CPU level over one GPU level. -->
+                    <meta-data
+                        android:name="com.oculus.trade_cpu_for_gpu_amount"
+                        android:value="-1" />
                     <activity
                         android:name=".{class_name}"
                         android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode"
@@ -389,6 +401,34 @@ impl HostOs {
     }
 }
 
+fn android_help() -> &'static str {
+    "Android commands:\n\
+  cargo makepad android [options] install-toolchain\n\
+  cargo makepad android [options] build <cargo args>\n\
+  cargo makepad android [options] run <cargo args>\n\
+  cargo makepad android [options] adb <adb args>\n\
+  cargo makepad android [options] adb-tcp [port]\n\
+\n\
+Common options:\n\
+  --abi=aarch64|x86_64|armv7|i686|all   (default: aarch64)\n\
+  --package-name=<id>\n\
+  --app-label=<label>\n\
+  --small-fonts\n\
+  --no-icon\n\
+  --sdk-path=<path>\n\
+  --host-os=linux-x64|windows-x64|macos-aarch64|macos-x64\n\
+  --variant=default|quest\n\
+  --devices=<serial1,serial2,...>        (for run)\n\
+  --keep-sdk-sources\n\
+\n\
+Examples:\n\
+  cargo makepad android --abi=aarch64 build -p my-app --release\n\
+  cargo makepad android --abi=aarch64 run -p my-app --release\n\
+  cargo makepad android adb devices -l\n\
+  cargo makepad android adb-tcp\n\
+  cargo makepad android --devices=<serial> adb-tcp 5555"
+}
+
 pub fn handle_android(mut args: &[String]) -> Result<(), String> {
     #[allow(unused)]
     let mut host_os = HostOs::Unsupported;
@@ -407,6 +447,8 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
     let mut variant = AndroidVariant::Default;
     let mut targets = vec![AndroidTarget::aarch64];
     let mut keep_sdk_sources = false;
+    let mut no_icon = false;
+    let mut config = AndroidConfig::default();
 
     let urls = sdk::ANDROID_SDK_URLS_33;
 
@@ -427,6 +469,10 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
             devices = d.split(",").map(|v| v.to_string()).collect()
         } else if let Some(opt) = v.strip_prefix("--variant=") {
             variant = AndroidVariant::from_str(opt)?;
+        } else if v.trim() == "--small-fonts" {
+            config.small_fonts = true;
+        } else if v.trim() == "--no-icon" {
+            no_icon = true;
         } else if v.trim() == "--keep-sdk-sources" {
             keep_sdk_sources = true;
         } else {
@@ -434,6 +480,19 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
             break;
         }
     }
+
+    if args.is_empty() {
+        return Err(format!(
+            "missing android subcommand. use one of: install-toolchain, build, run, adb, adb-tcp\n\n{}",
+            android_help()
+        ));
+    }
+
+    if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+        println!("{}", android_help());
+        return Ok(());
+    }
+
     if sdk_path.is_none() {
         sdk_path = Some(format!(
             "{}/{}",
@@ -444,9 +503,11 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
 
     let cwd = std::env::current_dir().unwrap();
     let sdk_dir = cwd.join(sdk_path.unwrap());
+    crate::utils::set_no_icon_requested(no_icon);
 
     match args[0].as_ref() {
         "adb" => compile::adb(&sdk_dir, host_os, &args[1..]),
+        "adb-tcp" => compile::adb_tcp(&sdk_dir, host_os, &devices, &args[1..]),
         "java" => compile::java(&sdk_dir, host_os, &args[1..]),
         "javac" => compile::javac(&sdk_dir, host_os, &args[1..]),
         "rustup-toolchain-install" | "rustup-install-toolchain" => {
@@ -478,6 +539,7 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
                 &args[1..],
                 &targets,
                 &variant,
+                &config,
                 &urls,
             )?;
             Ok(())
@@ -490,10 +552,15 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
             &args[1..],
             &targets,
             &variant,
+            &config,
             &urls,
             devices,
         ),
-        _ => Err(format!("{} is not a valid command or option", args[0])),
+        _ => Err(format!(
+            "{} is not a valid android subcommand\n\n{}",
+            args[0],
+            android_help()
+        )),
     }
 }
 
@@ -503,14 +570,16 @@ mod tests {
 
     #[test]
     fn default_manifest_uses_splash_and_app_themes() {
-        let xml = AndroidVariant::Default.manifest_xml("App", "MakepadApp", "dev.makepad.app", 33, true);
+        let xml =
+            AndroidVariant::Default.manifest_xml("App", "MakepadApp", "dev.makepad.app", 33, true);
         assert!(xml.contains("android:theme=\"@style/MakepadAppTheme\""));
         assert!(xml.contains("android:theme=\"@style/MakepadLaunchTheme\""));
     }
 
     #[test]
     fn quest_manifest_uses_splash_and_app_themes() {
-        let xml = AndroidVariant::Quest.manifest_xml("App", "MakepadApp", "dev.makepad.app", 33, true);
+        let xml =
+            AndroidVariant::Quest.manifest_xml("App", "MakepadApp", "dev.makepad.app", 33, true);
         assert!(xml.contains("android:theme=\"@style/MakepadAppTheme\""));
         assert!(xml.contains("android:theme=\"@style/MakepadLaunchTheme\""));
     }

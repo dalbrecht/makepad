@@ -84,6 +84,17 @@ pub struct FromWasmOpenUrl {
 }
 
 #[derive(FromWasm)]
+pub struct FromWasmBrowserUpdateUrl {
+    pub url: String,
+    pub replace: bool,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmBrowserHistoryGo {
+    pub delta: f64,
+}
+
+#[derive(FromWasm)]
 pub struct FromWasmShowTextIME {
     pub x: f64,
     pub y: f64,
@@ -135,6 +146,7 @@ impl DrawShaderTextureInput {
     }
 }
 
+#[cfg(target_feature = "atomics")]
 #[derive(FromWasm)]
 pub struct FromWasmCreateThread {
     pub context_ptr: u32,
@@ -295,6 +307,8 @@ pub struct FromWasmSetDefaultDepthAndBlendMode {}
 pub struct FromWasmDrawCall {
     pub vao_id: usize,
     pub shader_id: usize,
+    pub depth_write: bool,
+    pub backface_culling: bool,
     pub pass_uniforms: WasmPtrF32,
     pub draw_list_uniforms: WasmPtrF32,
     pub draw_call_uniforms: WasmPtrF32,

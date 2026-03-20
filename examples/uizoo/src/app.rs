@@ -43,6 +43,7 @@ script_mod! {
                 @tIconSet
                 @tImage
                 @tImageBlend
+                @tGlassPanel
                 @tLabel
                 @tLinkLabel
                 @tMarkdown
@@ -82,6 +83,7 @@ script_mod! {
         tIconSet := DockTab{name: "IconSet" template: @PermanentTab kind: @TabIconSet}
         tImage := DockTab{name: "Image" template: @PermanentTab kind: @TabImage}
         tImageBlend := DockTab{name: "ImageBlend" template: @PermanentTab kind: @TabImageBlend}
+        tGlassPanel := DockTab{name: "GlassPanel" template: @PermanentTab kind: @TabGlassPanel}
         tLabel := DockTab{name: "Label" template: @PermanentTab kind: @TabLabel}
         tLinkLabel := DockTab{name: "LinkLabel" template: @PermanentTab kind: @TabLinkLabel}
         tMarkdown := DockTab{name: "Markdown" template: @PermanentTab kind: @TabMarkdown}
@@ -111,6 +113,7 @@ script_mod! {
         TabIconSet := UIZooTab{DemoIconSet{}}
         TabImage := UIZooTab{DemoImage{}}
         TabImageBlend := UIZooTab{DemoImageBlend{}}
+        TabGlassPanel := UIZooTab{DemoGlassPanel{}}
         TabLabel := UIZooTab{DemoLabel{}}
         TabLinkLabel := UIZooTab{DemoLinkLabel{}}
         TabMarkdown := UIZooTab{DemoMarkdown{}}
@@ -145,43 +148,6 @@ script_mod! {
                 }
             }
         }
-    }
-}
-
-impl App {
-    fn run(vm: &mut ScriptVm) -> Self {
-        crate::makepad_widgets::script_mod(vm);
-        crate::layout_templates::script_mod(vm);
-        crate::demofiletree::script_mod(vm);
-        crate::tab_button::script_mod(vm);
-        crate::tab_checkbox::script_mod(vm);
-        crate::tab_dropdown::script_mod(vm);
-        crate::tab_filetree::script_mod(vm);
-        crate::tab_spinner::script_mod(vm);
-        crate::tab_html::script_mod(vm);
-        crate::tab_icon::script_mod(vm);
-        crate::tab_iconset::script_mod(vm);
-        crate::tab_image::script_mod(vm);
-        crate::tab_imageblend::script_mod(vm);
-        crate::tab_label::script_mod(vm);
-        crate::tab_layout::script_mod(vm);
-        crate::tab_linklabel::script_mod(vm);
-        crate::tab_markdown::script_mod(vm);
-        crate::tab_pageflip::script_mod(vm);
-        crate::tab_portallist::script_mod(vm);
-        crate::tab_radiobutton::script_mod(vm);
-        crate::tab_rotary::script_mod(vm);
-        crate::tab_rotatedimage::script_mod(vm);
-        crate::tab_scrollbar::script_mod(vm);
-        crate::tab_slider::script_mod(vm);
-        crate::tab_slidesview::script_mod(vm);
-        crate::tab_stacknavigation::script_mod(vm);
-        crate::tab_adaptiveview::script_mod(vm);
-        crate::tab_textinput::script_mod(vm);
-        crate::tab_video::script_mod(vm);
-        crate::tab_view::script_mod(vm);
-        crate::tab_widgetsoverview::script_mod(vm);
-        App::from_script_mod(vm, self::script_mod)
     }
 }
 
@@ -318,10 +284,18 @@ impl MatchEvent for App {
         if self.ui.button(cx, ids!(push_view_c)).clicked(&actions) {
             stack_nav.push(cx, live_id!(stack_view_c));
         }
-        if self.ui.button(cx, ids!(push_nested_from_a)).clicked(&actions) {
+        if self
+            .ui
+            .button(cx, ids!(push_nested_from_a))
+            .clicked(&actions)
+        {
             stack_nav.push(cx, live_id!(stack_view_b));
         }
-        if self.ui.button(cx, ids!(push_nested_from_b)).clicked(&actions) {
+        if self
+            .ui
+            .button(cx, ids!(push_nested_from_b))
+            .clicked(&actions)
+        {
             stack_nav.push(cx, live_id!(stack_view_c));
         }
         if self.ui.button(cx, ids!(pop_to_root_btn)).clicked(&actions) {
@@ -336,7 +310,9 @@ impl MatchEvent for App {
         ];
         for (item_id, title) in desktop_items {
             if let Some(_) = self.ui.view(cx, item_id).finger_down(actions) {
-                self.ui.label(cx, ids!(desktop_detail_title)).set_text(cx, title);
+                self.ui
+                    .label(cx, ids!(desktop_detail_title))
+                    .set_text(cx, title);
                 self.ui.label(cx, ids!(desktop_detail_body)).set_text(
                     cx,
                     &format!("{} detail content.\n\nOn Desktop, the list and detail are visible side-by-side.", title),
@@ -355,7 +331,9 @@ impl MatchEvent for App {
         for (item_id, title) in mobile_items {
             if let Some(_) = self.ui.view(cx, item_id).finger_down(actions) {
                 mobile_nav.set_title(cx, live_id!(mobile_detail_view), title);
-                self.ui.label(cx, ids!(mobile_detail_title)).set_text(cx, title);
+                self.ui
+                    .label(cx, ids!(mobile_detail_title))
+                    .set_text(cx, title);
                 self.ui.label(cx, ids!(mobile_detail_body)).set_text(
                     cx,
                     &format!("{} detail content.\n\nOn Mobile, this was pushed onto the navigation stack.", title),
@@ -367,6 +345,42 @@ impl MatchEvent for App {
 }
 
 impl AppMain for App {
+    fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+        crate::makepad_widgets::script_mod(vm);
+        crate::layout_templates::script_mod(vm);
+        crate::demofiletree::script_mod(vm);
+        crate::tab_button::script_mod(vm);
+        crate::tab_checkbox::script_mod(vm);
+        crate::tab_dropdown::script_mod(vm);
+        crate::tab_filetree::script_mod(vm);
+        crate::tab_spinner::script_mod(vm);
+        crate::tab_html::script_mod(vm);
+        crate::tab_icon::script_mod(vm);
+        crate::tab_iconset::script_mod(vm);
+        crate::tab_image::script_mod(vm);
+        crate::tab_imageblend::script_mod(vm);
+        crate::tab_glasspanel::script_mod(vm);
+        crate::tab_label::script_mod(vm);
+        crate::tab_layout::script_mod(vm);
+        crate::tab_linklabel::script_mod(vm);
+        crate::tab_markdown::script_mod(vm);
+        crate::tab_pageflip::script_mod(vm);
+        crate::tab_portallist::script_mod(vm);
+        crate::tab_radiobutton::script_mod(vm);
+        crate::tab_rotary::script_mod(vm);
+        crate::tab_rotatedimage::script_mod(vm);
+        crate::tab_scrollbar::script_mod(vm);
+        crate::tab_slider::script_mod(vm);
+        crate::tab_slidesview::script_mod(vm);
+        crate::tab_stacknavigation::script_mod(vm);
+        crate::tab_adaptiveview::script_mod(vm);
+        crate::tab_textinput::script_mod(vm);
+        crate::tab_video::script_mod(vm);
+        crate::tab_view::script_mod(vm);
+        crate::tab_widgetsoverview::script_mod(vm);
+        self::script_mod(vm)
+    }
+
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());

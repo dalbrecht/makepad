@@ -92,7 +92,7 @@ pub struct LongPressEvent {
 
 // Touch events
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TouchState {
     Start,
     Stop,
@@ -243,7 +243,7 @@ pub struct DigitId(pub LiveId);
 #[derive(Default, Clone)]
 pub struct CxDigitCapture {
     digit_id: DigitId,
-    has_long_press_occurred: bool,
+    pub(crate) has_long_press_occurred: bool,
     pub area: Area,
     pub sweep_area: Area,
     pub switch_capture: Option<Area>,
@@ -428,6 +428,11 @@ impl CxFingers {
             && pos.distance(&self.tap.last_pos) < TAP_COUNT_DISTANCE
         {
             self.tap.count += 1;
+            // Cycle back after triple-click so fast repeated
+            // double-clicks keep working (1→2→3→1→2→3…).
+            if self.tap.count > 3 {
+                self.tap.count = 1;
+            }
         } else {
             self.tap.count = 1;
         }
@@ -883,6 +888,11 @@ impl Event {
             Event::ImeAction(ia) => {
                 if cx.keyboard.has_key_focus(area) {
                     return Hit::ImeAction(ia.clone());
+                }
+            }
+            Event::SelectionHandleDrag(e) => {
+                if cx.keyboard.has_key_focus(area) {
+                    return Hit::SelectionHandleDrag(e.clone());
                 }
             }
             Event::Scroll(e) => {

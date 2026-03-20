@@ -1,5 +1,7 @@
 use super::*;
 
+const MAKEPAD_SPLASH_RUNNABLE: &str = "makepad.splash";
+
 macro_rules! ui_file_sync_trace {
     ($($arg:tt)*) => {};
 }
@@ -199,13 +201,19 @@ impl App {
                     self.data
                         .build_to_mount
                         .insert(build.build_id, build.mount.clone());
+                    self.data
+                        .build_package
+                        .insert(build.build_id, build.package.clone());
                 }
                 let Some(mount) = self.data.pending_stop_all_mount.take() else {
                     return;
                 };
                 let mut stop_count = 0usize;
                 for build in builds {
-                    if build.active && build.mount == mount {
+                    if build.active
+                        && build.mount == mount
+                        && build.package != MAKEPAD_SPLASH_RUNNABLE
+                    {
                         if let Some(tab_id) =
                             self.data.run_tab_by_build.get(&build.build_id).copied()
                         {
@@ -227,8 +235,8 @@ impl App {
                     &format!("stop-all {}: {} running build(s)", mount, stop_count),
                 );
             }
-            HubToClient::RunnableBuilds { mount, builds } => {
-                self.mount_state_mut(&mount).runnable_builds = builds;
+            HubToClient::RunItems { mount, items } => {
+                self.mount_state_mut(&mount).run_items = items;
                 if self.data.active_mount.as_deref() == Some(mount.as_str()) {
                     self.refresh_active_mount_run_list(cx);
                     self.set_status(cx, &format!("run targets loaded: {}", mount));
@@ -239,6 +247,11 @@ impl App {
                 mount,
                 package,
             } => {
+                self.data.build_to_mount.insert(build_id, mount.clone());
+                self.data.build_package.insert(build_id, package.clone());
+                if package == MAKEPAD_SPLASH_RUNNABLE {
+                    return;
+                }
                 let _ = self.ensure_mount_tab(cx, &mount);
                 if self.data.active_mount.as_deref() != Some(mount.as_str()) {
                     self.select_mount(cx, &mount);
@@ -247,8 +260,6 @@ impl App {
                     .profiler_running_by_build
                     .entry(build_id)
                     .or_insert(true);
-                self.data.build_to_mount.insert(build_id, mount.clone());
-                self.data.build_package.insert(build_id, package.clone());
                 self.data
                     .active_log_build_by_mount
                     .insert(mount.clone(), build_id);
@@ -266,9 +277,10 @@ impl App {
                         window_id = state.window_id;
                     }
                     if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
+                        let addr = self.studio_addr();
                         dock.item(tab_id)
                             .desktop_run_view(cx, ids!(run_view))
-                            .set_run_target(cx, build_id, window_id);
+                            .set_run_target(cx, build_id, window_id, addr.as_deref());
                         dock.redraw_tab(cx, tab_id);
                     }
                 }
@@ -283,6 +295,13 @@ impl App {
                 build_id,
                 exit_code,
             } => {
+                if self.data.build_package.get(&build_id).map(String::as_str)
+                    == Some(MAKEPAD_SPLASH_RUNNABLE)
+                {
+                    self.data.build_package.remove(&build_id);
+                    self.data.build_to_mount.remove(&build_id);
+                    return;
+                }
                 self.data.build_to_mount.remove(&build_id);
                 self.stop_profiler_query_for_build(build_id);
                 self.data.profiler_running_by_build.insert(build_id, false);
@@ -309,6 +328,10 @@ impl App {
                         }
                     }
                 }
+            }
+            HubToClient::BuildCleared { build_id } => {
+                self.clear_build_tabs(cx, build_id);
+                self.set_status(cx, &format!("build cleared: {}", build_id.0));
             }
             HubToClient::RunViewCreated {
                 build_id,
@@ -346,8 +369,9 @@ impl App {
                 }
                 if let Some(mount) = mount {
                     if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
+                        let addr = self.studio_addr();
                         let run_view = dock.item(tab_id).desktop_run_view(cx, ids!(run_view));
-                        run_view.set_run_target(cx, build_id, Some(window_id));
+                        run_view.set_run_target(cx, build_id, Some(window_id), addr.as_deref());
                         run_view.rebootstrap_after_app_ready(cx, build_id, window_id);
                         dock.redraw_tab(cx, tab_id);
                     }
@@ -377,9 +401,47 @@ impl App {
                     return;
                 };
                 if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
+                    let addr = self.studio_addr();
                     let run_view = dock.item(tab_id).desktop_run_view(cx, ids!(run_view));
-                    run_view.set_run_target(cx, build_id, Some(window_id));
+                    run_view.set_run_target(cx, build_id, Some(window_id), addr.as_deref());
                     run_view.set_presentable_draw(cx, presentable_draw);
+                    dock.redraw_tab(cx, tab_id);
+                }
+            }
+            HubToClient::RunViewFrame {
+                build_id,
+                window_id,
+                frame_id,
+                width,
+                height,
+                codec,
+                data,
+            } => {
+                let Some(tab_id) = self.data.run_tab_by_build.get(&build_id).copied() else {
+                    return;
+                };
+                let Some(mount) = self
+                    .data
+                    .run_tab_state
+                    .get(&tab_id)
+                    .map(|state| state.mount.clone())
+                else {
+                    return;
+                };
+                if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
+                    let run_view = dock.item(tab_id).desktop_run_view(cx, ids!(run_view));
+                    run_view.set_remote_frame(
+                        cx,
+                        build_id,
+                        makepad_studio_protocol::RunViewFrameData {
+                            window_id,
+                            frame_id,
+                            width,
+                            height,
+                            codec: Some(codec),
+                            data,
+                        },
+                    );
                     dock.redraw_tab(cx, tab_id);
                 }
             }
@@ -422,6 +484,32 @@ impl App {
                     dock.item(tab_id)
                         .desktop_run_view(cx, ids!(run_view))
                         .show_input_viz(cx, kind, x, y);
+                    dock.redraw_tab(cx, tab_id);
+                }
+            }
+            HubToClient::RunViewKeyFocusRect {
+                build_id,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let Some(tab_id) = self.data.run_tab_by_build.get(&build_id).copied() else {
+                    return;
+                };
+                let Some(mount) = self
+                    .data
+                    .run_tab_state
+                    .get(&tab_id)
+                    .map(|state| state.mount.clone())
+                else {
+                    return;
+                };
+                if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
+                    dock.item(tab_id)
+                        .desktop_run_view(cx, ids!(run_view))
+                        .set_input_focus_rect(cx, x, y, width, height);
+                    dock.redraw_tab(cx, tab_id);
                 }
             }
             HubToClient::QueryLogResults {
@@ -452,11 +540,15 @@ impl App {
                         log_entry.clone(),
                         2_000,
                     );
-                    push_capped_deque(
-                        &mut self.mount_state_mut(&mount).log_entries,
-                        log_entry,
-                        3_000,
-                    );
+                    if self.data.build_package.get(&build_id).map(String::as_str)
+                        == Some(MAKEPAD_SPLASH_RUNNABLE)
+                    {
+                        push_capped_deque(
+                            &mut self.mount_state_mut(&mount).log_entries,
+                            log_entry,
+                            3_000,
+                        );
+                    }
                     touched_mounts.insert(mount);
 
                     if let Some(log_tab_id) = self.data.log_tab_by_build.get(&build_id).copied() {
@@ -523,6 +615,10 @@ impl App {
                         self.data.live_profiler_query_by_build.remove(&build_id);
                     }
                 }
+            }
+            HubToClient::LogCleared => {
+                self.clear_ui_log_entries(cx);
+                self.set_status(cx, "logs cleared");
             }
             HubToClient::TerminalOpened { path } => {
                 self.data.terminal_open_paths.insert(path.clone());

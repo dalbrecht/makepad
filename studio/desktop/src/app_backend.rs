@@ -1,5 +1,7 @@
 use super::*;
 use makepad_studio_protocol::hub_protocol::{FileNode, FileTreeChange};
+use std::env;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn parse_mounts_spec(spec: &str, item_sep: char, pair_sep: char) -> Vec<MountConfig> {
     spec.split(item_sep)
@@ -21,19 +23,88 @@ fn parse_mounts_spec(spec: &str, item_sep: char, pair_sep: char) -> Vec<MountCon
         .collect()
 }
 
-fn parse_cli_mounts_spec() -> Option<String> {
-    let mut mounts_spec = None;
+fn parse_cli_arg_value(name: &str) -> Option<String> {
+    let mut value = None;
+    let prefixed = format!("--{name}=");
+    let plain = format!("--{name}");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if let Some(spec) = arg.strip_prefix("--mounts=") {
-            mounts_spec = Some(spec.to_string());
+        if let Some(parsed) = arg.strip_prefix(&prefixed) {
+            value = Some(parsed.to_string());
             continue;
         }
-        if arg == "--mounts" {
-            mounts_spec = Some(args.next().unwrap_or_default());
+        if arg == plain {
+            value = Some(args.next().unwrap_or_default());
         }
     }
-    mounts_spec
+    value
+}
+
+fn parse_cli_mounts_spec() -> Option<String> {
+    parse_cli_arg_value("mounts")
+}
+
+fn parse_cli_bind_spec() -> Option<String> {
+    let mut value = None;
+    let prefixed = "--bind=";
+    for arg in std::env::args().skip(1) {
+        if let Some(parsed) = arg.strip_prefix(prefixed) {
+            value = Some(parsed.to_string());
+            continue;
+        }
+        if arg == "--bind" {
+            value = Some("0.0.0.0".to_string());
+        }
+    }
+    value
+}
+
+fn parse_cli_bind_address(spec: Option<String>) -> Result<SocketAddr, String> {
+    let Some(spec) = spec.map(|spec| spec.trim().to_string()) else {
+        return Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8001));
+    };
+    if spec.is_empty() {
+        return Err("invalid --bind value '', expected ip or ip:port".to_string());
+    }
+    if let Ok(addr) = spec.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = spec.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, 8001));
+    }
+    Err(format!(
+        "invalid --bind value '{}', expected ip or ip:port",
+        spec
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_bind_address_defaults_to_localhost() {
+        assert_eq!(
+            parse_cli_bind_address(None).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8001)
+        );
+    }
+
+    #[test]
+    fn parse_cli_bind_address_accepts_ip_without_port() {
+        assert_eq!(
+            parse_cli_bind_address(Some("0.0.0.0".to_string())).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8001)
+        );
+    }
+
+    #[test]
+    fn parse_cli_bind_address_accepts_ip_with_port() {
+        assert_eq!(
+            parse_cli_bind_address(Some("127.0.0.1:9001".to_string())).unwrap(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001)
+        );
+    }
 }
 
 const FILE_FILTER_DEBOUNCE_SECONDS: f64 = 0.14;
@@ -110,13 +181,6 @@ impl App {
         }
     }
 
-    pub(super) fn run(vm: &mut ScriptVm) -> Self {
-        crate::makepad_widgets::script_mod(vm);
-        crate::makepad_code_editor::script_mod(vm);
-        crate::script_mod(vm);
-        App::from_script_mod(vm, self::script_mod)
-    }
-
     pub(super) fn start_backend(&mut self, cx: &mut Cx) {
         let current_path = match env::current_dir().and_then(|p| p.canonicalize()) {
             Ok(path) => path,
@@ -140,7 +204,16 @@ impl App {
             });
         }
 
+        let listen_address = match parse_cli_bind_address(parse_cli_bind_spec()) {
+            Ok(addr) => addr,
+            Err(err) => {
+                self.set_status(cx, &err);
+                return;
+            }
+        };
+
         let config = HubConfig {
+            listen_address,
             mounts: mounts.clone(),
             enable_in_process_gateway: true,
             ..Default::default()
@@ -154,9 +227,6 @@ impl App {
                         mount.path.clone();
                     let _ = self.ensure_mount_tab(cx, &mount.name);
                     let _ = self.send_studio(ClientToHub::LoadFileTree {
-                        mount: mount.name.clone(),
-                    });
-                    let _ = self.send_studio(ClientToHub::LoadRunnableBuilds {
                         mount: mount.name.clone(),
                     });
                     let _ = self.send_studio(ClientToHub::ObserveMount {
@@ -188,6 +258,10 @@ impl App {
 
     pub(super) fn send_studio(&mut self, msg: ClientToHub) -> Option<QueryId> {
         self.data.studio.as_mut().map(|studio| studio.send(msg))
+    }
+
+    pub(super) fn studio_addr(&self) -> Option<String> {
+        self.data.studio.as_ref().and_then(|s| s.studio_addr())
     }
 
     pub(super) fn mount_state(&self, mount: &str) -> Option<&MountState> {
@@ -223,7 +297,7 @@ impl App {
                 .filter_map(|state| state.tab_id)
                 .next()
                 .unwrap_or(id!(mount_first));
-            let (tab_bar, pos) = dock.find_tab_bar_of_tab(anchor)?;
+            let (tab_bar, pos) = Self::reachable_tab_bar_of_tab(&dock, anchor)?;
             let tab_id = dock.unique_id(LiveId::from_str(&format!("mount/{}", mount)).0);
             if dock
                 .create_tab(
@@ -453,6 +527,19 @@ impl App {
         self.refresh_active_mount_log_panels(cx);
     }
 
+    pub(super) fn clear_ui_log_entries(&mut self, cx: &mut Cx) {
+        self.data.build_log_entries.clear();
+        for mount_state in self.data.mounts.values_mut() {
+            mount_state.log_entries.clear();
+        }
+        self.refresh_active_mount_log_panels(cx);
+    }
+
+    pub(super) fn request_log_clear(&mut self, cx: &mut Cx) {
+        let _ = self.send_studio(ClientToHub::LogClear);
+        self.set_status(cx, "clearing logs...");
+    }
+
     pub(super) fn apply_mount_toolbar_state(&mut self, cx: &mut Cx, mount: &str) {
         let (file_filter, log_filter, log_tail) = self
             .mount_state(mount)
@@ -563,7 +650,8 @@ impl App {
                 tab_to_path.remove(&existing);
             }
             // Create a new terminal tab before the "+" button.
-            let Some((tab_bar, pos)) = dock.find_tab_bar_of_tab(id!(terminal_add)) else {
+            let Some((tab_bar, pos)) = Self::reachable_tab_bar_of_tab(&dock, id!(terminal_add))
+            else {
                 continue;
             };
             let tab_id = dock.unique_id(LiveId::from_str(path).0);
@@ -802,15 +890,6 @@ impl App {
             self.set_status(cx, &format!("loading mount: {}", mount));
         }
         self.ensure_mount_terminal_file(cx, mount);
-        if self
-            .mount_state(mount)
-            .map(|mount| mount.runnable_builds.is_empty())
-            .unwrap_or(true)
-        {
-            let _ = self.send_studio(ClientToHub::LoadRunnableBuilds {
-                mount: mount.to_string(),
-            });
-        }
         self.apply_mount_toolbar_state(cx, mount);
         self.restart_log_query_for_mount(cx, mount);
         self.refresh_active_mount_run_list(cx);

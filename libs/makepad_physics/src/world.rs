@@ -3,7 +3,7 @@ use crate::contact::ContactManifold;
 use crate::hash;
 use crate::narrow_phase;
 use crate::rigid_body::{BodyType, RigidBody};
-use crate::solver::{self, SolverContact};
+use crate::solver::{self, SolverContact, SolverFriction};
 use makepad_math::*;
 
 /// The only way to mutate physics state from outside.
@@ -27,6 +27,16 @@ pub enum PhysicsOp {
     ApplyImpulse {
         body: usize,
         impulse: Vec3f,
+    },
+    ApplyImpulseAtPoint {
+        body: usize,
+        impulse: Vec3f,
+        point: Vec3f,
+    },
+    ApplyImpulseWithAngularImpulse {
+        body: usize,
+        impulse: Vec3f,
+        angular_impulse: Vec3f,
     },
     RemoveBody {
         body: usize,
@@ -56,8 +66,10 @@ pub struct PhysicsWorld {
     // Reusable buffers — never deallocated, only cleared each frame
     aabbs: Vec<Aabb>,
     pairs: Vec<(usize, usize)>,
+    prev_manifolds: Vec<ContactManifold>,
     manifolds: Vec<ContactManifold>,
     solver_contacts: Vec<SolverContact>,
+    solver_frictions: Vec<SolverFriction>,
 }
 
 impl PhysicsWorld {
@@ -70,8 +82,10 @@ impl PhysicsWorld {
             frame: 0,
             aabbs: Vec::new(),
             pairs: Vec::new(),
+            prev_manifolds: Vec::new(),
             manifolds: Vec::new(),
             solver_contacts: Vec::new(),
+            solver_frictions: Vec::new(),
         }
     }
 
@@ -82,7 +96,7 @@ impl PhysicsWorld {
     ///   Each substep: apply gravity → update constraints (from current poses)
     ///   → warmstart → PGS solve → integrate positions → stabilization.
     pub fn step(&mut self, ops: &[PhysicsOp]) {
-        self.apply_ops(ops);
+        let topology_changed = self.apply_ops(ops);
 
         // Keep sleeping bodies fully frozen unless contacts/impulses wake them.
         for body in self.bodies.iter_mut() {
@@ -101,13 +115,23 @@ impl PhysicsWorld {
         // Collision detection runs ONCE before the substep loop (matching rapier).
         // Contact points are stored in body-local coordinates so they can be
         // re-transformed using updated poses each substep.
+        if topology_changed {
+            self.prev_manifolds.clear();
+            self.manifolds.clear();
+        } else {
+            std::mem::swap(&mut self.prev_manifolds, &mut self.manifolds);
+            self.manifolds.clear();
+        }
+
         broad_phase::broad_phase(&self.bodies, &mut self.aabbs, &mut self.pairs);
         narrow_phase::narrow_phase(
             &self.bodies,
             &self.pairs,
             self.ground_y,
+            &self.prev_manifolds,
             &mut self.manifolds,
         );
+        solver::inherit_warmstart_impulses(&self.prev_manifolds, &mut self.manifolds);
 
         // Build initial solver constraints from contact manifolds
         solver::prepare_contacts(
@@ -115,9 +139,10 @@ impl PhysicsWorld {
             &self.manifolds,
             substep_dt,
             &mut self.solver_contacts,
+            &mut self.solver_frictions,
         );
 
-        for substep in 0..NUM_SOLVER_ITERATIONS {
+        for _substep in 0..NUM_SOLVER_ITERATIONS {
             // 1. Apply gravity increment for this substep
             for body in self.bodies.iter_mut() {
                 if body.body_type == BodyType::Dynamic && !body.sleeping {
@@ -126,18 +151,27 @@ impl PhysicsWorld {
             }
 
             // 2. Update constraints from current poses (NOT re-running collision detection).
-            // On the first substep, constraints are already fresh from prepare_contacts.
-            // On subsequent substeps, re-transform contact points and recompute biases
-            // from updated body positions (matching rapier's constraint update).
-            if substep > 0 {
-                solver::update_contacts(&self.bodies, &mut self.solver_contacts, substep_dt);
-            }
+            // This runs on every substep in Rapier because it also advances the
+            // warmstart accumulators used for writeback.
+            solver::update_contacts(
+                &self.bodies,
+                &mut self.solver_contacts,
+                substep_dt,
+                WARMSTART_COEFFICIENT,
+            );
+            solver::update_frictions(
+                &self.bodies,
+                &mut self.solver_frictions,
+                substep_dt,
+                WARMSTART_COEFFICIENT,
+            );
 
             // 3. Warmstart: apply cached impulses (every substep, matching rapier)
             if WARMSTART_COEFFICIENT != 0.0 {
                 solver::warmstart(
                     &mut self.bodies,
                     &mut self.solver_contacts,
+                    &mut self.solver_frictions,
                     WARMSTART_COEFFICIENT,
                 );
             }
@@ -146,6 +180,7 @@ impl PhysicsWorld {
             solver::solve_contacts(
                 &mut self.bodies,
                 &mut self.solver_contacts,
+                &mut self.solver_frictions,
                 NUM_INTERNAL_PGS_ITERATIONS,
             );
 
@@ -164,9 +199,16 @@ impl PhysicsWorld {
             solver::solve_contacts_wo_bias(
                 &mut self.bodies,
                 &mut self.solver_contacts,
+                &mut self.solver_frictions,
                 NUM_INTERNAL_STABILIZATION_ITERATIONS,
             );
         }
+
+        solver::writeback_impulses(
+            &self.solver_contacts,
+            &self.solver_frictions,
+            &mut self.manifolds,
+        );
 
         self.update_sleep_states();
         self.frame += 1;
@@ -190,6 +232,12 @@ impl PhysicsWorld {
         self.frame = snap.frame;
         self.bodies.clear();
         self.bodies.extend_from_slice(&snap.bodies);
+        self.aabbs.clear();
+        self.pairs.clear();
+        self.prev_manifolds.clear();
+        self.manifolds.clear();
+        self.solver_contacts.clear();
+        self.solver_frictions.clear();
     }
 
     /// Fast-forward: restore snapshot, then replay ops for each frame.
@@ -201,7 +249,8 @@ impl PhysicsWorld {
         }
     }
 
-    fn apply_ops(&mut self, ops: &[PhysicsOp]) {
+    fn apply_ops(&mut self, ops: &[PhysicsOp]) -> bool {
+        let mut topology_changed = false;
         for op in ops {
             match op {
                 PhysicsOp::SpawnDynamic {
@@ -210,6 +259,7 @@ impl PhysicsWorld {
                     velocity,
                     density,
                 } => {
+                    topology_changed = true;
                     let mut body = RigidBody::new_dynamic(*position, *half_extents, *density);
                     body.linear_velocity = *velocity;
                     body.wake_up();
@@ -219,6 +269,7 @@ impl PhysicsWorld {
                     position,
                     half_extents,
                 } => {
+                    topology_changed = true;
                     self.bodies
                         .push(RigidBody::new_fixed(*position, *half_extents));
                 }
@@ -235,13 +286,42 @@ impl PhysicsWorld {
                         self.bodies[*body].wake_up();
                     }
                 }
+                PhysicsOp::ApplyImpulseAtPoint {
+                    body,
+                    impulse,
+                    point,
+                } => {
+                    if *body < self.bodies.len() && self.bodies[*body].is_dynamic() {
+                        let body = &mut self.bodies[*body];
+                        body.linear_velocity += *impulse * body.inv_mass;
+                        let r = *point - body.pose.position;
+                        let angular_impulse = Vec3f::cross(r, *impulse);
+                        body.angular_velocity += body.world_inv_inertia().mul_vec3(angular_impulse);
+                        body.wake_up();
+                    }
+                }
+                PhysicsOp::ApplyImpulseWithAngularImpulse {
+                    body,
+                    impulse,
+                    angular_impulse,
+                } => {
+                    if *body < self.bodies.len() && self.bodies[*body].is_dynamic() {
+                        let body = &mut self.bodies[*body];
+                        body.linear_velocity += *impulse * body.inv_mass;
+                        body.angular_velocity +=
+                            body.world_inv_inertia().mul_vec3(*angular_impulse);
+                        body.wake_up();
+                    }
+                }
                 PhysicsOp::RemoveBody { body } => {
                     if *body < self.bodies.len() {
+                        topology_changed = true;
                         self.bodies.swap_remove(*body);
                     }
                 }
             }
         }
+        topology_changed
     }
 
     fn update_sleep_states(&mut self) {

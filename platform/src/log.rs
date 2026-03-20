@@ -37,7 +37,10 @@ pub(crate) fn log_with_level_makepad_platform(
         }
     }
 
-    if !Cx::has_studio_web_socket() {
+    let studio_enabled = Cx::has_studio_web_socket();
+    let studio_connected = Cx::has_studio_web_socket_connected();
+
+    if !studio_connected {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         println!(
             "{}:{}:{} - {}",
@@ -54,7 +57,10 @@ pub(crate) fn log_with_level_makepad_platform(
             use crate::os::apple::apple_util::str_to_nsstring;
             let msg = format!(
                 "{}:{}:{} - {}",
-                file_name, line_start + 1, column_start + 1, message
+                file_name,
+                line_start + 1,
+                column_start + 1,
+                message
             );
             unsafe { NSLog(str_to_nsstring(&msg)) };
         }
@@ -65,11 +71,18 @@ pub(crate) fn log_with_level_makepad_platform(
             extern "C" {
                 pub fn __android_log_write(prio: c_int, tag: *const u8, text: *const u8) -> c_int;
             }
+            // Android log priorities: 2=VERBOSE, 3=DEBUG, 4=INFO, 5=WARN, 6=ERROR
+            // Some devices (e.g. Motorola/MediaTek) suppress DEBUG by default.
+            let prio: c_int = match level {
+                LogLevel::Error | LogLevel::Panic => 6,
+                LogLevel::Warning => 5,
+                _ => 4,
+            };
             let msg = format!(
                 "{}:{}:{} - {}\0",
                 file_name, line_start, column_start, message
             );
-            unsafe { __android_log_write(3, "Makepad\0".as_ptr(), msg.as_ptr()) };
+            unsafe { __android_log_write(prio, "Makepad\0".as_ptr(), msg.as_ptr()) };
         }
         #[cfg(target_env = "ohos")]
         {
@@ -94,20 +107,9 @@ pub(crate) fn log_with_level_makepad_platform(
                 )
             };
         }
-    } else {
-        #[cfg(target_os = "android")]
-        {
-            use std::ffi::c_int;
-            extern "C" {
-                pub fn __android_log_write(prio: c_int, tag: *const u8, text: *const u8) -> c_int;
-            }
-            let msg = format!(
-                "{}:{}:{} - {}\0",
-                file_name, line_start, column_start, message
-            );
-            unsafe { __android_log_write(3, "Makepad\0".as_ptr(), msg.as_ptr()) };
-        }
+    }
 
+    if studio_enabled {
         Cx::send_studio_message(AppToStudio::LogItem(StudioLogItem {
             file_name: file_name.to_string(),
             line_start,
@@ -121,10 +123,10 @@ pub(crate) fn log_with_level_makepad_platform(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn profile_start() -> Instant {

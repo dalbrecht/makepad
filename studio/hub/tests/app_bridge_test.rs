@@ -1,11 +1,11 @@
 use makepad_live_id::LiveId;
 use makepad_micro_serde::{DeBin, SerBin};
-use makepad_network::{
+use makepad_script_std::makepad_network::{
     HttpMethod, HttpRequest, NetworkConfig, NetworkResponse, NetworkRuntime, WsMessage, WsSend,
 };
 use makepad_studio_hub::{HubConfig, MountConfig, StudioHub};
 use makepad_studio_protocol::hub_protocol::{
-    ClientId, QueryId, HubToClient, ClientToHub, ClientToHubEnvelope,
+    ClientId, ClientToHub, ClientToHubEnvelope, HubToClient, QueryId,
 };
 use makepad_studio_protocol::{
     AppToStudio, AppToStudioVec, StudioToApp, StudioToAppVec, WidgetQueryResponse,
@@ -62,7 +62,7 @@ fn wait_for_ws_binary(runtime: &NetworkRuntime, socket_id: LiveId, timeout: Dura
 
 #[test]
 fn websocket_app_bridge_widget_dump_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
 
@@ -90,7 +90,7 @@ fn websocket_app_bridge_widget_dump_roundtrip() {
 
     let runtime = NetworkRuntime::new(NetworkConfig::default());
     let ui_socket = LiveId::from_str("studio2.backend.ui");
-    let ui_request = HttpRequest::new(format!("ws://127.0.0.1:{port}/$studio_ui"), HttpMethod::GET);
+    let ui_request = HttpRequest::new(format!("ws://127.0.0.1:{port}/ui/"), HttpMethod::GET);
     if runtime.ws_open(ui_socket, ui_request).is_err() {
         return;
     }
@@ -112,7 +112,7 @@ fn websocket_app_bridge_widget_dump_roundtrip() {
     let build_id = QueryId::new(client_id, 100);
     let app_socket = LiveId::from_str("studio2.backend.app");
     let app_request = HttpRequest::new(
-        format!("ws://127.0.0.1:{port}/$studio_app/{}", build_id.0),
+        format!("ws://127.0.0.1:{port}/app/{}", build_id.0),
         HttpMethod::GET,
     );
     runtime
@@ -171,7 +171,7 @@ fn websocket_app_bridge_widget_dump_roundtrip() {
 
 #[test]
 fn websocket_app_bridge_widget_query_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").unwrap();
 
@@ -199,7 +199,7 @@ fn websocket_app_bridge_widget_query_roundtrip() {
 
     let runtime = NetworkRuntime::new(NetworkConfig::default());
     let ui_socket = LiveId::from_str("studio2.backend.ui.query");
-    let ui_request = HttpRequest::new(format!("ws://127.0.0.1:{port}/$studio_ui"), HttpMethod::GET);
+    let ui_request = HttpRequest::new(format!("ws://127.0.0.1:{port}/ui/"), HttpMethod::GET);
     if runtime.ws_open(ui_socket, ui_request).is_err() {
         return;
     }
@@ -220,7 +220,7 @@ fn websocket_app_bridge_widget_query_roundtrip() {
     let build_id = QueryId::new(client_id, 100);
     let app_socket = LiveId::from_str("studio2.backend.app.query");
     let app_request = HttpRequest::new(
-        format!("ws://127.0.0.1:{port}/$studio_app/{}", build_id.0),
+        format!("ws://127.0.0.1:{port}/app/{}", build_id.0),
         HttpMethod::GET,
     );
     runtime

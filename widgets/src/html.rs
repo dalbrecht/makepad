@@ -317,7 +317,7 @@ impl Html {
                 trim_whitespace_in_text = TrimWhitespaceInText::Trim;
             }
             some_id!(br) => {
-                tf.new_line_collapsed(cx);
+                tf.new_line_with_wrap_spacing(cx);
                 trim_whitespace_in_text = TrimWhitespaceInText::Trim;
             }
             some_id!(hr) | some_id!(sep) => {
@@ -631,11 +631,13 @@ impl ScriptHook for HtmlLink {
         // populate its struct fields from the `<a>` tag's attributes.
         if let Some(doc) = scope.props.get::<HtmlDoc>() {
             let mut walker = doc.new_walker_with_index(scope.index + 1);
-
-            if let Some((lc, attr)) = walker.while_attr_lc() {
+            while let Some((lc, attr)) = walker.while_attr_lc() {
                 match lc {
-                    live_id!(href) => self.url = attr.into(),
-                    _ => (),
+                    live_id!(href) => {
+                        self.url = attr.into();
+                        break;
+                    }
+                    _ => {}
                 }
             }
         }

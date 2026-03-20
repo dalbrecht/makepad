@@ -594,12 +594,14 @@ fn emit_shape(
         current_color.3,
     );
 
-    // Fill
-    if let Some(ref paint) = style.fill {
-        let paint = if matches!(paint, SvgPaint::CurrentColor) {
+    // Fill (SVG default fill is black when not specified)
+    let default_fill = SvgPaint::Color(0.0, 0.0, 0.0, 1.0);
+    let fill_paint = style.fill.as_ref().unwrap_or(&default_fill);
+    {
+        let paint = if matches!(fill_paint, SvgPaint::CurrentColor) {
             &resolved_cc
         } else {
-            paint
+            fill_paint
         };
         if !matches!(paint, SvgPaint::None) {
             build_path(dv);
@@ -857,6 +859,7 @@ fn emit_ellipse(dv: &mut DrawVector, cx: f32, cy: f32, rx: f32, ry: f32, xf: &Tr
 }
 
 /// Emit arc bezier segments directly to DrawVector, transforming each control point.
+#[allow(clippy::too_many_arguments)]
 fn emit_arc(
     dv: &mut DrawVector,
     cx: f32,

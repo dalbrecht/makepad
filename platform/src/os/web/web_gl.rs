@@ -249,6 +249,8 @@ impl Cx {
                 self.os.from_wasm(FromWasmDrawCall {
                     shader_id: sh.os_shader_id.unwrap(),
                     vao_id: draw_item.os.vao.as_ref().unwrap().vao_id,
+                    depth_write: draw_call.options.depth_write,
+                    backface_culling: draw_call.options.backface_culling,
                     pass_uniforms: WasmPtrF32::new(pass_uniforms.as_slice()),
                     draw_list_uniforms: WasmPtrF32::new(draw_list.draw_list_uniforms.as_slice()),
                     draw_call_uniforms: WasmPtrF32::new(draw_call.draw_call_uniforms.as_slice()),
@@ -471,12 +473,15 @@ impl CxOsDrawShader {
     pub fn new(in_vertex: String, in_pixel: String) -> Self {
         let vertex = format!(
             "#version 300 es
+#define VIEW_ID 0
 precision highp float;
 precision highp int;
 vec4 sample2d(sampler2D sampler, vec2 pos){{return texture(sampler, vec2(pos.x, pos.y));}}
+vec4 sample2d_lod(sampler2D sampler, vec2 pos, float lod){{return textureLod(sampler, vec2(pos.x, pos.y), lod);}}
 vec4 sample2d_bgra(sampler2D sampler, vec2 pos){{return texture(sampler, vec2(pos.x, pos.y)).zyxw;}}
 vec4 sample2d_rt(sampler2D sampler, vec2 pos){{return texture(sampler, vec2(pos.x, 1.0 - pos.y));}}
 vec4 samplecube(samplerCube sampler, vec3 dir){{return texture(sampler, dir);}}
+vec4 samplecube_lod(samplerCube sampler, vec3 dir, float lod){{return textureLod(sampler, dir, lod);}}
 vec4 samplecube_bgra(samplerCube sampler, vec3 dir){{return texture(sampler, dir).zyxw;}}
 vec4 depth_clip(vec4 w, vec4 c, float clip){{return c;}}
 {}",
@@ -485,12 +490,15 @@ vec4 depth_clip(vec4 w, vec4 c, float clip){{return c;}}
 
         let pixel = format!(
             "#version 300 es
+#define VIEW_ID 0
 precision highp float;
 precision highp int;
 vec4 sample2d(sampler2D sampler, vec2 pos){{return texture(sampler, vec2(pos.x, pos.y));}}
+vec4 sample2d_lod(sampler2D sampler, vec2 pos, float lod){{return textureLod(sampler, vec2(pos.x, pos.y), lod);}}
 vec4 sample2d_bgra(sampler2D sampler, vec2 pos){{return texture(sampler, vec2(pos.x, pos.y)).zyxw;}}
 vec4 sample2d_rt(sampler2D sampler, vec2 pos){{return texture(sampler, vec2(pos.x, 1.0 - pos.y));}}
 vec4 samplecube(samplerCube sampler, vec3 dir){{return texture(sampler, dir);}}
+vec4 samplecube_lod(samplerCube sampler, vec3 dir, float lod){{return textureLod(sampler, dir, lod);}}
 vec4 samplecube_bgra(samplerCube sampler, vec3 dir){{return texture(sampler, dir).zyxw;}}
 vec4 depth_clip(vec4 w, vec4 c, float clip){{return c;}}
 {}",
@@ -537,6 +545,9 @@ pub struct CxOsDrawShader {
 
 #[derive(Clone, Default)]
 pub struct CxOsTexture {}
+
+#[derive(Clone, Default)]
+pub struct CxOsUniformBuffer {}
 
 #[derive(Clone, Default)]
 pub struct CxOsGeometry {

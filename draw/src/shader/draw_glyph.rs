@@ -255,13 +255,13 @@ script_mod! {
         }
 
         fragment: fn() {
-            self.fb0 = self.pixel()
+            self.fb0 = depth_clip(self.world, self.pixel(), self.depth_clip)
         }
-        
+
         get_color: fn(){
             self.color
         }
-        
+
         pixel: fn() {
             if self.curve_count < 0.5 {
                 return vec4(0.0, 0.0, 0.0, 0.0)
@@ -455,8 +455,10 @@ pub struct DrawGlyph {
     pub rect_size: Vec2f,
     #[live]
     pub draw_clip: Vec4f,
-    #[live(1.0)]
+    #[live(0.0)]
     pub draw_depth: f32,
+    #[live(1.0)]
+    pub depth_clip: f32,
     #[live(vec4(1., 1., 1., 1.))]
     pub color: Vec4f,
     #[live]
@@ -882,7 +884,7 @@ impl DrawGlyph {
                 self.curve_tex_width.max(1)
             };
             let texels = (self.curve_data.len() / 4).max(1);
-            let height = (texels + width - 1) / width;
+            let height = texels.div_ceil(width);
             let mut data = if self.curve_data.is_empty() {
                 vec![0.0f32; width * height * 4]
             } else {
@@ -905,7 +907,7 @@ impl DrawGlyph {
                 self.band_tex_width.max(1)
             };
             let texels = (self.band_data.len() / 4).max(1);
-            let height = (texels + width - 1) / width;
+            let height = texels.div_ceil(width);
             let mut data = if self.band_data.is_empty() {
                 vec![0.0f32; width * height * 4]
             } else {

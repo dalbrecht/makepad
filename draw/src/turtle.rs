@@ -246,26 +246,17 @@ impl Size {
 
     /// Returns `true` if this is a `Size::Fill`, or `false` otherwise.
     pub fn is_fill(self) -> bool {
-        match self {
-            Self::Fill { .. } => true,
-            _ => false,
-        }
+        matches!(self, Self::Fill { .. })
     }
 
     /// Returns `true` if this is a `Size::Fixed`, or `false` otherwise.
     pub fn is_fixed(self) -> bool {
-        match self {
-            Self::Fixed(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Fixed(_))
     }
 
     /// Returns `true` if this is a `Size::Fit`, or `false` otherwise.
     pub fn is_fit(self) -> bool {
-        match self {
-            Self::Fit { .. } => true,
-            _ => false,
-        }
+        matches!(self, Self::Fit { .. })
     }
 
     /// Returns the fixed size if this is a `Size::Fixed`, or `None` otherwise.
@@ -627,6 +618,14 @@ impl Turtle {
     /// Returns the padding around the inner rectangle of each walk of this turtle.
     pub fn padding(&self) -> Inset {
         self.layout.padding
+    }
+
+    /// Sets the left padding of this turtle's layout.
+    ///
+    /// This is useful for adjusting the hanging indent of list items
+    /// after measuring the actual width of the bullet/marker text.
+    pub fn set_padding_left(&mut self, left: f64) {
+        self.layout.padding.left = left;
     }
 
     /// Returns the alignment of each walk of this turtle with respect to it's rectangle.
@@ -1197,7 +1196,7 @@ impl DeferredWalk {
                     },
                     Flow::Down => Walk {
                         abs_pos: Some(pos + dvec2(0.0, turtle.total_resolved_length_to(index))),
-                        margin: margin,
+                        margin,
                         height: Size::Fixed(turtle.resolve_fill(index)),
                         width: other_axis,
                         metrics: Metrics::default(),
@@ -1444,7 +1443,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         // Now that the current turtle's rectangle is known, we can align its finished walks.
         match turtle.flow() {
             Flow::Right { wrap: false, .. } => {
-                if turtle.deferred_fills.len() == 0 {
+                if turtle.deferred_fills.is_empty() {
                     // If walks are laid out from left to right, and there are no deferred walks,
                     // then the horizontal alignment is applied to all walks as a whole, while
                     // the vertical alignment is applied to each walk individually.
@@ -1912,7 +1911,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     }
 
     fn walk_turtle_peek(&self, walk: Walk) -> Rect {
-        if self.turtles.len() == 0 {
+        if self.turtles.is_empty() {
             return Rect::default();
         }
         let turtle = self.turtles.last().unwrap();
@@ -2066,9 +2065,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                     let inst_buf = draw_item.instances.as_mut().unwrap();
                     for i in 0..inst.instance_count {
                         if let Some(rect_pos) = sh.mapping.rect_pos {
-                            inst_buf[inst.instance_offset
-                                + rect_pos
-                                + 0
+                            inst_buf[(inst.instance_offset + rect_pos)
                                 + i * sh.mapping.instances.total_slots] += dx as f32;
                             inst_buf[inst.instance_offset
                                 + rect_pos
@@ -2076,9 +2073,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                                 + i * sh.mapping.instances.total_slots] += dy as f32;
                             if shift_clip {
                                 if let Some(draw_clip) = sh.mapping.draw_clip {
-                                    inst_buf[inst.instance_offset
-                                        + draw_clip
-                                        + 0
+                                    inst_buf[(inst.instance_offset + draw_clip)
                                         + i * sh.mapping.instances.total_slots] += dx as f32;
                                     inst_buf[inst.instance_offset
                                         + draw_clip
@@ -2165,9 +2160,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                         let inst_buf = draw_item.instances.as_mut().unwrap();
                         for i in 0..inst.instance_count {
                             if let Some(draw_clip) = sh.mapping.draw_clip {
-                                inst_buf[inst.instance_offset
-                                    + draw_clip
-                                    + 0
+                                inst_buf[(inst.instance_offset + draw_clip)
                                     + i * sh.mapping.instances.total_slots] = clip0.x as f32;
                                 inst_buf[inst.instance_offset
                                     + draw_clip
@@ -2220,7 +2213,8 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     /// matching `pop_clip_rect` will have their GPU `draw_clip` intersected
     /// with this rect. Must be balanced with `pop_clip_rect`.
     pub fn push_clip_rect(&mut self, rect: Rect) {
-        self.align_list.push(AlignEntry::BeginClip(rect.pos, rect.pos + rect.size));
+        self.align_list
+            .push(AlignEntry::BeginClip(rect.pos, rect.pos + rect.size));
     }
 
     /// Pop a clip rectangle previously pushed by `push_clip_rect`.
@@ -2264,6 +2258,13 @@ impl Turtle {
         self.used_height = height_used;
     }
 
+    /// Returns the current wrap spacing, which is the extra vertical space
+    /// added between rows when text wraps (based on the line spacing of the
+    /// most recently drawn text).
+    pub fn wrap_spacing(&self) -> f64 {
+        self.wrap_spacing
+    }
+
     pub fn set_wrap_spacing(&mut self, value: f64) {
         self.wrap_spacing = self.wrap_spacing.max(value);
     }
@@ -2273,7 +2274,7 @@ impl Turtle {
             pos: self.origin + self.layout.scroll,
             size: dvec2(self.width, self.height),
         };
-        return view.intersects(geom);
+        view.intersects(geom)
     }
 
     pub fn rel_pos(&self) -> Vec2d {
@@ -2302,14 +2303,14 @@ impl Turtle {
         if walk.width.is_fit() {
             return None;
         }
-        Some(self.next_walk_width(walk.width, walk.margin) as f64)
+        Some(self.next_walk_width(walk.width, walk.margin))
     }
 
     pub fn max_height(&self, walk: Walk) -> Option<f64> {
         if walk.height.is_fit() {
             return None;
         }
-        Some(self.next_walk_width(walk.height, walk.margin) as f64)
+        Some(self.next_walk_width(walk.height, walk.margin))
     }
 }
 

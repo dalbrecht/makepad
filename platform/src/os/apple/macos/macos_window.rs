@@ -16,7 +16,10 @@ use {
                 macos_event::MacosEvent,
             },
         },
-        window::WindowId,
+        window::{
+            MacosWindowChrome, MacosWindowConfig, MacosWindowKind, MacosWindowLevel,
+            WindowBackdrop, WindowId, WindowVisuals,
+        },
     },
     std::{cell::Cell, os::raw::c_void, rc::Rc},
 };
@@ -27,7 +30,12 @@ pub struct MacosWindow {
     pub(crate) view: ObjcId,
     pub(crate) window: ObjcId,
     pub(crate) ime_spot: Vec2d,
+    // When ime_active is false, key events are not forward to NSTextInputContext so IME dose not active.
+    pub(crate) ime_active: bool,
     pub(crate) is_fullscreen: bool,
+    pub(crate) is_popup: bool,
+    pub(crate) macos_config: MacosWindowConfig,
+    pub(crate) visual_effect_view: ObjcId,
     pub(crate) last_mouse_pos: Vec2d,
     window_delegate: ObjcId,
     live_resize_timer: ObjcId,
@@ -35,11 +43,11 @@ pub struct MacosWindow {
 }
 
 impl MacosWindow {
-    pub fn new(window_id: WindowId) -> MacosWindow {
+    fn alloc_window(window_class: *const Class, window_id: WindowId) -> MacosWindow {
         unsafe {
             let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];
 
-            let window: ObjcId = msg_send![get_macos_class_global().window, alloc];
+            let window: ObjcId = msg_send![window_class, alloc];
             let window_delegate: ObjcId = msg_send![get_macos_class_global().window_delegate, new];
             let view: ObjcId = msg_send![get_macos_class_global().view, alloc];
 
@@ -47,6 +55,9 @@ impl MacosWindow {
             with_macos_app(|app| app.cocoa_windows.push((window, view)));
             MacosWindow {
                 is_fullscreen: false,
+                is_popup: false,
+                macos_config: MacosWindowConfig::default(),
+                visual_effect_view: nil,
                 live_resize_timer: nil,
                 window_delegate: window_delegate,
                 window: window,
@@ -55,12 +66,112 @@ impl MacosWindow {
                 last_window_geom: None,
                 ime_spot: Vec2d::default(),
                 last_mouse_pos: Vec2d::default(),
+                ime_active: false,
             }
         }
     }
 
+    pub fn new(window_id: WindowId, macos_config: MacosWindowConfig) -> MacosWindow {
+        let window_class = match macos_config.kind {
+            MacosWindowKind::Standard => get_macos_class_global().window,
+            MacosWindowKind::FloatingPanel => get_macos_class_global().panel,
+        };
+        let mut window = Self::alloc_window(window_class, window_id);
+        window.macos_config = macos_config.normalized();
+        window
+    }
+
+    pub fn new_popup(window_id: WindowId) -> MacosWindow {
+        Self::alloc_window(get_macos_class_global().window, window_id)
+    }
+
+    fn style_mask_for_config(config: MacosWindowConfig) -> u64 {
+        let mut style_mask = NSWindowStyleMask::NSFullSizeContentViewWindowMask as u64;
+
+        match config.chrome {
+            MacosWindowChrome::Borderless => {
+                style_mask |= NSWindowStyleMask::NSBorderlessWindowMask as u64;
+            }
+            MacosWindowChrome::Titled => {
+                style_mask |= NSWindowStyleMask::NSTitledWindowMask as u64;
+                if config.closable {
+                    style_mask |= NSWindowStyleMask::NSClosableWindowMask as u64;
+                }
+                if config.miniaturizable {
+                    style_mask |= NSWindowStyleMask::NSMiniaturizableWindowMask as u64;
+                }
+                if config.resizable {
+                    style_mask |= NSWindowStyleMask::NSResizableWindowMask as u64;
+                }
+            }
+        }
+
+        if config.kind == MacosWindowKind::FloatingPanel && config.non_activating {
+            style_mask |= NSWindowStyleMask::NSNonactivatingPanelWindowMask as u64;
+        }
+
+        style_mask
+    }
+
+    fn collection_behavior_for_config(config: MacosWindowConfig) -> u64 {
+        let mut collection_behavior = 0;
+        if config.join_all_spaces {
+            collection_behavior |= NSWindowCollectionBehaviorCanJoinAllSpaces;
+        }
+        if config.full_screen_auxiliary {
+            collection_behavior |= NSWindowCollectionBehaviorFullScreenAuxiliary;
+        }
+        collection_behavior
+    }
+
+    fn level_to_native(level: MacosWindowLevel) -> i64 {
+        match level {
+            MacosWindowLevel::Normal => NSNormalWindowLevel,
+            MacosWindowLevel::Floating => NSFloatingWindowLevel,
+            MacosWindowLevel::StatusBar => NSStatusWindowLevel,
+        }
+    }
+
+    pub fn set_window_level(&mut self, level: MacosWindowLevel) {
+        unsafe {
+            let () = msg_send![self.window, setLevel: Self::level_to_native(level)];
+        }
+    }
+
+    pub fn set_topmost(&mut self, topmost: bool) {
+        let level = if topmost {
+            MacosWindowLevel::Floating
+        } else {
+            MacosWindowLevel::Normal
+        };
+        self.set_window_level(level);
+        self.send_change_event();
+    }
+
+    fn is_topmost(&self) -> bool {
+        let level: i64 = unsafe { msg_send![self.window, level] };
+        level > NSNormalWindowLevel
+    }
+
+    pub fn is_nonactivating_panel(&self) -> bool {
+        self.macos_config.kind == MacosWindowKind::FloatingPanel && self.macos_config.non_activating
+    }
+
+    pub fn needs_panel_to_become_key(&self) -> bool {
+        self.macos_config.kind == MacosWindowKind::FloatingPanel
+            && self.macos_config.becomes_key_only_if_needed
+    }
+
     // complete window initialization with pointers to self
-    pub fn init(&mut self, title: &str, size: Vec2d, position: Option<Vec2d>, is_fullscreen: bool) {
+    pub fn init(
+        &mut self,
+        title: &str,
+        size: Vec2d,
+        position: Option<Vec2d>,
+        is_fullscreen: bool,
+        macos_config: MacosWindowConfig,
+    ) {
+        self.macos_config = macos_config.normalized();
         unsafe {
             let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];
 
@@ -84,11 +195,7 @@ impl MacosWindow {
                 origin: left_top,
                 size: ns_size,
             };
-            let window_masks = NSWindowStyleMask::NSClosableWindowMask as u64
-                | NSWindowStyleMask::NSMiniaturizableWindowMask as u64
-                | NSWindowStyleMask::NSResizableWindowMask as u64
-                | NSWindowStyleMask::NSTitledWindowMask as u64
-                | NSWindowStyleMask::NSFullSizeContentViewWindowMask as u64;
+            let window_masks = Self::style_mask_for_config(self.macos_config);
 
             let () = msg_send![
                 self.window,
@@ -105,16 +212,36 @@ impl MacosWindow {
             let () = msg_send![self.window, setTitle: title];
             let () = msg_send![self.window, setTitleVisibility: NSWindowTitleVisibility::NSWindowTitleHidden];
             let () = msg_send![self.window, setTitlebarAppearsTransparent: YES];
+            let () = msg_send![
+                self.window,
+                setCollectionBehavior: Self::collection_behavior_for_config(self.macos_config)
+            ];
+            self.set_window_level(self.macos_config.level);
 
-            //let subviews:id = msg_send![self.window, getSubviews];
-            //println!("{}", subviews as u64);
+            if self.macos_config.kind == MacosWindowKind::FloatingPanel {
+                let becomes_key_only_if_needed = if self.macos_config.becomes_key_only_if_needed {
+                    YES
+                } else {
+                    NO
+                };
+                let () = msg_send![self.window, setHidesOnDeactivate: NO];
+                let () = msg_send![
+                    self.window,
+                    setBecomesKeyOnlyIfNeeded: becomes_key_only_if_needed
+                ];
+            }
+
             let () = msg_send![self.window, setAcceptsMouseMovedEvents: YES];
 
-            let () = msg_send![self.view, setLayerContentsRedrawPolicy: 2]; //duringViewResize
+            let () = msg_send![self.view, setLayerContentsRedrawPolicy: 2];
 
             let () = msg_send![self.window, setContentView: self.view];
             let () = msg_send![self.window, makeFirstResponder: self.view];
-            let () = msg_send![self.window, makeKeyAndOrderFront: nil];
+            if self.is_nonactivating_panel() {
+                let () = msg_send![self.window, orderFront: nil];
+            } else {
+                let () = msg_send![self.window, makeKeyAndOrderFront: nil];
+            }
 
             let rect = NSRect {
                 origin: NSPoint { x: 0., y: 0. },
@@ -144,8 +271,98 @@ impl MacosWindow {
                 self.maximize();
             }
 
-            // Set application icon from default icon
             Self::set_application_icon();
+
+            let () = msg_send![pool, drain];
+        }
+    }
+
+    // complete window initialization with pointers to self
+    /// Initialize as a popup window (borderless NSPanel at popup menu level).
+    /// `position` is in screen coordinates. `parent_window` is the parent NSWindow for coordinate conversion.
+    pub fn init_popup(&mut self, size: Vec2d, position: Vec2d, parent_window: ObjcId) {
+        self.is_popup = true;
+        unsafe {
+            let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];
+
+            // set the backpointers
+            (*self.window_delegate).set_ivar("macos_window_ptr", self as *mut _ as *mut c_void);
+            let () = msg_send![self.view, initWithPtr: self as *mut _ as *mut c_void];
+
+            // Convert position from parent-client coordinates to screen coordinates.
+            // The position is relative to the parent window's content view origin (top-left).
+            let parent_frame: NSRect = msg_send![parent_window, frame];
+            let parent_content: NSRect = msg_send![parent_window, contentLayoutRect];
+            // macOS screen coordinates: origin at bottom-left.
+            // Parent content top-left in screen coords:
+            let screen_x = parent_frame.origin.x + parent_content.origin.x + position.x;
+            // Flip Y: parent content top is at frame.origin.y + frame.size.height - titlebar
+            let parent_content_top =
+                parent_frame.origin.y + parent_frame.size.height - parent_content.origin.y;
+            let screen_y = parent_content_top - position.y - size.y;
+
+            let ns_size = NSSize {
+                width: size.x as f64,
+                height: size.y as f64,
+            };
+            let window_frame = NSRect {
+                origin: NSPoint {
+                    x: screen_x,
+                    y: screen_y,
+                },
+                size: ns_size,
+            };
+
+            // NSPanel with borderless style
+            let window_masks = NSWindowStyleMask::NSBorderlessWindowMask as u64
+                | NSWindowStyleMask::NSFullSizeContentViewWindowMask as u64;
+
+            let () = msg_send![
+                self.window,
+                initWithContentRect: window_frame
+                styleMask: window_masks as u64
+                backing: NSBackingStoreType::NSBackingStoreBuffered as u64
+                defer: NO
+            ];
+
+            let () = msg_send![self.window, setDelegate: self.window_delegate];
+            let () = msg_send![self.window, setReleasedWhenClosed: NO];
+
+            let () = msg_send![self.window, setLevel: NSPopUpMenuWindowLevel];
+            let () = msg_send![self.window, setHasShadow: YES];
+
+            let () = msg_send![self.window, setAcceptsMouseMovedEvents: YES];
+
+            let () = msg_send![self.view, setLayerContentsRedrawPolicy: 2]; //duringViewResize
+
+            let () = msg_send![self.window, setContentView: self.view];
+            let () = msg_send![self.window, makeFirstResponder: self.view];
+
+            // orderFront instead of makeKeyAndOrderFront to avoid stealing key focus initially
+            // Then makeKey so we get resignKey on focus loss
+            let () = msg_send![self.window, orderFront: nil];
+            let () = msg_send![self.window, makeKeyWindow];
+
+            let rect = NSRect {
+                origin: NSPoint { x: 0., y: 0. },
+                size: ns_size,
+            };
+            let track: ObjcId = msg_send![class!(NSTrackingArea), alloc];
+            let track: ObjcId = msg_send![
+                track,
+                initWithRect: rect
+                options: NSTrackignActiveAlways
+                    | NSTrackingInVisibleRect
+                    | NSTrackingMouseEnteredAndExited
+                    | NSTrackingMouseMoved
+                    | NSTrackingCursorUpdate
+                owner: self.view
+                userInfo: nil
+            ];
+            let () = msg_send![self.view, addTrackingArea: track];
+
+            let input_context: ObjcId = msg_send![self.view, inputContext];
+            let () = msg_send![input_context, invalidateCharacterCoordinates];
 
             let () = msg_send![pool, drain];
         }
@@ -279,6 +496,67 @@ impl MacosWindow {
         }
     }
 
+    pub fn set_window_visuals(&mut self, visuals: WindowVisuals) {
+        const NS_VIEW_WIDTH_SIZABLE: i64 = 1 << 1;
+        const NS_VIEW_HEIGHT_SIZABLE: i64 = 1 << 4;
+        const NS_VISUAL_EFFECT_MATERIAL_HUD_WINDOW: i64 = 1;
+        const NS_VISUAL_EFFECT_MATERIAL_UNDER_WINDOW_BACKGROUND: i64 = 12;
+        const NS_VISUAL_EFFECT_BLENDING_MODE_BEHIND_WINDOW: i64 = 0;
+        const NS_VISUAL_EFFECT_STATE_ACTIVE: i64 = 1;
+
+        unsafe {
+            let opaque = if visuals.transparent { NO } else { YES };
+            let () = msg_send![self.window, setOpaque: opaque];
+            let bg_color = if visuals.transparent {
+                let clear: ObjcId = msg_send![class!(NSColor), clearColor];
+                clear
+            } else {
+                let color: ObjcId = msg_send![class!(NSColor), windowBackgroundColor];
+                color
+            };
+            let () = msg_send![self.window, setBackgroundColor: bg_color];
+
+            let use_effect = visuals.backdrop != WindowBackdrop::None;
+            if use_effect {
+                let effect_view = if self.visual_effect_view == nil {
+                    let effect_view: ObjcId = msg_send![class!(NSVisualEffectView), alloc];
+                    let bounds: NSRect = msg_send![self.view, bounds];
+                    let effect_view: ObjcId = msg_send![effect_view, initWithFrame: bounds];
+                    let () = msg_send![
+                        effect_view,
+                        setAutoresizingMask: NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE
+                    ];
+                    let () = msg_send![self.view, addSubview: effect_view positioned: 0i64 relativeTo: nil];
+                    self.visual_effect_view = effect_view;
+                    effect_view
+                } else {
+                    self.visual_effect_view
+                };
+                let material = match visuals.backdrop {
+                    WindowBackdrop::Blur => NS_VISUAL_EFFECT_MATERIAL_HUD_WINDOW,
+                    WindowBackdrop::Auto | WindowBackdrop::Vibrancy => {
+                        NS_VISUAL_EFFECT_MATERIAL_UNDER_WINDOW_BACKGROUND
+                    }
+                    WindowBackdrop::Mica | WindowBackdrop::Acrylic => {
+                        NS_VISUAL_EFFECT_MATERIAL_UNDER_WINDOW_BACKGROUND
+                    }
+                    WindowBackdrop::None => NS_VISUAL_EFFECT_MATERIAL_UNDER_WINDOW_BACKGROUND,
+                };
+                let () = msg_send![effect_view, setMaterial: material];
+                let () = msg_send![
+                    effect_view,
+                    setBlendingMode: NS_VISUAL_EFFECT_BLENDING_MODE_BEHIND_WINDOW
+                ];
+                let () = msg_send![effect_view, setState: NS_VISUAL_EFFECT_STATE_ACTIVE];
+                let alpha = visuals.backdrop_intensity.clamp(0.0, 1.0) as f64;
+                let () = msg_send![effect_view, setAlphaValue: alpha];
+            } else if self.visual_effect_view != nil {
+                let () = msg_send![self.visual_effect_view, removeFromSuperview];
+                self.visual_effect_view = nil;
+            }
+        }
+    }
+
     pub fn time_now(&self) -> f64 {
         with_macos_app(|app| app.time_now())
     }
@@ -286,7 +564,7 @@ impl MacosWindow {
     pub fn get_window_geom(&self) -> WindowGeom {
         WindowGeom {
             xr_is_presenting: false,
-            is_topmost: false,
+            is_topmost: self.is_topmost(),
             is_fullscreen: self.is_fullscreen,
             can_fullscreen: false,
             inner_size: self.get_inner_size(),
@@ -389,6 +667,15 @@ impl MacosWindow {
     }
 
     pub fn send_lost_focus_event(&mut self) {
+        if self.is_popup {
+            self.do_callback(MacosEvent::PopupDismissed(
+                crate::event::window::PopupDismissedEvent {
+                    window_id: self.window_id,
+                    reason: crate::event::window::PopupDismissReason::FocusLost,
+                },
+            ));
+            return;
+        }
         self.do_callback(MacosEvent::WindowLostFocus(self.window_id));
     }
 
@@ -430,7 +717,9 @@ impl MacosWindow {
     pub fn send_mouse_move(&mut self, _event: ObjcId, pos: Vec2d, modifiers: KeyModifiers) {
         self.last_mouse_pos = pos;
 
-        with_macos_app(|app| app.startup_focus_hack());
+        if !self.is_nonactivating_panel() {
+            with_macos_app(|app| app.startup_focus_hack());
+        }
 
         self.do_callback(MacosEvent::MouseMove(MouseMoveEvent {
             window_id: self.window_id,
@@ -483,6 +772,10 @@ impl MacosWindow {
             replace_last: replace_last,
             ..Default::default()
         }))
+    }
+
+    pub fn set_ime_active(&mut self, active: bool) {
+        self.ime_active = active;
     }
 
     #[cfg(target_os = "macos")]

@@ -266,6 +266,7 @@ impl Cx {
                     state.ensure_size_defaults();
                     self.redraw_all();
                 }
+                StudioToApp::RunViewFrameRequest(_) => {}
                 StudioToApp::Tick => {
                     if SignalToUI::check_and_clear_ui_signal() {
                         self.handle_script_signals();
@@ -386,14 +387,12 @@ impl Cx {
                     state.presentable_id = Some(id);
                     id
                 };
-                write_stdout_msg(&AppToStudio::DrawCompleteAndFlip(
-                    PresentableDraw {
-                        window_id,
-                        target_id,
-                        width,
-                        height,
-                    },
-                ));
+                write_stdout_msg(&AppToStudio::DrawCompleteAndFlip(PresentableDraw {
+                    window_id,
+                    target_id,
+                    width,
+                    height,
+                }));
             } else {
                 crate::log!(
                     "headless frame written: {} ({}x{})",
@@ -460,6 +459,34 @@ impl Cx {
                             kind_id: window.kind_id,
                         });
                     }
+                    self.redraw_all();
+                }
+                CxOsOp::CreatePopupWindow {
+                    window_id,
+                    parent_window_id,
+                    position,
+                    size,
+                    grab_keyboard,
+                } => {
+                    while window_id.id() >= windows.len() {
+                        windows.push(Default::default());
+                    }
+                    let state = &mut windows[window_id.id()];
+                    state.created = true;
+                    state.width = size.x.max(1.0) as u32;
+                    state.height = size.y.max(1.0) as u32;
+                    state.ensure_size_defaults();
+
+                    let window = &mut self.windows[window_id];
+                    window.is_created = true;
+                    window.window_geom.position = position;
+                    window.window_geom.inner_size = size;
+                    window.window_geom.outer_size = size;
+                    window.is_popup = true;
+                    window.popup_parent = Some(parent_window_id);
+                    window.popup_position = Some(position);
+                    window.popup_size = Some(size);
+                    window.popup_grab_keyboard = grab_keyboard;
                     self.redraw_all();
                 }
                 CxOsOp::ResizeWindow(window_id, size) => {

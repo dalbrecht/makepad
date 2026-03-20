@@ -32,26 +32,31 @@ use wayland_protocols::{
             wp_cursor_shape_manager_v1::{self, WpCursorShapeManagerV1},
         },
         fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
+        primary_selection::zv1::client::{
+            zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
+            zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
+        },
         text_input::zv3::client::{zwp_text_input_manager_v3, zwp_text_input_v3},
         viewporter::client::{wp_viewport, wp_viewporter},
     },
     xdg::{
         self,
         decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
-        shell::client::{xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
-        toplevel_icon::v1::client::{
-            xdg_toplevel_icon_manager_v1, xdg_toplevel_icon_v1,
-        },
+        shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
+        toplevel_icon::v1::client::{xdg_toplevel_icon_manager_v1, xdg_toplevel_icon_v1},
     },
 };
 
 use crate::{
-    cx_native::EventFlow, event::ScrollEvent, event::WindowGeom, select_timer::SelectTimers,
-    wayland::wayland_app::WaylandApp, x11::xlib_event::XlibEvent, KeyCode,
-    WindowCloseRequestedEvent, WindowGeomChangeEvent, WindowId, WindowMovedEvent,
+    cx_native::EventFlow,
+    event::{PopupDismissReason, PopupDismissedEvent, ScrollEvent, WindowGeom},
+    select_timer::SelectTimers,
+    wayland::wayland_app::WaylandApp,
+    x11::xlib_event::XlibEvent,
+    KeyCode, WindowCloseRequestedEvent, WindowGeomChangeEvent, WindowId, WindowMovedEvent,
 };
 
-use super::opengl_wayland::WaylandWindow;
+use super::opengl_wayland::{WaylandPopupWindow, WaylandWindow};
 
 pub(crate) struct ClipboardOffer {
     offer: wl_data_offer::WlDataOffer,
@@ -75,6 +80,8 @@ pub(crate) struct WaylandState {
     pub(crate) data_offers: Vec<ClipboardOffer>,
     pending_clipboard_read: Option<PendingClipboardRead>,
     pending_paste_text_input: Option<String>,
+    /// Queued clipboard copy content waiting for a serial from keyboard/pointer.
+    pub(crate) pending_clipboard_copy: Option<String>,
     pub(crate) internal_drag_items: Option<Arc<Vec<DragItem>>>,
     pub(crate) clipboard_text: String,
     pub(crate) cursor_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
@@ -86,7 +93,9 @@ pub(crate) struct WaylandState {
     pub(crate) decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub(crate) icon_manager: Option<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1>,
     pub(crate) windows: Vec<WaylandWindow>,
-    pub(crate) current_window: Option<WindowId>,
+    pub(crate) popups: Vec<WaylandPopupWindow>,
+    pub(crate) pointer_window: Option<WindowId>,
+    pub(crate) keyboard_window: Option<WindowId>,
     pub(crate) modifiers: KeyModifiers,
     pub(crate) timers: SelectTimers,
     pub(crate) scale_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
@@ -95,6 +104,13 @@ pub(crate) struct WaylandState {
     pub(crate) xkb_cx: xkb_sys::XkbContext,
     pub(crate) text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pub(crate) text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
+    pub(crate) primary_selection_manager:
+        Option<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1>,
+    pub(crate) primary_selection_device:
+        Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
+    pub(crate) primary_selection_source:
+        Option<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1>,
+    pub(crate) primary_selection_text: String,
     pub(crate) last_resize_edge: Option<xdg_toplevel::ResizeEdge>,
     event_callback: Option<Box<dyn FnMut(&mut WaylandState, XlibEvent)>>,
 
@@ -119,6 +135,7 @@ impl WaylandState {
             data_offers: Vec::new(),
             pending_clipboard_read: None,
             pending_paste_text_input: None,
+            pending_clipboard_copy: None,
             internal_drag_items: None,
             clipboard_text: String::new(),
             cursor_manager: None,
@@ -129,7 +146,9 @@ impl WaylandState {
             scale_manager: None,
             viewporter: None,
             windows: Vec::new(),
-            current_window: None,
+            popups: Vec::new(),
+            pointer_window: None,
+            keyboard_window: None,
             pointer_serial: None,
             keyboard_serial: None,
             modifiers: KeyModifiers::default(),
@@ -137,6 +156,10 @@ impl WaylandState {
             xkb_cx: xkb_sys::XkbContext::new().unwrap(),
             text_input: None,
             text_input_manager: None,
+            primary_selection_manager: None,
+            primary_selection_device: None,
+            primary_selection_source: None,
+            primary_selection_text: String::new(),
             last_mouse_pos: dvec2(0., 0.),
             last_resize_edge: None,
             timers: SelectTimers::new(),
@@ -147,6 +170,36 @@ impl WaylandState {
             event_flow: EventFlow::Wait,
             event_loop_running: true,
         }
+    }
+
+    fn window_id_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<WindowId> {
+        let surface_id = surface.id();
+        self.windows
+            .iter()
+            .find(|win| win.base_surface.id() == surface_id)
+            .map(|win| win.window_id)
+            .or_else(|| {
+                self.popups
+                    .iter()
+                    .find(|win| win.base_surface.id() == surface_id)
+                    .map(|win| win.window_id)
+            })
+    }
+
+    pub(crate) fn xdg_surface_for_window(
+        &self,
+        window_id: WindowId,
+    ) -> Option<xdg_surface::XdgSurface> {
+        self.windows
+            .iter()
+            .find(|win| win.window_id == window_id)
+            .map(|win| win.xdg_surface.clone())
+            .or_else(|| {
+                self.popups
+                    .iter()
+                    .find(|win| win.window_id == window_id)
+                    .map(|win| win.xdg_surface.clone())
+            })
     }
 }
 
@@ -228,8 +281,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     state.viewporter = Some(viewporter);
                 }
                 "wl_shm" => {
-                    let shm =
-                        wl_registry.bind::<wl_shm::WlShm, _, _>(name, 1, qhandle, ());
+                    let shm = wl_registry.bind::<wl_shm::WlShm, _, _>(name, 1, qhandle, ());
                     state.shm = Some(shm);
                 }
                 "xdg_toplevel_icon_manager_v1" => {
@@ -251,6 +303,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                         (),
                     );
                     state.text_input_manager = Some(text_input_manager);
+                }
+                "zwp_primary_selection_device_manager_v1" => {
+                    let manager = wl_registry
+                        .bind::<zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1, _, _>(
+                        name,
+                        1,
+                        qhandle,
+                        (),
+                    );
+                    state.primary_selection_manager = Some(manager);
+                    state.ensure_primary_selection_device(qhandle);
                 }
                 _ => {}
             }
@@ -290,7 +353,19 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, WindowId> for Wayland
                     .iter_mut()
                     .find(|win| win.window_id == *window_id)
                 {
-                    println!("preffered scale: {}", scale as f64 / 120.);
+                    let old_geom = window.window_geom.clone();
+                    let mut new_geom = window.window_geom.clone();
+                    new_geom.dpi_factor = scale as f64 / 120.;
+                    state.do_callback(XlibEvent::WindowGeomChange(WindowGeomChangeEvent {
+                        window_id: *window_id,
+                        old_geom,
+                        new_geom,
+                    }));
+                } else if let Some(window) = state
+                    .popups
+                    .iter_mut()
+                    .find(|win| win.window_id == *window_id)
+                {
                     let old_geom = window.window_geom.clone();
                     let mut new_geom = window.window_geom.clone();
                     new_geom.dpi_factor = scale as f64 / 120.;
@@ -384,10 +459,84 @@ impl Dispatch<xdg_surface::XdgSurface, WindowId> for WaylandState {
                     });
                 }
                 window.configured = true;
+            } else if let Some(window) = state
+                .popups
+                .iter_mut()
+                .find(|win| win.window_id == *window_id)
+            {
+                if !window.configured {
+                    let mut old_geom = window.window_geom.clone();
+                    old_geom.inner_size = dvec2(0., 0.);
+                    old_geom.outer_size = dvec2(0., 0.);
+                    first_configure_event = Some(WindowGeomChangeEvent {
+                        window_id: *window_id,
+                        old_geom,
+                        new_geom: window.window_geom.clone(),
+                    });
+                }
+                window.configured = true;
             }
             if let Some(event) = first_configure_event {
                 state.do_callback(XlibEvent::WindowGeomChange(event));
             }
+        }
+    }
+}
+
+impl Dispatch<xdg_popup::XdgPopup, WindowId> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _xdg_popup: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        window_id: &WindowId,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let mut geom_change = None;
+                if let Some(popup) = state
+                    .popups
+                    .iter_mut()
+                    .find(|popup| popup.window_id == *window_id)
+                {
+                    let old_geom = popup.window_geom.clone();
+                    popup.window_geom.position = dvec2(x as f64, y as f64);
+                    if width > 0 && height > 0 {
+                        popup.window_geom.inner_size = dvec2(width as f64, height as f64);
+                        popup.window_geom.outer_size = popup.window_geom.inner_size;
+                    }
+                    if popup.window_geom != old_geom {
+                        geom_change = Some(WindowGeomChangeEvent {
+                            window_id: *window_id,
+                            old_geom,
+                            new_geom: popup.window_geom.clone(),
+                        });
+                    }
+                }
+                if let Some(event) = geom_change {
+                    state.do_callback(XlibEvent::WindowGeomChange(event));
+                }
+            }
+            xdg_popup::Event::PopupDone => {
+                // WindowClosed must fire before PopupDismissed so the
+                // platform can access the CxWindow pool entry (valid
+                // generation) before the app drops its WindowHandle
+                // which frees the pool slot.
+                state.do_callback(XlibEvent::WindowClosed(WindowClosedEvent {
+                    window_id: *window_id,
+                }));
+                state.do_callback(XlibEvent::PopupDismissed(PopupDismissedEvent {
+                    window_id: *window_id,
+                    reason: PopupDismissReason::Compositor,
+                }));
+            }
+            _ => {}
         }
     }
 }
@@ -583,7 +732,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandState {
                 cursor_end,
             } => {}
             zwp_text_input_v3::Event::CommitString { text } => {
-                if let Some(text_str) = text {
+                if let Some(text_str) = text.filter(|text| !text.chars().all(char::is_control)) {
                     state.do_callback(XlibEvent::TextInput(TextInputEvent {
                         input: text_str,
                         replace_last: false,
@@ -597,6 +746,58 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandState {
                 after_length,
             } => {}
             zwp_text_input_v3::Event::Done { serial } => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1, ()> for WaylandState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        _event: <zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // We only set primary selection, not read it.
+    }
+
+    fn event_created_child(
+        opcode: u16,
+        qhandle: &QueueHandle<Self>,
+    ) -> Arc<dyn wayland_client::backend::ObjectData> {
+        match opcode {
+            zwp_primary_selection_device_v1::EVT_DATA_OFFER_OPCODE => {
+                qhandle
+                    .make_data::<zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1, ()>(())
+            }
+            _ => unreachable!(
+                "zwp_primary_selection_device_v1 created unknown child for opcode {}",
+                opcode
+            ),
+        }
+    }
+}
+
+impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _proxy: &zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+        event: <zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_primary_selection_source_v1::Event::Send { mime_type: _, fd } => {
+                use std::io::Write;
+                let mut file = std::fs::File::from(fd);
+                let _ = file.write_all(state.primary_selection_text.as_bytes());
+            }
+            zwp_primary_selection_source_v1::Event::Cancelled => {
+                state.primary_selection_source = None;
+            }
             _ => {}
         }
     }
@@ -630,12 +831,39 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
             wl_keyboard::Event::Enter {
                 serial,
                 surface,
-                keys,
+                keys: _,
             } => {
-                // state.do_callback(XlibEvent::AppGotFocus);
+                state.keyboard_serial = Some(serial);
+                state.flush_pending_clipboard_copy(qhandle, serial);
+                if let Some(window_id) = state.window_id_for_surface(&surface) {
+                    if state.keyboard_window != Some(window_id) {
+                        if let Some(prev) = state.keyboard_window {
+                            state.do_callback(XlibEvent::WindowLostFocus(prev));
+                        }
+                        state.keyboard_window = Some(window_id);
+                        state.do_callback(XlibEvent::WindowGotFocus(window_id));
+                    }
+                }
             }
             wl_keyboard::Event::Leave { serial, surface } => {
-                // state.do_callback(XlibEvent::AppLostFocus);
+                state.keyboard_serial = Some(serial);
+                state.flush_pending_clipboard_copy(qhandle, serial);
+                if let Some(window_id) = state.window_id_for_surface(&surface) {
+                    if state.keyboard_window == Some(window_id) {
+                        state.keyboard_window = None;
+                        state.do_callback(XlibEvent::WindowLostFocus(window_id));
+                    }
+                }
+                {
+                    let popup_ids: Vec<_> =
+                        state.popups.iter().rev().map(|p| p.window_id).collect();
+                    for window_id in popup_ids {
+                        state.do_callback(XlibEvent::PopupDismissed(PopupDismissedEvent {
+                            window_id,
+                            reason: PopupDismissReason::FocusLost,
+                        }));
+                    }
+                }
             }
             wl_keyboard::Event::Key {
                 serial,
@@ -647,6 +875,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                     match key_state {
                         wl_keyboard::KeyState::Pressed => {
                             state.keyboard_serial = Some(serial);
+                            state.flush_pending_clipboard_copy(qhandle, serial);
                             let (key_code, text_str) =
                                 if let Some(xkb_state) = state.xkb_state.as_mut() {
                                     (
@@ -695,7 +924,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                                 time: state.time_now(),
                             }));
 
-                            if !block_text && !text_str.is_empty() {
+                            if !block_text && text_str.chars().any(|ch| !ch.is_control()) {
                                 state.do_callback(XlibEvent::TextInput(TextInputEvent {
                                     input: text_str,
                                     replace_last: false,
@@ -769,33 +998,25 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x,
-                surface_y,
+                surface_x: _,
+                surface_y: _,
             } => {
                 state.pointer_serial = Some(serial);
-                let mut window_id = None;
-                state.windows.iter().for_each(|win| {
-                    if win.base_surface.id() == surface.id() {
-                        window_id = Some(win.window_id);
-                        state.current_window = window_id;
-                    }
-                });
-                if let Some(window_id) = window_id {
-                    state.do_callback(XlibEvent::WindowGotFocus(window_id));
-                }
+                state.flush_pending_clipboard_copy(qhandle, serial);
+                state.pointer_window = state.window_id_for_surface(&surface);
             }
             wl_pointer::Event::Leave { serial, surface: _ } => {
                 state.pointer_serial = Some(serial);
-                if let Some(window_id) = state.current_window {
-                    state.do_callback(XlibEvent::WindowLostFocus(window_id));
-                }
+                state.flush_pending_clipboard_copy(qhandle, serial);
+                state.pointer_window = None;
+                state.last_resize_edge = None;
             }
             wl_pointer::Event::Motion {
                 time,
                 surface_x,
                 surface_y,
             } => {
-                if let Some(window_id) = state.current_window {
+                if let Some(window_id) = state.pointer_window {
                     let pos = dvec2(surface_x as f64, surface_y as f64);
                     state.last_mouse_pos = pos;
 
@@ -896,44 +1117,68 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
                 state: key_state,
             } => {
                 state.pointer_serial = Some(serial);
+                state.flush_pending_clipboard_copy(qhandle, serial);
+                // Outside-click popup dismissal: if press lands on a
+                // regular window while popups are open, fire dismiss.
+                if let WEnum::Value(ButtonState::Pressed) = key_state {
+                    if let Some(win_id) = state.pointer_window {
+                        if state.windows.iter().any(|w| w.window_id == win_id)
+                            && !state.popups.is_empty()
+                        {
+                            let popup_ids: Vec<_> =
+                                state.popups.iter().rev().map(|p| p.window_id).collect();
+                            for popup_wid in popup_ids {
+                                state.do_callback(XlibEvent::PopupDismissed(PopupDismissedEvent {
+                                    window_id: popup_wid,
+                                    reason: PopupDismissReason::OutsideClick,
+                                }));
+                            }
+                        }
+                    }
+                }
                 if let Some(btn) = wayland_type::from_mouse(button) {
-                    if let Some(window_id) = state.current_window {
+                    if let Some(window_id) = state.pointer_window {
                         match key_state {
                             WEnum::Value(ButtonState::Pressed) => {
                                 if btn == MouseButton::PRIMARY {
-                                    // Edge resize takes priority
-                                    if let Some(resize_edge) = state.last_resize_edge.take() {
-                                        if let (Some(seat), Some(window)) = (
-                                            state.seat.as_ref(),
-                                            state
-                                                .windows
-                                                .iter()
-                                                .find(|win| win.window_id == window_id),
-                                        ) {
-                                            window.toplevel.resize(seat, serial, resize_edge);
-                                            return;
+                                    if state.windows.iter().any(|win| win.window_id == window_id) {
+                                        // Edge resize takes priority
+                                        if let Some(resize_edge) = state.last_resize_edge.take() {
+                                            if let (Some(seat), Some(window)) = (
+                                                state.seat.as_ref(),
+                                                state
+                                                    .windows
+                                                    .iter()
+                                                    .find(|win| win.window_id == window_id),
+                                            ) {
+                                                window.toplevel.resize(seat, serial, resize_edge);
+                                                return;
+                                            }
                                         }
-                                    }
 
-                                    let response =
-                                        Rc::new(Cell::new(WindowDragQueryResponse::NoAnswer));
-                                    state.do_callback(XlibEvent::WindowDragQuery(
-                                        WindowDragQueryEvent {
-                                            window_id,
-                                            abs: state.last_mouse_pos,
-                                            response: response.clone(),
-                                        },
-                                    ));
-                                    if matches!(response.get(), WindowDragQueryResponse::Caption) {
-                                        if let (Some(seat), Some(window)) = (
-                                            state.seat.as_ref(),
-                                            state
-                                                .windows
-                                                .iter()
-                                                .find(|win| win.window_id == window_id),
+                                        let response =
+                                            Rc::new(Cell::new(WindowDragQueryResponse::NoAnswer));
+                                        state.do_callback(XlibEvent::WindowDragQuery(
+                                            WindowDragQueryEvent {
+                                                window_id,
+                                                abs: state.last_mouse_pos,
+                                                response: response.clone(),
+                                            },
+                                        ));
+                                        if matches!(
+                                            response.get(),
+                                            WindowDragQueryResponse::Caption
                                         ) {
-                                            window.toplevel._move(seat, serial);
-                                            return;
+                                            if let (Some(seat), Some(window)) = (
+                                                state.seat.as_ref(),
+                                                state
+                                                    .windows
+                                                    .iter()
+                                                    .find(|win| win.window_id == window_id),
+                                            ) {
+                                                window.toplevel._move(seat, serial);
+                                                return;
+                                            }
                                         }
                                     }
                                 }
@@ -996,7 +1241,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
             wl_pointer::Event::Frame => {
                 let acc = state.scroll_accumulator;
                 if acc.x != 0.0 || acc.y != 0.0 {
-                    if let Some(window_id) = state.current_window {
+                    if let Some(window_id) = state.pointer_window {
                         let time_now = state.time_now();
                         let scroll = if state.scroll_is_wheel {
                             let last = state.last_scroll_time;
@@ -1066,7 +1311,9 @@ delegate_noop!(WaylandState: ignore xdg_toplevel_icon_v1::XdgToplevelIconV1);
 delegate_noop!(WaylandState: ignore wl_shm::WlShm);
 delegate_noop!(WaylandState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(WaylandState: ignore wl_buffer::WlBuffer);
-// delegate_noop!(WaylandState: ignore xdg_positioner::XdgPositioner);
+delegate_noop!(WaylandState: ignore xdg_positioner::XdgPositioner);
+delegate_noop!(WaylandState: ignore zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1);
+delegate_noop!(WaylandState: ignore zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1);
 
 impl Dispatch<xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, ()> for WaylandState {
     fn event(
@@ -1088,6 +1335,37 @@ impl WaylandState {
                 (self.data_device_manager.as_ref(), self.seat.as_ref())
             {
                 self.data_device = Some(data_device_manager.get_data_device(seat, qhandle, ()));
+            }
+        }
+    }
+
+    fn ensure_primary_selection_device(&mut self, qhandle: &QueueHandle<Self>) {
+        if self.primary_selection_device.is_none() {
+            if let (Some(manager), Some(seat)) =
+                (self.primary_selection_manager.as_ref(), self.seat.as_ref())
+            {
+                self.primary_selection_device = Some(manager.get_device(seat, qhandle, ()));
+            }
+        }
+    }
+
+    pub(crate) fn set_primary_selection_text(
+        &mut self,
+        qhandle: &QueueHandle<Self>,
+        serial: u32,
+        text: String,
+    ) {
+        self.primary_selection_text = text;
+        if let Some(device) = self.primary_selection_device.as_ref() {
+            if let Some(manager) = self.primary_selection_manager.as_ref() {
+                let source = manager.create_source(qhandle, ());
+                source.offer("text/plain;charset=utf-8".to_string());
+                source.offer("text/plain".to_string());
+                source.offer("UTF8_STRING".to_string());
+                source.offer("STRING".to_string());
+                source.offer("TEXT".to_string());
+                device.set_selection(Some(&source), serial);
+                self.primary_selection_source = Some(source);
             }
         }
     }
@@ -1133,6 +1411,17 @@ impl WaylandState {
             data_device.set_selection(Some(&source), serial);
             self.clipboard_source = Some(source);
             self.clipboard_text = text;
+        }
+    }
+
+    /// Flush a pending clipboard copy now that a serial is available.
+    pub(crate) fn flush_pending_clipboard_copy(
+        &mut self,
+        qhandle: &QueueHandle<Self>,
+        serial: u32,
+    ) {
+        if let Some(text) = self.pending_clipboard_copy.take() {
+            self.set_clipboard_text(qhandle, serial, text);
         }
     }
 

@@ -1,4 +1,5 @@
 use crate::cursor::MouseCursor;
+use crate::hub_protocol::FrameCodec;
 use crate::keyboard::{KeyEvent, TextInputEvent};
 use crate::mouse::KeyModifiers;
 use crate::shared_framebuf::{PresentableDraw, SharedSwapchain};
@@ -196,11 +197,16 @@ pub enum AppToStudio {
     EditFile(EditFile),
     SwapSelection(SwapSelection),
     Screenshot(ScreenshotResponse),
+    RunViewFrame(RunViewFrameData),
+    RunViewKeyFocusRect(RunViewKeyFocusRect),
     WidgetTreeDump(WidgetTreeDumpResponse),
     WidgetQuery(WidgetQueryResponse),
     TweakHits(TweakHitsResponse),
     BeforeStartup,
-    CreateWindow { window_id: usize, kind_id: usize },
+    CreateWindow {
+        window_id: usize,
+        kind_id: usize,
+    },
     AfterStartup,
     RequestAnimationFrame,
     SetCursor(MouseCursor),
@@ -217,6 +223,33 @@ pub struct ScreenshotResponse {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Default, SerBin, DeBin, SerJson, DeJson, Clone)]
+pub struct RunViewFrameRequest {
+    pub window_id: usize,
+    pub frame_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub dpi_factor: f64,
+}
+
+#[derive(Debug, Default, SerBin, DeBin, SerJson, DeJson, Clone)]
+pub struct RunViewFrameData {
+    pub window_id: usize,
+    pub frame_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub codec: Option<FrameCodec>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Default, SerBin, DeBin, SerJson, DeJson, Clone)]
+pub struct RunViewKeyFocusRect {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
 }
 
 #[derive(Debug, Default, SerBin, DeBin, SerJson, DeJson, Clone)]
@@ -268,6 +301,7 @@ pub struct ScreenshotRequest {
 #[derive(Debug, Default, SerBin, DeBin, SerJson, DeJson, Clone)]
 pub enum StudioToApp {
     Screenshot(ScreenshotRequest),
+    RunViewFrameRequest(RunViewFrameRequest),
     WidgetTreeDump(WidgetTreeDumpRequest),
     WidgetQuery(WidgetQueryRequest),
     KeepAlive,

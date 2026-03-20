@@ -8,7 +8,7 @@ script_mod! {
     use mod.net
     use mod.fs
     use mod.edmx
-    
+
     let self_ip = "10.0.0.112"
     let comfy_ip = "10.0.0.165:8000"
     let openai_base = "http://127.0.0.1:8080"
@@ -447,7 +447,7 @@ script_mod! {
                 return false
             }
         }
-        
+
         set_status("Fetching image from ComfyUI")
         let image = comfy_last_image(event_prompt_id, model).await()
         if image == nil {
@@ -471,7 +471,7 @@ script_mod! {
             ui.run_now_btn.set_text("Run Now")
             return false
         }
-        
+
         set_status("Uploading to EMDX " + display.ip)
         current_image_data = data
         set_preview_image(current_image_data)
@@ -660,15 +660,6 @@ script_mod! {
     app
 }
 
-impl App {
-    fn run(vm: &mut ScriptVm) -> Self {
-        crate::makepad_widgets::script_mod(vm);
-        crate::edmx::register_socket_extensions(vm);
-        crate::edmx::script_mod(vm);
-        App::from_script_mod(vm, script_mod)
-    }
-}
-
 #[derive(Script, ScriptHook)]
 pub struct App {
     #[live]
@@ -680,6 +671,13 @@ impl MatchEvent for App {
 }
 
 impl AppMain for App {
+    fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+        crate::makepad_widgets::script_mod(vm);
+        crate::edmx::register_socket_extensions(vm);
+        crate::edmx::script_mod(vm);
+        self::script_mod(vm)
+    }
+
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());

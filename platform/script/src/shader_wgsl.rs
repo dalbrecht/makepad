@@ -20,6 +20,7 @@ pub struct WgslDrawShaderSource {
     pub dyn_uniform_binding: u32,
     pub texture_binding_base: u32,
     pub sampler_binding_base: u32,
+    pub xr_depth_binding: u32,
     pub geometry_slots: usize,
     pub instance_slots: usize,
 }
@@ -31,13 +32,18 @@ enum WgslPackedFormat {
     SInt,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WgslPackedSource {
+    NumericFloat,
+    BitPackedFloat,
+}
+
 #[derive(Clone)]
 struct WgslPackedField {
     name: String,
     ty: ScriptPodType,
     slots: usize,
     offset: usize,
-    attr_format: WgslPackedFormat,
 }
 
 fn wgsl_texture_type(tex_type: TextureType) -> &'static str {
@@ -52,7 +58,7 @@ fn wgsl_texture_type(tex_type: TextureType) -> &'static str {
         TextureType::TextureCubeArray => "texture_cube_array<f32>",
         TextureType::TextureDepth => "texture_depth_2d",
         TextureType::TextureDepthArray => "texture_depth_2d_array",
-        TextureType::TextureVideo => "texture_external",
+        TextureType::TextureVideo => "texture_2d<f32>",
     }
 }
 
@@ -119,14 +125,6 @@ fn wgsl_packed_component(prefix: &str, slot: usize) -> String {
     format!("{prefix}{vec_idx}.{comp}")
 }
 
-fn wgsl_vertex_attr_vec_type(format: WgslPackedFormat) -> &'static str {
-    match format {
-        WgslPackedFormat::Float => "vec4f",
-        WgslPackedFormat::UInt => "vec4u",
-        WgslPackedFormat::SInt => "vec4i",
-    }
-}
-
 fn wgsl_push_field(
     output: &ShaderOutput,
     vm: &ScriptVm,
@@ -145,7 +143,11 @@ fn wgsl_push_field(
         WgslPackedFormat::Float
     };
 
-    if attribute_packing && attr_format != WgslPackedFormat::Float && (*offset & 3) != 0 {
+    if attribute_packing
+        && attr_format != WgslPackedFormat::Float
+        && slots > 1
+        && (*offset & 3) != 0
+    {
         *offset += 4 - (*offset & 3);
     }
 
@@ -154,11 +156,14 @@ fn wgsl_push_field(
         ty: io.ty,
         slots,
         offset: *offset,
-        attr_format,
     });
     *offset += slots;
 
-    if attribute_packing && attr_format != WgslPackedFormat::Float && (*offset & 3) != 0 {
+    if attribute_packing
+        && attr_format != WgslPackedFormat::Float
+        && slots > 1
+        && (*offset & 3) != 0
+    {
         *offset += 4 - (*offset & 3);
     }
 }
@@ -211,23 +216,6 @@ fn wgsl_collect_varying_fields(output: &ShaderOutput, vm: &ScriptVm) -> Vec<Wgsl
     out
 }
 
-fn wgsl_collect_chunk_formats(fields: &[WgslPackedField]) -> Vec<WgslPackedFormat> {
-    let slots = fields
-        .last()
-        .map(|field| field.offset + field.slots)
-        .unwrap_or(0);
-    let mut out = vec![WgslPackedFormat::Float; wgsl_num_packed_vec4s(slots)];
-    for field in fields {
-        if field.attr_format == WgslPackedFormat::Float {
-            continue;
-        }
-        for slot in field.offset..field.offset + field.slots {
-            out[slot / 4] = field.attr_format;
-        }
-    }
-    out
-}
-
 fn wgsl_to_float_scalar_expr(ty: &ScriptPodTy, expr: &str) -> String {
     match ty {
         ScriptPodTy::F32 | ScriptPodTy::F16 => expr.to_string(),
@@ -239,9 +227,9 @@ fn wgsl_to_float_scalar_expr(ty: &ScriptPodTy, expr: &str) -> String {
     }
 }
 
-fn wgsl_convert_scalar_expr(source: WgslPackedFormat, target: &ScriptPodTy, expr: &str) -> String {
+fn wgsl_convert_scalar_expr(source: WgslPackedSource, target: &ScriptPodTy, expr: &str) -> String {
     match source {
-        WgslPackedFormat::Float => match target {
+        WgslPackedSource::NumericFloat => match target {
             ScriptPodTy::F32 => expr.to_string(),
             ScriptPodTy::F16 => format!("f16({expr})"),
             ScriptPodTy::U32 | ScriptPodTy::AtomicU32 => format!("u32({expr})"),
@@ -249,38 +237,22 @@ fn wgsl_convert_scalar_expr(source: WgslPackedFormat, target: &ScriptPodTy, expr
             ScriptPodTy::Bool => format!("({expr} != 0.0)"),
             _ => format!("f32({expr})"),
         },
-        WgslPackedFormat::UInt => match target {
-            ScriptPodTy::U32 | ScriptPodTy::AtomicU32 => expr.to_string(),
-            ScriptPodTy::I32 | ScriptPodTy::AtomicI32 => format!("i32({expr})"),
-            ScriptPodTy::F32 => format!("f32({expr})"),
-            ScriptPodTy::F16 => format!("f16(f32({expr}))"),
-            ScriptPodTy::Bool => format!("({expr} != 0u)"),
-            _ => format!("f32({expr})"),
-        },
-        WgslPackedFormat::SInt => match target {
-            ScriptPodTy::I32 | ScriptPodTy::AtomicI32 => expr.to_string(),
-            ScriptPodTy::U32 | ScriptPodTy::AtomicU32 => format!("u32({expr})"),
-            ScriptPodTy::F32 => format!("f32({expr})"),
-            ScriptPodTy::F16 => format!("f16(f32({expr}))"),
-            ScriptPodTy::Bool => format!("({expr} != 0i)"),
-            _ => format!("f32({expr})"),
+        WgslPackedSource::BitPackedFloat => match target {
+            ScriptPodTy::F32 => expr.to_string(),
+            ScriptPodTy::F16 => format!("f16({expr})"),
+            ScriptPodTy::U32 | ScriptPodTy::AtomicU32 => format!("bitcast<u32>({expr})"),
+            ScriptPodTy::I32 | ScriptPodTy::AtomicI32 => format!("bitcast<i32>({expr})"),
+            ScriptPodTy::Bool => format!("(bitcast<u32>({expr}) != 0u)"),
+            _ => expr.to_string(),
         },
     }
 }
 
-fn wgsl_take_scalar_or_zero(
-    scalars: &[String],
-    scalar_index: &mut usize,
-    source_format: WgslPackedFormat,
-) -> String {
+fn wgsl_take_scalar_or_zero(scalars: &[String], scalar_index: &mut usize) -> String {
     let value = scalars
         .get(*scalar_index)
         .cloned()
-        .unwrap_or_else(|| match source_format {
-            WgslPackedFormat::Float => "0.0".to_string(),
-            WgslPackedFormat::UInt => "0u".to_string(),
-            WgslPackedFormat::SInt => "0i".to_string(),
-        });
+        .unwrap_or_else(|| "0.0".to_string());
     *scalar_index += 1;
     value
 }
@@ -340,7 +312,7 @@ fn wgsl_reconstruct_inline(
     output: &ShaderOutput,
     vm: &ScriptVm,
     ty: &ScriptPodTypeInline,
-    source_format: WgslPackedFormat,
+    source: WgslPackedSource,
     scalars: &[String],
     scalar_index: &mut usize,
 ) -> String {
@@ -352,7 +324,7 @@ fn wgsl_reconstruct_inline(
                     output,
                     vm,
                     &field.ty,
-                    source_format,
+                    source,
                     scalars,
                     scalar_index,
                 ));
@@ -368,8 +340,8 @@ fn wgsl_reconstruct_inline(
             let mut comps = Vec::with_capacity(dims);
             let elem_ty = vec_ty.elem_ty();
             for _ in 0..dims {
-                let scalar = wgsl_take_scalar_or_zero(scalars, scalar_index, source_format);
-                comps.push(wgsl_convert_scalar_expr(source_format, &elem_ty, &scalar));
+                let scalar = wgsl_take_scalar_or_zero(scalars, scalar_index);
+                comps.push(wgsl_convert_scalar_expr(source, &elem_ty, &scalar));
             }
             format!(
                 "{}({})",
@@ -380,12 +352,8 @@ fn wgsl_reconstruct_inline(
         ScriptPodTy::Mat(mat_ty) => {
             let mut comps = Vec::new();
             for _ in 0..mat_ty.dim() {
-                let scalar = wgsl_take_scalar_or_zero(scalars, scalar_index, source_format);
-                comps.push(wgsl_convert_scalar_expr(
-                    source_format,
-                    &ScriptPodTy::F32,
-                    &scalar,
-                ));
+                let scalar = wgsl_take_scalar_or_zero(scalars, scalar_index);
+                comps.push(wgsl_convert_scalar_expr(source, &ScriptPodTy::F32, &scalar));
             }
             format!(
                 "{}({})",
@@ -394,8 +362,8 @@ fn wgsl_reconstruct_inline(
             )
         }
         scalar_ty => {
-            let scalar = wgsl_take_scalar_or_zero(scalars, scalar_index, source_format);
-            wgsl_convert_scalar_expr(source_format, scalar_ty, &scalar)
+            let scalar = wgsl_take_scalar_or_zero(scalars, scalar_index);
+            wgsl_convert_scalar_expr(source, scalar_ty, &scalar)
         }
     }
 }
@@ -405,6 +373,7 @@ fn wgsl_unpack_expr_for_field(
     vm: &ScriptVm,
     field: &WgslPackedField,
     prefix: &str,
+    source: WgslPackedSource,
 ) -> String {
     let scalars = (0..field.slots)
         .map(|slot| wgsl_packed_component(prefix, field.offset + slot))
@@ -415,17 +384,13 @@ fn wgsl_unpack_expr_for_field(
         data: pod_ty.clone(),
     };
     let mut scalar_index = 0usize;
-    wgsl_reconstruct_inline(
-        output,
-        vm,
-        &inline,
-        field.attr_format,
-        &scalars,
-        &mut scalar_index,
-    )
+    wgsl_reconstruct_inline(output, vm, &inline, source, &scalars, &mut scalar_index)
 }
 
-fn build_draw_shader_wgsl(vm: &ScriptVm, output: &mut ShaderOutput) -> (String, u32, u32, u32) {
+fn build_draw_shader_wgsl(
+    vm: &ScriptVm,
+    output: &mut ShaderOutput,
+) -> (String, u32, u32, u32, u32) {
     let mut out = String::new();
 
     let geometry_fields = wgsl_collect_geometry_fields(output, vm);
@@ -435,9 +400,6 @@ fn build_draw_shader_wgsl(vm: &ScriptVm, output: &mut ShaderOutput) -> (String, 
         .last()
         .map(|field| field.offset + field.slots)
         .unwrap_or(0);
-
-    let geometry_formats = wgsl_collect_chunk_formats(&geometry_fields);
-    let instance_formats = wgsl_collect_chunk_formats(&instance_fields);
 
     let has_dyn_uniforms = output
         .io
@@ -654,26 +616,38 @@ fn build_draw_shader_wgsl(vm: &ScriptVm, output: &mut ShaderOutput) -> (String, 
         next_binding += 1;
     }
 
+    let xr_depth_binding = next_binding;
+    writeln!(
+        out,
+        "@group(0) @binding({}) var tex_xr_depth: texture_depth_2d;",
+        xr_depth_binding
+    )
+    .ok();
+
     writeln!(out, "struct VertexMainIn {{").ok();
     let mut location = 0u32;
-    for (idx, format) in geometry_formats.iter().enumerate() {
+    let geometry_slots = geometry_fields
+        .last()
+        .map(|field| field.offset + field.slots)
+        .unwrap_or(0);
+    let instance_slots = instance_fields
+        .last()
+        .map(|field| field.offset + field.slots)
+        .unwrap_or(0);
+    for idx in 0..wgsl_num_packed_vec4s(geometry_slots) {
         writeln!(
             out,
-            "    @location({}) packed_geometry_{}: {},",
-            location,
-            idx,
-            wgsl_vertex_attr_vec_type(*format)
+            "    @location({}) packed_geometry_{}: vec4f,",
+            location, idx
         )
         .ok();
         location += 1;
     }
-    for (idx, format) in instance_formats.iter().enumerate() {
+    for idx in 0..wgsl_num_packed_vec4s(instance_slots) {
         writeln!(
             out,
-            "    @location({}) packed_instance_{}: {},",
-            location,
-            idx,
-            wgsl_vertex_attr_vec_type(*format)
+            "    @location({}) packed_instance_{}: vec4f,",
+            location, idx
         )
         .ok();
         location += 1;
@@ -709,6 +683,60 @@ fn build_draw_shader_wgsl(vm: &ScriptVm, output: &mut ShaderOutput) -> (String, 
 
     writeln!(out).ok();
     output.create_functions(&mut out);
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "fn depth_clip(world: vec4f, color: vec4f, clip: f32) -> vec4f {{"
+    )
+    .ok();
+    writeln!(out, "    if (clip < 0.5) {{").ok();
+    writeln!(out, "        return color;").ok();
+    writeln!(out, "    }}").ok();
+    writeln!(
+        out,
+        "    if (abs(unibuf_draw_pass.depth_view[3].w - 1.0) > 0.5) {{"
+    )
+    .ok();
+    writeln!(out, "        return color;").ok();
+    writeln!(out, "    }}").ok();
+    writeln!(
+        out,
+        "    let depth_pos = unibuf_draw_pass.depth_projection * unibuf_draw_pass.depth_view * world;"
+    )
+    .ok();
+    writeln!(out, "    if (abs(depth_pos.w) < 0.000001) {{").ok();
+    writeln!(out, "        return color;").ok();
+    writeln!(out, "    }}").ok();
+    writeln!(
+        out,
+        "    let depth_hc = (depth_pos.xyz / vec3f(depth_pos.w)) * vec3f(0.5, 0.5, 0.5) + vec3f(0.5, 0.5, 0.5);"
+    )
+    .ok();
+    writeln!(out, "    let dims = textureDimensions(tex_xr_depth);").ok();
+    writeln!(out, "    if (dims.x == 0u || dims.y == 0u) {{").ok();
+    writeln!(out, "        return color;").ok();
+    writeln!(out, "    }}").ok();
+    writeln!(
+        out,
+        "    let depth_x = clamp(i32(depth_hc.x * f32(dims.x)), 0, max(i32(dims.x) - 1, 0));"
+    )
+    .ok();
+    writeln!(
+        out,
+        "    let depth_y = clamp(i32(depth_hc.y * f32(dims.y)), 0, max(i32(dims.y) - 1, 0));"
+    )
+    .ok();
+    writeln!(
+        out,
+        "    let depth_view_eye_z = textureLoad(tex_xr_depth, vec2i(depth_x, depth_y), 0);"
+    )
+    .ok();
+    writeln!(out, "    if (depth_view_eye_z >= depth_hc.z) {{").ok();
+    writeln!(out, "        return color;").ok();
+    writeln!(out, "    }}").ok();
+    writeln!(out, "    discard;").ok();
+    writeln!(out, "    return vec4f(0.0, 0.0, 0.0, 0.0);").ok();
+    writeln!(out, "}}").ok();
 
     let vertex_fn_name = output.backend.map_function_name("io_vertex");
     let fragment_fn_name = output.backend.map_function_name("io_fragment");
@@ -722,11 +750,23 @@ fn build_draw_shader_wgsl(vm: &ScriptVm, output: &mut ShaderOutput) -> (String, 
     writeln!(out, "@vertex").ok();
     writeln!(out, "fn vertex_main(in: VertexMainIn) -> VertexMainOut {{").ok();
     for field in &geometry_fields {
-        let value_expr = wgsl_unpack_expr_for_field(output, vm, field, "in.packed_geometry_");
+        let value_expr = wgsl_unpack_expr_for_field(
+            output,
+            vm,
+            field,
+            "in.packed_geometry_",
+            WgslPackedSource::BitPackedFloat,
+        );
         writeln!(out, "    {} = {};", field.name, value_expr).ok();
     }
     for field in &instance_fields {
-        let value_expr = wgsl_unpack_expr_for_field(output, vm, field, "in.packed_instance_");
+        let value_expr = wgsl_unpack_expr_for_field(
+            output,
+            vm,
+            field,
+            "in.packed_instance_",
+            WgslPackedSource::BitPackedFloat,
+        );
         writeln!(out, "    {} = {};", field.name, value_expr).ok();
     }
     if has_dyn_uniforms {
@@ -784,7 +824,13 @@ fn build_draw_shader_wgsl(vm: &ScriptVm, output: &mut ShaderOutput) -> (String, 
         writeln!(out, "@fragment").ok();
         writeln!(out, "fn fragment_main(in: VertexMainOut) {{").ok();
         for field in &varying_fields {
-            let value_expr = wgsl_unpack_expr_for_field(output, vm, field, "in.packed_varying_");
+            let value_expr = wgsl_unpack_expr_for_field(
+                output,
+                vm,
+                field,
+                "in.packed_varying_",
+                WgslPackedSource::NumericFloat,
+            );
             writeln!(out, "    {} = {};", field.name, value_expr).ok();
         }
         if has_dyn_uniforms {
@@ -825,7 +871,13 @@ fn build_draw_shader_wgsl(vm: &ScriptVm, output: &mut ShaderOutput) -> (String, 
         )
         .ok();
         for field in &varying_fields {
-            let value_expr = wgsl_unpack_expr_for_field(output, vm, field, "in.packed_varying_");
+            let value_expr = wgsl_unpack_expr_for_field(
+                output,
+                vm,
+                field,
+                "in.packed_varying_",
+                WgslPackedSource::NumericFloat,
+            );
             writeln!(out, "    {} = {};", field.name, value_expr).ok();
         }
         if has_dyn_uniforms {
@@ -885,6 +937,7 @@ fn build_draw_shader_wgsl(vm: &ScriptVm, output: &mut ShaderOutput) -> (String, 
         dyn_uniform_binding,
         texture_binding_base.unwrap_or(0),
         sampler_binding_base.unwrap_or(0),
+        xr_depth_binding,
     )
 }
 
@@ -963,7 +1016,7 @@ pub fn compile_draw_shader_wgsl_source(
         .map(|field| field.offset + field.slots)
         .unwrap_or(0);
 
-    let (wgsl, dyn_uniform_binding, texture_binding_base, sampler_binding_base) =
+    let (wgsl, dyn_uniform_binding, texture_binding_base, sampler_binding_base, xr_depth_binding) =
         build_draw_shader_wgsl(vm, &mut output);
 
     Ok(WgslDrawShaderSource {
@@ -971,6 +1024,7 @@ pub fn compile_draw_shader_wgsl_source(
         dyn_uniform_binding,
         texture_binding_base,
         sampler_binding_base,
+        xr_depth_binding,
         geometry_slots,
         instance_slots,
     })

@@ -765,6 +765,10 @@ impl Texture2D {
     pub fn sample<C: TextureSampleCoord>(&self, coord: C) -> Vec4f {
         coord.sample_texture(self)
     }
+
+    pub fn sample_lod<C: TextureSampleCoord>(&self, coord: C, _lod: f32) -> Vec4f {
+        coord.sample_texture(self)
+    }
 }
 
 pub trait TextureSampleCoord {
@@ -812,6 +816,9 @@ pub fn sqrt(x: f32) -> f32 {
 }
 pub fn inverse_sqrt(x: f32) -> f32 {
     1.0 / x.sqrt()
+}
+pub fn inverse(m: Mat4f) -> Mat4f {
+    m.invert()
 }
 pub fn modf(x: f32, y: f32) -> f32 {
     x - y * (x / y).floor()

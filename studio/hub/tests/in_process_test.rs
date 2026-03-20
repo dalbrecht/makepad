@@ -159,7 +159,7 @@ fn tail_lines(text: &str, n: usize) -> String {
 
 #[test]
 fn in_process_connection_roundtrip_and_cargo_build_lifecycle() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -246,7 +246,7 @@ fn in_process_connection_roundtrip_and_cargo_build_lifecycle() {
 fn terminal_large_paste_keeps_session_alive() {
     const LARGE_PASTE_BYTES: usize = 512 * 1024;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -330,7 +330,7 @@ fn terminal_resize_delivers_sigwinch_with_updated_stty_size() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -439,7 +439,7 @@ fn terminal_bash_prompt_sticks_to_bottom_after_grow_resize() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -524,7 +524,7 @@ fn terminal_bash_grow_resize_clamps_to_top_when_history_is_insufficient() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -600,7 +600,7 @@ fn terminal_codex_prompt_sticks_to_bottom_after_resize() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -678,7 +678,7 @@ fn terminal_codex_fast_resize_roundtrip_preserves_top_and_bottom_rows() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -790,7 +790,7 @@ fn terminal_codex_fast_vs_slow_wiggle_same_final_frame() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -806,11 +806,7 @@ fn terminal_codex_fast_vs_slow_wiggle_same_final_frame() {
     let wiggle: &[u16] = &[30, 12, 28, 10, 26, 14, 29, 11, 27, 13, 30, 20];
 
     let mut run_mode = |path: &str, slow: bool| -> String {
-        let tui_log_path = format!(
-            "/tmp/{}.{}.log",
-            path.replace('/', "_"),
-            std::process::id()
-        );
+        let tui_log_path = format!("/tmp/{}.{}.log", path.replace('/', "_"), std::process::id());
         let mut env = std::collections::HashMap::new();
         env.insert("TUI_LOG".to_string(), tui_log_path.clone());
         let _ = connection.send(ClientToHub::TerminalOpen {
@@ -824,7 +820,11 @@ fn terminal_codex_fast_vs_slow_wiggle_same_final_frame() {
             Duration::from_secs(5),
             |msg| matches!(msg, HubToClient::TerminalOpened { path: p, .. } if p == path),
         );
-        assert!(opened.is_some(), "did not receive TerminalOpened for {}", path);
+        assert!(
+            opened.is_some(),
+            "did not receive TerminalOpened for {}",
+            path
+        );
 
         request_terminal_viewport(&mut connection, path, 80, 20, usize::MAX);
         let _ = connection.send(ClientToHub::TerminalInput {
@@ -846,7 +846,9 @@ fn terminal_codex_fast_vs_slow_wiggle_same_final_frame() {
                     &connection,
                     path,
                     Duration::from_secs(6),
-                    |frame| frame.rows == *rows && !framebuffer_last_row_text(frame).trim().is_empty(),
+                    |frame| {
+                        frame.rows == *rows && !framebuffer_last_row_text(frame).trim().is_empty()
+                    },
                 )
                 .expect("did not observe slow wiggle step frame");
             }
@@ -897,7 +899,7 @@ fn terminal_makepad_tui_fast_wiggle_preserves_framebuffer() {
         return;
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -1008,11 +1010,7 @@ fn terminal_makepad_tui_fast_resize_during_output_matches_no_resize() {
     let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
 
     let mut run_mode = |path: &str, fast_resize: bool| -> String {
-        let tui_log_path = format!(
-            "/tmp/{}.{}.log",
-            path.replace('/', "_"),
-            std::process::id()
-        );
+        let tui_log_path = format!("/tmp/{}.{}.log", path.replace('/', "_"), std::process::id());
         let mut env = std::collections::HashMap::new();
         env.insert("TUI_LOG".to_string(), tui_log_path.clone());
         let _ = connection.send(ClientToHub::TerminalOpen {
@@ -1026,7 +1024,11 @@ fn terminal_makepad_tui_fast_resize_during_output_matches_no_resize() {
             Duration::from_secs(5),
             |msg| matches!(msg, HubToClient::TerminalOpened { path: p, .. } if p == path),
         );
-        assert!(opened.is_some(), "did not receive TerminalOpened for {}", path);
+        assert!(
+            opened.is_some(),
+            "did not receive TerminalOpened for {}",
+            path
+        );
 
         request_terminal_viewport(&mut connection, path, 80, 20, usize::MAX);
         let launch = format!("{}\n", tui_bin.display());
@@ -1118,13 +1120,11 @@ fn terminal_makepad_tui_fast_resize_during_output_matches_no_resize() {
         })
         .expect("did not observe settle 21-row frame");
         request_terminal_viewport(&mut connection, path, 80, 20, usize::MAX);
-        let settled = wait_for_terminal_frame_where(
-            &connection,
-            path,
-            Duration::from_secs(3),
-            |frame| frame.rows == 20,
-        )
-        .expect("did not observe settle 20-row frame");
+        let settled =
+            wait_for_terminal_frame_where(&connection, path, Duration::from_secs(3), |frame| {
+                frame.rows == 20
+            })
+            .expect("did not observe settle 20-row frame");
         let final_text = framebuffer_to_text(&settled);
 
         let _ = connection.send(ClientToHub::TerminalInput {
@@ -1190,11 +1190,7 @@ fn terminal_makepad_tui_fast_then_slow_same_session_matches_slow_only() {
                        path: &str,
                        do_fast_first: bool|
      -> String {
-        let tui_log_path = format!(
-            "/tmp/{}.{}.log",
-            path.replace('/', "_"),
-            std::process::id()
-        );
+        let tui_log_path = format!("/tmp/{}.{}.log", path.replace('/', "_"), std::process::id());
         let mut env = std::collections::HashMap::new();
         env.insert("TUI_LOG".to_string(), tui_log_path.clone());
         let _ = connection.send(ClientToHub::TerminalOpen {
@@ -1208,7 +1204,11 @@ fn terminal_makepad_tui_fast_then_slow_same_session_matches_slow_only() {
             Duration::from_secs(5),
             |msg| matches!(msg, HubToClient::TerminalOpened { path: p, .. } if p == path),
         );
-        assert!(opened.is_some(), "did not receive TerminalOpened for {}", path);
+        assert!(
+            opened.is_some(),
+            "did not receive TerminalOpened for {}",
+            path
+        );
 
         request_terminal_viewport(connection, path, 80, 20, usize::MAX);
         let launch = format!("{}\n", tui_bin.display());
@@ -1296,13 +1296,11 @@ fn terminal_makepad_tui_fast_then_slow_same_session_matches_slow_only() {
         })
         .expect("did not observe settle 21-row frame");
         request_terminal_viewport(connection, path, 80, 20, usize::MAX);
-        let settled = wait_for_terminal_frame_where(
-            connection,
-            path,
-            Duration::from_secs(3),
-            |frame| frame.rows == 20,
-        )
-        .expect("did not observe settle 20-row frame");
+        let settled =
+            wait_for_terminal_frame_where(connection, path, Duration::from_secs(3), |frame| {
+                frame.rows == 20
+            })
+            .expect("did not observe settle 20-row frame");
         let final_text = framebuffer_to_text(&settled);
 
         let _ = connection.send(ClientToHub::TerminalInput {
@@ -1335,7 +1333,7 @@ fn terminal_makepad_tui_fast_then_slow_same_session_matches_slow_only() {
 
 #[test]
 fn file_tree_keeps_hidden_directories_for_backend() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::create_dir_all(dir.path().join(".hidden")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
@@ -1383,8 +1381,8 @@ fn file_tree_keeps_hidden_directories_for_backend() {
 
 #[test]
 fn unmount_emits_file_tree_diff_scoped_to_mount() {
-    let mount_a = tempfile::tempdir().unwrap();
-    let mount_b = tempfile::tempdir().unwrap();
+    let mount_a = makepad_studio_hub::test_support::tempdir().unwrap();
+    let mount_b = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(mount_a.path().join("src")).unwrap();
     fs::create_dir_all(mount_b.path().join("src")).unwrap();
     fs::write(mount_a.path().join("src/a.rs"), "pub fn a() {}\n").unwrap();
@@ -1441,25 +1439,20 @@ fn unmount_emits_file_tree_diff_scoped_to_mount() {
 }
 
 #[test]
-fn runnable_builds_are_scoped_per_mount() {
-    let mount_a = tempfile::tempdir().unwrap();
-    let mount_b = tempfile::tempdir().unwrap();
+fn run_items_are_pushed_per_mount() {
+    let mount_a = makepad_studio_hub::test_support::tempdir().unwrap();
+    let mount_b = makepad_studio_hub::test_support::tempdir().unwrap();
 
-    fs::create_dir_all(mount_a.path().join("src")).unwrap();
     fs::write(
-        mount_a.path().join("Cargo.toml"),
-        "[package]\nname = \"alpha-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        mount_a.path().join("makepad.splash"),
+        "use mod.hub\nhub.set_run_items([{name:\"alpha-app\" in_studio:true on_run:fn(){}}])\n",
     )
     .unwrap();
-    fs::write(mount_a.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-
-    fs::create_dir_all(mount_b.path().join("src")).unwrap();
     fs::write(
-        mount_b.path().join("Cargo.toml"),
-        "[package]\nname = \"beta-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        mount_b.path().join("makepad.splash"),
+        "use mod.hub\nhub.set_run_items([{name:\"beta-app\" in_studio:true on_run:fn(){}}])\n",
     )
     .unwrap();
-    fs::write(mount_b.path().join("src/main.rs"), "fn main() {}\n").unwrap();
 
     let config = HubConfig {
         mounts: vec![
@@ -1476,46 +1469,999 @@ fn runnable_builds_are_scoped_per_mount() {
     };
     let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
 
-    let _ = connection.send(ClientToHub::LoadRunnableBuilds {
+    let _ = connection.send(ClientToHub::ObserveMount {
         mount: "alpha".to_string(),
+        primary: Some(true),
     });
     let alpha = wait_for_message(
         &connection,
         Duration::from_secs(5),
-        |msg| matches!(msg, HubToClient::RunnableBuilds { mount, .. } if mount == "alpha"),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "alpha" && items.len() == 1),
     )
-    .expect("did not receive alpha runnable builds");
+    .expect("did not receive alpha run items");
     match alpha {
-        HubToClient::RunnableBuilds { mount, builds } => {
+        HubToClient::RunItems { mount, items } => {
             assert_eq!(mount, "alpha");
-            assert_eq!(builds.len(), 1);
-            assert_eq!(builds[0].package, "alpha-app");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].name, "alpha-app");
         }
         _ => unreachable!(),
     }
 
-    let _ = connection.send(ClientToHub::LoadRunnableBuilds {
+    let _ = connection.send(ClientToHub::ObserveMount {
         mount: "beta".to_string(),
+        primary: Some(true),
     });
     let beta = wait_for_message(
         &connection,
         Duration::from_secs(5),
-        |msg| matches!(msg, HubToClient::RunnableBuilds { mount, .. } if mount == "beta"),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "beta" && items.len() == 1),
     )
-    .expect("did not receive beta runnable builds");
+    .expect("did not receive beta run items");
     match beta {
-        HubToClient::RunnableBuilds { mount, builds } => {
+        HubToClient::RunItems { mount, items } => {
             assert_eq!(mount, "beta");
-            assert_eq!(builds.len(), 1);
-            assert_eq!(builds[0].package, "beta-app");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].name, "beta-app");
         }
         _ => unreachable!(),
     }
 }
 
 #[test]
+fn run_item_executes_named_on_run_callback() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    fs::write(
+        dir.path().join("makepad.splash"),
+        "use mod.std\nuse mod.hub\nhub.set_run_items([{name:\"hello\" in_studio:true on_run:fn(){std.println(\"hello from item\")}}])\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::ObserveMount {
+        mount: "repo".to_string(),
+        primary: Some(true),
+    });
+    let started = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted { mount, package, .. }
+                if mount == "repo" && package == "makepad.splash"
+        )
+    })
+    .expect("did not receive BuildStarted");
+    let build_id = match started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.len() == 1),
+    )
+    .expect("did not receive RunItems");
+    match run_items {
+        HubToClient::RunItems { items, .. } => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].name, "hello");
+        }
+        _ => unreachable!(),
+    }
+
+    let _ = connection.send(ClientToHub::RunItem {
+        mount: "repo".to_string(),
+        name: "hello".to_string(),
+    });
+    let _ = drain_messages(&connection, Duration::from_millis(250));
+
+    let query_id = connection.send(ClientToHub::QueryLogs {
+        build_id: Some(build_id),
+        level: None,
+        source: None,
+        file: None,
+        pattern: Some("hello from item".to_string()),
+        is_regex: None,
+        since_index: None,
+        live: Some(false),
+    });
+    let log_results = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::QueryLogResults {
+                query_id: id, ..
+            } if *id == query_id
+        )
+    })
+    .expect("did not receive QueryLogResults");
+
+    match log_results {
+        HubToClient::QueryLogResults { entries, done, .. } => {
+            assert!(done);
+            let messages: Vec<String> = entries
+                .iter()
+                .map(|entry| entry.1.message.clone())
+                .collect();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.1.message.contains("hello from item")),
+                "expected run item log in splash logs, got {:?}",
+                messages
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    let _ = connection.send(ClientToHub::StopBuild { build_id });
+}
+
+#[test]
+fn run_item_spawns_cargo_run_for_clicked_name() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"makepad-example-splash\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/main.rs"),
+        "fn main() {\n    println!(\"hello from clicked item\");\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("makepad.splash"),
+        "use mod.hub\nhub.set_run_items([{name:\"makepad-example-splash\" in_studio:true on_run:fn(){let name = self.name hub.run({\"STUDIO\":hub.studio_ip}, \"cargo\", [\"run\" \"-p\" name \"--release\" \"--message-format=json\" \"--\" \"--message-format=json\" \"--stdin-loop\"])}}])\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::ObserveMount {
+        mount: "repo".to_string(),
+        primary: Some(true),
+    });
+    let splash_started = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted { mount, package, .. }
+                if mount == "repo" && package == "makepad.splash"
+        )
+    })
+    .expect("did not receive splash BuildStarted");
+    let splash_build_id = match splash_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.len() == 1),
+    )
+    .expect("did not receive RunItems");
+    match run_items {
+        HubToClient::RunItems { items, .. } => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].name, "makepad-example-splash");
+        }
+        _ => unreachable!(),
+    }
+
+    let _ = connection.send(ClientToHub::RunItem {
+        mount: "repo".to_string(),
+        name: "makepad-example-splash".to_string(),
+    });
+
+    let child_started = wait_for_message(&connection, Duration::from_secs(10), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted {
+                build_id,
+                mount,
+                package,
+            } if *build_id != splash_build_id
+                && mount == "repo"
+                && package == "makepad-example-splash"
+        )
+    })
+    .expect("did not receive child BuildStarted");
+    let child_build_id = match child_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let child_stopped = wait_for_message(
+        &connection,
+        Duration::from_secs(20),
+        |msg| matches!(msg, HubToClient::BuildStopped { build_id, exit_code: Some(0) } if *build_id == child_build_id),
+    );
+    assert!(
+        child_stopped.is_some(),
+        "did not receive successful child BuildStopped"
+    );
+
+    let query_id = connection.send(ClientToHub::QueryLogs {
+        build_id: Some(child_build_id),
+        level: None,
+        source: None,
+        file: None,
+        pattern: Some("hello from clicked item".to_string()),
+        is_regex: None,
+        since_index: None,
+        live: Some(false),
+    });
+    let log_results = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::QueryLogResults {
+                query_id: id, ..
+            } if *id == query_id
+        )
+    })
+    .expect("did not receive child QueryLogResults");
+
+    match log_results {
+        HubToClient::QueryLogResults { entries, done, .. } => {
+            assert!(done);
+            let messages: Vec<String> = entries
+                .iter()
+                .map(|entry| entry.1.message.clone())
+                .collect();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.1.message.contains("hello from clicked item")),
+                "expected child build log output, got {:?}",
+                messages
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    let _ = connection.send(ClientToHub::StopBuild {
+        build_id: splash_build_id,
+    });
+}
+
+#[test]
+fn run_item_binds_self_to_registered_item() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    fs::write(
+        dir.path().join("makepad.splash"),
+        "use mod.std\nuse mod.hub\nhub.set_run_items([{name:\"hello\" package:\"self-bound\" in_studio:true on_run:fn(){std.println(self.package) if me is nil {std.println(\"me-unbound\")}}}])\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::ObserveMount {
+        mount: "repo".to_string(),
+        primary: Some(true),
+    });
+    let started = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted { mount, package, .. }
+                if mount == "repo" && package == "makepad.splash"
+        )
+    })
+    .expect("did not receive BuildStarted");
+    let build_id = match started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let _run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.len() == 1),
+    )
+    .expect("did not receive RunItems");
+
+    let _ = connection.send(ClientToHub::RunItem {
+        mount: "repo".to_string(),
+        name: "hello".to_string(),
+    });
+    let _ = drain_messages(&connection, Duration::from_millis(250));
+
+    let query_id = connection.send(ClientToHub::QueryLogs {
+        build_id: Some(build_id),
+        level: None,
+        source: None,
+        file: None,
+        pattern: None,
+        is_regex: None,
+        since_index: None,
+        live: Some(false),
+    });
+    let log_results = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::QueryLogResults {
+                query_id: id, ..
+            } if *id == query_id
+        )
+    })
+    .expect("did not receive QueryLogResults");
+
+    match log_results {
+        HubToClient::QueryLogResults { entries, done, .. } => {
+            assert!(done);
+            let messages: Vec<String> = entries
+                .iter()
+                .map(|entry| entry.1.message.clone())
+                .collect();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.1.message.contains("self-bound")),
+                "expected self-bound log in splash logs, got {:?}",
+                messages
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.1.message.contains("me-unbound")),
+                "expected me-unbound log in splash logs, got {:?}",
+                messages
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    let _ = connection.send(ClientToHub::StopBuild { build_id });
+}
+
+#[test]
+fn run_item_reports_script_error_in_hub_run_args() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    fs::write(
+        dir.path().join("makepad.splash"),
+        "use mod.hub\nhub.set_run_items([{name:\"broken\" in_studio:true on_run:fn(){hub.run(nil, \"cargo\", [\"run\" \"-p\" self.package])}}])\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::ObserveMount {
+        mount: "repo".to_string(),
+        primary: Some(true),
+    });
+    let started = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted { mount, package, .. }
+                if mount == "repo" && package == "makepad.splash"
+        )
+    })
+    .expect("did not receive BuildStarted");
+    let build_id = match started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.len() == 1),
+    )
+    .expect("did not receive RunItems");
+    match run_items {
+        HubToClient::RunItems { items, .. } => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].name, "broken");
+        }
+        _ => unreachable!(),
+    }
+
+    let _ = connection.send(ClientToHub::RunItem {
+        mount: "repo".to_string(),
+        name: "broken".to_string(),
+    });
+    let unexpected_build = wait_for_message(&connection, Duration::from_millis(500), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted {
+                build_id: id, ..
+            } if *id != build_id
+        )
+    });
+    assert!(
+        unexpected_build.is_none(),
+        "expected invalid hub.run args to prevent spawning a child build, got {:?}",
+        unexpected_build
+    );
+
+    let _ = connection.send(ClientToHub::StopBuild { build_id });
+}
+
+#[test]
+fn splash_runnable_prints_hello() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    fs::write(
+        dir.path().join("makepad.splash"),
+        "use mod.std\nstd.println(\"hello\")\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::Run {
+        mount: "repo".to_string(),
+        process: "makepad.splash".to_string(),
+        args: Vec::new(),
+        standalone: None,
+        env: None,
+        buildbox: None,
+    });
+
+    let started = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStarted { mount, package, .. } if mount == "repo" && package == "makepad.splash"),
+    )
+    .expect("did not receive BuildStarted");
+    let build_id = match started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let stopped = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStopped { build_id: id, exit_code: Some(0) } if *id == build_id),
+    );
+    assert!(stopped.is_some(), "did not receive successful BuildStopped");
+
+    let query_id = connection.send(ClientToHub::QueryLogs {
+        build_id: Some(build_id),
+        level: None,
+        source: None,
+        file: None,
+        pattern: Some("hello".to_string()),
+        is_regex: None,
+        since_index: None,
+        live: Some(false),
+    });
+    let log_results = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::QueryLogResults {
+                query_id: id, ..
+            } if *id == query_id
+        )
+    })
+    .expect("did not receive QueryLogResults");
+
+    match log_results {
+        HubToClient::QueryLogResults { entries, done, .. } => {
+            assert!(done);
+            let messages: Vec<String> = entries
+                .iter()
+                .map(|entry| entry.1.message.clone())
+                .collect();
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.1.message.contains("hello")),
+                "expected hello in splash logs, got {:?}",
+                messages
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn observe_mount_auto_starts_splash() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    fs::write(
+        dir.path().join("makepad.splash"),
+        "use mod.std\nstd.println(\"hello\")\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::ObserveMount {
+        mount: "repo".to_string(),
+        primary: Some(true),
+    });
+
+    let started = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStarted { mount, package, .. } if mount == "repo" && package == "makepad.splash"),
+    )
+    .expect("did not receive BuildStarted");
+    let build_id = match started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let stopped = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStopped { build_id: id, exit_code: Some(0) } if *id == build_id),
+    );
+    assert!(stopped.is_some(), "did not receive successful BuildStopped");
+
+    let query_id = connection.send(ClientToHub::QueryLogs {
+        build_id: Some(build_id),
+        level: None,
+        source: None,
+        file: None,
+        pattern: Some("hello".to_string()),
+        is_regex: None,
+        since_index: None,
+        live: Some(false),
+    });
+    let log_results = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::QueryLogResults {
+                query_id: id, ..
+            } if *id == query_id
+        )
+    })
+    .expect("did not receive QueryLogResults");
+
+    match log_results {
+        HubToClient::QueryLogResults { entries, done, .. } => {
+            assert!(done);
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.1.message.contains("hello")),
+                "expected hello in splash logs"
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn observe_mount_reload_splash_after_save() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    fs::write(
+        dir.path().join("makepad.splash"),
+        "use mod.std\nstd.println(\"one\")\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::ObserveMount {
+        mount: "repo".to_string(),
+        primary: Some(true),
+    });
+
+    let first_started = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStarted { mount, package, .. } if mount == "repo" && package == "makepad.splash"),
+    )
+    .expect("did not receive initial BuildStarted");
+    let first_build_id = match first_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let first_stopped = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStopped { build_id: id, exit_code: Some(0) } if *id == first_build_id),
+    );
+    assert!(
+        first_stopped.is_some(),
+        "did not receive successful initial BuildStopped"
+    );
+
+    let new_content = "use mod.std\nstd.println(\"two\")\n".to_string();
+    let _ = connection.send(ClientToHub::SaveTextFile {
+        path: "repo/makepad.splash".to_string(),
+        content: new_content,
+    });
+
+    let saved = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::TextFileSaved { path, .. } if path == "repo/makepad.splash"
+        )
+    });
+    assert!(saved.is_some(), "did not receive TextFileSaved");
+
+    let second_started = wait_for_message(&connection, Duration::from_secs(6), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted {
+                build_id,
+                mount,
+                package,
+            } if mount == "repo" && package == "makepad.splash" && *build_id != first_build_id
+        )
+    })
+    .expect("did not receive reloaded BuildStarted");
+    let second_build_id = match second_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let second_stopped = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStopped { build_id: id, exit_code: Some(0) } if *id == second_build_id),
+    );
+    assert!(
+        second_stopped.is_some(),
+        "did not receive successful reloaded BuildStopped"
+    );
+
+    let query_id = connection.send(ClientToHub::QueryLogs {
+        build_id: Some(second_build_id),
+        level: None,
+        source: None,
+        file: None,
+        pattern: Some("two".to_string()),
+        is_regex: None,
+        since_index: None,
+        live: Some(false),
+    });
+    let log_results = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::QueryLogResults {
+                query_id: id, ..
+            } if *id == query_id
+        )
+    })
+    .expect("did not receive QueryLogResults for reloaded splash");
+
+    match log_results {
+        HubToClient::QueryLogResults { entries, done, .. } => {
+            assert!(done);
+            assert!(
+                entries.iter().any(|entry| entry.1.message.contains("two")),
+                "expected updated splash logs"
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn observe_mount_recovers_splash_after_error_on_followup_save() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    fs::write(
+        dir.path().join("makepad.splash"),
+        "use mod.hub\nhub.set_run_items([{name:\"one\" in_studio:true on_run:fn(){}}])\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::ObserveMount {
+        mount: "repo".to_string(),
+        primary: Some(true),
+    });
+
+    let first_started = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStarted { mount, package, .. } if mount == "repo" && package == "makepad.splash"),
+    )
+    .expect("did not receive initial BuildStarted");
+    let first_build_id = match first_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let initial_run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.len() == 1 && items[0].name == "one"),
+    );
+    assert!(
+        initial_run_items.is_some(),
+        "did not receive initial RunItems from splash"
+    );
+
+    let _ = connection.send(ClientToHub::SaveTextFile {
+        path: "repo/makepad.splash".to_string(),
+        content: "use mod.hub\nhub.set_run_items([\n".to_string(),
+    });
+    let broken_saved = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::TextFileSaved { path, .. } if path == "repo/makepad.splash"
+        )
+    });
+    assert!(
+        broken_saved.is_some(),
+        "did not receive broken TextFileSaved"
+    );
+
+    let broken_started = wait_for_message(&connection, Duration::from_secs(6), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted {
+                build_id,
+                mount,
+                package,
+            } if mount == "repo" && package == "makepad.splash" && *build_id != first_build_id
+        )
+    })
+    .expect("did not receive broken splash BuildStarted");
+    let broken_build_id = match broken_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let broken_stopped = wait_for_message(&connection, Duration::from_secs(6), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStopped { build_id, exit_code: Some(1) } if *build_id == broken_build_id
+        )
+    });
+    assert!(
+        broken_stopped.is_some(),
+        "did not receive failed BuildStopped for broken splash"
+    );
+
+    let empty_run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.is_empty()),
+    );
+    assert!(
+        empty_run_items.is_some(),
+        "did not receive empty RunItems after broken splash"
+    );
+
+    let _ = connection.send(ClientToHub::SaveTextFile {
+        path: "repo/makepad.splash".to_string(),
+        content: "use mod.hub\nhub.set_run_items([{name:\"two\" in_studio:true on_run:fn(){}}])\n"
+            .to_string(),
+    });
+    let fixed_saved = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::TextFileSaved { path, .. } if path == "repo/makepad.splash"
+        )
+    });
+    assert!(fixed_saved.is_some(), "did not receive fixed TextFileSaved");
+
+    let fixed_started = wait_for_message(&connection, Duration::from_secs(6), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted {
+                build_id,
+                mount,
+                package,
+            } if mount == "repo"
+                && package == "makepad.splash"
+                && *build_id != first_build_id
+                && *build_id != broken_build_id
+        )
+    })
+    .expect("did not receive recovered splash BuildStarted");
+
+    let fixed_build_id = match fixed_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let recovered_run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(6),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.len() == 1 && items[0].name == "two"),
+    );
+    assert!(
+        recovered_run_items.is_some(),
+        "did not receive recovered RunItems after fixing splash"
+    );
+
+    let _ = connection.send(ClientToHub::StopBuild {
+        build_id: fixed_build_id,
+    });
+}
+
+#[test]
+fn external_makepad_splash_fix_restarts_failed_splash() {
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
+    let splash_path = dir.path().join("makepad.splash");
+    fs::write(
+        &splash_path,
+        "use mod.hub\nhub.set_run_items([{name:\"one\" in_studio:true on_run:fn(){}}])\n",
+    )
+    .unwrap();
+
+    let config = HubConfig {
+        mounts: vec![MountConfig {
+            name: "repo".to_string(),
+            path: dir.path().to_path_buf(),
+        }],
+        ..Default::default()
+    };
+    let mut connection = StudioHub::start_in_process(config).expect("start in-process backend");
+
+    let _ = connection.send(ClientToHub::ObserveMount {
+        mount: "repo".to_string(),
+        primary: Some(true),
+    });
+
+    let first_started = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::BuildStarted { mount, package, .. } if mount == "repo" && package == "makepad.splash"),
+    )
+    .expect("did not receive initial BuildStarted");
+    let first_build_id = match first_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let initial_run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.len() == 1 && items[0].name == "one"),
+    );
+    assert!(
+        initial_run_items.is_some(),
+        "did not receive initial RunItems from splash"
+    );
+
+    let _ = connection.send(ClientToHub::SaveTextFile {
+        path: "repo/makepad.splash".to_string(),
+        content: "use mod.hub\nhub.set_run_items([\n".to_string(),
+    });
+    let broken_saved = wait_for_message(&connection, Duration::from_secs(3), |msg| {
+        matches!(
+            msg,
+            HubToClient::TextFileSaved { path, .. } if path == "repo/makepad.splash"
+        )
+    });
+    assert!(
+        broken_saved.is_some(),
+        "did not receive broken TextFileSaved"
+    );
+
+    let broken_started = wait_for_message(&connection, Duration::from_secs(6), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted {
+                build_id,
+                mount,
+                package,
+            } if mount == "repo" && package == "makepad.splash" && *build_id != first_build_id
+        )
+    })
+    .expect("did not receive broken splash BuildStarted");
+    let broken_build_id = match broken_started {
+        HubToClient::BuildStarted { build_id, .. } => build_id,
+        _ => unreachable!(),
+    };
+
+    let broken_stopped = wait_for_message(&connection, Duration::from_secs(6), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStopped { build_id, exit_code: Some(1) } if *build_id == broken_build_id
+        )
+    });
+    assert!(
+        broken_stopped.is_some(),
+        "did not receive failed BuildStopped for broken splash"
+    );
+
+    let empty_run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(3),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.is_empty()),
+    );
+    assert!(
+        empty_run_items.is_some(),
+        "did not receive empty RunItems after broken splash"
+    );
+
+    let fixed_tmp = dir.path().join("makepad.splash.tmp");
+    fs::write(
+        &fixed_tmp,
+        "use mod.hub\nhub.set_run_items([{name:\"two\" in_studio:true on_run:fn(){}}])\n",
+    )
+    .unwrap();
+    fs::rename(&fixed_tmp, &splash_path).unwrap();
+
+    let fixed_started = wait_for_message(&connection, Duration::from_secs(8), |msg| {
+        matches!(
+            msg,
+            HubToClient::BuildStarted {
+                build_id,
+                mount,
+                package,
+            } if mount == "repo"
+                && package == "makepad.splash"
+                && *build_id != first_build_id
+                && *build_id != broken_build_id
+        )
+    });
+    assert!(
+        fixed_started.is_some(),
+        "did not receive recovered splash BuildStarted after external rewrite"
+    );
+
+    let recovered_run_items = wait_for_message(
+        &connection,
+        Duration::from_secs(8),
+        |msg| matches!(msg, HubToClient::RunItems { mount, items } if mount == "repo" && items.len() == 1 && items[0].name == "two"),
+    );
+    assert!(
+        recovered_run_items.is_some(),
+        "did not receive recovered RunItems after external splash rewrite"
+    );
+}
+
+#[test]
 fn file_watch_emits_single_path_delta_without_full_tree_reload() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -1578,7 +2524,7 @@ fn file_watch_emits_single_path_delta_without_full_tree_reload() {
 
 #[test]
 fn save_text_file_does_not_echo_file_changed_to_saving_client() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -1629,7 +2575,7 @@ fn save_text_file_does_not_echo_file_changed_to_saving_client() {
 
 #[test]
 fn file_watch_ignores_makepad_term_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".makepad")).unwrap();
     fs::write(dir.path().join(".makepad/a.term"), "").unwrap();
 
@@ -1668,7 +2614,7 @@ fn file_watch_ignores_makepad_term_writes() {
 
 #[test]
 fn file_watch_emits_hidden_directory_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
 
     let config = HubConfig {
         mounts: vec![MountConfig {
@@ -1718,7 +2664,7 @@ fn file_watch_emits_hidden_directory_writes() {
 
 #[test]
 fn file_watch_picks_up_external_new_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -1784,7 +2730,7 @@ fn file_watch_picks_up_external_new_file() {
 
 #[test]
 fn file_watch_emits_file_changed_for_external_write() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -1829,7 +2775,7 @@ fn file_watch_emits_file_changed_for_external_write() {
 
 #[test]
 fn read_text_file_returns_fresh_content_after_external_write() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
 
@@ -1879,7 +2825,7 @@ fn read_text_file_returns_fresh_content_after_external_write() {
 
 #[test]
 fn file_watch_picks_up_external_removed_directory() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src/nested")).unwrap();
     fs::write(dir.path().join("src/nested/mod.rs"), "pub fn nested() {}\n").unwrap();
 
@@ -1943,7 +2889,7 @@ fn file_watch_picks_up_external_removed_directory() {
 
 #[test]
 fn find_in_files_defaults_to_rs_md_toml_and_returns_concise_hits() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(
         dir.path().join("src/lib.rs"),
@@ -2008,7 +2954,7 @@ fn find_in_files_defaults_to_rs_md_toml_and_returns_concise_hits() {
 
 #[test]
 fn find_in_files_regex_respects_max_results() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(
         dir.path().join("src/lib.rs"),
@@ -2053,7 +2999,7 @@ fn find_in_files_regex_respects_max_results() {
 
 #[test]
 fn read_text_range_returns_line_window_and_total_line_count() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = makepad_studio_hub::test_support::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(
         dir.path().join("src/lib.rs"),

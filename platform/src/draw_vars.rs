@@ -13,6 +13,7 @@ use crate::{
     makepad_script::*,
     script::vm::*,
     texture::Texture,
+    uniform_buffer::UniformBuffer,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -22,7 +23,8 @@ use crate::makepad_script::{
 };
 
 pub const DRAW_CALL_DYN_UNIFORMS: usize = 256;
-pub const DRAW_CALL_TEXTURE_SLOTS: usize = 8;
+pub const DRAW_CALL_TEXTURE_SLOTS: usize = 16;
+pub const DRAW_CALL_UNIFORM_BUFFER_SLOTS: usize = 2;
 pub const DRAW_CALL_DYN_INSTANCES: usize = 32;
 
 #[derive(Clone, Script, Debug)]
@@ -46,6 +48,8 @@ pub struct DrawVars {
     pub dyn_uniforms: [f32; DRAW_CALL_DYN_UNIFORMS],
     #[rust]
     pub texture_slots: [Option<Texture>; DRAW_CALL_TEXTURE_SLOTS],
+    #[rust]
+    pub uniform_buffer_slots: [Option<UniformBuffer>; DRAW_CALL_UNIFORM_BUFFER_SLOTS],
     #[rust([0f32; DRAW_CALL_DYN_INSTANCES])]
     pub dyn_instances: [f32; DRAW_CALL_DYN_INSTANCES],
 }
@@ -83,6 +87,15 @@ impl ScriptHook for DrawVars {
                 self.options.depth_write = v != 0.0;
             }
 
+            let backface_culling_value =
+                vm.bx
+                    .heap
+                    .value(io_self, id!(backface_culling).into(), NoTrap);
+            if let Some(v) = backface_culling_value.as_bool() {
+                self.options.backface_culling = v;
+            } else if let Some(v) = backface_culling_value.as_f64() {
+                self.options.backface_culling = v != 0.0;
+            }
         }
         // lets fill our values
         if self.draw_shader_id.is_some() {
@@ -124,6 +137,14 @@ impl DrawVars {
         self.texture_slots[slot] = None;
     }
 
+    pub fn set_uniform_buffer(&mut self, slot: usize, uniform_buffer: &UniformBuffer) {
+        self.uniform_buffer_slots[slot] = Some(uniform_buffer.clone());
+    }
+
+    pub fn empty_uniform_buffer(&mut self, slot: usize) {
+        self.uniform_buffer_slots[slot] = None;
+    }
+
     pub fn redraw(&self, cx: &mut Cx) {
         self.area.redraw(cx);
     }
@@ -137,10 +158,21 @@ impl DrawVars {
     }
 
     pub fn as_slice<'a>(&'a self) -> &'a [f32] {
+        debug_assert!(
+            self.dyn_instance_start <= self.dyn_instances.len(),
+            "dyn instance start out of bounds: start={} len={}",
+            self.dyn_instance_start,
+            self.dyn_instances.len()
+        );
         unsafe {
+            // NOTE:
+            // Instance layout intentionally spans beyond `dyn_instances` into trailing
+            // live instance fields in repr(C) draw shader structs.
             std::slice::from_raw_parts(
-                (&self.dyn_instances[self.dyn_instance_start - 1] as *const _ as *const f32)
-                    .offset(1),
+                self.dyn_instances
+                    .as_ptr()
+                    .add(self.dyn_instance_start)
+                    .cast::<f32>(),
                 self.dyn_instance_slots,
             )
         }
@@ -311,7 +343,13 @@ impl DrawVars {
         };
 
         let sh = &cx.draw_shaders[draw_shader_id.index];
-        let Some(input) = sh.mapping.instances.inputs.iter().find(|input| input.id == inst) else {
+        let Some(input) = sh
+            .mapping
+            .instances
+            .inputs
+            .iter()
+            .find(|input| input.id == inst)
+        else {
             return false;
         };
         let Some(draw_list) = cx.draw_lists.checked_index(area.draw_list_id) else {
