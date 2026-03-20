@@ -1234,6 +1234,7 @@ impl Cx {
                         window.popup_size = None;
                     }
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }

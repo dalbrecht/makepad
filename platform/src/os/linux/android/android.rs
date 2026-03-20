@@ -2415,6 +2415,7 @@ impl Cx {
                 CxOsOp::SetCursor(_) => {
                     // no need
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }

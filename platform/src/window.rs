@@ -563,6 +563,10 @@ impl WindowHandle {
         cx.push_unique_platform_op(CxOsOp::RepositionWindow(self.window_id(), position));
     }
 
+    pub fn set_title(&self, cx: &mut Cx, title: &str) {
+        cx.set_window_title(self.window_id(), title);
+    }
+
     pub fn restore(&mut self, cx: &mut Cx) {
         cx.push_unique_platform_op(CxOsOp::RestoreWindow(self.window_id()));
     }
