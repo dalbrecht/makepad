@@ -3091,6 +3091,7 @@ impl Cx {
                     crate::error!("external file dragging is not implemented on Android");
                     self.call_event_handler(&Event::DragEnd);
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
