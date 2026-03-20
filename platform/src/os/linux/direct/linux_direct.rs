@@ -392,6 +392,7 @@ impl Cx {
                         },
                     ));
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
