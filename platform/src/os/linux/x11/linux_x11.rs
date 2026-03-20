@@ -627,6 +627,7 @@ impl X11Cx {
                         window.xlib_window.restore();
                     }
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 CxOsOp::ResizeWindow(window_id, size) => {
                     if let Some(window) =
                         opengl_windows.iter_mut().find(|w| w.window_id == window_id)
