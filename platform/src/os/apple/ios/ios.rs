@@ -1644,6 +1644,7 @@ impl Cx {
                 CxOsOp::DeferSystemGestures(edges) => {
                     IosApp::set_deferred_system_gesture_edges(ui_rect_edges(edges));
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
