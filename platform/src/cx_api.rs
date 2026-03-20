@@ -254,6 +254,7 @@ pub enum CxOsOp {
     FullscreenWindow(WindowId),
     NormalizeWindow(WindowId),
     RestoreWindow(WindowId),
+    SetWindowTitle(WindowId, String),
     HideWindow(WindowId),
     HideWindowButtons(WindowId),
     ShowWindowButtons(WindowId),
@@ -418,6 +419,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::FullscreenWindow(..) => write!(f, "FullscreenWindow"),
             Self::NormalizeWindow(..) => write!(f, "NormalizeWindow"),
             Self::RestoreWindow(..) => write!(f, "RestoreWindow"),
+            Self::SetWindowTitle(..) => write!(f, "SetWindowTitle"),
             Self::HideWindow(..) => write!(f, "HideWindow"),
             Self::HideWindowButtons(..) => write!(f, "HideWindowButtons"),
             Self::ShowWindowButtons(..) => write!(f, "ShowWindowButtons"),
@@ -878,6 +880,10 @@ impl Cx {
     // You can remove the dock icon by setting this value to false.
     pub fn show_in_dock(&mut self, show: bool) {
         self.platform_ops.push(CxOsOp::ShowInDock(show));
+    }
+
+    pub fn set_window_title(&mut self, window_id: WindowId, title: &str) {
+        self.push_unique_platform_op(CxOsOp::SetWindowTitle(window_id, title.to_string()));
     }
 
     /// Controls how the system bars (status bar and navigation bar) icons and
