@@ -790,6 +790,7 @@ impl Cx {
                 CxOsOp::SetVideoVolume(_, _) => {}
                 CxOsOp::SetVideoPlaybackRate(_, _) => {}
                 CxOsOp::PrepareAudioPlayback(_, _, _, _) => {}
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 } /*
