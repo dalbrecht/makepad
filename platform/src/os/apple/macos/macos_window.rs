@@ -493,6 +493,13 @@ impl MacosWindow {
         }
     }
 
+    pub fn set_title(&self, title: &str) {
+        unsafe {
+            let ns_title = str_to_nsstring(title);
+            let () = msg_send![self.window, setTitle: ns_title];
+        }
+    }
+
     pub fn minimize(&mut self) {
         unsafe {
             let () = msg_send![self.window, miniaturize: nil];
