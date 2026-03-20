@@ -254,6 +254,7 @@ pub enum CxOsOp {
     FullscreenWindow(WindowId),
     NormalizeWindow(WindowId),
     RestoreWindow(WindowId),
+    SetWindowTitle(WindowId, String),
     HideWindow(WindowId),
     HideWindowButtons(WindowId),
     ShowWindowButtons(WindowId),
@@ -418,6 +419,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::FullscreenWindow(..) => write!(f, "FullscreenWindow"),
             Self::NormalizeWindow(..) => write!(f, "NormalizeWindow"),
             Self::RestoreWindow(..) => write!(f, "RestoreWindow"),
+            Self::SetWindowTitle(..) => write!(f, "SetWindowTitle"),
             Self::HideWindow(..) => write!(f, "HideWindow"),
             Self::HideWindowButtons(..) => write!(f, "HideWindowButtons"),
             Self::ShowWindowButtons(..) => write!(f, "ShowWindowButtons"),
@@ -879,7 +881,6 @@ impl Cx {
     pub fn show_in_dock(&mut self, show: bool) {
         self.platform_ops.push(CxOsOp::ShowInDock(show));
     }
-
     /// Controls how the system bars (status bar and navigation bar) icons and
     /// text are tinted, on platforms that support it (currently Android only).
     ///
@@ -894,6 +895,11 @@ impl Cx {
     pub fn set_system_bar_appearance(&mut self, appearance: SystemBarAppearance) {
         self.display_context.system_bar_appearance = appearance;
     }
+
+    pub fn set_window_title(&mut self, window_id: WindowId, title: &str) {
+        self.push_unique_platform_op(CxOsOp::SetWindowTitle(window_id, title.to_string()));
+    }
+
     pub fn push_unique_platform_op(&mut self, op: CxOsOp) {
         if self.platform_ops.iter().find(|o| **o == op).is_none() {
             self.platform_ops.push(op);

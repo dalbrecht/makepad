@@ -1423,6 +1423,7 @@ impl Cx {
                 CxOsOp::SetSystemBarDarkIcons(dark_icons) => {
                     IosApp::set_status_bar_dark_icons(dark_icons);
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
