@@ -21,7 +21,7 @@ script_mod! {
 
         // color: vec4(-1,-1,-1,-1) means "use original SVG colors"
         // Any non-negative color replaces the SVG color, preserving per-vertex alpha.
-        color: vec4(-1.0, -1.0, -1.0, -1.0)
+        color: instance(vec4(-1.0, -1.0, -1.0, -1.0))
 
         // GPU-side transform for cached SVG geometry
         svg_scale: uniform(vec2(1.0, 1.0))
@@ -115,7 +115,9 @@ script_mod! {
         get_color: fn() {
             let base = self.eval_gradient()
             if self.color.x >= 0.0 {
-                return vec4(self.color.rgb * self.color.a * base.a, self.color.a * base.a)
+                // Replace base RGB with the override color, preserving the
+                // vertex alpha (shape mask from tessellation).
+                return vec4(self.color.rgb * base.a, self.color.a * base.a)
             }
             return base
         }
