@@ -1,13 +1,9 @@
-pub use makepad_widgets_dll as makepad_widgets;
+use makepad_widgets;
 
 use makepad_widgets::*;
-use makepad_xr::obj::Tank;
-use makepad_xr::scene::*;
-use std::fmt::Write as _;
+use makepad_xr::*;
 
 app_main!(App);
-
-const DEBUG_VIEW_REFRESH_INTERVAL_SECONDS: f64 = 1.0;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -37,166 +33,6 @@ script_mod! {
         metallic: 0.04
     }
 
-    let TankSlot = XrNode{
-        body: mod.widgets.XrBodyKind.Dynamic
-        depth_query_support: mod.widgets.XrDepthQuerySupportRig.FourWheels
-        shared_object_policy: mod.widgets.XrSharedObjectPolicy.PooledOnDemand
-        spawn_pool: true
-        physics_size: vec3(0.29, 0.09, 0.41)
-        density: 120.0
-        friction: 1.35
-        restitution: 0.02
-        pos: vec3(-12.0, -12.0, 0.0)
-        rot: vec3(0.0, 0.0, 0.0)
-
-        tank_body_mount := XrNode{
-            body: mod.widgets.XrBodyKind.Disabled
-            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-            pos: vec3(0.0, 0.0, 0.0)
-
-            hull_block := Cube{
-                body: mod.widgets.XrBodyKind.Disabled
-                shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                size: vec3(0.28, 0.09, 0.41)
-                corner_radius: 0.03
-                roughness: 0.58
-                metallic: 0.03
-                color: #x6a8337
-            }
-
-            tank_turret_yaw := XrNode{
-                body: mod.widgets.XrBodyKind.Disabled
-                shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                pos: vec3(0.0, 0.08, 0.015)
-                turret_block := Cube{
-                    body: mod.widgets.XrBodyKind.Disabled
-                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                    size: vec3(0.12, 0.07, 0.17)
-                    corner_radius: 0.026
-                    roughness: 0.44
-                    metallic: 0.02
-                    color: #x8ca853
-                }
-
-                tank_barrel_pitch := XrNode{
-                    body: mod.widgets.XrBodyKind.Disabled
-                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                    pos: vec3(0.0, 0.0, 0.08)
-                    barrel_block := Cube{
-                        body: mod.widgets.XrBodyKind.Disabled
-                        shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                        pos: vec3(0.0, 0.0, 0.14)
-                        size: vec3(0.025, 0.025, 0.28)
-                        corner_radius: 0.02
-                        roughness: 0.30
-                        metallic: 0.06
-                        color: #x24291c
-                    }
-                }
-            }
-        }
-
-        tank_wheel_0 := XrNode{
-            body: mod.widgets.XrBodyKind.Disabled
-            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-            pos: vec3(-0.113, -0.045, 0.189)
-            wheel_mesh := IcoSphere{
-                body: mod.widgets.XrBodyKind.Disabled
-                shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                scale: vec3(0.44, 1.0, 1.0)
-                radius: 0.117
-                diffuse: #xc4c7ce
-                color: #x18212b
-
-                marker := Cube{
-                    body: mod.widgets.XrBodyKind.Disabled
-                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                    size: vec3(0.020, 0.020, 0.020)
-                    pos: vec3(0.0, 0.072, 0.0)
-                    corner_radius: 0.006
-                    roughness: 0.22
-                    metallic: 0.06
-                    color: #xe8ebf2
-                }
-            }
-        }
-
-        tank_wheel_1 := XrNode{
-            body: mod.widgets.XrBodyKind.Disabled
-            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-            pos: vec3(-0.113, -0.045, -0.189)
-            wheel_mesh := IcoSphere{
-                body: mod.widgets.XrBodyKind.Disabled
-                shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                scale: vec3(0.44, 1.0, 1.0)
-                radius: 0.117
-                diffuse: #xc4c7ce
-                color: #x18212b
-
-                marker := Cube{
-                    body: mod.widgets.XrBodyKind.Disabled
-                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                    size: vec3(0.020, 0.020, 0.020)
-                    pos: vec3(0.0, 0.072, 0.0)
-                    corner_radius: 0.006
-                    roughness: 0.22
-                    metallic: 0.06
-                    color: #xe8ebf2
-                }
-            }
-        }
-
-        tank_wheel_2 := XrNode{
-            body: mod.widgets.XrBodyKind.Disabled
-            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-            pos: vec3(0.113, -0.045, 0.189)
-            wheel_mesh := IcoSphere{
-                body: mod.widgets.XrBodyKind.Disabled
-                shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                scale: vec3(0.44, 1.0, 1.0)
-                radius: 0.117
-                diffuse: #xc4c7ce
-                color: #x18212b
-
-                marker := Cube{
-                    body: mod.widgets.XrBodyKind.Disabled
-                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                    size: vec3(0.020, 0.020, 0.020)
-                    pos: vec3(0.0, 0.072, 0.0)
-                    corner_radius: 0.006
-                    roughness: 0.22
-                    metallic: 0.06
-                    color: #xe8ebf2
-                }
-            }
-        }
-
-        tank_wheel_3 := XrNode{
-            body: mod.widgets.XrBodyKind.Disabled
-            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-            pos: vec3(0.113, -0.045, -0.189)
-            wheel_mesh := IcoSphere{
-                body: mod.widgets.XrBodyKind.Disabled
-                shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                scale: vec3(0.44, 1.0, 1.0)
-                radius: 0.117
-                diffuse: #xc4c7ce
-                color: #x18212b
-
-                marker := Cube{
-                    body: mod.widgets.XrBodyKind.Disabled
-                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                    size: vec3(0.020, 0.020, 0.020)
-                    pos: vec3(0.0, 0.072, 0.0)
-                    corner_radius: 0.006
-                    roughness: 0.22
-                    metallic: 0.06
-                    color: #xe8ebf2
-                }
-            }
-        }
-    }
-
     let XrUiButton = mod.widgets.ButtonFlat{
         draw_bg +: {
             border_size: 0.0
@@ -216,9 +52,8 @@ script_mod! {
         ui:  XrRoot{
             window.inner_size: vec2(1400, 900)
             pass.clear_color: #x0b1118
-            camera.fov_y: 38.0
-            camera.desktop_target: vec3(0.05, 0.10, -0.72)
-            camera.distance: 1.85
+            camera.fov_y: 52.0
+            camera.distance: 1.8
             env.gravity: 9.8
             env.env_cube: true
             env.depth_mesh: false
@@ -226,7 +61,7 @@ script_mod! {
             scene_select := XrSelect{
                 pos: vec3(0.0, -0.02, -0.62)
                 scale: vec3(0.5, 0.5, 0.5)
-                active_child: @tanks_scene
+                active_child: @ico_box_scene
 
                 test_scene := XrNode{
                     on_render: ||{
@@ -436,7 +271,7 @@ script_mod! {
                             pos: vec3(0.05, 0.20, -0.42)
                         }
 
-                        for index in 0..80 {
+                        for index in 0..160 {
                             let diffuse = #xa0a4aa
                             let color = if index % 6 == 0 {
                                 #xff6f59
@@ -452,8 +287,7 @@ script_mod! {
                                 #xd58cff
                             }
                             IcoSphere{
-                                spawn_pool: true
-                                shared_object_policy: mod.widgets.XrSharedObjectPolicy.PooledOnDemand
+                                projectile_pool: true
                                 density: 0.75
                                 friction: 0.48
                                 restitution: 0.04
@@ -466,62 +300,6 @@ script_mod! {
                     }
                 }
 
-                tanks_scene := XrNode{
-                    pos: vec3(0.0, -0.16, 0.0)
-                    scale: vec3(0.62, 0.62, 0.62)
-                    on_render: ||{
-                        tank_controller := Tank{}
-
-                        Platform{
-                            pos: vec3(0.0, -0.06, 0.0)
-                            size: vec3(0.48387095, 0.08, 0.48387095)
-                            friction: 1.8
-                            color: #x283544
-                        }
-
-                        Cube{
-                            body: mod.widgets.XrBodyKind.Fixed
-                            size: vec3(0.34, 0.05, 0.46)
-                            corner_radius: 0.018
-                            roughness: 0.78
-                            metallic: 0.0
-                            friction: 1.6
-                            color: #x4b5f72
-                            pos: vec3(0.30, 0.01, -0.06)
-                            rot: vec3(0.24, 0.0, 0.0)
-                        }
-
-                        tank_slots := XrNode{
-                            body: mod.widgets.XrBodyKind.Disabled
-                            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                            for index in 0..8 {
-                                TankSlot{
-                                    pos: vec3(-14.0 - index * 0.7, -8.0, 0.0)
-                                }
-                            }
-                        }
-
-                        tank_projectiles := XrNode{
-                            body: mod.widgets.XrBodyKind.Disabled
-                            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                            for index in 0..48 {
-                                IcoSphere{
-                                    spawn_pool: true
-                                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.PooledOnDemand
-                                    gravity_scale: 1.0
-                                    density: 0.65
-                                    friction: 0.08
-                                    restitution: 0.01
-                                    radius: 0.024
-                                    diffuse: #xa0a4aa
-                                    color: #xffc857
-                                    pos: vec3(-12.0, -12.0 - index * 0.01, 0.0)
-                                }
-                            }
-                        }
-                    }
-                }
-
                 helmet_scene := XrNode{
                     on_render: ||{
                         Platform{pos: vec3(0.05, -0.06, -0.10)}
@@ -529,7 +307,6 @@ script_mod! {
                             for col in 0..1 {
                                 Gltf{
                                     body: mod.widgets.XrBodyKind.Dynamic
-                                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.BootstrapShared
                                     physics_size: vec3(0.17, 0.21, 0.17)
                                     density: 0.9
                                     friction: 0.7
@@ -584,18 +361,13 @@ script_mod! {
                     }
                 }
             }
-            xr_peer_sync := XrPeerSync{
-                auto_alignment_enabled: false
-            }
-
-            xr_scene_sync_controller := XrSceneSyncController{}
+            xr_people_debug := XrPeopleDebug{}
 
             control_strip := XrView{
                 visible: false
                 show_in_non_xr: true
-                pos: vec3(0.05, 0.44, -0.78)
                 wrist_left: true
-                logical_size: vec2(1220, 700)
+                logical_size: vec2(920, 468)
                 pixel_scale: 0.000215
                 dpi_factor: 2.0
                 SolidView{
@@ -648,12 +420,6 @@ script_mod! {
                             width: 84
                             text: "Shooter"
                             on_press: || ui.scene_select.ico_shoot_scene()
-                        }
-
-                        tanks_scene_button := XrUiButton{
-                            width: 72
-                            text: "Tanks"
-                            on_press: || ui.scene_select.tanks_scene()
                         }
 
                         block_scene_button := XrUiButton{
@@ -732,15 +498,9 @@ script_mod! {
                             on_press: || ui.root.set_depth_query_hits(!ui.root.depth_query_hits_visible())
                         }
 
-                        tank_depth_mesh_mode_button := XrUiButton{
-                            width: 154
-                            text: "Tank TSDF Mode"
-                            on_press: || ui.root.toggle_depth_mesh_focus_cube()
-                        }
-
                         scene_status := Label{
                             width: Fill
-                            text: "Default scene: tank mode. Left stick steers, right trigger accelerates, left trigger reverses, right stick aims the turret, A/X fire shells, B resets the tank, and controller grip picks the tank up."
+                            text: "Default scene: 160 faceted icosahedra with sphere colliders. Shooter mode fires pooled icos from the main index fingertip."
                             draw_text.color: #xe8f4ff
                         }
                     }
@@ -758,10 +518,16 @@ script_mod! {
                             draw_text.color: #xe8f4ff
                         }
 
-                        depth_resolution_2_button := XrUiButton{
-                            width: 94
-                            text: "2 cm fixed"
-                            on_press: || ui.root.set_depth_voxel_size(0.02)
+                        depth_resolution_5_button := XrUiButton{
+                            width: 64
+                            text: "5 cm"
+                            on_press: || ui.root.set_depth_voxel_size(0.05)
+                        }
+
+                        depth_resolution_10_button := XrUiButton{
+                            width: 72
+                            text: "10 cm"
+                            on_press: || ui.root.set_depth_voxel_size(0.10)
                         }
                     }
 
@@ -811,35 +577,138 @@ script_mod! {
 
                     View{
                         width: Fill
-                        height: Fill
-                        flow: Right
-                        spacing: 12
+                        height: Fit
+                        flow: Down
+                        spacing: 8
 
-                        View{
-                            width: Fill{weight: 66.0}
-                            height: Fill
-                            flow: Down
-                            spacing: 8
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
 
-                            SolidView{
+                            peer_sync_status_field := Label{
                                 width: Fill
-                                height: Fit
-                                padding: Inset{left: 10 right: 10 top: 6 bottom: 6}
-                                draw_bg.color: #x0d1824
-
-                                debug_field := Label{
-                                    width: Fill
-                                    height: Fit
-                                    text: "Waiting for debug stats..."
-                                    draw_text.color: #xe8f4ff
-                                    draw_text.flow: Flow.Right{wrap: true}
-                                }
+                                text: "Peers: off"
+                                draw_text.color: #xe8f4ff
                             }
                         }
 
-                        View{
-                            width: Fill{weight: 34.0}
-                            height: Fill
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            network_status_field := Label{
+                                width: Fill
+                                text: "Network: off"
+                                draw_text.color: #x9ec8e8
+                            }
+                        }
+
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            peer_scene_field := Label{
+                                width: Fill
+                                text: "PeerScene: off"
+                                draw_text.color: #xffd29a
+                            }
+                        }
+
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            alignment_state_field := Label{
+                                width: Fill
+                                text: "AlignState: off"
+                                draw_text.color: #xfff1ab
+                            }
+                        }
+
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            alignment_debug_field := Label{
+                                width: Fill
+                                text: "AlignDbg: off"
+                                draw_text.color: #xffd29a
+                            }
+                        }
+
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            plane_scan_field := Label{
+                                width: Fill
+                                text: "PlaneScan: off"
+                                draw_text.color: #x9af7c4
+                            }
+                        }
+
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            physics_geom_field := Label{
+                                width: Fill
+                                text: "Physics geometry: waiting for frame"
+                                draw_text.color: #xe8f4ff
+                            }
+                        }
+
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            physics_timing_field := Label{
+                                width: Fill
+                                text: "Physics compute: waiting for frame"
+                                draw_text.color: #xe8f4ff
+                            }
+                        }
+
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            frame_cpu_field := Label{
+                                width: Fill
+                                text: "CPU frame: waiting for frame"
+                                draw_text.color: #xe8f4ff
+                            }
+                        }
+
+                        SolidView{
+                            width: Fill
+                            height: 32
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                            draw_bg.color: #x0d1824
+
+                            xr_runtime_field := Label{
+                                width: Fill
+                                text: "XR render scale: waiting for XR session"
+                                draw_text.color: #xe8f4ff
+                            }
                         }
                     }
                 }
@@ -849,7 +718,7 @@ script_mod! {
                 visible: false
                 mode: mod.widgets.XrViewMode.StuckToWrist
                 wrist_left: true
-                logical_size: vec2(112, 188)
+                logical_size: vec2(112, 104)
                 pixel_scale: 0.00030
                 dpi_factor: 1.6
                 depth_scale: 120.0
@@ -877,22 +746,6 @@ script_mod! {
                         draw_bg.border_radius: 12.0
                         on_press: || ui.root.reset_physics()
                     }
-
-                    wrist_pose_button := XrUiButton{
-                        width: Fill
-                        height: 40
-                        text: "Pose"
-                        draw_bg.border_radius: 12.0
-                        on_press: || ui.root.reset_activity_pose()
-                    }
-
-                    wrist_sync_status := Label{
-                        width: Fill
-                        height: Fit
-                        text: "P:0.0 X:0.0"
-                        draw_text.color: #xe8f4ff
-                        draw_text.flow: Flow.Right{wrap: true}
-                    }
                 }
             }
 
@@ -906,288 +759,246 @@ pub struct App {
     #[live]
     ui: WidgetRef,
     #[rust]
-    last_debug_text: String,
+    network_started: bool,
     #[rust]
-    last_debug_refresh_at: Option<f64>,
+    last_physics_geometry_text: String,
     #[rust]
-    last_wrist_perf_text: String,
+    last_physics_timing_text: String,
     #[rust]
-    debug_text_scratch: String,
+    last_frame_cpu_text: String,
     #[rust]
-    wrist_perf_text_scratch: String,
+    last_xr_runtime_text: String,
+    #[rust]
+    last_peer_sync_status_text: String,
+    #[rust]
+    last_network_status_text: String,
+    #[rust]
+    last_peer_scene_text: String,
+    #[rust]
+    last_alignment_state_text: String,
+    #[rust]
+    last_alignment_debug_text: String,
+    #[rust]
+    last_plane_scan_text: String,
 }
 
 impl App {
-    fn run_scene_sync_pre_event(&self, cx: &mut Cx, event: &Event) {
-        let controller = self.ui.widget(cx, ids!(xr_scene_sync_controller));
-        if let Some(mut controller) = controller.borrow_mut::<XrSceneSyncController>() {
-            controller.pre_ui_event(cx, event);
-        };
-    }
-
-    fn run_scene_sync_post_event(&self, cx: &mut Cx, event: &Event) {
-        let controller = self.ui.widget(cx, ids!(xr_scene_sync_controller));
-        if let Some(mut controller) = controller.borrow_mut::<XrSceneSyncController>() {
-            controller.post_ui_event(cx, event);
-        };
-    }
-
-    fn run_tank_pre_event(&self, cx: &mut Cx, event: &Event) {
-        let tank = self.ui.widget(cx, ids!(tank_controller));
-        if let Some(mut tank) = tank.borrow_mut::<Tank>() {
-            tank.pre_ui_event(cx, event);
-        };
-    }
-
-    fn run_tank_post_event(&self, cx: &mut Cx) {
-        let tank = self.ui.widget(cx, ids!(tank_controller));
-        if let Some(mut tank) = tank.borrow_mut::<Tank>() {
-            tank.post_ui_event(cx);
-        };
+    fn ensure_network_started(&mut self, cx: &mut Cx) {
+        if self.network_started {
+            return;
+        }
+        if let Some(mut people_debug) = self
+            .ui
+            .widget(cx, ids!(xr_people_debug))
+            .borrow_mut::<XrPeopleDebug>()
+        {
+            people_debug.set_enabled(cx, true);
+            self.network_started = true;
+        }
     }
 
     fn refresh_debug_fields(&mut self, cx: &mut Cx) {
-        let now = Cx::time_now();
-        if self
-            .last_debug_refresh_at
-            .is_some_and(|last| now - last < DEBUG_VIEW_REFRESH_INTERVAL_SECONDS)
-        {
-            return;
-        }
-        self.last_debug_refresh_at = Some(now);
-
-        let mut draw_top_children_text = String::new();
         let (
             surface_count,
+            vertex_count,
+            triangle_count,
             compute_ms,
-            query_ms,
-            rapier_ms,
+            physics_time_scale,
+            step_dt_ms,
             frame_cpu_ms,
             frame_update_cpu_ms,
             frame_draw_cpu_ms,
-            draw_setup_cpu_ms,
-            draw_env_prepare_cpu_ms,
-            draw_sort_cpu_ms,
-            draw_children_cpu_ms,
-            draw_child_count,
-            draw_transparent_child_count,
-            draw_runtime_body_count,
-            draw_geometry_pool_slots,
-            draw_geometry_pool_live,
-            draw_draw_list_pool_slots,
-            draw_draw_list_pool_live,
-            draw_texture_pool_slots,
-            draw_texture_pool_live,
-            draw_depth_mesh_chunk_count,
-            draw_recycled_depth_mesh_geometry_count,
-            draw_depth_mesh_pending_upsert_count,
-            draw_depth_query_retained_hit_count,
-            xr_frame_cpu_ms,
-            xr_render_cpu_ms,
-            xr_depth_readback_cpu_ms,
-            xr_frame_cpu_breakdown,
         ) = if let Some(root) = self.ui.borrow::<XrRoot>() {
             (
                 root.physics_depth_query_surface_count(),
+                root.physics_depth_query_vertex_count(),
+                root.physics_depth_query_triangle_count(),
                 root.physics_compute_ms(),
-                root.physics_tsdf_query_ms(),
-                root.physics_rapier_step_ms(),
+                root.physics_time_scale(),
+                root.physics_step_dt_ms(),
                 root.frame_cpu_ms(),
                 root.frame_update_cpu_ms(),
                 root.frame_draw_cpu_ms(),
-                root.draw_setup_cpu_ms(),
-                root.draw_env_prepare_cpu_ms(),
-                root.draw_sort_cpu_ms(),
-                root.draw_children_cpu_ms(),
-                root.draw_child_count(),
-                root.draw_transparent_child_count(),
-                root.draw_runtime_body_count(),
-                root.draw_geometry_pool_slots(),
-                root.draw_geometry_pool_live(),
-                root.draw_draw_list_pool_slots(),
-                root.draw_draw_list_pool_live(),
-                root.draw_texture_pool_slots(),
-                root.draw_texture_pool_live(),
-                root.draw_depth_mesh_chunk_count(),
-                root.draw_recycled_depth_mesh_geometry_count(),
-                root.draw_depth_mesh_pending_upsert_count(),
-                root.draw_depth_query_retained_hit_count(),
-                cx.xr_frame_cpu_time_ms(),
-                cx.xr_render_cpu_time_ms(),
-                cx.xr_depth_readback_cpu_time_ms(),
-                cx.xr_frame_cpu_breakdown(),
             )
         } else {
             return;
         };
-        if let Some(root) = self.ui.borrow::<XrRoot>() {
-            root.write_draw_top_children_text(&mut draw_top_children_text);
-        }
-        let connected_peers = self
+        let peer_sync_status_text = self
             .ui
-            .widget(cx, ids!(xr_peer_sync))
-            .borrow::<XrPeerSync>()
-            .map(|peer_sync| { 
-                (
-                    peer_sync.connected_peer_count(),
-                    peer_sync.shared_object_count(),
-                    peer_sync.touch_sync_status_text(),
-                    peer_sync.local_touch_signal_text(),
-                    peer_sync.remote_touch_signal_text(),
-                    peer_sync.alignment_debug_text().to_string(),
-                    peer_sync.alignment_state_text().to_string(),
-                    peer_sync.peer_scene_text().to_string(),
-                )
-            })
-            .unwrap_or((
-                0,
-                0,
-                "Touch sync: off".to_string(),
-                "TouchRaw: off".to_string(),
-                "TouchPeer: off".to_string(),
-                "AlignDbg: off".to_string(),
-                "AlignState: off".to_string(),
-                "PeerMap: off".to_string(),
-            ));
-        let tsdf_memory_mb = cx
-            .xr_tsdf()
-            .latest_tsdf_snapshot()
-            .as_ref()
-            .map(|snapshot| {
-                let grid = &snapshot.grid;
-                grid.heap_bytes() as f64 / 1_000_000.0
-            })
-            .unwrap_or(0.0);
-        let (depth_frames_seen, depth_frames_dropped) = cx
-            .xr_tsdf()
-            .state()
-            .read()
-            .ok()
-            .map(|state| (state.stats.frames_seen, state.stats.frames_dropped))
-            .unwrap_or((0, 0));
-        let depth_frames_kept = depth_frames_seen.saturating_sub(depth_frames_dropped);
-        let gpu_time_text = cx
-            .xr_gpu_frame_time_ms()
-            .map(|gpu_ms| format!("{gpu_ms:.2} ms"))
-            .unwrap_or_else(|| "waiting".to_string());
-        let xr_frame_cpu_text = xr_frame_cpu_ms
-            .map(|cpu_ms| format!("{cpu_ms:.2} ms"))
-            .unwrap_or_else(|| "waiting".to_string());
-        let xr_render_cpu_text = xr_render_cpu_ms
-            .map(|cpu_ms| format!("{cpu_ms:.2} ms"))
-            .unwrap_or_else(|| "waiting".to_string());
-        let xr_depth_readback_cpu_text = xr_depth_readback_cpu_ms
-            .map(|cpu_ms| format!("{cpu_ms:.2} ms"))
-            .unwrap_or_else(|| "waiting".to_string());
-        let xr_begin_chain = xr_frame_cpu_breakdown
-            .map(|cpu| {
-                format!(
-                    "wait {:.2} > begin {:.2} > loc-space {:.2} > loc-views {:.2} > acq {:.2} > wait-img {:.2} > acq-depth {:.2}",
-                    cpu.wait_frame_ms,
-                    cpu.begin_frame_ms,
-                    cpu.locate_space_ms,
-                    cpu.locate_views_ms,
-                    cpu.acquire_swapchain_ms,
-                    cpu.wait_swapchain_ms,
-                    cpu.acquire_depth_ms,
-                )
-            })
-            .unwrap_or_else(|| "waiting".to_string());
-        let xr_work_chain = xr_frame_cpu_breakdown
-            .map(|cpu| {
-                format!(
-                    "prep {:.2} > xr {:.2} > next {:.2} > draw {:.2} > shaders {:.2} > repaint {:.2} > readback {:.2} > end {:.2} > resize {:.2} > total {:.2}",
-                    cpu.update_prepare_ms,
-                    cpu.update_dispatch_ms,
-                    cpu.next_frame_ms,
-                    cpu.draw_event_ms,
-                    cpu.compile_shaders_ms,
-                    cpu.repaint_ms,
-                    cpu.depth_readback_ms,
-                    cpu.end_frame_ms,
-                    cpu.resize_projection_ms,
-                    cpu.total_ms,
-                )
-            })
-            .unwrap_or_else(|| "waiting".to_string());
-        let bytes_to_mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
-        let xr_repaint_chain = xr_frame_cpu_breakdown
-            .map(|cpu| {
-                format!(
-                    "wait-fence {:.2} > prep-tex {:.2} > record {:.2} > submit {:.2}",
-                    cpu.repaint_wait_inflight_ms,
-                    cpu.repaint_prepare_textures_ms,
-                    cpu.repaint_record_draw_ms,
-                    cpu.repaint_submit_ms,
-                )
-            })
-            .unwrap_or_else(|| "waiting".to_string());
-        let xr_repaint_uploads = xr_frame_cpu_breakdown
-            .map(|cpu| {
-                format!(
-                    "tex {:.2} MB/{} > packet {:.2} MB/{} > geom {:.2} MB > desc {}",
-                    bytes_to_mb(cpu.repaint_texture_upload_bytes),
-                    cpu.repaint_texture_upload_count,
-                    bytes_to_mb(cpu.repaint_packet_buffer_bytes),
-                    cpu.repaint_packet_buffer_count,
-                    bytes_to_mb(cpu.repaint_geometry_upload_bytes),
-                    cpu.repaint_descriptor_set_count,
-                )
-            })
-            .unwrap_or_else(|| "waiting".to_string());
-        let xr_repaint_draw = xr_frame_cpu_breakdown
-            .map(|cpu| {
-                format!(
-                    "items {} > calls {} > packets {} > instances {} > indices {}",
-                    cpu.repaint_draw_items,
-                    cpu.repaint_draw_calls,
-                    cpu.repaint_packets,
-                    cpu.repaint_instances,
-                    cpu.repaint_indices,
-                )
-            })
-            .unwrap_or_else(|| "waiting".to_string());
-        let mut gamepad_count = 0usize;
-        for state in cx.game_input_states() {
-            let GameInputState::Gamepad(_gamepad) = state else {
-                continue;
-            };
-            gamepad_count += 1;
-        }
-        self.debug_text_scratch.clear();
-        let _ = write!(
-            &mut self.debug_text_scratch,
-            "OpenXR frame CPU: {xr_frame_cpu_text}\nOpenXR begin chain: {xr_begin_chain}\nOpenXR work chain: {xr_work_chain}\nOpenXR repaint chain: {xr_repaint_chain}\nOpenXR repaint uploads: {xr_repaint_uploads}\nOpenXR repaint draw: {xr_repaint_draw}\nVulkan XR render CPU: {xr_render_cpu_text}\nDepth readback CPU: {xr_depth_readback_cpu_text}\nUI frame CPU: {frame_cpu_ms:.2} ms\nUI update time: {frame_update_cpu_ms:.2} ms\nUI draw time: {frame_draw_cpu_ms:.2} ms\nUI draw chain: setup {draw_setup_cpu_ms:.2} > env {draw_env_prepare_cpu_ms:.2} > sort {draw_sort_cpu_ms:.2} > children {draw_children_cpu_ms:.2}\nUI top children: {draw_top_children_text}\nUI draw state: children {draw_child_count}/{draw_transparent_child_count} runtime-bodies {draw_runtime_body_count}\nUI pool state: geom {draw_geometry_pool_live}/{draw_geometry_pool_slots} > lists {draw_draw_list_pool_live}/{draw_draw_list_pool_slots} > tex {draw_texture_pool_live}/{draw_texture_pool_slots}\nUI depth state: chunks {draw_depth_mesh_chunk_count} recycled-geoms {draw_recycled_depth_mesh_geometry_count} pending-upserts {draw_depth_mesh_pending_upsert_count} retained-hits {draw_depth_query_retained_hit_count}\nPhysics planes: {surface_count}\nPhysics compute time: {compute_ms:.2} ms\nQuery time: {query_ms:.2} ms\nRapier time: {rapier_ms:.2} ms\nTSDF size: {tsdf_memory_mb:.1} MB\nDepth frames kept: {depth_frames_kept}\nGPU time: {gpu_time_text}\nGamepads: {gamepad_count}\nConnected peers: {}\nShared objects: {}\n{}\n{}\n{}\n{}\n{}\n{}",
-            connected_peers.0,
-            connected_peers.1,
-            connected_peers.2,
-            connected_peers.3,
-            connected_peers.4,
-            connected_peers.5,
-            connected_peers.6,
-            connected_peers.7,
-        );
-        if self.last_debug_text != self.debug_text_scratch {
+            .widget(cx, ids!(xr_people_debug))
+            .borrow::<XrPeopleDebug>()
+            .map(|people_debug| people_debug.status_text().to_string())
+            .unwrap_or_else(|| "Peers: unavailable".to_string());
+        let network_status_text = self
+            .ui
+            .widget(cx, ids!(xr_people_debug))
+            .borrow::<XrPeopleDebug>()
+            .map(|people_debug| people_debug.network_status_text().to_string())
+            .unwrap_or_else(|| "Network: unavailable".to_string());
+        let alignment_debug_text = self
+            .ui
+            .widget(cx, ids!(xr_people_debug))
+            .borrow::<XrPeopleDebug>()
+            .map(|people_debug| people_debug.alignment_debug_text().to_string())
+            .unwrap_or_else(|| "AlignDbg: unavailable".to_string());
+        let alignment_state_text = self
+            .ui
+            .widget(cx, ids!(xr_people_debug))
+            .borrow::<XrPeopleDebug>()
+            .map(|people_debug| people_debug.alignment_state_text().to_string())
+            .unwrap_or_else(|| "AlignState: unavailable".to_string());
+        let peer_scene_text = self
+            .ui
+            .widget(cx, ids!(xr_people_debug))
+            .borrow::<XrPeopleDebug>()
+            .map(|people_debug| people_debug.peer_scene_text().to_string())
+            .unwrap_or_else(|| "PeerScene: unavailable".to_string());
+        let plane_scan_text = self
+            .ui
+            .widget(cx, ids!(xr_people_debug))
+            .borrow::<XrPeopleDebug>()
+            .map(|people_debug| people_debug.plane_scan_text().to_string())
+            .unwrap_or_else(|| "PlaneScan: unavailable".to_string());
+
+        if self.last_peer_sync_status_text != peer_sync_status_text {
             self.ui
-                .widget(cx, ids!(debug_field))
-                .set_text(cx, &self.debug_text_scratch);
-            self.last_debug_text.clear();
-            self.last_debug_text.push_str(&self.debug_text_scratch);
+                .widget(cx, ids!(peer_sync_status_field))
+                .set_text(cx, &peer_sync_status_text);
+            self.last_peer_sync_status_text = peer_sync_status_text;
         }
-        self.wrist_perf_text_scratch.clear();
-        let _ = write!(
-            &mut self.wrist_perf_text_scratch,
-            "P:{:.1} X:{:.1}",
-            compute_ms + query_ms + rapier_ms,
-            xr_frame_cpu_ms.unwrap_or(frame_cpu_ms),
-        );
-        if self.last_wrist_perf_text != self.wrist_perf_text_scratch {
+        if self.last_network_status_text != network_status_text {
             self.ui
-                .widget(cx, ids!(wrist_sync_status))
-                .set_text(cx, &self.wrist_perf_text_scratch);
-            self.last_wrist_perf_text.clear();
-            self.last_wrist_perf_text
-                .push_str(&self.wrist_perf_text_scratch);
+                .widget(cx, ids!(network_status_field))
+                .set_text(cx, &network_status_text);
+            self.last_network_status_text = network_status_text;
+        }
+        if self.last_alignment_debug_text != alignment_debug_text {
+            self.ui
+                .widget(cx, ids!(alignment_debug_field))
+                .set_text(cx, &alignment_debug_text);
+            self.last_alignment_debug_text = alignment_debug_text;
+        }
+        if self.last_alignment_state_text != alignment_state_text {
+            self.ui
+                .widget(cx, ids!(alignment_state_field))
+                .set_text(cx, &alignment_state_text);
+            self.last_alignment_state_text = alignment_state_text;
+        }
+        if self.last_peer_scene_text != peer_scene_text {
+            self.ui
+                .widget(cx, ids!(peer_scene_field))
+                .set_text(cx, &peer_scene_text);
+            self.last_peer_scene_text = peer_scene_text;
+        }
+        if self.last_plane_scan_text != plane_scan_text {
+            self.ui
+                .widget(cx, ids!(plane_scan_field))
+                .set_text(cx, &plane_scan_text);
+            self.last_plane_scan_text = plane_scan_text;
+        }
+
+        let geometry_text = format!(
+            "Physics geometry: {} planes, {} vertices, {} triangles",
+            surface_count, vertex_count, triangle_count
+        );
+        if self.last_physics_geometry_text != geometry_text {
+            self.ui
+                .widget(cx, ids!(physics_geom_field))
+                .set_text(cx, &geometry_text);
+            self.last_physics_geometry_text = geometry_text;
+        }
+
+        let timing_text = if step_dt_ms > 0.0 {
+            format!(
+                "Physics compute: {:.2} ms | tick {:.2} ms ({:.0} Hz) | sim {:.2}x",
+                compute_ms,
+                step_dt_ms,
+                1000.0 / step_dt_ms,
+                physics_time_scale
+            )
+        } else {
+            format!(
+                "Physics compute: {:.2} ms | sim {:.2}x",
+                compute_ms, physics_time_scale
+            )
+        };
+        if self.last_physics_timing_text != timing_text {
+            self.ui
+                .widget(cx, ids!(physics_timing_field))
+                .set_text(cx, &timing_text);
+            self.last_physics_timing_text = timing_text;
+        }
+
+        let frame_cpu_text = format!(
+            "CPU frame: {:.2} ms total | update {:.2} ms | draw {:.2} ms",
+            frame_cpu_ms, frame_update_cpu_ms, frame_draw_cpu_ms
+        );
+        if self.last_frame_cpu_text != frame_cpu_text {
+            self.ui
+                .widget(cx, ids!(frame_cpu_field))
+                .set_text(cx, &frame_cpu_text);
+            self.last_frame_cpu_text = frame_cpu_text;
+        }
+
+        let xr_runtime_text = match (
+            cx.xr_render_scale(),
+            cx.xr_display_refresh_rate_hz(),
+            cx.xr_effective_frame_rate_hz(),
+            cx.xr_gpu_frame_time_ms(),
+        ) {
+            (Some(scale), Some(refresh_hz), Some(effective_hz), Some(gpu_ms)) => format!(
+                "Depth: {:.0} cm | XR scale: {:.2} | refresh {:.1} Hz | cadence {:.1} Hz | GPU {:.2} ms",
+                cx.xr_depth_mesh().voxel_size_meters() * 100.0,
+                scale,
+                refresh_hz,
+                effective_hz,
+                gpu_ms
+            ),
+            (Some(scale), Some(refresh_hz), Some(effective_hz), None) => format!(
+                "Depth: {:.0} cm | XR scale: {:.2} | refresh {:.1} Hz | cadence {:.1} Hz | GPU waiting",
+                cx.xr_depth_mesh().voxel_size_meters() * 100.0,
+                scale,
+                refresh_hz,
+                effective_hz
+            ),
+            (Some(scale), Some(refresh_hz), None, Some(gpu_ms)) => format!(
+                "Depth: {:.0} cm | XR scale: {:.2} | refresh {:.1} Hz | cadence waiting | GPU {:.2} ms",
+                cx.xr_depth_mesh().voxel_size_meters() * 100.0,
+                scale,
+                refresh_hz,
+                gpu_ms
+            ),
+            (Some(scale), Some(refresh_hz), None, None) => format!(
+                "Depth: {:.0} cm | XR scale: {:.2} | refresh {:.1} Hz | cadence waiting | GPU waiting",
+                cx.xr_depth_mesh().voxel_size_meters() * 100.0,
+                scale,
+                refresh_hz
+            ),
+            (Some(scale), None, _, Some(gpu_ms)) => {
+                format!(
+                    "Depth: {:.0} cm | XR scale: {:.2} | refresh waiting | GPU {:.2} ms",
+                    cx.xr_depth_mesh().voxel_size_meters() * 100.0,
+                    scale,
+                    gpu_ms
+                )
+            }
+            (Some(scale), None, _, None) => {
+                format!(
+                    "Depth: {:.0} cm | XR scale: {:.2} | refresh waiting | GPU waiting",
+                    cx.xr_depth_mesh().voxel_size_meters() * 100.0,
+                    scale
+                )
+            }
+            (None, _, _, _) => format!(
+                "Depth: {:.0} cm | XR render scale: not active",
+                cx.xr_depth_mesh().voxel_size_meters() * 100.0
+            ),
+        };
+        if self.last_xr_runtime_text != xr_runtime_text {
+            self.ui
+                .widget(cx, ids!(xr_runtime_field))
+                .set_text(cx, &xr_runtime_text);
+            self.last_xr_runtime_text = xr_runtime_text;
         }
     }
 }
@@ -1200,11 +1011,10 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        self.run_scene_sync_pre_event(cx, event);
-        self.run_tank_pre_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
-        self.run_tank_post_event(cx);
-        self.run_scene_sync_post_event(cx, event);
+        if matches!(event, Event::Startup) {
+            self.ensure_network_started(cx);
+        }
         self.refresh_debug_fields(cx);
     }
 }
