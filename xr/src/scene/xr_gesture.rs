@@ -1,182 +1,130 @@
-use crate::prelude::*;
-
-const OPEN_HAND_SYNC_PALM_OFFSET_METERS: f32 = 0.020;
-const FLOOR_SET_MIN_HAND_GAP_METERS: f32 = 0.08;
-const FLOOR_SET_MAX_HAND_GAP_METERS: f32 = 0.55;
-const FLOOR_SET_MAX_HAND_VERTICAL_SPLIT_METERS: f32 = 0.06;
-const FLOOR_SET_MAX_HAND_DEPTH_SPLIT_METERS: f32 = 0.14;
-const FLOOR_SET_MAX_HEAD_HORIZONTAL_DISTANCE_METERS: f32 = 0.24;
-const FLOOR_SET_MIN_HEAD_CLEARANCE_METERS: f32 = 0.25;
+use crate::*;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct XrFloorSetGestureSample {
-    pub anchor: XrAnchor,
-    pub floor_y: f32,
-    pub midpoint: Vec3f,
-    pub hand_gap: f32,
+pub(crate) struct ClosedFistGestureConfig {
+    pub min_finger_bend_degrees: f32,
+    pub min_thumb_bend_degrees: f32,
+    pub max_finger_forward_extension_ratio: f32,
+    pub max_thumb_center_distance_ratio: f32,
+    pub min_back_of_hand_up_dot: f32,
+    pub max_pinch_strength: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct XrArmPairMetrics {
-    pub left_forward: f32,
-    pub right_forward: f32,
-    pub left_lateral: f32,
-    pub right_lateral: f32,
-    pub hand_gap: f32,
-    pub average_forward_distance: f32,
-    pub left_elevation_degrees: f32,
-    pub right_elevation_degrees: f32,
-}
+pub(crate) const CLOSED_FIST_GESTURE: ClosedFistGestureConfig = ClosedFistGestureConfig {
+    min_finger_bend_degrees: 55.0,
+    min_thumb_bend_degrees: 32.0,
+    max_finger_forward_extension_ratio: 0.60,
+    max_thumb_center_distance_ratio: 0.95,
+    min_back_of_hand_up_dot: 0.35,
+    max_pinch_strength: 0.88,
+};
 
-pub(crate) fn flat_head_forward(orientation: Quat) -> Vec3f {
-    let mut forward = orientation.rotate_vec3(&vec3f(0.0, 0.0, -1.0));
-    forward.y = 0.0;
-    if forward.length() <= 1.0e-6 {
-        vec3f(0.0, 0.0, -1.0)
-    } else {
-        forward.normalize()
-    }
-}
-
-pub(crate) fn flat_head_right(orientation: Quat) -> Vec3f {
-    let mut right = orientation.rotate_vec3(&vec3f(1.0, 0.0, 0.0));
-    right.y = 0.0;
-    if right.length() <= 1.0e-6 {
-        vec3f(1.0, 0.0, 0.0)
-    } else {
-        right.normalize()
-    }
-}
-
-pub(crate) fn arm_pair_metrics(
-    head_pose: Pose,
-    left_point: Vec3f,
-    right_point: Vec3f,
-) -> Option<XrArmPairMetrics> {
-    let forward = flat_head_forward(head_pose.orientation);
-    let right = flat_head_right(head_pose.orientation);
-    let left_local = left_point - head_pose.position;
-    let right_local = right_point - head_pose.position;
-    let left_forward = left_local.dot(forward);
-    let right_forward = right_local.dot(forward);
-    let left_lateral = left_local.dot(right);
-    let right_lateral = right_local.dot(right);
-    let hand_gap = (right_point - left_point).length();
-    let left_horizontal = (left_forward * left_forward + left_lateral * left_lateral).sqrt();
-    let right_horizontal = (right_forward * right_forward + right_lateral * right_lateral).sqrt();
-    if !left_horizontal.is_finite()
-        || !right_horizontal.is_finite()
-        || left_horizontal <= 1.0e-4
-        || right_horizontal <= 1.0e-4
-    {
-        return None;
-    }
-    Some(XrArmPairMetrics {
-        left_forward,
-        right_forward,
-        left_lateral,
-        right_lateral,
-        hand_gap,
-        average_forward_distance: (left_forward + right_forward) * 0.5,
-        left_elevation_degrees: left_local.y.atan2(left_horizontal).abs().to_degrees(),
-        right_elevation_degrees: right_local.y.atan2(right_horizontal).abs().to_degrees(),
-    })
-}
-
-pub(crate) fn hand_closed_fist_contact_point(
+pub(crate) fn hand_is_palm_down_closed_fist(
     hand: &XrHand,
-    forward: Vec3f,
     is_left: bool,
-) -> Option<Vec3f> {
-    if !(hand.is_open() && hand.is_upright_for_box_sync()) {
-        return None;
+    config: ClosedFistGestureConfig,
+) -> bool {
+    if !hand.in_view() {
+        return false;
     }
-    let pose = hand.tracking_pose()?;
-    let offset_direction = hand_palm_surface_direction(hand, is_left).unwrap_or_else(|| {
-        if forward.length() > 1.0e-5 {
-            forward.normalize()
-        } else {
-            vec3f(0.0, 0.0, -1.0)
-        }
-    });
-    Some(pose.position + offset_direction.scale(OPEN_HAND_SYNC_PALM_OFFSET_METERS))
-}
-
-pub(crate) fn hand_closed_fist_contact_point_geometry_only(
-    hand: &XrHand,
-    forward: Vec3f,
-    is_left: bool,
-) -> Option<Vec3f> {
-    hand_closed_fist_contact_point(hand, forward, is_left)
-}
-
-pub(crate) fn hand_open_palm_contact_point(hand: &XrHand, is_left: bool) -> Option<Vec3f> {
-    if !(hand.is_open() && hand.is_palm_down(is_left)) {
-        return None;
-    }
-    let pose = hand.tracking_pose()?;
-    let offset_direction = hand_palm_surface_direction(hand, is_left)?;
-    Some(pose.position + offset_direction.scale(OPEN_HAND_SYNC_PALM_OFFSET_METERS))
-}
-
-pub(crate) fn floor_set_gesture_sample(state: &XrState) -> Option<XrFloorSetGestureSample> {
-    let left_point = hand_open_palm_contact_point(&state.left_hand, true)?;
-    let right_point = hand_open_palm_contact_point(&state.right_hand, false)?;
-    let metrics = arm_pair_metrics(state.head_pose, left_point, right_point)?;
-    let midpoint = (left_point + right_point) * 0.5;
-    let midpoint_delta = midpoint - state.head_pose.position;
-    let head_forward = flat_head_forward(state.head_pose.orientation);
-    let head_right = flat_head_right(state.head_pose.orientation);
-    let midpoint_forward = midpoint_delta.dot(head_forward);
-    let midpoint_lateral = midpoint_delta.dot(head_right);
-    let midpoint_horizontal_distance =
-        (midpoint_forward * midpoint_forward + midpoint_lateral * midpoint_lateral).sqrt();
-    if metrics.left_lateral >= -0.01
-        || metrics.right_lateral <= 0.01
-        || metrics.hand_gap < FLOOR_SET_MIN_HAND_GAP_METERS
-        || metrics.hand_gap > FLOOR_SET_MAX_HAND_GAP_METERS
-        || (left_point.y - right_point.y).abs() > FLOOR_SET_MAX_HAND_VERTICAL_SPLIT_METERS
-        || (metrics.left_forward - metrics.right_forward).abs()
-            > FLOOR_SET_MAX_HAND_DEPTH_SPLIT_METERS
-        || midpoint_horizontal_distance > FLOOR_SET_MAX_HEAD_HORIZONTAL_DISTANCE_METERS
-        || state.head_pose.position.y - midpoint.y < FLOOR_SET_MIN_HEAD_CLEARANCE_METERS
+    if hand.pinch_strength_index() > config.max_pinch_strength
+        || hand.pinch_strength_middle() > config.max_pinch_strength
     {
-        return None;
+        return false;
     }
-    Some(XrFloorSetGestureSample {
-        anchor: XrAnchor {
-            left: left_point,
-            right: right_point,
-        },
-        floor_y: midpoint.y,
-        midpoint,
-        hand_gap: metrics.hand_gap,
-    })
+
+    let Some(along_hand) = hand_along_direction(hand) else {
+        return false;
+    };
+    let Some(palm_width) = palm_width(hand) else {
+        return false;
+    };
+    let Some(back_of_hand) = back_of_hand_normal(hand, is_left) else {
+        return false;
+    };
+    if back_of_hand.y < config.min_back_of_hand_up_dot {
+        return false;
+    }
+
+    [
+        XrHand::INDEX_TIP,
+        XrHand::MIDDLE_TIP,
+        XrHand::RING_TIP,
+        XrHand::LITTLE_TIP,
+    ]
+    .into_iter()
+    .all(|tip| finger_is_tucked(hand, tip, along_hand, palm_width, config))
+        && thumb_is_tucked(hand, palm_width, config)
 }
 
-fn hand_palm_surface_direction(hand: &XrHand, is_left: bool) -> Option<Vec3f> {
-    let center = hand.joint_pose_checked(XrHand::CENTER)?.position;
-    let wrist = hand.joint_pose_checked(XrHand::WRIST)?.position;
-    let along_hand = center - wrist;
-    if along_hand.length() <= 1.0e-5 {
-        return None;
-    }
+fn hand_along_direction(hand: &XrHand) -> Option<Vec3f> {
+    let along_hand = hand.joints[XrHand::CENTER].position - hand.joints[XrHand::WRIST].position;
+    (along_hand.length() > 1.0e-5).then_some(along_hand.normalize())
+}
+
+fn palm_width(hand: &XrHand) -> Option<f32> {
+    let width = (hand.joints[XrHand::INDEX_BASE].position
+        - hand.joints[XrHand::LITTLE_BASE].position)
+        .length();
+    (width > 1.0e-5).then_some(width)
+}
+
+fn back_of_hand_normal(hand: &XrHand, is_left: bool) -> Option<Vec3f> {
+    let along_hand = hand_along_direction(hand)?;
     let across_hand = if is_left {
-        hand.joint_pose_checked(XrHand::INDEX_BASE)?.position
-            - hand.joint_pose_checked(XrHand::LITTLE_BASE)?.position
+        hand.joints[XrHand::INDEX_BASE].position - hand.joints[XrHand::LITTLE_BASE].position
     } else {
-        hand.joint_pose_checked(XrHand::LITTLE_BASE)?.position
-            - hand.joint_pose_checked(XrHand::INDEX_BASE)?.position
+        hand.joints[XrHand::LITTLE_BASE].position - hand.joints[XrHand::INDEX_BASE].position
     };
     if across_hand.length() <= 1.0e-5 {
         return None;
     }
-    let back_of_hand = Vec3f::cross(across_hand.normalize(), along_hand.normalize());
-    if back_of_hand.length() <= 1.0e-5 {
-        return None;
-    }
-    Some(back_of_hand.normalize().scale(-1.0))
+    let back_of_hand = Vec3f::cross(across_hand.normalize(), along_hand);
+    (back_of_hand.length() > 1.0e-5).then_some(back_of_hand.normalize())
 }
 
-#[cfg(test)]
-include!("../tests/scene/xr_gesture.rs");
+fn finger_base_joint(tip: usize) -> Option<usize> {
+    match tip {
+        XrHand::INDEX_TIP => Some(XrHand::INDEX_BASE),
+        XrHand::MIDDLE_TIP => Some(XrHand::MIDDLE_BASE),
+        XrHand::RING_TIP => Some(XrHand::RING_BASE),
+        XrHand::LITTLE_TIP => Some(XrHand::LITTLE_BASE),
+        _ => None,
+    }
+}
+
+fn finger_is_tucked(
+    hand: &XrHand,
+    tip: usize,
+    along_hand: Vec3f,
+    palm_width: f32,
+    config: ClosedFistGestureConfig,
+) -> bool {
+    let Some(base_joint) = finger_base_joint(tip) else {
+        return false;
+    };
+    let Some(bend) = hand.finger_max_bend_angle_degrees(tip) else {
+        return false;
+    };
+    if bend < config.min_finger_bend_degrees {
+        return false;
+    }
+
+    let tip_position = hand.tip_pos_for_index(tip);
+    let base_position = hand.joints[base_joint].position;
+    let forward_extension = (tip_position - base_position).dot(along_hand);
+    forward_extension <= palm_width * config.max_finger_forward_extension_ratio
+}
+
+fn thumb_is_tucked(hand: &XrHand, palm_width: f32, config: ClosedFistGestureConfig) -> bool {
+    let Some(bend) = hand.finger_max_bend_angle_degrees(XrHand::THUMB_TIP) else {
+        return false;
+    };
+    if bend < config.min_thumb_bend_degrees {
+        return false;
+    }
+
+    let thumb_tip = hand.tip_pos_thumb();
+    let palm_center = hand.joints[XrHand::CENTER].position;
+    (thumb_tip - palm_center).length() <= palm_width * config.max_thumb_center_distance_ratio
+}
