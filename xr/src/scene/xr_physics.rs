@@ -363,157 +363,6 @@ fn decode_depth_query_surface_owner(user_data: u128) -> Option<u64> {
         .then_some((user_data & DEPTH_QUERY_USER_DATA_OWNER_MASK) as u64)
 }
 
-fn decode_depth_query_surface_role(user_data: u128) -> Option<DepthQueryColliderRole> {
-    ((user_data & DEPTH_QUERY_SURFACE_USER_DATA_TAG) != 0).then_some(
-        if (user_data & DEPTH_QUERY_SURFACE_IMPACT_ROLE_TAG) != 0 {
-            DepthQueryColliderRole::Impact
-        } else {
-            DepthQueryColliderRole::Support
-        },
-    )
-}
-
-fn quat_from_to(from: Vec3f, to: Vec3f) -> Quat {
-    let from_len = from.length();
-    let to_len = to.length();
-    if from_len <= 1.0e-6 || to_len <= 1.0e-6 {
-        return Quat::default();
-    }
-    let from = from * (1.0 / from_len);
-    let to = to * (1.0 / to_len);
-    let dot = from.dot(to).clamp(-1.0, 1.0);
-    if dot >= 0.9999 {
-        return Quat::default();
-    }
-    if dot <= -0.9999 {
-        let fallback_axis = if from.x.abs() < 0.8 {
-            vec3f(1.0, 0.0, 0.0)
-        } else {
-            vec3f(0.0, 1.0, 0.0)
-        };
-        let axis = Vec3f::cross(from, fallback_axis).normalize();
-        return Quat::from_axis_angle(axis, std::f32::consts::PI);
-    }
-    let axis = Vec3f::cross(from, to).normalize();
-    Quat::from_axis_angle(axis, dot.acos())
-}
-
-fn sphere_support_radius(half_extents: Vec3f) -> f32 {
-    half_extents
-        .x
-        .min(half_extents.y)
-        .min(half_extents.z)
-        .max(0.0005)
-}
-
-fn four_wheel_support_radius(half_extents: Vec3f) -> f32 {
-    (sphere_support_radius(half_extents) * XR_FOUR_WHEEL_RADIUS_SCALE).clamp(0.036, 0.160)
-}
-
-fn four_wheel_support_specs(
-    half_extents: Vec3f,
-) -> [Option<SupportMarkerSpec>; XR_MAX_LINKED_SUPPORT_BODIES_PER_CUBE] {
-    let radius = four_wheel_support_radius(half_extents);
-    let lateral = (half_extents.x * XR_FOUR_WHEEL_LATERAL_FRACTION).max(radius * 0.75);
-    let rest_length = (radius * XR_FOUR_WHEEL_REST_LENGTH_SCALE).clamp(0.024, 0.110);
-    let min_length_floor = (rest_length * XR_FOUR_WHEEL_MIN_SUSPENSION_LENGTH_FRACTION).max(0.004);
-    let travel = (radius * XR_FOUR_WHEEL_TRAVEL_SCALE).clamp(0.018, 0.090);
-    let min_length = (rest_length - travel).max(min_length_floor);
-    let max_length = rest_length + travel;
-    let local_wheel_center_y = -half_extents.y;
-    let front = half_extents.z * XR_FOUR_WHEEL_FRONT_BACK_FRACTION;
-    let back = -half_extents.z * XR_FOUR_WHEEL_FRONT_BACK_FRACTION;
-    let positions = [
-        vec3f(-lateral, local_wheel_center_y, front),
-        vec3f(-lateral, local_wheel_center_y, back),
-        vec3f(lateral, local_wheel_center_y, front),
-        vec3f(lateral, local_wheel_center_y, back),
-    ];
-    std::array::from_fn(|index| {
-        positions
-            .get(index)
-            .copied()
-            .map(|anchor_local_position| SupportMarkerSpec {
-                anchor_local_position: anchor_local_position + vec3f(0.0, rest_length, 0.0),
-                local_position: anchor_local_position,
-                radius,
-                rest_length,
-                min_length,
-                max_length,
-            })
-    })
-}
-
-impl VehicleConfig {
-    fn default_four_wheel() -> Self {
-        Self {
-            drive: VehicleDrive::All,
-            mass_kg: XR_CAR_MASS_KG,
-            max_steer_deg: XR_CAR_MAX_STEER_DEG,
-            steer_smoothing_factor: XR_CAR_STEER_SMOOTHING_FACTOR,
-            acceleration_force: XR_CAR_ACCELERATION_FORCE,
-            brake_force: XR_CAR_BRAKE_FORCE,
-            top_speed_mps: XR_CAR_TOP_SPEED_MPS,
-            downforce_gain: XR_CAR_DOWNFORCE_GAIN,
-        }
-    }
-}
-
-fn linked_support_world_pose(owner_pose: Pose, support: LinkedSupportBody) -> Pose {
-    Pose::multiply(&owner_pose, &support.local_pose)
-}
-
-fn four_wheel_chassis_collider_half_extents(half_extents: Vec3f) -> Vec3f {
-    vec3f(
-        half_extents.x * XR_FOUR_WHEEL_CHASSIS_WIDTH_SCALE,
-        half_extents.y * XR_FOUR_WHEEL_CHASSIS_HEIGHT_SCALE,
-        half_extents.z * XR_FOUR_WHEEL_CHASSIS_DEPTH_SCALE,
-    )
-}
-
-fn four_wheel_chassis_collider_translation(half_extents: Vec3f) -> Vec3f {
-    vec3f(
-        0.0,
-        half_extents.y * XR_FOUR_WHEEL_CHASSIS_UP_OFFSET_SCALE,
-        0.0,
-    )
-}
-
-fn four_wheel_chassis_collider_bottom_y(half_extents: Vec3f) -> f32 {
-    let collider_half_extents = four_wheel_chassis_collider_half_extents(half_extents);
-    let collider_translation = four_wheel_chassis_collider_translation(half_extents);
-    collider_translation.y - collider_half_extents.y
-}
-
-fn four_wheel_min_chassis_clearance(radius: f32) -> f32 {
-    (radius * XR_FOUR_WHEEL_MIN_CHASSIS_CLEARANCE_FRACTION).clamp(0.018, 0.040)
-}
-
-fn linked_support_world_linvel(
-    owner_pose: Pose,
-    support_pose: Pose,
-    owner_linvel: Vec3f,
-    owner_angvel: Vec3f,
-) -> Vec3f {
-    owner_linvel + Vec3f::cross(owner_angvel, support_pose.position - owner_pose.position)
-}
-
-fn wheel_query_accepts_collider(
-    _handle: ColliderHandle,
-    collider: &Collider,
-    owner_body: RigidBodyHandle,
-    support_body: RigidBodyHandle,
-    support_filter_key: u64,
-) -> bool {
-    if collider.parent() == Some(owner_body) || collider.parent() == Some(support_body) {
-        return false;
-    }
-    if let Some(owner) = decode_depth_query_surface_owner(collider.user_data) {
-        return owner == support_filter_key;
-    }
-    decode_depth_query_body_owner(collider.user_data).is_none()
-}
-
 fn depth_query_surface_target_should_enable(
     target: DepthQuerySurfaceTarget,
     body_position: Vec3f,
@@ -2783,23 +2632,13 @@ impl RapierScene {
             };
             if let Some(collider) = self.colliders.get_mut(surface.collider) {
                 let DepthQueryColliderGeometry::HalfSpace(plane) = target.collider.geometry;
-                let footprint_supports_body = depth_query_plane_supports_body(
-                    plane,
+                let supports_body = depth_query_surface_target_should_enable(
+                    *target,
                     body_position,
                     body_velocity,
                     surface_set.query_radius,
                     physics_edge_margin,
                 );
-                let supports_body = match target.collider.role {
-                    DepthQueryColliderRole::Support => footprint_supports_body,
-                    DepthQueryColliderRole::Impact => {
-                        let speed = body_velocity.length();
-                        let approach_speed = -body_velocity.dot(plane.normal);
-                        footprint_supports_body
-                            && speed >= XR_DEPTH_QUERY_IMPACT_ENABLE_SPEED_MIN
-                            && approach_speed >= XR_DEPTH_QUERY_IMPACT_ENABLE_APPROACH_SPEED_MIN
-                    }
-                };
                 if surface.fingerprint != target.collider.fingerprint {
                     collider.set_shape(SharedShape::halfspace(rapier_vec3(plane.normal)));
                     collider.set_position_wrt_parent(RapierPose::from_parts(
@@ -2824,4 +2663,34 @@ impl RapierScene {
 }
 
 #[cfg(test)]
-include!("../tests/scene/xr_physics.rs");
+mod tests {
+    use super::*;
+
+    #[test]
+    fn impact_surface_enables_before_current_body_overlaps_quad() {
+        let plane = DepthQuerySupportPlane {
+            point: vec3f(1.0, 0.0, 0.0),
+            normal: vec3f(-1.0, 0.0, 0.0),
+            tangent: vec3f(0.0, 1.0, 0.0),
+            bitangent: vec3f(0.0, 0.0, 1.0),
+            half_extent_tangent: 0.08,
+            half_extent_bitangent: 0.08,
+        };
+        let target = DepthQuerySurfaceTarget {
+            collider: DepthQueryCollider {
+                fingerprint: 1,
+                geometry: DepthQueryColliderGeometry::HalfSpace(plane),
+                role: DepthQueryColliderRole::Impact,
+                restitution: 0.38,
+            },
+        };
+
+        assert!(depth_query_surface_target_should_enable(
+            target,
+            vec3f(0.78, 0.0, 0.0),
+            vec3f(0.55, 0.0, 0.0),
+            0.05,
+            0.004,
+        ));
+    }
+}
