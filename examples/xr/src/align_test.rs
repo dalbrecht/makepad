@@ -1,10 +1,11 @@
-use makepad_widgets::{
+use makepad_xr::{
     makepad_derive_widget::*,
     makepad_draw::*,
     widget::*,
     widget_async::{ScriptAsyncId, ScriptAsyncResult},
+    xr_node::xr_widget_world_transform,
+    *,
 };
-use makepad_xr::{net::*, scene::*};
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -60,7 +61,7 @@ impl AlignTest {
             return self.enabled;
         }
         self.enabled = enabled;
-        cx.xr_tsdf().set_surface_analysis_enabled(enabled);
+        cx.xr_depth_mesh().set_surface_analysis_enabled(enabled);
         self.last_mesh_generation = 0;
         self.last_mesh_update_sequence = 0;
         self.last_solution = None;
@@ -80,7 +81,7 @@ impl AlignTest {
             return;
         }
 
-        let Some(snapshot) = cx.xr_tsdf().latest_tsdf_snapshot() else {
+        let Some(snapshot) = cx.xr_depth_mesh().latest_tsdf_snapshot() else {
             self.last_solution = None;
             self.local_markers = None;
             self.remote_markers_local = None;
@@ -120,10 +121,8 @@ impl AlignTest {
         self.remote_markers_local = remote_descriptor
             .transformed(&ground_truth_remote_to_local)
             .test_markers();
-        self.last_solution = XrNetAlignmentDescriptorFrame::solve_remote_to_local(
-            &local_descriptor,
-            &remote_descriptor,
-        );
+        self.last_solution =
+            XrNetAlignmentDescriptorFrame::solve_remote_to_local(&local_descriptor, &remote_descriptor);
 
         let Some(solution) = self.last_solution else {
             if self.local_markers.is_none() {

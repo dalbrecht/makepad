@@ -1,18 +1,18 @@
-use crate::algorithms::tsdf_query::{depth_query_plane_quad, DepthQuerySupportPlane};
-use crate::prelude::*;
+use crate::tsdf_query::{depth_query_plane_quad, DepthQuerySupportPlane};
+use crate::*;
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
-    sync::Arc,
 };
 
 const XR_DEBUG_DEPTH_FLOATS_PER_VERTEX: usize = 8;
-const XR_DEBUG_TSDF_MESH_CHUNK_WORLD_SIZE_METERS: f32 = 0.32;
-const XR_DEBUG_TSDF_MESH_VIEW_DISTANCE_METERS: f32 = 5.5;
-const XR_DEBUG_TSDF_MESH_NEAR_VISIBILITY_METERS: f32 = 1.35;
-const XR_DEBUG_TSDF_MESH_VIEW_CONE_DOT: f32 = 0.309_016_88;
+const XR_DEBUG_TSDF_MESH_CHUNK_EDGE_VOXELS: i32 = 24;
+const XR_DEBUG_TSDF_MESH_CHUNK_OVERLAP_VOXELS: i32 = 4;
 const XR_DEBUG_TSDF_MESH_CELL_STRIDE_VOXELS: i32 = 1;
-const XR_DEBUG_TSDF_MESH_CHUNK_OVERLAP_CELLS: i32 = 2;
+const XR_DEBUG_TSDF_MIN_MESH_CONFIDENCE: u8 = 3;
+const XR_DEBUG_TSDF_RECENT_MESH_CONFIDENCE: u8 = 1;
+const XR_DEBUG_TSDF_RECENT_MESH_GENERATIONS: u64 = 6;
+const XR_DEBUG_TSDF_RECENT_MESH_MAX_ABS_DISTANCE: f32 = 0.6;
 const XR_DEBUG_TSDF_DENSE_HOLE_FILL_MAX_PASSES: usize = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -44,37 +44,10 @@ impl core::ops::Sub for VoxelCoord {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct DebugDepthMeshLayout {
-    pub(crate) chunk_edge_voxels: i32,
-    pub(crate) overlap_voxels: i32,
-    pub(crate) stride_voxels: i32,
-    pub(crate) chunk_world_size_meters: f32,
-    pub(crate) view_distance_meters: f32,
-    pub(crate) near_distance_meters: f32,
-    pub(crate) view_cone_dot: f32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DebugDepthMeshChunkSignature {
-    pub(crate) sources: Vec<(ChunkKey, usize)>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DebugDepthMeshChunkPlan {
-    pub(crate) chunk_key: ChunkKey,
-    pub(crate) signature: DebugDepthMeshChunkSignature,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DebugDepthMeshViewPlan {
-    pub(crate) layout: DebugDepthMeshLayout,
-    pub(crate) visible_chunks: Vec<DebugDepthMeshChunkPlan>,
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 struct SurfaceMesh32 {
     positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
     indices: Vec<u32>,
 }
 
@@ -84,12 +57,6 @@ pub(crate) struct DebugDepthMeshChunk {
     pub(crate) fingerprint: u64,
     pub(crate) indices: Vec<u32>,
     pub(crate) vertices: Vec<f32>,
-}
-
-#[derive(Default)]
-pub(crate) struct DebugDepthMeshTriangulator {
-    dense: Vec<f32>,
-    fill_scratch: Vec<f32>,
 }
 
 const SURFACE_NET_CORNERS: [VoxelCoord; 8] = [
@@ -118,59 +85,80 @@ const SURFACE_NET_EDGES: [(usize, usize); 12] = [
     (3, 7),
 ];
 
-const DEBUG_DEPTH_TRIANGLE_BARYCENTRICS: [[f32; 3]; 3] =
-    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-
 fn quantize_f32(value: f32, quantum: f32) -> i32 {
     (value / quantum.max(f32::EPSILON)).round() as i32
 }
 
-fn push_debug_depth_vertex(vertices: &mut Vec<f32>, position: Vec3f, barycentric: [f32; 3]) {
+#[cfg(test)]
+fn depth_tsd_distance_meters(voxel_size_meters: f32) -> f32 {
+    voxel_size_meters * 2.0
+}
+
+fn chunk_key_and_id(grid: &SparseTsdGridReadSnapshot, coord: VoxelCoord) -> (ChunkKey, usize) {
+    let cx = coord.x.div_euclid(grid.chunk_edge);
+    let cy = coord.y.div_euclid(grid.chunk_edge);
+    let cz = coord.z.div_euclid(grid.chunk_edge);
+    let lx = coord.x.rem_euclid(grid.chunk_edge) as usize;
+    let ly = coord.y.rem_euclid(grid.chunk_edge) as usize;
+    let lz = coord.z.rem_euclid(grid.chunk_edge) as usize;
+    let edge = grid.chunk_edge as usize;
+    let id = lx + ly * edge + lz * edge * edge;
+    (ChunkKey::new(cx, cy, cz), id)
+}
+
+fn snapshot_meshing_distance(
+    grid: &SparseTsdGridReadSnapshot,
+    coord: VoxelCoord,
+    current_generation: u64,
+) -> Option<f32> {
+    let (chunk_key, id) = chunk_key_and_id(grid, coord);
+    let chunk = grid.chunks.get(&chunk_key)?;
+    if chunk.valid.get(id).copied().unwrap_or(0) == 0 {
+        return None;
+    }
+    let confidence = chunk.confidence.get(id).copied().unwrap_or(0);
+    let value = *chunk.values.get(id)?;
+    if confidence >= XR_DEBUG_TSDF_MIN_MESH_CONFIDENCE {
+        return Some(value);
+    }
+    let observed_generation = chunk.observed_generation.get(id).copied().unwrap_or(0);
+    (confidence >= XR_DEBUG_TSDF_RECENT_MESH_CONFIDENCE
+        && current_generation.saturating_sub(observed_generation)
+            <= XR_DEBUG_TSDF_RECENT_MESH_GENERATIONS
+        && value.abs() <= XR_DEBUG_TSDF_RECENT_MESH_MAX_ABS_DISTANCE)
+        .then_some(value)
+}
+
+fn push_debug_depth_vertex(vertices: &mut Vec<f32>, position: Vec3f, normal: Vec3f) {
     vertices.extend_from_slice(&[
-        position.x,
-        position.y,
-        position.z,
-        1.0,
-        barycentric[0],
-        barycentric[1],
-        barycentric[2],
-        0.0,
+        position.x, position.y, position.z, 1.0, normal.x, normal.y, normal.z, 0.0,
     ]);
 }
 
 fn pack_surface_mesh_debug_vertices(mesh: &SurfaceMesh32) -> (Vec<u32>, Vec<f32>) {
-    let mut indices = Vec::with_capacity(mesh.indices.len());
-    let mut vertices = Vec::with_capacity(mesh.indices.len() * XR_DEBUG_DEPTH_FLOATS_PER_VERTEX);
-    for triangle in mesh.indices.chunks_exact(3) {
-        let base = (vertices.len() / XR_DEBUG_DEPTH_FLOATS_PER_VERTEX) as u32;
-        for (corner, vertex_index) in triangle.iter().enumerate() {
-            let position = mesh.positions[*vertex_index as usize];
-            push_debug_depth_vertex(
-                &mut vertices,
-                vec3f(position[0], position[1], position[2]),
-                DEBUG_DEPTH_TRIANGLE_BARYCENTRICS[corner],
-            );
-        }
-        indices.extend_from_slice(&[base, base + 1, base + 2]);
-    }
-    (indices, vertices)
-}
-
-fn push_debug_depth_triangle(indices: &mut Vec<u32>, vertices: &mut Vec<f32>, tri: [Vec3f; 3]) {
-    let base = (vertices.len() / XR_DEBUG_DEPTH_FLOATS_PER_VERTEX) as u32;
-    for (corner, position) in tri.into_iter().enumerate() {
+    let mut vertices = Vec::with_capacity(mesh.positions.len() * XR_DEBUG_DEPTH_FLOATS_PER_VERTEX);
+    for (position, normal) in mesh.positions.iter().zip(mesh.normals.iter()) {
         push_debug_depth_vertex(
-            vertices,
-            position,
-            DEBUG_DEPTH_TRIANGLE_BARYCENTRICS[corner],
+            &mut vertices,
+            vec3f(position[0], position[1], position[2]),
+            vec3f(normal[0], normal[1], normal[2]),
         );
     }
-    indices.extend_from_slice(&[base, base + 1, base + 2]);
+    (mesh.indices.clone(), vertices)
 }
 
 fn push_debug_depth_quad(indices: &mut Vec<u32>, vertices: &mut Vec<f32>, quad: [Vec3f; 4]) {
-    push_debug_depth_triangle(indices, vertices, [quad[0], quad[1], quad[2]]);
-    push_debug_depth_triangle(indices, vertices, [quad[0], quad[2], quad[3]]);
+    let base = (vertices.len() / XR_DEBUG_DEPTH_FLOATS_PER_VERTEX) as u32;
+    let raw_normal = Vec3f::cross(quad[1] - quad[0], quad[2] - quad[0]);
+    let normal = if raw_normal.length() > 1.0e-6 {
+        raw_normal.normalize()
+    } else {
+        vec3f(0.0, 1.0, 0.0)
+    };
+    for position in quad {
+        push_debug_depth_vertex(vertices, position, normal);
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 pub(crate) fn push_debug_depth_plane(
@@ -204,16 +192,46 @@ fn dense_corner_coord(base: VoxelCoord, corner: VoxelCoord, stride: i32) -> Voxe
     )
 }
 
-fn snapshot_meshing_distance(grid: &SparseTsdGridReadSnapshot, coord: VoxelCoord) -> Option<f32> {
-    let (chunk_key, id) = grid.chunk_key_and_local_index_xyz(coord.x, coord.y, coord.z);
-    let chunk = grid.chunks.get(&chunk_key)?;
-    chunk.value(id)
+fn snapshot_region_has_surface(
+    grid: &SparseTsdGridReadSnapshot,
+    start: VoxelCoord,
+    extent: VoxelCoord,
+) -> bool {
+    if grid.chunks.is_empty() {
+        return false;
+    }
+    let max = VoxelCoord::new(
+        start.x + extent.x.saturating_sub(1),
+        start.y + extent.y.saturating_sub(1),
+        start.z + extent.z.saturating_sub(1),
+    );
+    let min_chunk = VoxelCoord::new(
+        start.x.div_euclid(grid.chunk_edge),
+        start.y.div_euclid(grid.chunk_edge),
+        start.z.div_euclid(grid.chunk_edge),
+    );
+    let max_chunk = VoxelCoord::new(
+        max.x.div_euclid(grid.chunk_edge),
+        max.y.div_euclid(grid.chunk_edge),
+        max.z.div_euclid(grid.chunk_edge),
+    );
+    for z in min_chunk.z..=max_chunk.z {
+        for y in min_chunk.y..=max_chunk.y {
+            for x in min_chunk.x..=max_chunk.x {
+                if grid.chunks.contains_key(&ChunkKey::new(x, y, z)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn extract_dense_region_into(
     grid: &SparseTsdGridReadSnapshot,
     start: VoxelCoord,
     extent: VoxelCoord,
+    current_generation: u64,
     dense: &mut Vec<f32>,
 ) {
     let sx = extent.x.max(0) as usize;
@@ -225,7 +243,8 @@ fn extract_dense_region_into(
         for y in 0..extent.y.max(0) {
             for x in 0..extent.x.max(0) {
                 let coord = VoxelCoord::new(start.x + x, start.y + y, start.z + z);
-                let value = snapshot_meshing_distance(grid, coord).unwrap_or(f32::NEG_INFINITY);
+                let value = snapshot_meshing_distance(grid, coord, current_generation)
+                    .unwrap_or(f32::NEG_INFINITY);
                 dense[(x as usize) + (y as usize) * sx + (z as usize) * sx * sy] = value;
             }
         }
@@ -302,7 +321,13 @@ fn repair_dense_meshing_holes(dense: &mut Vec<f32>, scratch: &mut Vec<f32>, exte
     }
 }
 
-fn scaled_voxel_count(voxel_count: VoxelCoord, stride: i32) -> Option<VoxelCoord> {
+fn surface_net_mesh_from_dense(
+    volume: &[f32],
+    voxel_count: VoxelCoord,
+    voxel_size: f32,
+    start_coord: VoxelCoord,
+    stride: i32,
+) -> Option<SurfaceMesh32> {
     if voxel_count.x <= 1 || voxel_count.y <= 1 || voxel_count.z <= 1 {
         return None;
     }
@@ -312,30 +337,18 @@ fn scaled_voxel_count(voxel_count: VoxelCoord, stride: i32) -> Option<VoxelCoord
         voxel_count.y.div_euclid(stride),
         voxel_count.z.div_euclid(stride),
     );
-    (scaled_count.x > 1 && scaled_count.y > 1 && scaled_count.z > 1).then_some(scaled_count)
-}
-
-fn surface_net_mesh_from_dense(
-    volume: &[f32],
-    voxel_count: VoxelCoord,
-    voxel_size: f32,
-    start_coord: VoxelCoord,
-    stride: i32,
-) -> Option<SurfaceMesh32> {
-    let stride = stride.max(1);
-    let scaled_count = scaled_voxel_count(voxel_count, stride)?;
+    if scaled_count.x <= 1 || scaled_count.y <= 1 || scaled_count.z <= 1 {
+        return None;
+    }
 
     let sample_value = |coord: VoxelCoord| -> f32 {
         let raw = volume[flatten_coord(coord, voxel_count)];
-        if raw.is_finite() {
-            raw
-        } else {
-            0.0
-        }
+        if raw.is_finite() { raw } else { 0.0 }
     };
     let raw_value = |coord: VoxelCoord| -> f32 { volume[flatten_coord(coord, voxel_count)] };
 
     let mut positions = Vec::<[f32; 3]>::new();
+    let mut normals = Vec::<[f32; 3]>::new();
     let mut indices = Vec::<u32>::new();
     let mut coord_vert_map =
         vec![i32::MIN; (scaled_count.x * scaled_count.y * scaled_count.z) as usize];
@@ -349,6 +362,7 @@ fn surface_net_mesh_from_dense(
                 }
                 let coord = VoxelCoord::new(x, y, z);
                 let mut pos_coord = vec3f(0.0, 0.0, 0.0);
+                let mut direction = vec3f(0.0, 0.0, 0.0);
                 let mut crossings = 0u8;
                 let mut bad_crossings = 0u8;
 
@@ -358,6 +372,12 @@ fn surface_net_mesh_from_dense(
                     let value_a = sample_value(coord_a);
                     let value_b = sample_value(coord_b);
                     let change = value_a - value_b;
+                    direction += vec3f(
+                        (coord_a.x - coord_b.x) as f32,
+                        (coord_a.y - coord_b.y) as f32,
+                        (coord_a.z - coord_b.z) as f32,
+                    )
+                    .scale(change);
                     if (value_a < 0.0) == (value_b < 0.0) || change.abs() <= f32::EPSILON {
                         continue;
                     }
@@ -383,8 +403,14 @@ fn surface_net_mesh_from_dense(
                     (start_coord.y as f32 + pos_coord.y + 0.5) * voxel_size,
                     (start_coord.z as f32 + pos_coord.z + 0.5) * voxel_size,
                 );
+                let normal = if direction.length() > 1.0e-6 {
+                    direction.normalize()
+                } else {
+                    vec3f(0.0, 1.0, 0.0)
+                };
                 let vertex_index = positions.len() as u32;
                 positions.push([world.x, world.y, world.z]);
+                normals.push([normal.x, normal.y, normal.z]);
                 coord_vert_map[flatten_coord(coord, scaled_count)] = vertex_index as i32;
                 vert_coords.push(coord);
             }
@@ -430,7 +456,11 @@ fn surface_net_mesh_from_dense(
     if indices.is_empty() {
         None
     } else {
-        Some(SurfaceMesh32 { positions, indices })
+        Some(SurfaceMesh32 {
+            positions,
+            normals,
+            indices,
+        })
     }
 }
 
@@ -476,105 +506,40 @@ fn surface_net_tris_for_axis(
     }
 }
 
-fn mesh_chunk_extent(layout: DebugDepthMeshLayout) -> VoxelCoord {
-    let edge = layout.chunk_edge_voxels.max(1);
-    let overlap = layout.overlap_voxels.max(0);
-    VoxelCoord::new(edge + overlap, edge + overlap, edge + overlap)
-}
-
-fn mesh_chunk_start_coord(chunk_key: ChunkKey, layout: DebugDepthMeshLayout) -> VoxelCoord {
-    let edge = layout.chunk_edge_voxels.max(1);
-    VoxelCoord::new(chunk_key.x * edge, chunk_key.y * edge, chunk_key.z * edge)
-}
-
-fn mesh_chunk_world_bounds(
-    voxel_size: f32,
+fn snapshot_surface_net_chunk_mesh(
+    snapshot: &TsdfPublishedSnapshot,
     chunk_key: ChunkKey,
-    layout: DebugDepthMeshLayout,
-) -> (Vec3f, Vec3f) {
-    let start = mesh_chunk_start_coord(chunk_key, layout);
-    let edge = layout.chunk_edge_voxels.max(1);
-    (
-        vec3f(
-            start.x as f32 * voxel_size,
-            start.y as f32 * voxel_size,
-            start.z as f32 * voxel_size,
-        ),
-        vec3f(
-            (start.x + edge) as f32 * voxel_size,
-            (start.y + edge) as f32 * voxel_size,
-            (start.z + edge) as f32 * voxel_size,
-        ),
+    dense: &mut Vec<f32>,
+    fill_scratch: &mut Vec<f32>,
+) -> Option<SurfaceMesh32> {
+    let edge = XR_DEBUG_TSDF_MESH_CHUNK_EDGE_VOXELS.max(1);
+    let overlap = XR_DEBUG_TSDF_MESH_CHUNK_OVERLAP_VOXELS.max(0);
+    let stride = XR_DEBUG_TSDF_MESH_CELL_STRIDE_VOXELS.max(1);
+    let start = VoxelCoord::new(chunk_key.x * edge, chunk_key.y * edge, chunk_key.z * edge);
+    let extent = VoxelCoord::new(edge + overlap, edge + overlap, edge + overlap);
+    if !snapshot_region_has_surface(snapshot.grid.as_ref(), start, extent) {
+        return None;
+    }
+    let dense_size = VoxelCoord::new(
+        align_extent(extent.x, stride),
+        align_extent(extent.y, stride),
+        align_extent(extent.z, stride),
+    );
+    extract_dense_region_into(
+        snapshot.grid.as_ref(),
+        start,
+        dense_size,
+        snapshot.generation,
+        dense,
+    );
+    repair_dense_meshing_holes(dense, fill_scratch, dense_size);
+    surface_net_mesh_from_dense(
+        dense,
+        dense_size,
+        snapshot.grid.voxel_size,
+        start,
+        stride,
     )
-}
-
-fn aabb_intersects(min_a: Vec3f, max_a: Vec3f, min_b: Vec3f, max_b: Vec3f) -> bool {
-    min_a.x <= max_b.x
-        && max_a.x >= min_b.x
-        && min_a.y <= max_b.y
-        && max_a.y >= min_b.y
-        && min_a.z <= max_b.z
-        && max_a.z >= min_b.z
-}
-
-fn chunk_visible_from_head(
-    head_position: Vec3f,
-    head_forward: Vec3f,
-    world_min: Vec3f,
-    world_max: Vec3f,
-    layout: DebugDepthMeshLayout,
-) -> bool {
-    let center = (world_min + world_max).scale(0.5);
-    let half_extent = (world_max - world_min).scale(0.5);
-    let radius = half_extent.length();
-    let to_center = center - head_position;
-    let distance = to_center.length();
-    if distance > layout.view_distance_meters + radius {
-        return false;
-    }
-    if distance <= layout.near_distance_meters + radius || distance <= 1.0e-4 {
-        return true;
-    }
-    let direction = to_center.scale(1.0 / distance);
-    direction.dot(head_forward) >= layout.view_cone_dot - (radius / distance).min(0.35)
-}
-
-fn snapshot_region_signature(
-    grid: &SparseTsdGridReadSnapshot,
-    start: VoxelCoord,
-    extent: VoxelCoord,
-) -> DebugDepthMeshChunkSignature {
-    if extent.x <= 0 || extent.y <= 0 || extent.z <= 0 || grid.chunks.is_empty() {
-        return DebugDepthMeshChunkSignature::default();
-    }
-    let max = VoxelCoord::new(
-        start.x + extent.x.saturating_sub(1),
-        start.y + extent.y.saturating_sub(1),
-        start.z + extent.z.saturating_sub(1),
-    );
-    let min_chunk = VoxelCoord::new(
-        start.x.div_euclid(grid.chunk_edge),
-        start.y.div_euclid(grid.chunk_edge),
-        start.z.div_euclid(grid.chunk_edge),
-    );
-    let max_chunk = VoxelCoord::new(
-        max.x.div_euclid(grid.chunk_edge),
-        max.y.div_euclid(grid.chunk_edge),
-        max.z.div_euclid(grid.chunk_edge),
-    );
-    let mut sources = Vec::new();
-    for z in min_chunk.z..=max_chunk.z {
-        for y in min_chunk.y..=max_chunk.y {
-            for x in min_chunk.x..=max_chunk.x {
-                let key = ChunkKey::new(x, y, z);
-                let Some(chunk) = grid.chunks.get(&key) else {
-                    continue;
-                };
-                sources.push((key, Arc::as_ptr(chunk) as usize));
-            }
-        }
-    }
-    DebugDepthMeshChunkSignature { sources }
 }
 
 fn mesh_chunk_fingerprint(chunk_key: ChunkKey, mesh: &SurfaceMesh32) -> u64 {
@@ -589,275 +554,209 @@ fn mesh_chunk_fingerprint(chunk_key: ChunkKey, mesh: &SurfaceMesh32) -> u64 {
     hasher.finish()
 }
 
-pub(crate) fn snapshot_debug_mesh_layout(snapshot: &TsdfPublishedSnapshot) -> DebugDepthMeshLayout {
-    let voxel_size = snapshot.grid.voxel_size.max(1.0e-5);
-    let stride = XR_DEBUG_TSDF_MESH_CELL_STRIDE_VOXELS.max(1);
-    let approx_edge = (XR_DEBUG_TSDF_MESH_CHUNK_WORLD_SIZE_METERS / voxel_size).ceil() as i32;
-    let chunk_edge_voxels = align_extent(approx_edge.max(stride * 2), stride);
-    let overlap_voxels = stride * XR_DEBUG_TSDF_MESH_CHUNK_OVERLAP_CELLS.max(1);
-    DebugDepthMeshLayout {
-        chunk_edge_voxels,
-        overlap_voxels,
-        stride_voxels: stride,
-        chunk_world_size_meters: chunk_edge_voxels as f32 * voxel_size,
-        view_distance_meters: XR_DEBUG_TSDF_MESH_VIEW_DISTANCE_METERS,
-        near_distance_meters: XR_DEBUG_TSDF_MESH_NEAR_VISIBILITY_METERS,
-        view_cone_dot: XR_DEBUG_TSDF_MESH_VIEW_CONE_DOT,
-    }
-}
+fn snapshot_debug_mesh_chunk_keys(snapshot: &TsdfPublishedSnapshot) -> Vec<ChunkKey> {
+    let tsdf_edge = snapshot.grid.chunk_edge.max(1);
+    let mesh_edge = XR_DEBUG_TSDF_MESH_CHUNK_EDGE_VOXELS.max(1);
+    let overlap = XR_DEBUG_TSDF_MESH_CHUNK_OVERLAP_VOXELS.max(0);
+    let mut keys = HashSet::new();
 
-pub(crate) fn debug_depth_mesh_view_plan(
-    snapshot: &TsdfPublishedSnapshot,
-    head_pose: Pose,
-) -> DebugDepthMeshViewPlan {
-    let layout = snapshot_debug_mesh_layout(snapshot);
-    let Some((active_min, active_max)) = snapshot.grid.active_bounds else {
-        return DebugDepthMeshViewPlan {
-            layout,
-            visible_chunks: Vec::new(),
-        };
-    };
-
-    let mut head_forward = head_pose.orientation.rotate_vec3(&vec3f(0.0, 0.0, -1.0));
-    if head_forward.length() > 1.0e-4 {
-        head_forward = head_forward.normalize();
-    } else {
-        head_forward = vec3f(0.0, 0.0, -1.0);
-    }
-
-    let (head_voxel_x, head_voxel_y, head_voxel_z) =
-        snapshot.grid.world_to_voxel_xyz(head_pose.position);
-    let head_chunk = VoxelCoord::new(
-        head_voxel_x.div_euclid(layout.chunk_edge_voxels.max(1)),
-        head_voxel_y.div_euclid(layout.chunk_edge_voxels.max(1)),
-        head_voxel_z.div_euclid(layout.chunk_edge_voxels.max(1)),
-    );
-    let search_radius =
-        (layout.view_distance_meters / layout.chunk_world_size_meters.max(0.1)).ceil() as i32 + 1;
-    let extent = mesh_chunk_extent(layout);
-
-    #[derive(Clone)]
-    struct VisibilityCandidate {
-        forward_depth: f32,
-        distance: f32,
-        plan: DebugDepthMeshChunkPlan,
-    }
-
-    let mut candidates = Vec::<VisibilityCandidate>::new();
-    for z in (head_chunk.z - search_radius)..=(head_chunk.z + search_radius) {
-        for y in (head_chunk.y - search_radius)..=(head_chunk.y + search_radius) {
-            for x in (head_chunk.x - search_radius)..=(head_chunk.x + search_radius) {
-                let chunk_key = ChunkKey::new(x, y, z);
-                let (world_min, world_max) =
-                    mesh_chunk_world_bounds(snapshot.grid.voxel_size, chunk_key, layout);
-                if !aabb_intersects(world_min, world_max, active_min, active_max) {
-                    continue;
+    for chunk_key in snapshot.grid.chunks.keys() {
+        let min_voxel = VoxelCoord::new(
+            chunk_key.x * tsdf_edge - overlap,
+            chunk_key.y * tsdf_edge - overlap,
+            chunk_key.z * tsdf_edge - overlap,
+        );
+        let max_voxel = VoxelCoord::new(
+            (chunk_key.x + 1) * tsdf_edge - 1 + overlap,
+            (chunk_key.y + 1) * tsdf_edge - 1 + overlap,
+            (chunk_key.z + 1) * tsdf_edge - 1 + overlap,
+        );
+        let min_mesh = VoxelCoord::new(
+            min_voxel.x.div_euclid(mesh_edge),
+            min_voxel.y.div_euclid(mesh_edge),
+            min_voxel.z.div_euclid(mesh_edge),
+        );
+        let max_mesh = VoxelCoord::new(
+            max_voxel.x.div_euclid(mesh_edge),
+            max_voxel.y.div_euclid(mesh_edge),
+            max_voxel.z.div_euclid(mesh_edge),
+        );
+        for z in min_mesh.z..=max_mesh.z {
+            for y in min_mesh.y..=max_mesh.y {
+                for x in min_mesh.x..=max_mesh.x {
+                    keys.insert(ChunkKey::new(x, y, z));
                 }
-                if !chunk_visible_from_head(
-                    head_pose.position,
-                    head_forward,
-                    world_min,
-                    world_max,
-                    layout,
-                ) {
-                    continue;
-                }
-
-                let signature = snapshot_region_signature(
-                    snapshot.grid.as_ref(),
-                    mesh_chunk_start_coord(chunk_key, layout),
-                    extent,
-                );
-                if signature.sources.is_empty() {
-                    continue;
-                }
-
-                let center = (world_min + world_max).scale(0.5);
-                let to_center = center - head_pose.position;
-                candidates.push(VisibilityCandidate {
-                    forward_depth: to_center.dot(head_forward),
-                    distance: to_center.length(),
-                    plan: DebugDepthMeshChunkPlan {
-                        chunk_key,
-                        signature,
-                    },
-                });
             }
         }
     }
 
-    candidates.sort_by(|left, right| {
-        left.distance
-            .total_cmp(&right.distance)
-            .then_with(|| right.forward_depth.total_cmp(&left.forward_depth))
-            .then_with(|| {
-                (
-                    left.plan.chunk_key.x,
-                    left.plan.chunk_key.y,
-                    left.plan.chunk_key.z,
-                )
-                    .cmp(&(
-                        right.plan.chunk_key.x,
-                        right.plan.chunk_key.y,
-                        right.plan.chunk_key.z,
-                    ))
-            })
-    });
-
-    DebugDepthMeshViewPlan {
-        layout,
-        visible_chunks: candidates
-            .into_iter()
-            .map(|candidate| candidate.plan)
-            .collect(),
-    }
+    let mut keys: Vec<_> = keys.into_iter().collect();
+    keys.sort_by_key(|key| (key.x, key.y, key.z));
+    keys
 }
 
-pub(crate) fn debug_depth_mesh_focus_cube_plan(
+pub(crate) fn build_tsdf_snapshot_debug_mesh_chunks(
     snapshot: &TsdfPublishedSnapshot,
-    focus_center: Vec3f,
-    cube_size_meters: f32,
-) -> DebugDepthMeshViewPlan {
-    let layout = snapshot_debug_mesh_layout(snapshot);
-    let Some((active_min, active_max)) = snapshot.grid.active_bounds else {
-        return DebugDepthMeshViewPlan {
-            layout,
-            visible_chunks: Vec::new(),
+) -> Vec<DebugDepthMeshChunk> {
+    let mut dense = Vec::new();
+    let mut fill_scratch = Vec::new();
+    let mut chunks = Vec::new();
+
+    for chunk_key in snapshot_debug_mesh_chunk_keys(snapshot) {
+        let Some(mesh) = snapshot_surface_net_chunk_mesh(snapshot, chunk_key, &mut dense, &mut fill_scratch)
+        else {
+            continue;
         };
-    };
-    if !focus_center.is_finite() {
-        return DebugDepthMeshViewPlan {
-            layout,
-            visible_chunks: Vec::new(),
-        };
-    }
-
-    let cube_half_extent = (cube_size_meters * 0.5)
-        .max(snapshot.grid.voxel_size.max(1.0e-5))
-        .max(0.05);
-    let cube_extent = vec3f(cube_half_extent, cube_half_extent, cube_half_extent);
-    let cube_min = focus_center - cube_extent;
-    let cube_max = focus_center + cube_extent;
-    if !aabb_intersects(cube_min, cube_max, active_min, active_max) {
-        return DebugDepthMeshViewPlan {
-            layout,
-            visible_chunks: Vec::new(),
-        };
-    }
-
-    let (min_voxel_x, min_voxel_y, min_voxel_z) = snapshot.grid.world_to_voxel_xyz(cube_min);
-    let (max_voxel_x, max_voxel_y, max_voxel_z) = snapshot.grid.world_to_voxel_xyz(cube_max);
-    let min_chunk = VoxelCoord::new(
-        min_voxel_x.div_euclid(layout.chunk_edge_voxels.max(1)),
-        min_voxel_y.div_euclid(layout.chunk_edge_voxels.max(1)),
-        min_voxel_z.div_euclid(layout.chunk_edge_voxels.max(1)),
-    );
-    let max_chunk = VoxelCoord::new(
-        max_voxel_x.div_euclid(layout.chunk_edge_voxels.max(1)),
-        max_voxel_y.div_euclid(layout.chunk_edge_voxels.max(1)),
-        max_voxel_z.div_euclid(layout.chunk_edge_voxels.max(1)),
-    );
-    let extent = mesh_chunk_extent(layout);
-
-    #[derive(Clone)]
-    struct FocusCandidate {
-        distance: f32,
-        plan: DebugDepthMeshChunkPlan,
-    }
-
-    let mut candidates = Vec::<FocusCandidate>::new();
-    for z in min_chunk.z..=max_chunk.z {
-        for y in min_chunk.y..=max_chunk.y {
-            for x in min_chunk.x..=max_chunk.x {
-                let chunk_key = ChunkKey::new(x, y, z);
-                let (world_min, world_max) =
-                    mesh_chunk_world_bounds(snapshot.grid.voxel_size, chunk_key, layout);
-                if !aabb_intersects(world_min, world_max, cube_min, cube_max) {
-                    continue;
-                }
-                if !aabb_intersects(world_min, world_max, active_min, active_max) {
-                    continue;
-                }
-
-                let signature = snapshot_region_signature(
-                    snapshot.grid.as_ref(),
-                    mesh_chunk_start_coord(chunk_key, layout),
-                    extent,
-                );
-                if signature.sources.is_empty() {
-                    continue;
-                }
-
-                let center = (world_min + world_max).scale(0.5);
-                candidates.push(FocusCandidate {
-                    distance: (center - focus_center).length(),
-                    plan: DebugDepthMeshChunkPlan {
-                        chunk_key,
-                        signature,
-                    },
-                });
-            }
-        }
-    }
-
-    candidates.sort_by(|left, right| {
-        left.distance.total_cmp(&right.distance).then_with(|| {
-            (
-                left.plan.chunk_key.x,
-                left.plan.chunk_key.y,
-                left.plan.chunk_key.z,
-            )
-                .cmp(&(
-                    right.plan.chunk_key.x,
-                    right.plan.chunk_key.y,
-                    right.plan.chunk_key.z,
-                ))
-        })
-    });
-
-    DebugDepthMeshViewPlan {
-        layout,
-        visible_chunks: candidates
-            .into_iter()
-            .map(|candidate| candidate.plan)
-            .collect(),
-    }
-}
-
-impl DebugDepthMeshTriangulator {
-    pub(crate) fn build_chunk(
-        &mut self,
-        snapshot: &TsdfPublishedSnapshot,
-        layout: DebugDepthMeshLayout,
-        plan: &DebugDepthMeshChunkPlan,
-    ) -> Option<DebugDepthMeshChunk> {
-        if plan.signature.sources.is_empty() {
-            return None;
-        }
-        let start = mesh_chunk_start_coord(plan.chunk_key, layout);
-        let extent = mesh_chunk_extent(layout);
-        extract_dense_region_into(snapshot.grid.as_ref(), start, extent, &mut self.dense);
-        repair_dense_meshing_holes(&mut self.dense, &mut self.fill_scratch, extent);
-        let mesh = surface_net_mesh_from_dense(
-            &self.dense,
-            extent,
-            snapshot.grid.voxel_size,
-            start,
-            layout.stride_voxels,
-        )?;
-        let fingerprint = mesh_chunk_fingerprint(plan.chunk_key, &mesh);
+        let fingerprint = mesh_chunk_fingerprint(chunk_key, &mesh);
         let (indices, vertices) = pack_surface_mesh_debug_vertices(&mesh);
         if indices.is_empty() || vertices.is_empty() {
-            return None;
+            continue;
         }
-        Some(DebugDepthMeshChunk {
-            chunk_key: plan.chunk_key,
+        chunks.push(DebugDepthMeshChunk {
+            chunk_key,
             fingerprint,
             indices,
             vertices,
-        })
+        });
     }
+
+    chunks
 }
 
 #[cfg(test)]
-include!("../tests/util/depth_debug_mesh.rs");
+mod tests {
+    use super::*;
+    use std::{collections::HashMap, sync::Arc};
+
+    fn packed_position(vertices: &[f32], vertex_index: usize) -> Vec3f {
+        let base = vertex_index * XR_DEBUG_DEPTH_FLOATS_PER_VERTEX;
+        vec3f(vertices[base], vertices[base + 1], vertices[base + 2])
+    }
+
+    fn set_normalized_distance(
+        chunks: &mut HashMap<ChunkKey, Arc<SparseTsdReadChunk>>,
+        chunk_edge: i32,
+        coord: VoxelCoord,
+        normalized_distance: f32,
+    ) {
+        let chunk_key = ChunkKey::new(
+            coord.x.div_euclid(chunk_edge),
+            coord.y.div_euclid(chunk_edge),
+            coord.z.div_euclid(chunk_edge),
+        );
+        let lx = coord.x.rem_euclid(chunk_edge) as usize;
+        let ly = coord.y.rem_euclid(chunk_edge) as usize;
+        let lz = coord.z.rem_euclid(chunk_edge) as usize;
+        let edge = chunk_edge as usize;
+        let id = lx + ly * edge + lz * edge * edge;
+
+        let chunk = Arc::make_mut(
+            chunks
+                .entry(chunk_key)
+                .or_insert_with(|| {
+                    Arc::new(SparseTsdReadChunk {
+                        values: vec![0.0; edge * edge * edge],
+                        valid: vec![0; edge * edge * edge],
+                        confidence: vec![0; edge * edge * edge],
+                        observed_generation: vec![0; edge * edge * edge],
+                    })
+                }),
+        );
+        chunk.values[id] = normalized_distance;
+        chunk.valid[id] = 1;
+        chunk.confidence[id] = 8;
+        chunk.observed_generation[id] = 1;
+    }
+
+    fn make_flat_floor_snapshot(voxel_size: f32) -> TsdfPublishedSnapshot {
+        let chunk_edge = 8;
+        let mut chunks = HashMap::new();
+        let tsd_distance_meters = depth_tsd_distance_meters(voxel_size);
+        let mut active_value_count = 0usize;
+        for z in -6..=6 {
+            for y in -6..=6 {
+                for x in -6..=6 {
+                    let world_y = (y as f32 + 0.5) * voxel_size;
+                    let normalized = (world_y / tsd_distance_meters).clamp(-1.0, 1.0);
+                    set_normalized_distance(
+                        &mut chunks,
+                        chunk_edge,
+                        VoxelCoord::new(x, y, z),
+                        normalized,
+                    );
+                    active_value_count += 1;
+                }
+            }
+        }
+        TsdfPublishedSnapshot {
+            generation: 1,
+            latest_topology_generation: 1,
+            update_sequence: 1,
+            grid: Arc::new(SparseTsdGridReadSnapshot {
+                voxel_size,
+                chunk_edge,
+                chunk_volume: (chunk_edge as usize).pow(3),
+                active_value_count,
+                active_bounds: Some((
+                    vec3f(-6.0 * voxel_size, -6.0 * voxel_size, -6.0 * voxel_size),
+                    vec3f(7.0 * voxel_size, 7.0 * voxel_size, 7.0 * voxel_size),
+                )),
+                chunks,
+            }),
+            height_map: None,
+        }
+    }
+
+    #[test]
+    fn pack_surface_mesh_debug_vertices_keeps_shared_indexed_vertices() {
+        let mesh = SurfaceMesh32 {
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+        };
+
+        let (indices, vertices) = pack_surface_mesh_debug_vertices(&mesh);
+
+        assert_eq!(indices, vec![0, 1, 2, 0, 2, 3]);
+        assert_eq!(vertices.len(), 4 * XR_DEBUG_DEPTH_FLOATS_PER_VERTEX);
+        assert_eq!(packed_position(&vertices, 0), vec3f(0.0, 0.0, 0.0));
+        assert_eq!(packed_position(&vertices, 2), vec3f(1.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn push_debug_depth_plane_emits_single_quad_mesh() {
+        let plane = DepthQuerySupportPlane {
+            point: vec3f(0.0, 0.5, 0.0),
+            normal: vec3f(0.0, 1.0, 0.0),
+            tangent: vec3f(1.0, 0.0, 0.0),
+            bitangent: vec3f(0.0, 0.0, 1.0),
+            half_extent_tangent: 0.25,
+            half_extent_bitangent: 0.10,
+        };
+        let mut indices = Vec::new();
+        let mut vertices = Vec::new();
+
+        push_debug_depth_plane(&mut indices, &mut vertices, plane);
+
+        assert_eq!(indices, vec![0, 1, 2, 0, 2, 3]);
+        assert_eq!(vertices.len(), 4 * XR_DEBUG_DEPTH_FLOATS_PER_VERTEX);
+        let first = packed_position(&vertices, 0);
+        let third = packed_position(&vertices, 2);
+        assert_eq!(first, vec3f(-0.25, 0.5, -0.10));
+        assert_eq!(third, vec3f(0.25, 0.5, 0.10));
+    }
+
+    #[test]
+    fn build_tsdf_snapshot_debug_mesh_chunks_extracts_surface_from_snapshot() {
+        let snapshot = make_flat_floor_snapshot(0.05);
+        let chunks = build_tsdf_snapshot_debug_mesh_chunks(&snapshot);
+
+        assert!(!chunks.is_empty(), "expected debug mesh chunks for a flat floor snapshot");
+        assert!(chunks.iter().all(|chunk| !chunk.indices.is_empty() && !chunk.vertices.is_empty()));
+    }
+}
