@@ -19,21 +19,7 @@ use rapier3d::prelude::{
     Pose as RapierPose, Real as RapierReal, RigidBodyBuilder, RigidBodyHandle, RigidBodySet,
     Rotation as RapierRotation, SharedShape, Vector as RapierVector,
 };
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    rc::Rc,
-    sync::Arc,
-};
-
-const XR_DEPTH_MESH_FOCUS_CUBE_SIZE_METERS: f32 = 0.96;
-const XR_DEPTH_MESH_FOCUS_GRID_METERS: f32 = 0.32;
-const XR_DEPTH_MESH_FOCUS_FADE_NEAR_METERS: f32 = 0.16;
-const XR_DEPTH_MESH_FOCUS_FADE_FAR_METERS: f32 = 0.82;
-const XR_DEPTH_MESH_FOCUS_FADE_FAR_ALPHA: f32 = 0.12;
-const XR_DEPTH_MESH_FOCUS_FADE_FAR_COLOR_SCALE: f32 = 0.28;
-const XR_DEBUG_FLOOR_PREVIEW_SIZE_METERS: f32 = 1.0;
-const XR_DEBUG_FLOOR_PREVIEW_THICKNESS_METERS: f32 = 0.004;
-const XR_DEBUG_FLOOR_PREVIEW_ALPHA: f32 = 0.18;
+use std::{collections::HashMap, rc::Rc, sync::Arc};
 
 #[path = "xr_depth.rs"]
 mod xr_depth;
@@ -54,6 +40,8 @@ use self::{
     },
     xr_physics_worker::{XrPhysicsWorker, XrPhysicsWorkerResult},
 };
+use crate::depth_debug_mesh_worker::XrDepthDebugMeshWorker;
+
 script_mod! {
     use mod.pod.*
     use mod.math.*
@@ -69,52 +57,10 @@ script_mod! {
         draw_call: uniform_buffer(draw.DrawCallUniforms)
         draw_pass: uniform_buffer(draw.DrawPassUniforms)
         draw_list: uniform_buffer(draw.DrawListUniforms)
-        geom: vertex_buffer(geom.DepthMeshVertex, geom.DepthMeshGeom)
-        u_focus_fade_enabled: uniform(float(0.0))
-        u_focus_fade_world: uniform(vec3(0.0, 0.0, 0.0))
-        u_focus_fade_near_m: uniform(float(0.16))
-        u_focus_fade_far_m: uniform(float(0.82))
-        u_focus_fade_far_alpha: uniform(float(0.12))
-        u_focus_fade_far_color_scale: uniform(float(0.28))
+        geom: vertex_buffer(geom.IcoVertex, geom.IcoGeom)
 
-        v_barycentric: varying(vec3f)
-        v_world_pos: varying(vec3f)
-
-        edge_distance_px: fn(bary: vec3f) -> f32 {
-            let bary_fw = vec3(
-                length(vec2(dFdx(bary.x), dFdy(bary.x))),
-                length(vec2(dFdx(bary.y), dFdy(bary.y))),
-                length(vec2(dFdx(bary.z), dFdy(bary.z)))
-            );
-            return min(
-                bary.x / max(bary_fw.x, 0.00001),
-                min(
-                    bary.y / max(bary_fw.y, 0.00001),
-                    bary.z / max(bary_fw.z, 0.00001)
-                )
-            )
-        }
-
-        wire_band_alpha: fn(bary: vec3f) -> f32 {
-            let edge_px = self.edge_distance_px(bary);
-            let inner = smoothstep(self.wire_inner_px - 0.75, self.wire_inner_px + 0.75, edge_px);
-            let outer = 1.0 - smoothstep(self.wire_outer_px - 0.75, self.wire_outer_px + 0.75, edge_px);
-            return clamp(inner * outer, 0.0, 1.0)
-        }
-
-        focus_fade_scales: fn(world_pos: vec3f) -> vec2f {
-            if self.u_focus_fade_enabled <= 0.5 {
-                return vec2(1.0, 1.0)
-            }
-            let fade_far = max(self.u_focus_fade_far_m, self.u_focus_fade_near_m + 0.0001);
-            let focus_delta = world_pos - self.u_focus_fade_world;
-            let dist = length(focus_delta);
-            let near_mix = 1.0 - smoothstep(self.u_focus_fade_near_m, fade_far, dist);
-            return vec2(
-                mix(self.u_focus_fade_far_color_scale, 1.0, near_mix),
-                mix(self.u_focus_fade_far_alpha, 1.0, near_mix)
-            )
-        }
+        v_world: varying(vec3f)
+        v_geom_normal: varying(vec3f)
 
         vertex: fn() {
             let world = vec4(
@@ -123,27 +69,33 @@ script_mod! {
                 self.geom.pos.z,
                 1.0
             );
-            let view = self.draw_pass.camera_view * world;
-            let biased_view = vec4(view.x, view.y, view.z + self.depth_bias, view.w);
-            self.v_barycentric = vec3(
-                self.geom.barycentric.x,
-                self.geom.barycentric.y,
-                self.geom.barycentric.z
-            );
-            self.v_world_pos = vec3(world.x, world.y, world.z);
-            self.vertex_pos = self.draw_pass.camera_projection * biased_view;
+            let geom_normal = normalize(vec3(
+                self.geom.normal.x,
+                self.geom.normal.y,
+                self.geom.normal.z
+            ));
+            let biased_world = vec4(world.xyz + geom_normal * self.normal_bias, 1.0);
+            self.v_world = world.xyz;
+            self.v_geom_normal = geom_normal;
+            self.vertex_pos = self.draw_pass.camera_projection * (self.draw_pass.camera_view * biased_world);
         }
 
         pixel: fn() {
-            let fade = self.focus_fade_scales(self.v_world_pos);
-            let wire_alpha = self.base_color.w * self.wire_band_alpha(self.v_barycentric) * fade.y;
-            let color_alpha = wire_alpha * fade.x;
-            return vec4(
-                self.base_color.x * color_alpha,
-                self.base_color.y * color_alpha,
-                self.base_color.z * color_alpha,
-                wire_alpha
-            );
+            let face_raw = cross(dFdx(self.v_world), dFdy(self.v_world));
+            let face_len = length(face_raw);
+            let geom_normal = normalize(self.v_geom_normal);
+            let mut n = if face_len > 0.00001 {
+                normalize(face_raw)
+            } else {
+                geom_normal
+            };
+            if dot(n, geom_normal) < 0.0 {
+                n = -n;
+            }
+            let l = normalize(self.light_dir);
+            let diffuse = max(dot(n, l), 0.0);
+            let lit = self.ambient + diffuse * (1.0 - self.ambient);
+            return vec4(self.base_color.xyz * lit, self.base_color.w);
         }
 
         fragment: fn() {
@@ -425,7 +377,46 @@ pub struct XrEnv {
     #[live(false)]
     env_cube: bool,
     #[rust]
-    world: XrWorld,
+    last_xr_state: Option<Rc<XrState>>,
+    #[rust]
+    depth_surface_mesh_generation: u64,
+    #[rust]
+    depth_surface_mesh_update_sequence: u64,
+    #[rust]
+    depth_surface_mesh_requested_snapshot_grid: Option<Arc<SparseTsdGridReadSnapshot>>,
+    #[rust]
+    depth_surface_mesh_snapshot_grid: Option<Arc<SparseTsdGridReadSnapshot>>,
+    #[rust]
+    depth_surface_mesh_chunks: HashMap<(i32, i32, i32), (Geometry, DepthSurfaceMeshChunkHandle)>,
+    #[rust]
+    depth_query_hit_geometry: Option<Geometry>,
+    #[rust]
+    depth_surface_mesh_upload_count: usize,
+    #[rust]
+    depth_surface_mesh_worker: Option<XrDepthDebugMeshWorker>,
+    #[allow(dead_code)]
+    #[rust]
+    depth_query_retained_hits: HashMap<u64, RetainedDepthQueryHit>,
+    #[rust]
+    passthrough_camera_choice: Option<XrPassthroughCameraChoice>,
+    #[rust]
+    passthrough_camera_textures: Option<XrPassthroughCameraTextures>,
+    #[rust]
+    passthrough_camera_video: VideoYuvMetadata,
+    #[rust]
+    passthrough_camera_permission: Option<PermissionStatus>,
+    #[rust]
+    passthrough_camera_source_size: Vec2f,
+    #[rust]
+    passthrough_camera_playback_requested: bool,
+    #[rust]
+    passthrough_camera_failed: bool,
+    #[rust]
+    passthrough_camera_has_frame: bool,
+    #[rust]
+    passthrough_env_face_quad: Option<Geometry>,
+    #[rust]
+    passthrough_env_cube: Option<XrPassthroughEnvCube>,
 
     // Physics (moved from XrScene)
     #[live(9.81)]
@@ -618,105 +609,27 @@ impl XrEnv {
         draw_pbr.set_env_texture(Some(env_tex));
     }
 
-    fn depth_surface_mesh_request_pose_changed(previous: Pose, next: Pose) -> bool {
-        if (next.position - previous.position).length() >= XR_DEPTH_SURFACE_MESH_REQUEST_MOVE_METERS
-        {
-            return true;
-        }
-        let mut previous_forward = previous.orientation.rotate_vec3(&vec3f(0.0, 0.0, -1.0));
-        let mut next_forward = next.orientation.rotate_vec3(&vec3f(0.0, 0.0, -1.0));
-        if previous_forward.length() <= 1.0e-4 || next_forward.length() <= 1.0e-4 {
-            return false;
-        }
-        previous_forward = previous_forward.normalize();
-        next_forward = next_forward.normalize();
-        let cos_threshold = XR_DEPTH_SURFACE_MESH_REQUEST_ROTATE_DEGREES
-            .to_radians()
-            .cos();
-        previous_forward.dot(next_forward) <= cos_threshold
-    }
-
-    fn prepare_depth_mesh(&mut self, cx: &mut Cx2d, state: &XrState) {
-        self.draw_depth_mesh.draw_vars.options.depth_write = false;
-        self.world.depth.poll_surface_mesh_worker(cx);
+    fn prepare_depth_mesh(&mut self, cx: &mut Cx2d) {
+        self.draw_depth_mesh.draw_vars.options.depth_write = true;
+        self.poll_depth_surface_mesh_worker(cx);
         if !self.depth_mesh_visible() {
-            self.world.depth.clear_surface_mesh();
+            self.clear_depth_surface_mesh();
             return;
         }
-        let Some(snapshot) = cx.cx.xr_tsdf().latest_tsdf_snapshot() else {
-            self.world.depth.clear_surface_mesh();
+        let Some(snapshot) = cx.cx.xr_depth_mesh().latest_tsdf_snapshot() else {
+            self.clear_depth_surface_mesh();
             return;
         };
-        let snapshot_unchanged = self
-            .world
-            .depth
-            .requested_snapshot_grid
+        if self
+            .depth_surface_mesh_requested_snapshot_grid
             .as_ref()
-            .is_some_and(|previous| Arc::ptr_eq(previous, &snapshot.grid));
-        let (selection_mode, requested_head_pose, requested_focus_grid, request_selection) =
-            match self.world.depth.selection_mode {
-                XrDepthMeshSelectionMode::HeadView => {
-                    let pose_unchanged = self
-                        .world
-                        .depth
-                        .requested_head_pose
-                        .map(|previous| {
-                            !Self::depth_surface_mesh_request_pose_changed(
-                                previous,
-                                state.head_pose,
-                            )
-                        })
-                        .unwrap_or(false);
-                    let selection_unchanged = self.world.depth.requested_selection_mode
-                        == Some(XrDepthMeshSelectionMode::HeadView)
-                        && pose_unchanged;
-                    if snapshot_unchanged && selection_unchanged {
-                        return;
-                    }
-                    (
-                        XrDepthMeshSelectionMode::HeadView,
-                        Some(state.head_pose),
-                        None,
-                        XrDepthDebugMeshSelection::HeadView {
-                            head_pose: state.head_pose,
-                        },
-                    )
-                }
-                XrDepthMeshSelectionMode::FocusCube => {
-                    let Some(focus_grid) = self
-                        .world
-                        .depth
-                        .focus_point
-                        .and_then(Self::depth_mesh_focus_grid)
-                    else {
-                        self.world.depth.clear_surface_mesh();
-                        return;
-                    };
-                    let selection_unchanged = self.world.depth.requested_selection_mode
-                        == Some(XrDepthMeshSelectionMode::FocusCube)
-                        && self.world.depth.requested_focus_grid == Some(focus_grid);
-                    if snapshot_unchanged && selection_unchanged {
-                        return;
-                    }
-                    (
-                        XrDepthMeshSelectionMode::FocusCube,
-                        None,
-                        Some(focus_grid),
-                        XrDepthDebugMeshSelection::FocusCube {
-                            center: Self::depth_mesh_focus_point_for_grid(focus_grid),
-                            cube_size_meters: XR_DEPTH_MESH_FOCUS_CUBE_SIZE_METERS,
-                        },
-                    )
-                }
-            };
-        self.world
-            .depth
-            .ensure_surface_mesh_worker()
-            .request_snapshot(snapshot.clone(), request_selection);
-        self.world.depth.requested_snapshot_grid = Some(snapshot.grid.clone());
-        self.world.depth.requested_selection_mode = Some(selection_mode);
-        self.world.depth.requested_head_pose = requested_head_pose;
-        self.world.depth.requested_focus_grid = requested_focus_grid;
+            .is_some_and(|previous| Arc::ptr_eq(previous, &snapshot.grid))
+        {
+            return;
+        }
+        self.ensure_depth_surface_mesh_worker()
+            .request_snapshot(snapshot.clone());
+        self.depth_surface_mesh_requested_snapshot_grid = Some(snapshot.grid.clone());
     }
 
     fn draw_pbr_rounded_cube(
@@ -1179,7 +1092,7 @@ impl XrEnv {
     // --- New API for XrRoot ---
 
     pub fn prepare_and_draw(&mut self, cx: &mut Cx2d) -> XrDrawScopeData {
-        let state = self.world.last_xr_state.clone();
+        let state = self.last_xr_state.clone();
         if let Some(state) = state.as_deref() {
             if self.depth_debug_enabled() {
                 self.prepare_depth_mesh(cx, state);

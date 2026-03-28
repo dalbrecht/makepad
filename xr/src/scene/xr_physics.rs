@@ -2,10 +2,9 @@
 
 use super::xr_depth::{DepthQuerySurfaceCollider, DepthQuerySurfaceTarget};
 use super::*;
-use crate::algorithms::tsdf_query::{
+use crate::tsdf_query::{
     depth_query_plane_supports_body, DepthQueryColliderGeometry, DepthQueryColliderRole,
 };
-use rapier3d::control::{DynamicRayCastVehicleController, WheelTuning};
 use rapier3d::dynamics::CoefficientCombineRule;
 use rapier3d::pipeline::{ActiveHooks, PairFilterContext, PhysicsHooks};
 use rapier3d::prelude::{Collider, QueryFilter, RigidBodyType, SolverFlags};
@@ -2784,13 +2783,23 @@ impl RapierScene {
             };
             if let Some(collider) = self.colliders.get_mut(surface.collider) {
                 let DepthQueryColliderGeometry::HalfSpace(plane) = target.collider.geometry;
-                let supports_body = depth_query_surface_target_should_enable(
-                    *target,
+                let footprint_supports_body = depth_query_plane_supports_body(
+                    plane,
                     body_position,
                     body_velocity,
                     surface_set.query_radius,
                     physics_edge_margin,
                 );
+                let supports_body = match target.collider.role {
+                    DepthQueryColliderRole::Support => footprint_supports_body,
+                    DepthQueryColliderRole::Impact => {
+                        let speed = body_velocity.length();
+                        let approach_speed = -body_velocity.dot(plane.normal);
+                        footprint_supports_body
+                            && speed >= XR_DEPTH_QUERY_IMPACT_ENABLE_SPEED_MIN
+                            && approach_speed >= XR_DEPTH_QUERY_IMPACT_ENABLE_APPROACH_SPEED_MIN
+                    }
+                };
                 if surface.fingerprint != target.collider.fingerprint {
                     collider.set_shape(SharedShape::halfspace(rapier_vec3(plane.normal)));
                     collider.set_position_wrt_parent(RapierPose::from_parts(

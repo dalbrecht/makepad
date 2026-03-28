@@ -430,17 +430,8 @@ fn physics_worker_loop(
                         body_spawn.spawn.pose,
                         body_spawn.spawn.linvel,
                         body_spawn.spawn.angvel,
-                    );
-                    if query_keys.iter().any(Option::is_some) {
-                        clear_depth_query_keys(&mut retained_hits, query_keys);
-                        physics_body_spawn_apply_count =
-                            physics_body_spawn_apply_count.saturating_add(1);
-                        total_body_spawn_apply_count =
-                            total_body_spawn_apply_count.saturating_add(1);
-                    } else {
-                        physics_body_spawn_miss_count =
-                            physics_body_spawn_miss_count.saturating_add(1);
-                        total_body_spawn_miss_count = total_body_spawn_miss_count.saturating_add(1);
+                    ) {
+                        retained_hits.remove(&query_key);
                     }
                     applied_spawn = true;
                 }
