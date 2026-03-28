@@ -14,11 +14,6 @@ pub const XR_TOUCH_CAPTURE_FRONT: f32 = 11.0;
 pub const XR_TOUCH_CAPTURE_BACK: f32 = -16.0;
 pub const XR_TOUCH_REARM_FRONT: f32 = 28.0;
 
-pub fn normalize_xr_controller_stick(stick: Vec2f) -> Vec2f {
-    // Match the desktop gamepad convention so pushing the stick up yields a negative Y.
-    vec2f(stick.x, -stick.y)
-}
-
 #[derive(Clone, Debug, Default, SerBin, DeBin)]
 pub struct XrController {
     pub grip_pose: Pose,
@@ -1354,13 +1349,5 @@ mod tests {
         assert!(!XrLocalEvent::tip_is_touching_for_capture(&tip(
             false, -18.0
         )));
-    }
-
-    #[test]
-    fn xr_controller_stick_normalization_matches_gamepad_y_sign() {
-        assert_eq!(
-            normalize_xr_controller_stick(vec2f(0.25, 0.75)),
-            vec2f(0.25, -0.75)
-        );
     }
 }
