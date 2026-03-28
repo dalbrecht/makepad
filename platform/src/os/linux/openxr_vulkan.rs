@@ -1,10 +1,7 @@
 use super::*;
 use crate::{
     os::linux::openxr_depth::CxOpenXrDepthMeshPipeline,
-    os::linux::vulkan::{
-        CxVulkan, CxVulkanOpenXrFoveationImageInfo, CxVulkanOpenXrSessionData,
-        OpenXrVulkanRepaintStats,
-    },
+    os::linux::vulkan::{CxVulkan, CxVulkanOpenXrFoveationImageInfo, CxVulkanOpenXrSessionData},
     xr_tsdf::xr_tsdf_store,
 };
 pub(super) struct CxOpenXrVulkanSession {
@@ -25,7 +22,7 @@ impl Cx {
         &mut self,
         draw_pass_id: DrawPassId,
         frame: &CxOpenXrFrame,
-    ) -> Result<OpenXrVulkanRepaintStats, String> {
+    ) -> Result<(), String> {
         let draw_list_id = self.passes[draw_pass_id]
             .main_draw_list_id
             .ok_or_else(|| "OpenXR Vulkan render failed: missing main draw list".to_string())?;
@@ -86,7 +83,7 @@ impl Cx {
             )
         };
         self.os.vulkan = Some(vulkan);
-        let stats = result?;
+        result?;
 
         #[cfg(target_os = "android")]
         if let Some(request) = self.take_studio_run_view_frame_request(0) {
@@ -114,7 +111,7 @@ impl Cx {
                 }
             }
         }
-        Ok(stats)
+        Ok(())
     }
 }
 
