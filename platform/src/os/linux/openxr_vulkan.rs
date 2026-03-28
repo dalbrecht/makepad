@@ -1,10 +1,7 @@
 use super::*;
 use crate::{
     os::linux::openxr_depth::CxOpenXrDepthMeshPipeline,
-    os::linux::vulkan::{
-        CxVulkan, CxVulkanOpenXrFoveationImageInfo, CxVulkanOpenXrSessionData,
-        OpenXrVulkanRepaintStats,
-    },
+    os::linux::vulkan::{CxVulkan, CxVulkanOpenXrFoveationImageInfo, CxVulkanOpenXrSessionData},
     xr_tsdf::xr_tsdf_store,
 };
 pub(super) struct CxOpenXrVulkanSession {

@@ -398,10 +398,7 @@ impl XrRoot {
     }
 
     fn set_depth_voxel_size(&mut self, cx: &mut Cx, voxel_size_meters: f32) -> f32 {
-        let _ = voxel_size_meters;
-        let voxel_size_meters = cx
-            .xr_tsdf()
-            .set_voxel_size_meters(XR_FIXED_DEPTH_VOXEL_SIZE_METERS);
+        let voxel_size_meters = cx.xr_tsdf().set_voxel_size_meters(voxel_size_meters);
         self.env.reset_physics(cx);
         voxel_size_meters
     }

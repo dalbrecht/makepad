@@ -15,6 +15,7 @@ use makepad_widgets::makepad_platform::{
     event::{XrController, XrHand},
     XrTsdfStore,
 };
+use makepad_widgets::makepad_platform::{event::XrHand, XrTsdfStore};
 use std::{
     collections::HashMap,
     mem,

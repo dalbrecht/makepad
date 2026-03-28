@@ -2665,6 +2665,7 @@ impl RapierScene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tsdf_query::{DepthQueryCollider, DepthQuerySupportPlane};
 
     #[test]
     fn impact_surface_enables_before_current_body_overlaps_quad() {

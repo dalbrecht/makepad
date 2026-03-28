@@ -616,7 +616,7 @@ impl XrEnv {
             self.clear_depth_surface_mesh();
             return;
         }
-        let Some(snapshot) = cx.cx.xr_depth_mesh().latest_tsdf_snapshot() else {
+        let Some(snapshot) = cx.cx.xr_tsdf().latest_tsdf_snapshot() else {
             self.clear_depth_surface_mesh();
             return;
         };
@@ -868,9 +868,7 @@ impl XrEnv {
     }
 
     fn ensure_physics_worker(&mut self, cx: &mut Cx) -> &mut XrPhysicsWorker {
-        self.world
-            .physics
-            .worker
+        self.physics_worker
             .get_or_insert_with(|| XrPhysicsWorker::new(cx.xr_tsdf()))
     }
 

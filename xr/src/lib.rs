@@ -3,22 +3,22 @@ pub use makepad_widgets::*;
 
 #[path = "obj/cube.rs"]
 pub mod cube;
+#[path = "util/depth_align.rs"]
+pub mod depth_align;
+#[path = "util/depth_debug_mesh.rs"]
+pub mod depth_debug_mesh;
+#[path = "util/depth_debug_mesh_worker.rs"]
+mod depth_debug_mesh_worker;
 #[path = "obj/gltf.rs"]
 pub mod gltf;
 #[path = "util/gltf_bridge.rs"]
 pub mod gltf_bridge;
 #[path = "obj/icosphere.rs"]
 pub mod icosphere;
-#[path = "util/depth_debug_mesh.rs"]
-pub mod depth_debug_mesh;
-#[path = "util/depth_debug_mesh_worker.rs"]
-mod depth_debug_mesh_worker;
 #[path = "util/mesh_generators.rs"]
 pub mod mesh_generators;
 #[path = "util/passthrough_env.rs"]
 pub mod passthrough_env;
-#[path = "util/tsdf_query.rs"]
-mod tsdf_query;
 #[path = "obj/physics_view.rs"]
 pub mod physics_view;
 #[path = "obj/refractive_cube.rs"]
@@ -29,6 +29,8 @@ mod scene_draw;
 pub mod shooter;
 #[path = "obj/tree.rs"]
 pub mod tree;
+#[path = "util/tsdf_query.rs"]
+mod tsdf_query;
 #[path = "obj/view_splat.rs"]
 pub mod view_splat;
 #[path = "scene/xr_body_spawn.rs"]
@@ -52,19 +54,28 @@ pub mod xr_select;
 #[path = "scene/xr_view.rs"]
 pub mod xr_view;
 
-pub mod render {
-    pub use crate::util::gltf_bridge::{
-        GltfDecodedMeshes, GltfDecodedPrimitiveObject, GltfDefaultView, GltfDrawObject,
-        GltfMaterialState, GltfMeshObjects, GltfPrimitiveObject, GltfRenderer,
-    };
-    pub use crate::util::passthrough_env::DrawPassthroughEnvFace;
-}
-
-pub(crate) mod prelude {
-    pub use crate::algorithms::depth_align::*;
-    pub use crate::{net::*, render::*, scene::*};
-    pub use makepad_widgets::*;
-}
+pub use cube::*;
+pub use depth_align::*;
+pub use gltf::*;
+pub use gltf_bridge::*;
+pub use icosphere::*;
+pub use passthrough_env::DrawPassthroughEnvFace;
+pub use physics_view::*;
+pub use refractive_cube::*;
+pub use shooter::*;
+pub use tree::{
+    CpuPythagoreanTree, DrawTreeBranches, DrawTreeLeaves, Tree, PYTHAGOREAN_TREE_ROOT_DROP,
+};
+pub use view_splat::*;
+pub use xr_body_spawn::*;
+pub use xr_env::XrEnv;
+pub use xr_net::*;
+pub use xr_node::*;
+pub use xr_people_debug::XrPeopleDebug;
+pub use xr_permissions_flow::*;
+pub use xr_root::XrRoot;
+pub use xr_select::XrSelect;
+pub use xr_view::XrView;
 
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     scene::xr_node::script_mod(vm);

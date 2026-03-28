@@ -9,7 +9,7 @@ use crate::tsdf_query::{
     DepthQuery, DepthQueryCollider, DepthQueryColliderGeometry, DepthQueryColliderRole,
     DepthQueryHit, DepthQueryResult, DepthQuerySupportPlane,
 };
-use makepad_widgets::makepad_platform::XrDepthMeshStore;
+use makepad_widgets::makepad_platform::XrTsdfStore;
 
 #[derive(Clone, Copy)]
 pub(super) struct DepthSurfaceMeshChunkHandle {
@@ -613,17 +613,7 @@ impl XrEnv {
         let Some(scene) = scene else {
             return;
         };
-        sync_depth_query_surfaces_with_store(retained_hits, Some(scene), &cx.xr_tsdf(), None);
-    }
-}
-
-impl XrDepthRuntime {
-    const SURFACE_MESH_UPSERTS_PER_FRAME: usize = 2;
-
-    fn alloc_surface_mesh_geometry(&mut self, cx: &mut Cx2d) -> Geometry {
-        self.recycled_mesh_geometries
-            .pop()
-            .unwrap_or_else(|| Geometry::new(cx.cx.cx))
+        sync_depth_query_surfaces_with_store(retained_hits, Some(scene), &cx.xr_tsdf());
     }
 
     pub(super) fn sync_depth_surface_mesh(&mut self, cx: &mut Cx2d) {
@@ -702,7 +692,6 @@ pub(super) fn sync_depth_query_surfaces_with_store(
     retained_hits: &mut HashMap<u64, RetainedDepthQueryHit>,
     scene: Option<&mut RapierScene>,
     depth_mesh: &XrTsdfStore,
-    floor_y_override: Option<f32>,
 ) {
     let Some(scene) = scene else {
         return;
