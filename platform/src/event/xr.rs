@@ -959,17 +959,9 @@ impl XrAnchor {
 }
 
 #[derive(Clone, Copy, Debug, Default, SerBin, DeBin, PartialEq)]
-pub enum XrSyncAnchorExtrema {
-    #[default]
-    Low,
-    High,
-}
-
-#[derive(Clone, Copy, Debug, Default, SerBin, DeBin, PartialEq)]
 pub struct XrSyncAnchor {
     pub id: u32,
     pub captured_at: f64,
-    pub extrema: XrSyncAnchorExtrema,
     pub anchor: XrAnchor,
 }
 
@@ -979,8 +971,6 @@ pub struct XrState {
     pub head_pose: Pose,
     pub order_counter: u8,
     pub anchor: Option<XrAnchor>,
-    pub anchor_persisted: bool,
-    pub floor_y: Option<f32>,
     pub sync_anchor: Option<XrSyncAnchor>,
     pub left_controller: XrController,
     pub right_controller: XrController,
@@ -994,8 +984,6 @@ impl XrState {
             time: (b.time - a.time) * f as f64 + a.time,
             head_pose: Pose::from_lerp(a.head_pose, b.head_pose, f),
             anchor: b.anchor,
-            anchor_persisted: b.anchor_persisted,
-            floor_y: b.floor_y,
             sync_anchor: b.sync_anchor,
             left_controller: b.left_controller.clone(),
             right_controller: b.right_controller.clone(),
