@@ -3,7 +3,9 @@
 use super::xr_physics::{makepad_pose, DepthQuerySource, RapierScene};
 use super::*;
 use crate::depth_debug_mesh::{push_debug_depth_plane, DebugDepthMeshChunk};
-use crate::depth_debug_mesh_worker::{XrDepthDebugMeshWorker, XrDepthDebugMeshWorkerResult};
+use crate::depth_debug_mesh_worker::{
+    XrDepthDebugMeshVisibleSet, XrDepthDebugMeshWorker, XrDepthDebugMeshWorkerResult,
+};
 use crate::tsdf_query::{
     depth_query_might_need_impact_refresh, depth_query_plane_supports_body, evaluate_tsdf_query,
     DepthQuery, DepthQueryCollider, DepthQueryColliderGeometry, DepthQueryColliderRole,
@@ -366,9 +368,12 @@ impl XrEnv {
         self.depth_surface_mesh_generation = 0;
         self.depth_surface_mesh_update_sequence = 0;
         self.depth_surface_mesh_requested_snapshot_grid = None;
+        self.depth_surface_mesh_requested_head_pose = None;
         self.depth_surface_mesh_snapshot_grid = None;
+        self.depth_surface_mesh_visible_request_id = 0;
+        self.depth_surface_mesh_visible_chunks.clear();
         self.depth_surface_mesh_chunks.clear();
-        self.depth_surface_mesh_upload_count = 0;
+        self.depth_surface_mesh_worker = None;
     }
 
     pub(super) fn ensure_depth_surface_mesh_worker(&mut self) -> &mut XrDepthDebugMeshWorker {
@@ -414,7 +419,7 @@ impl XrEnv {
     }
 
     fn upsert_depth_surface_mesh_chunk(&mut self, cx: &mut Cx2d, chunk: DebugDepthMeshChunk) {
-        let key = (chunk.chunk_key.x, chunk.chunk_key.y, chunk.chunk_key.z);
+        let key = chunk.chunk_key;
         if self
             .depth_surface_mesh_chunks
             .get(&key)
@@ -439,9 +444,22 @@ impl XrEnv {
             };
             self.depth_surface_mesh_chunks
                 .insert(key, (geometry, handle));
-            self.depth_surface_mesh_upload_count =
-                self.depth_surface_mesh_upload_count.saturating_add(1);
         }
+    }
+
+    fn apply_depth_surface_mesh_visible_set(&mut self, result: XrDepthDebugMeshVisibleSet) {
+        if result.request_id < self.depth_surface_mesh_visible_request_id {
+            return;
+        }
+        self.depth_surface_mesh_visible_request_id = result.request_id;
+        self.depth_surface_mesh_generation = result.generation;
+        self.depth_surface_mesh_update_sequence = result.update_sequence;
+        self.depth_surface_mesh_snapshot_grid = Some(result.snapshot_grid);
+        self.depth_surface_mesh_visible_chunks = result.visible_chunk_keys.into_iter().collect();
+    }
+
+    fn remove_depth_surface_mesh_chunk(&mut self, chunk_key: ChunkKey) {
+        self.depth_surface_mesh_chunks.remove(&chunk_key);
     }
 
     fn apply_depth_surface_mesh_worker_result(
@@ -449,40 +467,40 @@ impl XrEnv {
         cx: &mut Cx2d,
         result: XrDepthDebugMeshWorkerResult,
     ) {
-        self.depth_surface_mesh_generation = result.generation;
-        self.depth_surface_mesh_update_sequence = result.update_sequence;
-        self.depth_surface_mesh_snapshot_grid = Some(result.snapshot_grid);
-
-        if result.chunks.is_empty() {
-            self.depth_surface_mesh_chunks.clear();
-            self.depth_surface_mesh_upload_count = 0;
-            return;
+        match result {
+            XrDepthDebugMeshWorkerResult::VisibleSet(result) => {
+                self.apply_depth_surface_mesh_visible_set(result);
+            }
+            XrDepthDebugMeshWorkerResult::ChunkUpserts { request_id, chunks } => {
+                if request_id != self.depth_surface_mesh_visible_request_id {
+                    return;
+                }
+                for chunk in chunks {
+                    self.upsert_depth_surface_mesh_chunk(cx, chunk);
+                }
+            }
+            XrDepthDebugMeshWorkerResult::ChunkRemovals {
+                request_id,
+                chunk_keys,
+            } => {
+                if request_id != self.depth_surface_mesh_visible_request_id {
+                    return;
+                }
+                for chunk_key in chunk_keys {
+                    self.remove_depth_surface_mesh_chunk(chunk_key);
+                }
+            }
         }
-
-        let active_chunk_count = result.chunks.len();
-        if self.depth_surface_mesh_upload_count > active_chunk_count.saturating_mul(3) + 64 {
-            self.depth_surface_mesh_chunks.clear();
-            self.depth_surface_mesh_upload_count = 0;
-        }
-
-        let mut desired_keys = std::collections::HashSet::with_capacity(result.chunks.len());
-        for chunk in result.chunks {
-            desired_keys.insert((chunk.chunk_key.x, chunk.chunk_key.y, chunk.chunk_key.z));
-            self.upsert_depth_surface_mesh_chunk(cx, chunk);
-        }
-        self.depth_surface_mesh_chunks
-            .retain(|key, _| desired_keys.contains(key));
     }
 
     pub(super) fn poll_depth_surface_mesh_worker(&mut self, cx: &mut Cx2d) {
-        let Some(result) = self
+        while let Some(result) = self
             .depth_surface_mesh_worker
             .as_mut()
-            .and_then(|worker| worker.take_latest_result())
-        else {
-            return;
-        };
-        self.apply_depth_surface_mesh_worker_result(cx, result);
+            .and_then(|worker| worker.take_next_result())
+        {
+            self.apply_depth_surface_mesh_worker_result(cx, result);
+        }
     }
 
     fn sync_retained_depth_query_result(
@@ -649,14 +667,16 @@ impl XrEnv {
         if (!show_mesh || self.mesh_chunks.is_empty()) && query_hits.is_none() {
             return;
         }
-        draw_depth_mesh.base_color = vec4(0.60, 0.62, 0.66, 0.95);
-        if show_mesh && !self.mesh_chunks.is_empty() && !self.visible_chunks.is_empty() {
-            draw_depth_mesh.set_focus_fade(cx, self.focus_point);
+        self.draw_depth_mesh.base_color = vec4(0.76, 0.88, 0.98, 1.0);
+        if show_mesh
+            && !self.depth_surface_mesh_chunks.is_empty()
+            && !self.depth_surface_mesh_visible_chunks.is_empty()
+        {
             let mut chunk_handles: Vec<_> = self
-                .visible_chunks
+                .depth_surface_mesh_visible_chunks
                 .iter()
                 .filter_map(|key| {
-                    self.mesh_chunks
+                    self.depth_surface_mesh_chunks
                         .get(key)
                         .map(|chunk| (*key, chunk.1.geometry_id))
                 })
