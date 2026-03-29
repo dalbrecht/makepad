@@ -1843,11 +1843,7 @@ impl App {
         } else {
             return;
         };
-        let (
-            peer_sync_status_text,
-            alignment_debug_text,
-            alignment_state_text,
-        ) = self
+        let (peer_sync_status_text, alignment_debug_text, alignment_state_text) = self
             .ui
             .widget(cx, ids!(xr_people_debug))
             .borrow::<XrPeopleDebug>()
