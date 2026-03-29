@@ -20,7 +20,7 @@ use rapier3d::prelude::{
     Rotation as RapierRotation, SharedShape, Vector as RapierVector,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::Arc,
 };
@@ -44,6 +44,7 @@ use self::{
     },
     xr_physics_worker::{XrPhysicsWorker, XrPhysicsWorkerResult},
 };
+use crate::depth_debug_mesh::DebugDepthMeshChunk;
 use crate::depth_debug_mesh_worker::XrDepthDebugMeshWorker;
 
 script_mod! {
@@ -61,10 +62,31 @@ script_mod! {
         draw_call: uniform_buffer(draw.DrawCallUniforms)
         draw_pass: uniform_buffer(draw.DrawPassUniforms)
         draw_list: uniform_buffer(draw.DrawListUniforms)
-        geom: vertex_buffer(geom.IcoVertex, geom.IcoGeom)
+        geom: vertex_buffer(geom.DepthMeshVertex, geom.DepthMeshGeom)
 
-        v_world: varying(vec3f)
-        v_geom_normal: varying(vec3f)
+        v_barycentric: varying(vec3f)
+
+        edge_distance_px: fn(bary: vec3f) -> f32 {
+            let bary_fw = vec3(
+                length(vec2(dFdx(bary.x), dFdy(bary.x))),
+                length(vec2(dFdx(bary.y), dFdy(bary.y))),
+                length(vec2(dFdx(bary.z), dFdy(bary.z)))
+            );
+            return min(
+                bary.x / max(bary_fw.x, 0.00001),
+                min(
+                    bary.y / max(bary_fw.y, 0.00001),
+                    bary.z / max(bary_fw.z, 0.00001)
+                )
+            )
+        }
+
+        wire_band_alpha: fn(bary: vec3f) -> f32 {
+            let edge_px = self.edge_distance_px(bary);
+            let inner = smoothstep(self.wire_inner_px - 0.75, self.wire_inner_px + 0.75, edge_px);
+            let outer = 1.0 - smoothstep(self.wire_outer_px - 0.75, self.wire_outer_px + 0.75, edge_px);
+            return clamp(inner * outer, 0.0, 1.0)
+        }
 
         vertex: fn() {
             let world = vec4(
@@ -73,33 +95,24 @@ script_mod! {
                 self.geom.pos.z,
                 1.0
             );
-            let geom_normal = normalize(vec3(
-                self.geom.normal.x,
-                self.geom.normal.y,
-                self.geom.normal.z
-            ));
-            let biased_world = vec4(world.xyz + geom_normal * self.normal_bias, 1.0);
-            self.v_world = world.xyz;
-            self.v_geom_normal = geom_normal;
-            self.vertex_pos = self.draw_pass.camera_projection * (self.draw_pass.camera_view * biased_world);
+            let view = self.draw_pass.camera_view * world;
+            let biased_view = vec4(view.x, view.y, view.z + self.depth_bias, view.w);
+            self.v_barycentric = vec3(
+                self.geom.barycentric.x,
+                self.geom.barycentric.y,
+                self.geom.barycentric.z
+            );
+            self.vertex_pos = self.draw_pass.camera_projection * biased_view;
         }
 
         pixel: fn() {
-            let face_raw = cross(dFdx(self.v_world), dFdy(self.v_world));
-            let face_len = length(face_raw);
-            let geom_normal = normalize(self.v_geom_normal);
-            let mut n = if face_len > 0.00001 {
-                normalize(face_raw)
-            } else {
-                geom_normal
-            };
-            if dot(n, geom_normal) < 0.0 {
-                n = -n;
-            }
-            let l = normalize(self.light_dir);
-            let diffuse = max(dot(n, l), 0.0);
-            let lit = self.ambient + diffuse * (1.0 - self.ambient);
-            return vec4(self.base_color.xyz * lit, self.base_color.w);
+            let wire_alpha = self.base_color.w * self.wire_band_alpha(self.v_barycentric);
+            return vec4(
+                self.base_color.x * wire_alpha,
+                self.base_color.y * wire_alpha,
+                self.base_color.z * wire_alpha,
+                wire_alpha
+            );
         }
 
         fragment: fn() {
@@ -399,6 +412,8 @@ pub struct XrEnv {
     #[rust]
     depth_surface_mesh_chunks: HashMap<ChunkKey, (Geometry, DepthSurfaceMeshChunkHandle)>,
     #[rust]
+    depth_surface_mesh_pending_upserts: VecDeque<(u64, DebugDepthMeshChunk)>,
+    #[rust]
     depth_query_hit_geometry: Option<Geometry>,
     #[rust]
     depth_surface_mesh_worker: Option<XrDepthDebugMeshWorker>,
@@ -668,7 +683,7 @@ impl XrEnv {
     }
 
     fn prepare_depth_mesh(&mut self, cx: &mut Cx2d, state: &XrState) {
-        self.draw_depth_mesh.draw_vars.options.depth_write = true;
+        self.draw_depth_mesh.draw_vars.options.depth_write = false;
         self.poll_depth_surface_mesh_worker(cx);
         if !self.depth_mesh_visible() {
             self.clear_depth_surface_mesh();
