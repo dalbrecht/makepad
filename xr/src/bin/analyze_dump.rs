@@ -1,7 +1,6 @@
 #![allow(dead_code, unused_mut, unused_variables)]
 
-use makepad_widgets::*;
-use makepad_xr::{algorithms::depth_align::*, net::*};
+use makepad_xr::*;
 use std::{
     env,
     f32::consts::{PI, TAU},
@@ -13,6 +12,8 @@ use std::{
 #[derive(Clone, Copy, Debug, Default)]
 struct AnalyzeOptions {
     solve: bool,
+    compress_pass: bool,
+    lossless_compress_pass: bool,
     latest_count: usize,
 }
 
@@ -229,7 +230,7 @@ fn analysis_thread_count(work_items: usize) -> usize {
 }
 
 fn latest_dump_paths(count: usize) -> Vec<PathBuf> {
-    let dump_dir = PathBuf::from("xr/dump/dumps");
+    let dump_dir = PathBuf::from("xr/util/dumps");
     let mut entries = fs::read_dir(dump_dir)
         .ok()
         .into_iter()
@@ -267,6 +268,14 @@ fn parse_args() -> Result<(AnalyzeOptions, Vec<PathBuf>), String> {
             options.solve = true;
             continue;
         }
+        if arg == "--compress-pass" {
+            options.compress_pass = true;
+            continue;
+        }
+        if arg == "--lossless-compress-pass" {
+            options.lossless_compress_pass = true;
+            continue;
+        }
         if arg == "--latest" {
             let Some(count) = args.next() else {
                 return Err("expected a count after --latest".to_string());
@@ -284,7 +293,7 @@ fn parse_args() -> Result<(AnalyzeOptions, Vec<PathBuf>), String> {
         paths = latest_dump_paths(options.latest_count);
     }
     if paths.is_empty() {
-        return Err("no dump files found in xr/dump/dumps".to_string());
+        return Err("no dump files found in xr/util/dumps".to_string());
     }
     Ok((options, paths))
 }
@@ -433,7 +442,7 @@ fn print_descriptor_stats(label: &str, descriptor: &XrDepthAlignDescriptor) {
         descriptor.vertical_descriptor.is_some()
     );
     print_height_map_stats(label, descriptor.height_map.as_ref());
-    if let Some(markers) = descriptor.test_markers() {
+    if let Some(markers) = xr_depth_align_test_markers(descriptor) {
         println!(
             "{label}: markers ({:.2}, {:.2}, {:.2}) and ({:.2}, {:.2}, {:.2})",
             markers[0].x, markers[0].y, markers[0].z, markers[1].x, markers[1].y, markers[1].z
@@ -3222,7 +3231,8 @@ fn score_focused_pose_evidence(
         seed_prior: seed_prior_factor(pose, seed_pose),
     };
     if with_runtime {
-        let rescored = local.rescore_remote_to_local(
+        let rescored = xr_depth_align_rescore_remote_to_local(
+            local,
             remote,
             XrDepthAlignSolution {
                 yaw_radians,
@@ -6330,8 +6340,45 @@ fn analyze_path(options: AnalyzeOptions, path: &Path) -> Result<(), String> {
 
     let mut local = pair.local_descriptor.descriptor.clone();
     let mut remote = pair.remote_descriptor.descriptor.clone();
+    if options.lossless_compress_pass {
+        local.height_map = local
+            .height_map
+            .as_ref()
+            .map(|height_map| height_map.compress_sparse_lossless().decompress())
+            .transpose()
+            .map_err(|err| format!("local lossless compression pass failed: {err}"))?;
+        remote.height_map = remote
+            .height_map
+            .as_ref()
+            .map(|height_map| height_map.compress_sparse_lossless().decompress())
+            .transpose()
+            .map_err(|err| format!("remote lossless compression pass failed: {err}"))?;
+    } else if options.compress_pass {
+        local.height_map = local
+            .height_map
+            .as_ref()
+            .map(|height_map| height_map.compress_sparse_u16().decompress())
+            .transpose()
+            .map_err(|err| format!("local compression pass failed: {err}"))?;
+        remote.height_map = remote
+            .height_map
+            .as_ref()
+            .map(|height_map| height_map.compress_sparse_u16().decompress())
+            .transpose()
+            .map_err(|err| format!("remote compression pass failed: {err}"))?;
+    }
     let local = &local;
     let remote = &remote;
+    println!(
+        "compression_pass: {}",
+        if options.lossless_compress_pass {
+            "sparse_lossless_roundtrip"
+        } else if options.compress_pass {
+            "sparse_u16_roundtrip"
+        } else {
+            "none"
+        }
+    );
     print_descriptor_stats("local", local);
     print_descriptor_stats("remote", remote);
     let manual_pose = load_manual_pose(path);
@@ -6458,7 +6505,7 @@ fn analyze_path(options: AnalyzeOptions, path: &Path) -> Result<(), String> {
 
     if let Some(manual_pose) = manual_pose {
         let manual_seed = manual_pose_solution(local, remote, manual_pose);
-        let manual_scored = local.rescore_remote_to_local(remote, manual_seed);
+        let manual_scored = xr_depth_align_rescore_remote_to_local(local, remote, manual_seed);
         println!(
             "manual_scored: yaw {:.3} rad ({:.1} deg) | translation ({:.3}, {:.3}, {:.3}) | conf {:.3} | sym {:.3} | residual {:.3} m | matched {} | accepted {}",
             manual_scored.yaw_radians,
@@ -6470,7 +6517,7 @@ fn analyze_path(options: AnalyzeOptions, path: &Path) -> Result<(), String> {
             manual_scored.symmetry_confidence,
             manual_scored.residual_meters,
             manual_scored.matched_samples,
-            manual_scored.is_accepted(&diagnostic)
+            xr_depth_align_solution_is_accepted(&diagnostic, manual_scored)
         );
     }
     let run_legacy_search_paths = false;
