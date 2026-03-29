@@ -1090,6 +1090,17 @@ impl TextFlow {
         }
     }
 
+    /// Reset internal draw state so this TextFlow can be used for another
+    /// `begin`/`end` cycle within the same redraw pass.
+    ///
+    /// Normally `draw_state` tracks `redraw_id` and only allows one
+    /// `begin` per redraw.  Call this after `end` when reusing the same
+    /// TextFlow instance for multiple independent layout regions (e.g.
+    /// table cells).
+    pub fn reset_draw_state(&mut self) {
+        self.draw_state = DrawStateWrap::default();
+    }
+
     /// Start streaming text animation with fade-in effect on new characters.
     /// Call this before drawing when streaming new content.
     pub fn start_streaming_animation(&mut self) {
