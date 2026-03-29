@@ -46,42 +46,6 @@ pub enum CxThreadPriority {
     Idle,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct XrFrameCpuBreakdown {
-    pub total_ms: f64,
-    pub wait_frame_ms: f64,
-    pub begin_frame_ms: f64,
-    pub locate_space_ms: f64,
-    pub locate_views_ms: f64,
-    pub acquire_swapchain_ms: f64,
-    pub wait_swapchain_ms: f64,
-    pub acquire_depth_ms: f64,
-    pub update_prepare_ms: f64,
-    pub update_dispatch_ms: f64,
-    pub next_frame_ms: f64,
-    pub draw_event_ms: f64,
-    pub compile_shaders_ms: f64,
-    pub repaint_ms: f64,
-    pub repaint_wait_inflight_ms: f64,
-    pub repaint_prepare_textures_ms: f64,
-    pub repaint_record_draw_ms: f64,
-    pub repaint_submit_ms: f64,
-    pub repaint_texture_upload_count: u32,
-    pub repaint_texture_upload_bytes: u64,
-    pub repaint_packet_buffer_count: u32,
-    pub repaint_packet_buffer_bytes: u64,
-    pub repaint_geometry_upload_bytes: u64,
-    pub repaint_descriptor_set_count: u32,
-    pub repaint_draw_items: u64,
-    pub repaint_draw_calls: u64,
-    pub repaint_packets: u64,
-    pub repaint_instances: u64,
-    pub repaint_indices: u64,
-    pub depth_readback_ms: f64,
-    pub end_frame_ms: f64,
-    pub resize_projection_ms: f64,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SystemBrowserId(pub LiveId);
 
@@ -569,30 +533,6 @@ impl Cx {
 
     pub fn xr_effective_frame_rate_hz(&self) -> Option<f64> {
         <Self as CxOsApi>::xr_effective_frame_rate_hz(self)
-    }
-
-    pub fn geometry_pool_slot_count(&self) -> usize {
-        self.geometries.0.slot_count()
-    }
-
-    pub fn geometry_pool_live_count(&self) -> usize {
-        self.geometries.0.live_count()
-    }
-
-    pub fn draw_list_pool_slot_count(&self) -> usize {
-        self.draw_lists.0.slot_count()
-    }
-
-    pub fn draw_list_pool_live_count(&self) -> usize {
-        self.draw_lists.0.live_count()
-    }
-
-    pub fn texture_pool_slot_count(&self) -> usize {
-        self.textures.0.slot_count()
-    }
-
-    pub fn texture_pool_live_count(&self) -> usize {
-        self.textures.0.live_count()
     }
 
     pub fn set_thread_priority(priority: CxThreadPriority) {

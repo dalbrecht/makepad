@@ -73,7 +73,9 @@ pub mod display_context;
 mod app_main;
 pub use crate::app_main::{resolve_studio_http, should_run_stdin_loop_from_env};
 pub use crate::cx_api::{can_play_type, CxSystemBrowser, SystemBrowserId};
-pub use crate::xr_tsdf::XrDepthAlignHeightMap;
+pub use crate::xr_tsdf::{
+    XrDepthAlignHeightMap, XrTsdfCooperativeStepResult, XrTsdfCooperativeStepStats,
+};
 
 #[cfg(target_arch = "wasm32")]
 pub use makepad_wasm_bridge;
@@ -103,8 +105,10 @@ pub use {
         audio::*,
         component::{ComponentInfo, ComponentRegistries, ComponentRegistry},
         cursor::MouseCursor,
-        cx::{Cx, CxRef, LinuxWindowParams, OsType},
-        cx_api::{AccessibilityUpdatePayload, CxOsApi, CxOsOp, CxThreadPriority, OpenUrlInPlace},
+        cx::{Cx, CxRef, OsType},
+        cx_api::{
+            AccessibilityUpdatePayload, CxOsApi, CxOsOp, CxThreadPriority, OpenUrlInPlace,
+        },
         draw_list::{CxDrawCall, CxDrawItem, CxDrawListPool, CxRectArea, DrawList, DrawListId},
         draw_matrix::DrawMatrix,
         draw_pass::{
