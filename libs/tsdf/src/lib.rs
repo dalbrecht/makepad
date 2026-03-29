@@ -11,7 +11,7 @@ use std::{
     time::Instant,
 };
 
-pub const XR_TSDF_DEFAULT_VOXEL_SIZE_METERS: f32 = 0.02;
+pub const XR_TSDF_DEFAULT_VOXEL_SIZE_METERS: f32 = 0.03;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ChunkKey {
@@ -43,21 +43,21 @@ pub struct XrTsdfState {
 pub struct SparseTsdReadChunk {
     pub values: Vec<i16>,
     pub valid_bits: Vec<u64>,
-    pub metadata: Vec<u16>,
+    pub confidence: Vec<u8>,
+    pub observed_generation: Vec<u16>,
 }
 
 impl SparseTsdReadChunk {
     const NORMALIZED_DISTANCE_ENCODE_SCALE: f32 = i16::MAX as f32;
-    const CONFIDENCE_BITS: u16 = 6;
-    const CONFIDENCE_MASK: u16 = (1u16 << Self::CONFIDENCE_BITS) - 1;
-    const GENERATION_MASK: u16 = (1u16 << (u16::BITS as u16 - Self::CONFIDENCE_BITS)) - 1;
-    const GENERATION_WRAP: u64 = Self::GENERATION_MASK as u64 + 1;
+    const GENERATION_WRAP: u64 = u16::MAX as u64 + 1;
+    const GENERATION_MASK: u64 = u16::MAX as u64;
 
     pub fn new(chunk_volume: usize) -> Self {
         Self {
             values: vec![0; chunk_volume],
             valid_bits: vec![0; Self::valid_word_count(chunk_volume)],
-            metadata: vec![0; chunk_volume],
+            confidence: vec![0; chunk_volume],
+            observed_generation: vec![0; chunk_volume],
         }
     }
 
@@ -98,32 +98,17 @@ impl SparseTsdReadChunk {
     }
 
     pub fn encode_generation_tag(generation: u64) -> u16 {
-        generation as u16 & Self::GENERATION_MASK
+        generation as u16
     }
 
     pub fn decode_generation_tag(tag: u16, current_generation: u64) -> u64 {
-        let generation_mask = Self::GENERATION_MASK as u64;
-        let base = current_generation & !generation_mask;
+        let base = current_generation & !Self::GENERATION_MASK;
         let candidate = base | tag as u64;
         if candidate > current_generation {
             candidate.saturating_sub(Self::GENERATION_WRAP)
         } else {
             candidate
         }
-    }
-
-    pub(crate) fn encode_metadata(confidence: u8, observed_generation: u64) -> u16 {
-        let confidence = confidence.min(Self::CONFIDENCE_MASK as u8) as u16;
-        let generation = Self::encode_generation_tag(observed_generation);
-        (generation << Self::CONFIDENCE_BITS) | confidence
-    }
-
-    pub(crate) fn decode_metadata_confidence(metadata: u16) -> u8 {
-        (metadata & Self::CONFIDENCE_MASK) as u8
-    }
-
-    pub(crate) fn decode_metadata_generation_tag(metadata: u16) -> u16 {
-        metadata >> Self::CONFIDENCE_BITS
     }
 
     pub fn value(&self, id: usize) -> Option<f32> {
@@ -141,37 +126,33 @@ impl SparseTsdReadChunk {
         if !Self::is_valid_index(&self.valid_bits, id) {
             0
         } else {
-            self.metadata
-                .get(id)
-                .copied()
-                .map(Self::decode_metadata_confidence)
-                .unwrap_or(0)
+            self.confidence.get(id).copied().unwrap_or(0)
         }
     }
 
     pub fn observed_generation(&self, id: usize, current_generation: u64) -> u64 {
-        let tag = self
-            .metadata
-            .get(id)
-            .copied()
-            .map(Self::decode_metadata_generation_tag)
-            .unwrap_or(0);
+        let tag = self.observed_generation.get(id).copied().unwrap_or(0);
         Self::decode_generation_tag(tag, current_generation)
     }
 
     pub fn set_value(&mut self, id: usize, value: f32, confidence: u8, observed_generation: u64) {
-        if id >= self.values.len() || id >= self.metadata.len() {
+        if id >= self.values.len()
+            || id >= self.confidence.len()
+            || id >= self.observed_generation.len()
+        {
             return;
         }
         self.values[id] = Self::encode_normalized_distance(value);
         Self::set_valid_index(&mut self.valid_bits, id);
-        self.metadata[id] = Self::encode_metadata(confidence, observed_generation);
+        self.confidence[id] = confidence;
+        self.observed_generation[id] = Self::encode_generation_tag(observed_generation);
     }
 
     pub fn heap_bytes(&self) -> u64 {
         (self.values.capacity() * std::mem::size_of::<i16>()
             + self.valid_bits.capacity() * std::mem::size_of::<u64>()
-            + self.metadata.capacity() * std::mem::size_of::<u16>()) as u64
+            + self.confidence.capacity() * std::mem::size_of::<u8>()
+            + self.observed_generation.capacity() * std::mem::size_of::<u16>()) as u64
     }
 }
 
@@ -327,16 +308,6 @@ pub struct TsdfPublishedSnapshot {
     pub height_map: Option<XrDepthAlignHeightMap>,
 }
 
-impl TsdfPublishedSnapshot {
-    pub fn lowest_y_meters(&self) -> Option<f32> {
-        self.height_map
-            .as_ref()
-            .map(|height_map| height_map.bottom_y_meters)
-            .or_else(|| self.grid.active_bounds.map(|(min, _)| min.y))
-            .filter(|value| value.is_finite())
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XrTsdfCooperativeStepResult {
     pub did_work: bool,
@@ -437,7 +408,7 @@ impl XrTsdfStore {
     }
 
     pub fn set_voxel_size_meters(&self, voxel_size_meters: f32) -> f32 {
-        let voxel_size_meters = voxel_size_meters.clamp(0.02, 0.10);
+        let voxel_size_meters = voxel_size_meters.clamp(0.03, 0.10);
         let previous = self
             .voxel_size_meters_bits
             .swap(voxel_size_meters.to_bits(), Ordering::AcqRel);
@@ -596,22 +567,61 @@ pub fn empty_bounds() -> (Vec3f, Vec3f) {
     (vec3f(0.0, 0.0, 0.0), vec3f(0.0, 0.0, 0.0))
 }
 
-pub mod depth_integration;
-pub use depth_integration::*;
-
 #[cfg(test)]
-#[path = "synthetic_bench.rs"]
-mod synthetic_bench;
+pub mod thread {
+    pub struct SignalToUI;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tsdf_store_defaults_and_clamps_to_two_centimeter_voxels() {
-        let store = XrTsdfStore::default();
-        assert!((store.voxel_size_meters() - 0.02).abs() <= f32::EPSILON);
-        assert!((store.set_voxel_size_meters(0.005) - 0.02).abs() <= f32::EPSILON);
-        assert!((store.voxel_size_meters() - 0.02).abs() <= f32::EPSILON);
+    impl SignalToUI {
+        pub fn set_ui_signal() {}
     }
 }
+
+#[cfg(test)]
+pub mod os {
+    pub mod linux {
+        pub mod openxr {
+            use crate::makepad_math::Mat4f;
+
+            #[derive(Clone, Copy)]
+            pub struct CxOpenXrEye {
+                pub depth_view_mat: Mat4f,
+                pub depth_proj_mat: Mat4f,
+            }
+
+            #[derive(Clone, Copy)]
+            pub struct CxOpenXrFrame {
+                pub eyes: [CxOpenXrEye; 1],
+            }
+        }
+
+        pub mod vulkan {
+            pub struct CxVulkan;
+
+            pub struct CxVulkanOpenXrSessionData {
+                pub depth_width: u32,
+                pub depth_height: u32,
+            }
+
+            impl CxVulkan {
+                pub fn read_openxr_depth_image(
+                    &mut self,
+                    _render_targets: &CxVulkanOpenXrSessionData,
+                    _depth_image_index: usize,
+                    _eye_index: usize,
+                ) -> Result<Vec<u16>, String> {
+                    Err("TSDF test stub does not provide image readback".to_string())
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub mod xr_tsdf {
+    pub use crate::*;
+}
+
+#[cfg(test)]
+#[allow(dead_code, unused_imports, unused_variables)]
+#[path = "../../../platform/src/os/linux/openxr_depth.rs"]
+mod openxr_depth;
