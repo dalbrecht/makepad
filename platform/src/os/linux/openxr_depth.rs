@@ -165,21 +165,14 @@ impl CxOpenXrDepthMeshPipeline {
             ))
         })();
 
-        let (
-            width,
-            height,
-            depth_proj,
-            inv_depth_proj,
-            world_from_depth_view,
-            camera_world,
-            camera_forward,
-        ) = match pose_result {
-            Ok(parts) => parts,
-            Err(err) => {
-                self.store.set_error(err.clone());
-                return Err(err);
-            }
-        };
+        let (width, height, depth_proj, inv_depth_proj, world_from_depth_view, camera_world) =
+            match pose_result {
+                Ok(parts) => parts,
+                Err(err) => {
+                    self.store.set_error(err.clone());
+                    return Err(err);
+                }
+            };
 
         let now = Instant::now();
         if !submit_should_readback_depth_frame(
@@ -212,7 +205,6 @@ impl CxOpenXrDepthMeshPipeline {
                 height,
                 voxel_size_meters,
                 camera_world,
-                camera_forward,
                 depth_proj,
                 inv_depth_proj,
                 depth_view_from_world: frame.eyes[DEPTH_VOXEL_EYE_INDEX].depth_view_mat,
