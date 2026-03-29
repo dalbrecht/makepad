@@ -43,8 +43,8 @@ mod xr_gesture;
 pub mod xr_net;
 #[path = "scene/xr_node.rs"]
 pub mod xr_node;
-#[path = "scene/xr_people_debug.rs"]
-pub mod xr_people_debug;
+#[path = "scene/xr_peer_sync.rs"]
+pub mod xr_peer_sync;
 #[path = "scene/xr_permissions_flow.rs"]
 pub mod xr_permissions_flow;
 #[path = "scene/xr_root.rs"]
@@ -71,7 +71,7 @@ pub use xr_body_spawn::*;
 pub use xr_env::XrEnv;
 pub use xr_net::*;
 pub use xr_node::*;
-pub use xr_people_debug::XrPeopleDebug;
+pub use xr_peer_sync::XrPeerSync;
 pub use xr_permissions_flow::*;
 pub use xr_root::XrRoot;
 pub use xr_select::XrSelect;
@@ -89,13 +89,12 @@ pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     obj::shooter::script_mod(vm);
     obj::tank::script_mod(vm);
 
-    util::passthrough_env::script_mod(vm);
-    obj::tree::script_mod(vm);
-    obj::view_splat::script_mod(vm);
-    scene::xr_env::script_mod(vm);
-    sync::xr_peer_sync::script_mod(vm);
-    sync::xr_scene_sync_controller::script_mod(vm);
-    scene::xr_select::script_mod(vm);
-    scene::xr_view::script_mod(vm);
-    scene::xr_root::script_mod(vm)
+    passthrough_env::script_mod(vm);
+    tree::script_mod(vm);
+    view_splat::script_mod(vm);
+    xr_env::script_mod(vm);
+    xr_peer_sync::script_mod(vm);
+    xr_select::script_mod(vm);
+    xr_view::script_mod(vm);
+    xr_root::script_mod(vm)
 }
