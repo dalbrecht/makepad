@@ -423,6 +423,30 @@ pub struct XrEnv {
     pub gravity: f32,
     #[rust(0.25)]
     physics_time_scale: f32,
+    #[rust]
+    physics_worker: Option<XrPhysicsWorker>,
+    #[rust]
+    runtime_bodies: Rc<HashMap<WidgetUid, XrRuntimeBodyState>>,
+    #[rust]
+    root_pose: Option<Pose>,
+    #[rust(true)]
+    scene_dirty: bool,
+    #[rust]
+    physics_revision: u64,
+    #[rust]
+    physics_compute_ms: f64,
+    #[rust]
+    physics_tsdf_query_ms: f64,
+    #[rust]
+    physics_rapier_step_ms: f64,
+    #[rust]
+    physics_step_dt_ms: f64,
+    #[rust]
+    physics_depth_query_surface_count: usize,
+    #[rust]
+    physics_depth_query_vertex_count: usize,
+    #[rust]
+    physics_depth_query_triangle_count: usize,
     #[allow(dead_code)]
     #[rust]
     next_frame: NextFrame,
@@ -512,6 +536,14 @@ impl XrEnv {
 
     pub(crate) fn physics_rapier_step_ms(&self) -> f64 {
         self.world.physics.metrics.rapier_step_ms
+    }
+
+    pub(crate) fn physics_tsdf_query_ms(&self) -> f64 {
+        self.physics_tsdf_query_ms
+    }
+
+    pub(crate) fn physics_rapier_step_ms(&self) -> f64 {
+        self.physics_rapier_step_ms
     }
 
     pub(crate) fn physics_time_scale(&self) -> f32 {
@@ -881,15 +913,13 @@ impl XrEnv {
         if let Some(retained_hits) = result.depth_query_retained_hits {
             self.world.depth.query_retained_hits = retained_hits;
         }
-        self.world.physics.metrics = XrPhysicsMetrics {
-            compute_ms: result.physics_compute_ms,
-            tsdf_query_ms: result.physics_tsdf_query_ms,
-            rapier_step_ms: result.physics_rapier_step_ms,
-            depth_query_surface_count: result.physics_depth_query_surface_count,
-            scene_body_count: result.physics_scene_body_count,
-            body_spawn_apply_count: result.physics_body_spawn_apply_count,
-            body_spawn_miss_count: result.physics_body_spawn_miss_count,
-        };
+        self.physics_compute_ms = result.physics_compute_ms;
+        self.physics_tsdf_query_ms = result.physics_tsdf_query_ms;
+        self.physics_rapier_step_ms = result.physics_rapier_step_ms;
+        self.physics_step_dt_ms = result.physics_step_dt_ms;
+        self.physics_depth_query_surface_count = result.physics_depth_query_surface_count;
+        self.physics_depth_query_vertex_count = result.physics_depth_query_vertex_count;
+        self.physics_depth_query_triangle_count = result.physics_depth_query_triangle_count;
         true
     }
 
@@ -1021,17 +1051,16 @@ impl XrEnv {
         if let Some(worker) = self.world.physics.worker.as_mut() {
             worker.request_reset(self.world.physics.revision);
         }
-        self.world.physics.metrics = XrPhysicsMetrics::default();
-        self.world.depth.query_retained_hits.clear();
-        Rc::make_mut(&mut self.world.physics.runtime_bodies).clear();
-        Rc::make_mut(&mut self.world.physics.runtime_contacts).clear();
-        self.world.physics.pending_body_spawns.clear();
-        self.world.physics.pending_body_despawns.clear();
-        self.world.physics.pending_body_impulses.clear();
-        self.world.physics.pending_body_wrenches.clear();
-        self.world.physics.pending_body_drives.clear();
-        self.world.physics.pending_car_controls.clear();
-        self.world.physics.scene_dirty = true;
+        self.physics_compute_ms = 0.0;
+        self.physics_tsdf_query_ms = 0.0;
+        self.physics_rapier_step_ms = 0.0;
+        self.physics_step_dt_ms = 0.0;
+        self.physics_depth_query_surface_count = 0;
+        self.physics_depth_query_vertex_count = 0;
+        self.physics_depth_query_triangle_count = 0;
+        self.depth_query_retained_hits.clear();
+        Rc::make_mut(&mut self.runtime_bodies).clear();
+        self.scene_dirty = true;
         cx.redraw_all();
     }
 

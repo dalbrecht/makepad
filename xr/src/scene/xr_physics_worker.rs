@@ -120,6 +120,7 @@ pub(super) struct XrPhysicsWorkerResult {
     pub(super) physics_compute_ms: f64,
     pub(super) physics_tsdf_query_ms: f64,
     pub(super) physics_rapier_step_ms: f64,
+    pub(super) physics_step_dt_ms: f64,
     pub(super) physics_depth_query_surface_count: usize,
     pub(super) physics_scene_body_count: usize,
     pub(super) physics_body_spawn_apply_count: usize,
@@ -535,16 +536,7 @@ fn physics_worker_loop(
                 adaptive_step_dt =
                     choose_worker_simulation_dt(last_step_started_at, started, adaptive_step_dt);
                 last_step_started_at = Some(started);
-                if let Some(scene) = scene.as_mut() {
-                    scene.sync_vehicle_query_sources_pre_step();
-                }
-                sync_hands_on_scene(
-                    scene.as_mut(),
-                    &step.left_hand,
-                    &step.right_hand,
-                    &step.left_controller,
-                    &step.right_controller,
-                );
+                sync_hands_on_scene(scene.as_mut(), &step.left_hand, &step.right_hand);
                 let tsdf_query_started = Instant::now();
                 sync_depth_query_surfaces_with_store(
                     &mut retained_hits,
@@ -555,8 +547,8 @@ fn physics_worker_loop(
                 let physics_tsdf_query_ms = tsdf_query_started.elapsed().as_secs_f64() * 1000.0;
                 let (
                     runtime_bodies,
-                    runtime_contacts,
                     physics_rapier_step_ms,
+                    physics_step_dt_ms,
                     physics_depth_query_surface_count,
                 ) = if let Some(scene) = scene.as_mut() {
                     let simulation_dt = (adaptive_step_dt * step.time_scale.clamp(0.1, 1.0))
@@ -564,20 +556,6 @@ fn physics_worker_loop(
                     scene.set_simulation_dt(simulation_dt);
                     let rapier_step_started = Instant::now();
                     scene.step();
-                    for body_drive in pending_body_drives.iter().copied() {
-                        if body_drive.revision != revision {
-                            continue;
-                        }
-                        scene.apply_drive(
-                            body_drive.drive.widget_uid,
-                            body_drive.drive.target_linvel,
-                            body_drive.drive.target_angvel,
-                            body_drive.drive.max_linear_accel,
-                            body_drive.drive.max_angular_accel,
-                            body_drive.drive.preserve_vertical_linvel,
-                            simulation_dt,
-                        );
-                    }
                     let physics_rapier_step_ms =
                         rapier_step_started.elapsed().as_secs_f64() * 1000.0;
                     let stats = scene.depth_query_stats();
@@ -585,12 +563,14 @@ fn physics_worker_loop(
                     scene.snapshot_active_contacts(&mut runtime_contacts_scratch);
                     (
                         mem::take(&mut runtime_bodies_scratch),
-                        mem::take(&mut runtime_contacts_scratch),
                         physics_rapier_step_ms,
-                        stats.surface_count,
+                        simulation_dt as f64 * 1000.0,
+                        stats.active_surface_count,
+                        stats.vertex_count,
+                        stats.triangle_count,
                     )
                 } else {
-                    (HashMap::new(), Vec::new(), 0.0, 0)
+                    (HashMap::new(), 0.0, 0.0, 0, 0, 0)
                 };
                 if step.include_retained_hits {
                     snapshot_retained_hits(&retained_hits, &mut retained_hits_snapshot_scratch);
@@ -609,6 +589,7 @@ fn physics_worker_loop(
                         physics_compute_ms: started.elapsed().as_secs_f64() * 1000.0,
                         physics_tsdf_query_ms,
                         physics_rapier_step_ms,
+                        physics_step_dt_ms,
                         physics_depth_query_surface_count,
                         physics_scene_body_count: scene
                             .as_ref()
@@ -652,6 +633,10 @@ fn physics_worker_loop(
                     physics_compute_ms: 0.0,
                     physics_tsdf_query_ms: 0.0,
                     physics_rapier_step_ms: 0.0,
+                    physics_step_dt_ms: scene
+                        .as_ref()
+                        .map(|scene| scene.simulation_dt() as f64 * 1000.0)
+                        .unwrap_or(XR_WORKER_SIMULATION_DT_DEFAULT as f64 * 1000.0),
                     physics_depth_query_surface_count: surface_count,
                     physics_scene_body_count: scene
                         .as_ref()
