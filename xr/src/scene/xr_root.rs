@@ -935,30 +935,6 @@ impl XrRoot {
         self.env.physics_depth_query_surface_count()
     }
 
-    pub fn physics_scene_body_count(&self) -> usize {
-        self.env.physics_scene_body_count()
-    }
-
-    pub fn physics_body_spawn_apply_count(&self) -> usize {
-        self.env.physics_body_spawn_apply_count()
-    }
-
-    pub fn physics_body_spawn_miss_count(&self) -> usize {
-        self.env.physics_body_spawn_miss_count()
-    }
-
-    pub fn physics_revision(&self) -> u64 {
-        self.env.physics_revision()
-    }
-
-    pub fn runtime_bodies(&self) -> Rc<HashMap<WidgetUid, XrRuntimeBodyState>> {
-        self.env.runtime_bodies()
-    }
-
-    pub fn runtime_contacts(&self) -> Rc<Vec<(WidgetUid, WidgetUid)>> {
-        self.env.runtime_contacts()
-    }
-
     pub fn frame_cpu_ms(&self) -> f64 {
         self.frame_metrics.last_frame_cpu_ms
     }

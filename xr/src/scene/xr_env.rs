@@ -463,13 +463,7 @@ pub struct XrEnv {
     #[rust]
     physics_rapier_step_ms: f64,
     #[rust]
-    physics_step_dt_ms: f64,
-    #[rust]
     physics_depth_query_surface_count: usize,
-    #[rust]
-    physics_depth_query_vertex_count: usize,
-    #[rust]
-    physics_depth_query_triangle_count: usize,
     #[allow(dead_code)]
     #[rust]
     next_frame: NextFrame,
@@ -585,46 +579,6 @@ impl XrEnv {
 
     pub(crate) fn physics_depth_query_surface_count(&self) -> usize {
         self.world.physics.metrics.depth_query_surface_count
-    }
-
-    pub(crate) fn physics_scene_body_count(&self) -> usize {
-        self.world.physics.metrics.scene_body_count
-    }
-
-    pub(crate) fn physics_body_spawn_apply_count(&self) -> usize {
-        self.world.physics.metrics.body_spawn_apply_count
-    }
-
-    pub(crate) fn physics_body_spawn_miss_count(&self) -> usize {
-        self.world.physics.metrics.body_spawn_miss_count
-    }
-
-    pub(crate) fn depth_mesh_chunk_count(&self) -> usize {
-        self.world.depth.mesh_chunks.len()
-    }
-
-    pub(crate) fn recycled_depth_mesh_geometry_count(&self) -> usize {
-        self.world.depth.recycled_mesh_geometries.len()
-    }
-
-    pub(crate) fn depth_mesh_pending_upsert_count(&self) -> usize {
-        self.world.depth.pending_upserts.len()
-    }
-
-    pub(crate) fn depth_query_retained_hit_count(&self) -> usize {
-        self.world.depth.query_retained_hits.len()
-    }
-
-    pub(crate) fn physics_revision(&self) -> u64 {
-        self.world.physics.revision
-    }
-
-    pub(crate) fn runtime_bodies(&self) -> Rc<HashMap<WidgetUid, XrRuntimeBodyState>> {
-        self.world.physics.runtime_bodies.clone()
-    }
-
-    pub(crate) fn runtime_contacts(&self) -> Rc<Vec<(WidgetUid, WidgetUid)>> {
-        self.world.physics.runtime_contacts.clone()
     }
 
     fn passthrough_video_id() -> LiveId {
@@ -964,10 +918,7 @@ impl XrEnv {
         self.physics_compute_ms = result.physics_compute_ms;
         self.physics_tsdf_query_ms = result.physics_tsdf_query_ms;
         self.physics_rapier_step_ms = result.physics_rapier_step_ms;
-        self.physics_step_dt_ms = result.physics_step_dt_ms;
         self.physics_depth_query_surface_count = result.physics_depth_query_surface_count;
-        self.physics_depth_query_vertex_count = result.physics_depth_query_vertex_count;
-        self.physics_depth_query_triangle_count = result.physics_depth_query_triangle_count;
         true
     }
 
@@ -1102,10 +1053,7 @@ impl XrEnv {
         self.physics_compute_ms = 0.0;
         self.physics_tsdf_query_ms = 0.0;
         self.physics_rapier_step_ms = 0.0;
-        self.physics_step_dt_ms = 0.0;
         self.physics_depth_query_surface_count = 0;
-        self.physics_depth_query_vertex_count = 0;
-        self.physics_depth_query_triangle_count = 0;
         self.depth_query_retained_hits.clear();
         Rc::make_mut(&mut self.runtime_bodies).clear();
         self.scene_dirty = true;
