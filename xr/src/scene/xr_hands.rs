@@ -1,13 +1,7 @@
 use super::xr_physics::{capsule_pose, makepad_pose, HandCollider, HandColliderBody, RapierScene};
 use super::*;
-use makepad_widgets::makepad_platform::event::XrController;
 
 impl XrHandSystem {
-    fn controller_grip_pose(controller: &XrController) -> Option<Pose> {
-        let pose = controller.grip_pose;
-        (controller.active() && pose.is_finite()).then_some(pose)
-    }
-
     fn pose_point_world(pose: Pose, local: Vec3f) -> Vec3f {
         pose.to_mat4().transform_vec4(local.to_vec4()).to_vec3f()
     }
@@ -24,16 +18,20 @@ impl XrHandSystem {
         colliders.push(HandCollider::Box { pose, half_extents });
     }
 
-    fn hand_plate_pose(hand: &XrHand) -> Option<Pose> {
-        let palm_pose = hand.tracking_pose()?;
-        Some(Pose::new(
+    fn hand_plate_pose(hand: &XrHand) -> Pose {
+        let palm_pose = hand.joints[XrHand::CENTER];
+        Pose::new(
             palm_pose.orientation,
             Self::pose_point_world(palm_pose, vec3f(0.0, 0.0, XR_HAND_PLATE_FORWARD_OFFSET)),
-        ))
+        )
     }
 
-    fn hand_tip_world(hand: &XrHand, finger_index: usize) -> Option<Vec3f> {
-        hand.tip_pos_checked(finger_index)
+    fn hand_tip_world(hand: &XrHand, finger_index: usize) -> Vec3f {
+        let tip_len = hand.tips[finger_index].max(0.0);
+        hand.joints[XrHand::END_KNUCKLES[finger_index]]
+            .to_mat4()
+            .transform_vec4(vec4(0.0, 0.0, -tip_len, 1.0))
+            .to_vec3f()
     }
 
     fn append_finger_chain_colliders(
@@ -43,19 +41,22 @@ impl XrHandSystem {
         tip_index: usize,
         radius: f32,
     ) {
-        let Some(points) = hand.joint_chain_positions(chain) else {
-            return;
-        };
-        for segment in points.windows(2) {
-            Self::append_capsule_collider(colliders, segment[0], segment[1], radius);
+        for segment in chain.windows(2) {
+            Self::append_capsule_collider(
+                colliders,
+                hand.joints[segment[0]].position,
+                hand.joints[segment[1]].position,
+                radius,
+            );
         }
         if hand.tip_active(tip_index) {
-            if let (Some(end_joint), Some(tip_world)) = (
-                points.last().copied(),
+            let end_joint = *chain.last().unwrap_or(&XrHand::CENTER);
+            Self::append_capsule_collider(
+                colliders,
+                hand.joints[end_joint].position,
                 Self::hand_tip_world(hand, tip_index),
-            ) {
-                Self::append_capsule_collider(colliders, end_joint, tip_world, radius * 0.85);
-            }
+                radius * 0.85,
+            );
         }
     }
 
@@ -66,37 +67,25 @@ impl XrHandSystem {
         radius: f32,
     ) {
         if hand.tip_active(tip_index) {
-            if let Some(tip_world) = Self::hand_tip_world(hand, tip_index) {
-                Self::append_ball_collider(colliders, tip_world, radius);
-            }
+            Self::append_ball_collider(colliders, Self::hand_tip_world(hand, tip_index), radius);
         }
     }
 
-    pub(super) fn build_hand_colliders(
-        &self,
-        hand: &XrHand,
-        controller: &XrController,
-    ) -> Vec<HandCollider> {
+    pub(super) fn build_hand_colliders(&self, hand: &XrHand) -> Vec<HandCollider> {
         let mut colliders = Vec::with_capacity(XR_HAND_COLLIDER_SLOTS_PER_HAND);
-        if let Some(grip_pose) = Self::controller_grip_pose(controller) {
-            Self::append_box_collider(&mut colliders, grip_pose, vec3f(0.032, 0.030, 0.055));
-            return colliders;
-        }
         if !hand.in_view() {
             return colliders;
         }
 
-        if let Some(hand_plate_pose) = Self::hand_plate_pose(hand) {
-            Self::append_box_collider(
-                &mut colliders,
-                hand_plate_pose,
-                vec3f(
-                    XR_HAND_PLATE_HALF_WIDTH,
-                    XR_HAND_PLATE_HALF_HEIGHT,
-                    XR_HAND_PLATE_HALF_DEPTH,
-                ),
-            );
-        }
+        Self::append_box_collider(
+            &mut colliders,
+            Self::hand_plate_pose(hand),
+            vec3f(
+                XR_HAND_PLATE_HALF_WIDTH,
+                XR_HAND_PLATE_HALF_HEIGHT,
+                XR_HAND_PLATE_HALF_DEPTH,
+            ),
+        );
 
         Self::append_finger_chain_colliders(
             &mut colliders,
@@ -251,7 +240,14 @@ impl XrHandSystem {
         if !hand.in_view() || !hand.tip_active(tip) {
             return None;
         }
-        hand.tip_pos_checked(tip)
+        Some(match tip {
+            XrHand::THUMB_TIP => hand.tip_pos_thumb(),
+            XrHand::INDEX_TIP => hand.tip_pos_index(),
+            XrHand::MIDDLE_TIP => hand.tip_pos_middle(),
+            XrHand::RING_TIP => hand.tip_pos_ring(),
+            XrHand::LITTLE_TIP => hand.tip_pos_little(),
+            _ => hand.tip_pos_index(),
+        })
     }
 
     fn hand_influence_point(
@@ -268,13 +264,16 @@ impl XrHandSystem {
     }
 
     fn palm_world(&self, hand: &XrHand) -> Option<Vec3f> {
-        let center = hand.joint_pose_checked(XrHand::CENTER)?.position;
-        let wrist = hand.joint_pose_checked(XrHand::WRIST)?.position;
-        let thumb = hand.joint_pose_checked(XrHand::THUMB_BASE)?.position;
-        let index = hand.joint_pose_checked(XrHand::INDEX_BASE)?.position;
-        let middle = hand.joint_pose_checked(XrHand::MIDDLE_BASE)?.position;
-        let ring = hand.joint_pose_checked(XrHand::RING_BASE)?.position;
-        let little = hand.joint_pose_checked(XrHand::LITTLE_BASE)?.position;
+        if !hand.in_view() {
+            return None;
+        }
+        let center = hand.joints[XrHand::CENTER].position;
+        let wrist = hand.joints[XrHand::WRIST].position;
+        let thumb = hand.joints[XrHand::THUMB_BASE].position;
+        let index = hand.joints[XrHand::INDEX_BASE].position;
+        let middle = hand.joints[XrHand::MIDDLE_BASE].position;
+        let ring = hand.joints[XrHand::RING_BASE].position;
+        let little = hand.joints[XrHand::LITTLE_BASE].position;
         Some(
             center * 0.28
                 + wrist * 0.10
@@ -373,10 +372,7 @@ impl XrEnv {
         let colliders = if let Some(physics_colliders) = physics_colliders {
             physics_colliders
         } else {
-            raw_colliders = self
-                .world
-                .hands
-                .build_hand_colliders(hand, &XrController::default());
+            raw_colliders = self.world.hands.build_hand_colliders(hand);
             &raw_colliders
         };
         self.draw_hand_shapes(cx, colliders, is_left);
@@ -389,19 +385,14 @@ impl XrEnv {
     }
 }
 
-pub(super) fn build_hand_colliders_for_physics(
-    hand: &XrHand,
-    controller: &XrController,
-) -> Vec<HandCollider> {
-    XrHandSystem.build_hand_colliders(hand, controller)
+pub(super) fn build_hand_colliders_for_physics(hand: &XrHand) -> Vec<HandCollider> {
+    XrHandSystem.build_hand_colliders(hand)
 }
 
 pub(super) fn sync_hands_on_scene(
     scene: Option<&mut RapierScene>,
     left_hand: &XrHand,
     right_hand: &XrHand,
-    left_controller: &XrController,
-    right_controller: &XrController,
 ) {
     if !XR_ENABLE_HAND_PHYSICS {
         return;
@@ -411,8 +402,8 @@ pub(super) fn sync_hands_on_scene(
         return;
     };
 
-    let left = build_hand_colliders_for_physics(left_hand, left_controller);
-    let right = build_hand_colliders_for_physics(right_hand, right_controller);
+    let left = build_hand_colliders_for_physics(left_hand);
+    let right = build_hand_colliders_for_physics(right_hand);
     let RapierScene {
         bodies,
         colliders,
@@ -422,5 +413,4 @@ pub(super) fn sync_hands_on_scene(
     } = scene;
     RapierScene::sync_hand_bodies(left_slots, &left, bodies, colliders);
     RapierScene::sync_hand_bodies(right_slots, &right, bodies, colliders);
-    scene.sync_tracked_hands(left_hand, right_hand, left_controller, right_controller);
 }
