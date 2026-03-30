@@ -1,11 +1,11 @@
 use super::xr_env::XrEnv;
-use super::xr_select::{XrSelect, XrSelectAction};
+use super::xr_select::XrSelectAction;
 use super::{hand_is_palm_down_closed_fist, CLOSED_FIST_GESTURE};
 use crate::prelude::*;
 use crate::util::scene_draw::{ray_from_scene_viewport, SceneState3D};
 use makepad_widgets::event::{XrFingerTip, XrSyncAnchor};
 use makepad_widgets::makepad_script::ScriptFnRef;
-use std::{cell::Cell, collections::HashMap, fmt::Write as _, rc::Rc, time::Instant};
+use std::{cell::Cell, collections::HashMap, rc::Rc, time::Instant};
 
 const DESKTOP_TOUCH_DOWN_Z: f32 = 0.0;
 const DESKTOP_TOUCH_UP_Z: f32 = 64.0;
@@ -525,6 +525,14 @@ impl XrRoot {
         self.env.spawn_body(cx, spawn);
     }
 
+    pub fn despawn_body(&mut self, cx: &mut Cx, widget_uid: WidgetUid) {
+        self.env.despawn_body(cx, widget_uid);
+    }
+
+    pub fn apply_body_impulse(&mut self, cx: &mut Cx, impulse: XrBodyImpulse) {
+        self.env.apply_body_impulse(cx, impulse);
+    }
+
     fn set_depth_mesh_visible(&mut self, cx: &mut Cx, visible: bool) -> bool {
         self.env.set_depth_mesh_visible(visible);
         self.env.mark_scene_dirty();
@@ -805,14 +813,6 @@ impl XrRoot {
         }
 
         xr_sort_child_draw_order(&mut draw_order_entries);
-        self.frame_metrics.last_draw_sort_cpu_ms = sort_started.elapsed().as_secs_f64() * 1000.0;
-        self.frame_metrics.last_draw_child_count = draw_order_entries.len();
-        self.frame_metrics.last_draw_transparent_child_count = draw_order_entries
-            .iter()
-            .filter(|(_, _, transparent)| *transparent)
-            .count();
-        let children_draw_started = Instant::now();
-        let mut child_timings = Vec::with_capacity(draw_order_entries.len());
         for (index, _, _) in draw_order_entries {
             let child_id = self.children[index].0;
             let child = self.children[index].1.clone();
@@ -947,6 +947,26 @@ impl XrRoot {
 
     pub fn physics_depth_query_surface_count(&self) -> usize {
         self.env.physics_depth_query_surface_count()
+    }
+
+    pub fn physics_scene_body_count(&self) -> usize {
+        self.env.physics_scene_body_count()
+    }
+
+    pub fn physics_body_spawn_apply_count(&self) -> usize {
+        self.env.physics_body_spawn_apply_count()
+    }
+
+    pub fn physics_body_spawn_miss_count(&self) -> usize {
+        self.env.physics_body_spawn_miss_count()
+    }
+
+    pub fn physics_revision(&self) -> u64 {
+        self.env.physics_revision()
+    }
+
+    pub fn runtime_bodies(&self) -> Rc<HashMap<WidgetUid, XrRuntimeBodyState>> {
+        self.env.runtime_bodies()
     }
 
     pub fn frame_cpu_ms(&self) -> f64 {
@@ -1257,7 +1277,9 @@ impl Widget for XrRoot {
                     last,
                 };
                 self.runtime.last_dispatched_xr_state = Some(augmented_state.clone());
-                self.ensure_xr_content_pose(cx, &augmented_state);
+                if cx.in_xr_mode() {
+                    self.ensure_xr_content_pose(cx, &augmented_state);
+                }
                 self.runtime.last_xr_state = Some(augmented_state.clone());
                 if augmented_update.clicked_menu() {
                     self.env.reset_physics(cx);

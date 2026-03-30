@@ -26,11 +26,9 @@ const XR_WORKER_SIMULATION_DT_MAX: f32 = 1.0 / 45.0;
 const XR_WORKER_SIMULATION_DT_SMOOTHING: f32 = 0.35;
 const XR_WORKER_SIMULATION_DT_LADDER: [f32; 5] =
     [1.0 / 120.0, 1.0 / 90.0, 1.0 / 72.0, 1.0 / 60.0, 1.0 / 45.0];
+const XR_PHYSICS_WORKER_MAX_PENDING_BODY_SPAWNS: usize = 8;
 const XR_PHYSICS_WORKER_MAX_PENDING_BODY_DESPAWNS: usize = 8;
 const XR_PHYSICS_WORKER_MAX_PENDING_BODY_IMPULSES: usize = 8;
-const XR_PHYSICS_WORKER_MAX_PENDING_BODY_WRENCHES: usize = 8;
-const XR_PHYSICS_WORKER_MAX_PENDING_BODY_DRIVES: usize = 8;
-const XR_PHYSICS_WORKER_MAX_PENDING_CAR_CONTROLS: usize = 8;
 
 #[derive(Clone)]
 struct PhysicsWorkerRebuild {
@@ -70,24 +68,6 @@ struct PhysicsWorkerBodyImpulse {
     impulse: XrBodyImpulse,
 }
 
-#[derive(Clone, Copy)]
-struct PhysicsWorkerBodyWrench {
-    revision: u64,
-    wrench: XrBodyWrench,
-}
-
-#[derive(Clone, Copy)]
-struct PhysicsWorkerBodyDrive {
-    revision: u64,
-    drive: XrBodyDrive,
-}
-
-#[derive(Clone, Copy)]
-struct PhysicsWorkerCarControl {
-    revision: u64,
-    control: XrCarControl,
-}
-
 #[derive(Default)]
 struct PhysicsWorkerMailbox {
     version: u64,
@@ -95,17 +75,12 @@ struct PhysicsWorkerMailbox {
     pending_reset_revision: Option<u64>,
     pending_rebuild: Option<PhysicsWorkerRebuild>,
     pending_step: Option<PhysicsWorkerStep>,
-    pending_body_spawns: Vec<PhysicsWorkerBodySpawn>,
+    pending_body_spawns:
+        SmallVec<[PhysicsWorkerBodySpawn; XR_PHYSICS_WORKER_MAX_PENDING_BODY_SPAWNS]>,
     pending_body_despawns:
         SmallVec<[PhysicsWorkerBodyDespawn; XR_PHYSICS_WORKER_MAX_PENDING_BODY_DESPAWNS]>,
     pending_body_impulses:
         SmallVec<[PhysicsWorkerBodyImpulse; XR_PHYSICS_WORKER_MAX_PENDING_BODY_IMPULSES]>,
-    pending_body_wrenches:
-        SmallVec<[PhysicsWorkerBodyWrench; XR_PHYSICS_WORKER_MAX_PENDING_BODY_WRENCHES]>,
-    pending_body_drives:
-        SmallVec<[PhysicsWorkerBodyDrive; XR_PHYSICS_WORKER_MAX_PENDING_BODY_DRIVES]>,
-    pending_car_controls:
-        SmallVec<[PhysicsWorkerCarControl; XR_PHYSICS_WORKER_MAX_PENDING_CAR_CONTROLS]>,
 }
 
 pub(super) struct XrPhysicsWorkerResult {
@@ -117,6 +92,9 @@ pub(super) struct XrPhysicsWorkerResult {
     pub(super) physics_tsdf_query_ms: f64,
     pub(super) physics_rapier_step_ms: f64,
     pub(super) physics_depth_query_surface_count: usize,
+    pub(super) physics_scene_body_count: usize,
+    pub(super) physics_body_spawn_apply_count: usize,
+    pub(super) physics_body_spawn_miss_count: usize,
 }
 
 pub(super) struct XrPhysicsWorker {
@@ -279,6 +257,35 @@ impl XrPhysicsWorker {
         }
     }
 
+    pub(super) fn request_body_despawn(&mut self, revision: u64, widget_uid: WidgetUid) {
+        let (lock, wake) = &*self.mailbox;
+        if let Ok(mut mailbox) = lock.lock() {
+            if mailbox.pending_body_despawns.len() < XR_PHYSICS_WORKER_MAX_PENDING_BODY_DESPAWNS {
+                mailbox
+                    .pending_body_despawns
+                    .push(PhysicsWorkerBodyDespawn {
+                        revision,
+                        widget_uid,
+                    });
+                mailbox.version = mailbox.version.saturating_add(1);
+                wake.notify_one();
+            }
+        }
+    }
+
+    pub(super) fn request_body_impulse(&mut self, revision: u64, impulse: XrBodyImpulse) {
+        let (lock, wake) = &*self.mailbox;
+        if let Ok(mut mailbox) = lock.lock() {
+            if mailbox.pending_body_impulses.len() < XR_PHYSICS_WORKER_MAX_PENDING_BODY_IMPULSES {
+                mailbox
+                    .pending_body_impulses
+                    .push(PhysicsWorkerBodyImpulse { revision, impulse });
+                mailbox.version = mailbox.version.saturating_add(1);
+                wake.notify_one();
+            }
+        }
+    }
+
     pub(super) fn request_reset(&mut self, revision: u64) {
         let (lock, wake) = &*self.mailbox;
         if let Ok(mut mailbox) = lock.lock() {
@@ -288,9 +295,6 @@ impl XrPhysicsWorker {
             mailbox.pending_body_spawns.clear();
             mailbox.pending_body_despawns.clear();
             mailbox.pending_body_impulses.clear();
-            mailbox.pending_body_wrenches.clear();
-            mailbox.pending_body_drives.clear();
-            mailbox.pending_car_controls.clear();
             mailbox.version = mailbox.version.saturating_add(1);
             wake.notify_one();
         }
@@ -343,9 +347,6 @@ fn physics_worker_loop(
             pending_body_spawns,
             pending_body_despawns,
             pending_body_impulses,
-            pending_body_wrenches,
-            pending_body_drives,
-            pending_car_controls,
         ) = {
             let (lock, wake) = &*mailbox;
             let mut guard = match lock.lock() {
@@ -370,9 +371,6 @@ fn physics_worker_loop(
                 std::mem::take(&mut guard.pending_body_spawns),
                 std::mem::take(&mut guard.pending_body_despawns),
                 std::mem::take(&mut guard.pending_body_impulses),
-                std::mem::take(&mut guard.pending_body_wrenches),
-                std::mem::take(&mut guard.pending_body_drives),
-                std::mem::take(&mut guard.pending_car_controls),
             )
         };
 
@@ -426,6 +424,15 @@ fn physics_worker_loop(
                         body_spawn.spawn.angvel,
                     ) {
                         retained_hits.remove(&query_key);
+                        physics_body_spawn_apply_count =
+                            physics_body_spawn_apply_count.saturating_add(1);
+                        total_body_spawn_apply_count =
+                            total_body_spawn_apply_count.saturating_add(1);
+                    } else {
+                        physics_body_spawn_miss_count =
+                            physics_body_spawn_miss_count.saturating_add(1);
+                        total_body_spawn_miss_count =
+                            total_body_spawn_miss_count.saturating_add(1);
                     }
                     applied_spawn = true;
                 }
@@ -440,10 +447,9 @@ fn physics_worker_loop(
                     if body_despawn.revision != revision {
                         continue;
                     }
-                    clear_depth_query_keys(
-                        &mut retained_hits,
-                        scene.despawn_body(body_despawn.widget_uid),
-                    );
+                    if let Some(query_key) = scene.despawn_body(body_despawn.widget_uid) {
+                        retained_hits.remove(&query_key);
+                    }
                     applied_despawn = true;
                 }
                 should_publish |= applied_despawn;
@@ -464,61 +470,6 @@ fn physics_worker_loop(
                     );
                 }
                 should_publish |= applied_impulse;
-            }
-        }
-
-        if !pending_body_wrenches.is_empty() {
-            if let Some(scene) = scene.as_mut() {
-                let mut applied_wrench = false;
-                for body_wrench in pending_body_wrenches {
-                    if body_wrench.revision != revision {
-                        continue;
-                    }
-                    applied_wrench |= scene.apply_wrench(
-                        body_wrench.wrench.widget_uid,
-                        body_wrench.wrench.force,
-                        body_wrench.wrench.torque,
-                    );
-                }
-                should_publish |= applied_wrench;
-            }
-        }
-
-        if !pending_body_drives.is_empty() && pending_step.is_none() {
-            if let Some(scene) = scene.as_mut() {
-                let mut applied_drive = false;
-                let simulation_dt = scene.simulation_dt();
-                for body_drive in pending_body_drives.iter().copied() {
-                    if body_drive.revision != revision {
-                        continue;
-                    }
-                    applied_drive |= scene.apply_drive(
-                        body_drive.drive.widget_uid,
-                        body_drive.drive.target_linvel,
-                        body_drive.drive.target_angvel,
-                        body_drive.drive.max_linear_accel,
-                        body_drive.drive.max_angular_accel,
-                        body_drive.drive.preserve_vertical_linvel,
-                        simulation_dt,
-                    );
-                }
-                should_publish |= applied_drive;
-            }
-        }
-
-        if pending_step.is_some() {
-            if let Some(scene) = scene.as_mut() {
-                scene.clear_car_controls();
-            }
-        }
-        if !pending_car_controls.is_empty() {
-            if let Some(scene) = scene.as_mut() {
-                for car_control in pending_car_controls.iter().copied() {
-                    if car_control.revision != revision {
-                        continue;
-                    }
-                    scene.apply_car_control(car_control.control);
-                }
             }
         }
 
@@ -574,6 +525,12 @@ fn physics_worker_loop(
                         physics_tsdf_query_ms,
                         physics_rapier_step_ms,
                         physics_depth_query_surface_count,
+                        physics_scene_body_count: scene
+                            .as_ref()
+                            .map(|scene| scene.cubes.len())
+                            .unwrap_or(0),
+                        physics_body_spawn_apply_count: total_body_spawn_apply_count,
+                        physics_body_spawn_miss_count: total_body_spawn_miss_count,
                     },
                 );
                 recycle_worker_buffers(
@@ -605,6 +562,12 @@ fn physics_worker_loop(
                     physics_tsdf_query_ms: 0.0,
                     physics_rapier_step_ms: 0.0,
                     physics_depth_query_surface_count: surface_count,
+                    physics_scene_body_count: scene
+                        .as_ref()
+                        .map(|scene| scene.cubes.len())
+                        .unwrap_or(0),
+                    physics_body_spawn_apply_count: total_body_spawn_apply_count,
+                    physics_body_spawn_miss_count: total_body_spawn_miss_count,
                 },
             );
             recycle_worker_buffers(
@@ -685,11 +648,6 @@ fn build_scene(gravity: f32, cubes: Vec<CollectedXrCube>) -> RapierScene {
                         cube.depth_query_support,
                     );
                 }
-                if let Some(body_handle) = scene.cubes.last().map(|cube| cube.body) {
-                    if let Some(body) = scene.bodies.get_mut(body_handle) {
-                        body.set_gravity_scale(cube.gravity_scale.max(0.0), true);
-                    }
-                }
                 if spawn_pool && !scene.cubes.is_empty() {
                     scene.register_spawn_pool_cube(scene.cubes.len() - 1);
                 }
@@ -739,27 +697,16 @@ fn snapshot_runtime_bodies(
                 XrRuntimeBodyState {
                     pose: makepad_pose(body.position()),
                     scale: cube.scale,
-                    linvel: scene
-                        .shadow_body_motion_for_body(cube.body)
-                        .map(|(linvel, _)| linvel)
-                        .unwrap_or_else(|| {
-                            let linvel = body.linvel();
-                            vec3f(linvel.x, linvel.y, linvel.z)
-                        }),
-                    angvel: scene
-                        .shadow_body_motion_for_body(cube.body)
-                        .map(|(_, angvel)| angvel)
-                        .unwrap_or_else(|| {
-                            let angvel = body.angvel();
-                            vec3f(angvel.x, angvel.y, angvel.z)
-                        }),
+                    linvel: {
+                        let linvel = body.linvel();
+                        vec3f(linvel.x, linvel.y, linvel.z)
+                    },
+                    angvel: {
+                        let angvel = body.angvel();
+                        vec3f(angvel.x, angvel.y, angvel.z)
+                    },
                     sleeping: body.is_sleeping(),
-                    dynamic_body: body.body_type() == rapier3d::prelude::RigidBodyType::Dynamic,
-                    shadowed: scene.is_shadow_body(cube.body),
                     held_by: scene.held_by_for_body(cube.body),
-                    linked_support_local_poses: scene.cube_linked_support_local_poses(*cube),
-                    linked_support_spin_angles: scene.cube_linked_support_spin_angles(*cube),
-                    linked_support_steer_angles: scene.cube_linked_support_steer_angles(*cube),
                 },
             );
         }

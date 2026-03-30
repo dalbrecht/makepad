@@ -1,4 +1,5 @@
-use crate::obj::{Cube, Gltf, IcoSphere, RefractiveCube, Tree};
+use crate::obj::{Cube, Gltf, IcoSphere, RefractiveCube, Shooter, Tree};
+use crate::prelude::XrSharedHand;
 use crate::scene::{XrSelect, XrView};
 use makepad_widgets::{
     makepad_derive_widget::*,
@@ -33,10 +34,6 @@ script_mod! {
     mod.widgets.XrNodeBase = #(XrNode::register_widget(vm))
     mod.widgets.XrNode = set_type_default() do mod.widgets.XrNodeBase{
         body: XrBodyKind.Disabled
-        physics_shape: XrPhysicsShape.Box
-        render_class: XrRenderClass.Opaque
-        depth_query_support: XrDepthQuerySupportRig.Body
-        shared_object_policy: XrSharedObjectPolicy.None
         spawn_pool: false
         physics_size: vec3(0.0, 0.0, 0.0)
         density: 1.0
@@ -133,12 +130,7 @@ pub struct XrRuntimeBodyState {
     pub linvel: Vec3f,
     pub angvel: Vec3f,
     pub sleeping: bool,
-    pub dynamic_body: bool,
-    pub shadowed: bool,
     pub held_by: Option<XrSharedHand>,
-    pub linked_support_local_poses: [Option<Pose>; XR_RUNTIME_LINKED_SUPPORT_BODY_COUNT],
-    pub linked_support_spin_angles: [Option<f32>; XR_RUNTIME_LINKED_SUPPORT_BODY_COUNT],
-    pub linked_support_steer_angles: [Option<f32>; XR_RUNTIME_LINKED_SUPPORT_BODY_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -326,33 +318,6 @@ impl XrNode {
         self.body
     }
 
-    pub fn physics_shape(&self) -> XrPhysicsShape {
-        self.physics_shape
-    }
-
-    pub fn render_class(&self) -> XrRenderClass {
-        self.render_class
-    }
-
-    pub fn depth_query_support(&self) -> XrDepthQuerySupportRig {
-        self.depth_query_support
-    }
-
-    pub fn shared_object_policy(&self) -> XrSharedObjectPolicy {
-        self.shared_object_policy
-    }
-
-    pub fn bootstrap_shared(&self) -> bool {
-        matches!(
-            self.shared_object_policy,
-            XrSharedObjectPolicy::BootstrapShared
-        )
-    }
-
-    pub fn is_transparent(&self) -> bool {
-        matches!(self.render_class, XrRenderClass::Transparent)
-    }
-
     pub fn spawn_pool(&self) -> bool {
         self.spawn_pool
     }
@@ -413,20 +378,75 @@ impl XrNode {
     }
 }
 
+}
+
 pub fn xr_widget_with_scene_node<R>(
     widget: &WidgetRef,
     visit: impl FnOnce(&XrNode) -> R,
 ) -> Option<R> {
-    if let Some(node) = widget.borrow::<XrNode>() {
-        return Some(visit(&node));
+    if let Some(select) = widget.borrow::<XrSelect>() {
+        return Some(visit(select.node()));
     }
-    if let Some(node) = widget.cast_inner::<XrNode>() {
+    if let Some(view) = widget.borrow::<XrView>() {
+        return Some(visit(view.node()));
+    }
+    if let Some(cube) = widget.borrow::<Cube>() {
+        return Some(visit(cube.node()));
+    }
+    if let Some(ico) = widget.borrow::<IcoSphere>() {
+        return Some(visit(ico.node()));
+    }
+    if let Some(refractive_cube) = widget.borrow::<RefractiveCube>() {
+        return Some(visit(refractive_cube.node()));
+    }
+    if let Some(gltf) = widget.borrow::<Gltf>() {
+        return Some(visit(gltf.node()));
+    }
+    if let Some(tree) = widget.borrow::<Tree>() {
+        return Some(visit(tree.node()));
+    }
+    if let Some(shooter) = widget.borrow::<Shooter>() {
+        return Some(visit(shooter.node()));
+    }
+    if let Some(node) = widget.borrow::<XrNode>() {
         return Some(visit(&node));
     }
     None
 }
 
 pub fn xr_widget_children(widget: &WidgetRef, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
+    if widget.borrow::<XrSelect>().is_some() || widget.borrow::<XrView>().is_some() {
+        widget.children(visit);
+        return;
+    }
+    if let Some(cube) = widget.borrow::<Cube>() {
+        cube.node().children(visit);
+        return;
+    }
+    if let Some(ico) = widget.borrow::<IcoSphere>() {
+        ico.node().children(visit);
+        return;
+    }
+    if let Some(refractive_cube) = widget.borrow::<RefractiveCube>() {
+        refractive_cube.node().children(visit);
+        return;
+    }
+    if let Some(gltf) = widget.borrow::<Gltf>() {
+        gltf.node().children(visit);
+        return;
+    }
+    if let Some(tree) = widget.borrow::<Tree>() {
+        tree.node().children(visit);
+        return;
+    }
+    if let Some(shooter) = widget.borrow::<Shooter>() {
+        shooter.node().children(visit);
+        return;
+    }
+    if let Some(node) = widget.borrow::<XrNode>() {
+        node.children(visit);
+        return;
+    }
     widget.children(visit);
 }
 
@@ -435,14 +455,13 @@ pub fn xr_widget_local_sort_center(widget: &WidgetRef) -> Option<Vec3f> {
 }
 
 pub fn xr_widget_is_transparent(widget: &WidgetRef) -> bool {
-    xr_widget_with_scene_node(widget, |node| node.is_transparent()).unwrap_or(false)
+    widget.borrow::<RefractiveCube>().is_some() || widget.borrow::<XrView>().is_some()
 }
 
 pub fn xr_draw_list_depth(scene_state: &SceneState3D, world_pos: Vec3f) -> f32 {
-    let view_pos =
-        scene_state
-            .view
-            .transform_vec4(vec4f(world_pos.x, world_pos.y, world_pos.z, 1.0));
+    let view_pos = scene_state
+        .view
+        .transform_vec4(vec4f(world_pos.x, world_pos.y, world_pos.z, 1.0));
     if view_pos.w.abs() > 1.0e-6 {
         view_pos.z / view_pos.w
     } else {

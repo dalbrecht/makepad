@@ -143,6 +143,7 @@ impl XrPassthroughRuntime {
         self.camera_textures = None;
         self.camera_video = VideoYuvMetadata::disabled();
         self.camera_has_frame = false;
+        self.camera_choice_wait_logged = false;
         if let Some(cube) = self.env_cube.as_mut() {
             cube.reset_state();
         }
@@ -161,7 +162,10 @@ impl XrPassthroughRuntime {
         }
 
         let Some(choice) = self.camera_choice.clone() else {
-            crate::warning!("XR passthrough camera: sync waiting for camera choice");
+            if !self.camera_choice_wait_logged {
+                crate::warning!("XR passthrough camera: sync waiting for camera choice");
+                self.camera_choice_wait_logged = true;
+            }
             return;
         };
         self.camera_choice_wait_logged = false;
