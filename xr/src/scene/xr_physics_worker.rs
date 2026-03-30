@@ -11,10 +11,6 @@ use crate::{
     prelude::*,
     scene::{XrBodyKind, XrRuntimeBodyState},
 };
-use makepad_widgets::makepad_platform::{
-    event::{XrController, XrHand},
-    XrTsdfStore,
-};
 use makepad_widgets::makepad_platform::{event::XrHand, XrTsdfStore};
 use std::{
     collections::HashMap,

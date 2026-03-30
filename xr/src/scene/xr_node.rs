@@ -1,4 +1,5 @@
-use crate::prelude::XrSharedHand;
+use crate::obj::{Cube, Gltf, IcoSphere, RefractiveCube, Tree};
+use crate::scene::{XrSelect, XrView};
 use makepad_widgets::{
     makepad_derive_widget::*,
     makepad_draw::*,
@@ -217,32 +218,6 @@ impl XrDrawContext {
             enabled: self.scope_data.camera_enabled,
         }
     }
-}
-
-pub fn xr_runtime_body_from_scope(scope: &mut Scope, uid: WidgetUid) -> Option<XrRuntimeBodyState> {
-    XrDrawContext::from_scope(scope).runtime_body(uid)
-}
-
-pub fn xr_tracking_from_content_from_scope(scope: &mut Scope) -> Mat4f {
-    XrDrawContext::from_scope(scope).tracking_from_content()
-}
-
-pub fn xr_content_from_tracking_from_scope(scope: &mut Scope) -> Mat4f {
-    XrDrawContext::from_scope(scope).content_from_tracking()
-}
-
-pub fn xr_hand_influence_points_from_scope(
-    scope: &mut Scope,
-) -> [Option<XrHandInfluencePoint>; XR_HAND_INFLUENCE_POINT_COUNT] {
-    XrDrawContext::from_scope(scope).hand_influence_points()
-}
-
-pub fn xr_env_texture_from_scope(scope: &mut Scope) -> Option<Texture> {
-    XrDrawContext::from_scope(scope).env_texture()
-}
-
-pub fn xr_passthrough_from_scope(scope: &mut Scope) -> XrPassthroughScopeData {
-    XrDrawContext::from_scope(scope).passthrough()
 }
 
 #[derive(Script, WidgetRef, WidgetRegister)]

@@ -1,5 +1,4 @@
-use crate::prelude::XrSharedObjectMode;
-use crate::scene::{xr_widget_children, xr_widget_with_scene_node, XrBodySpawn, XrNode};
+use crate::scene::{XrBodySpawn, XrNode};
 use makepad_widgets::{
     makepad_derive_widget::*,
     makepad_draw::*,

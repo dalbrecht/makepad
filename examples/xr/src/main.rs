@@ -1,7 +1,7 @@
 pub use makepad_widgets_dll as makepad_widgets;
 
 use makepad_widgets::*;
-use makepad_xr::*;
+use makepad_xr::scene::*;
 
 app_main!(App);
 

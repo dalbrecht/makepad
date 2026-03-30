@@ -120,8 +120,10 @@ impl AlignTest {
         self.remote_markers_local = remote_descriptor
             .transformed(&ground_truth_remote_to_local)
             .test_markers();
-        self.last_solution =
-            XrNetAlignmentDescriptorFrame::solve_remote_to_local(&local_descriptor, &remote_descriptor);
+        self.last_solution = XrNetAlignmentDescriptorFrame::solve_remote_to_local(
+            &local_descriptor,
+            &remote_descriptor,
+        );
 
         let Some(solution) = self.last_solution else {
             if self.local_markers.is_none() {

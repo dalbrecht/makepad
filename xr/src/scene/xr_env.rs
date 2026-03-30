@@ -1,12 +1,10 @@
 use super::xr_node::{
-    xr_widget_children, xr_widget_with_scene_node, XrBodyKind, XrDepthQuerySupportRig,
-    XrDrawScopeData, XrHandInfluencePoint, XrNode, XrRuntimeBodyState,
+    XrBodyKind, XrDrawScopeData, XrHandInfluencePoint, XrNode, XrRuntimeBodyState,
     XR_HAND_INFLUENCE_POINTS_PER_HAND, XR_HAND_INFLUENCE_POINT_COUNT,
 };
 use crate::prelude::*;
 use crate::util::{
-    depth_debug_mesh::DebugDepthMeshChunk,
-    depth_debug_mesh_worker::{XrDepthDebugMeshSelection, XrDepthDebugMeshWorker},
+    depth_debug_mesh::DebugDepthMeshChunk, depth_debug_mesh_worker::XrDepthDebugMeshWorker,
 };
 use makepad_widgets::makepad_platform::{
     event::{CameraPreviewMode, VideoSource, VideoYuvMetadata},
@@ -44,9 +42,6 @@ use self::{
     },
     xr_physics_worker::{XrPhysicsWorker, XrPhysicsWorkerResult},
 };
-use crate::depth_debug_mesh::DebugDepthMeshChunk;
-use crate::depth_debug_mesh_worker::XrDepthDebugMeshWorker;
-
 script_mod! {
     use mod.pod.*
     use mod.math.*
@@ -471,6 +466,18 @@ impl Default for XrPassthroughRuntime {
     }
 }
 
+#[derive(Default)]
+struct XrHandSystem;
+
+#[derive(Default)]
+struct XrWorld {
+    last_xr_state: Option<Rc<XrState>>,
+    depth: XrDepthRuntime,
+    passthrough: XrPassthroughRuntime,
+    physics: XrPhysicsRuntime,
+    hands: XrHandSystem,
+}
+
 #[derive(Script, ScriptHook)]
 pub struct XrEnv {
     #[live]
@@ -488,19 +495,13 @@ pub struct XrEnv {
     #[live(false)]
     env_cube: bool,
     #[rust]
-    last_xr_state: Option<Rc<XrState>>,
-    #[rust]
-    depth: XrDepthRuntime,
-    #[rust]
-    passthrough: XrPassthroughRuntime,
+    world: XrWorld,
 
     // Physics (moved from XrScene)
     #[live(9.81)]
     pub gravity: f32,
     #[rust(0.25)]
     physics_time_scale: f32,
-    #[rust]
-    physics: XrPhysicsRuntime,
     #[allow(dead_code)]
     #[rust]
     next_frame: NextFrame,
@@ -581,15 +582,15 @@ impl XrEnv {
     }
 
     pub(crate) fn physics_compute_ms(&self) -> f64 {
-        self.physics.metrics.compute_ms
+        self.world.physics.metrics.compute_ms
     }
 
     pub(crate) fn physics_tsdf_query_ms(&self) -> f64 {
-        self.physics.metrics.tsdf_query_ms
+        self.world.physics.metrics.tsdf_query_ms
     }
 
     pub(crate) fn physics_rapier_step_ms(&self) -> f64 {
-        self.physics.metrics.rapier_step_ms
+        self.world.physics.metrics.rapier_step_ms
     }
 
     pub(crate) fn physics_time_scale(&self) -> f32 {
@@ -607,7 +608,7 @@ impl XrEnv {
     }
 
     pub(crate) fn physics_depth_query_surface_count(&self) -> usize {
-        self.physics.metrics.depth_query_surface_count
+        self.world.physics.metrics.depth_query_surface_count
     }
 
     fn passthrough_video_id() -> LiveId {
@@ -667,21 +668,23 @@ impl XrEnv {
 
     fn prepare_depth_mesh(&mut self, cx: &mut Cx2d, state: &XrState) {
         self.draw_depth_mesh.draw_vars.options.depth_write = false;
-        self.depth.poll_surface_mesh_worker(cx);
+        self.world.depth.poll_surface_mesh_worker(cx);
         if !self.depth_mesh_visible() {
-            self.depth.clear_surface_mesh();
+            self.world.depth.clear_surface_mesh();
             return;
         }
         let Some(snapshot) = cx.cx.xr_tsdf().latest_tsdf_snapshot() else {
-            self.depth.clear_surface_mesh();
+            self.world.depth.clear_surface_mesh();
             return;
         };
         let snapshot_unchanged = self
+            .world
             .depth
             .requested_snapshot_grid
             .as_ref()
             .is_some_and(|previous| Arc::ptr_eq(previous, &snapshot.grid));
         let pose_unchanged = self
+            .world
             .depth
             .requested_head_pose
             .map(|previous| {
@@ -691,11 +694,12 @@ impl XrEnv {
         if snapshot_unchanged && pose_unchanged {
             return;
         }
-        self.depth
+        self.world
+            .depth
             .ensure_surface_mesh_worker()
             .request_snapshot(snapshot.clone(), state.head_pose);
-        self.depth.requested_snapshot_grid = Some(snapshot.grid.clone());
-        self.depth.requested_head_pose = Some(state.head_pose);
+        self.world.depth.requested_snapshot_grid = Some(snapshot.grid.clone());
+        self.world.depth.requested_head_pose = Some(state.head_pose);
     }
 
     fn draw_pbr_rounded_cube(
@@ -763,28 +767,31 @@ impl XrEnv {
     pub(crate) fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         match event {
             Event::XrUpdate(update) => {
-                self.last_xr_state = Some(update.state.clone());
-                self.passthrough
+                self.world.last_xr_state = Some(update.state.clone());
+                self.world
+                    .passthrough
                     .sync_camera(cx, Self::passthrough_video_id());
             }
             Event::PermissionResult(result) if result.permission == Permission::HeadsetCamera => {
-                self.passthrough.camera_permission = Some(result.status);
-                self.passthrough
+                self.world.passthrough.camera_permission = Some(result.status);
+                self.world
+                    .passthrough
                     .sync_camera(cx, Self::passthrough_video_id());
                 cx.redraw_all();
             }
             Event::VideoInputs(ev) => {
-                self.passthrough.camera_failed = false;
-                self.passthrough.camera_choice = XrPassthroughRuntime::pick_camera_choice(ev);
-                if self.passthrough.camera_choice.is_none() {
+                self.world.passthrough.camera_failed = false;
+                self.world.passthrough.camera_choice = XrPassthroughRuntime::pick_camera_choice(ev);
+                if self.world.passthrough.camera_choice.is_none() {
                     crate::warning!("XR passthrough camera: no suitable camera choice found");
                 }
-                self.passthrough
+                self.world
+                    .passthrough
                     .sync_camera(cx, Self::passthrough_video_id());
                 cx.redraw_all();
             }
             Event::VideoYuvTexturesReady(ev) if ev.video_id == Self::passthrough_video_id() => {
-                if let Some(textures) = self.passthrough.camera_textures.as_mut() {
+                if let Some(textures) = self.world.passthrough.camera_textures.as_mut() {
                     textures.tex_y = Some(ev.tex_y.clone());
                     textures.tex_u = Some(ev.tex_u.clone());
                     textures.tex_v = Some(ev.tex_v.clone());
@@ -792,26 +799,26 @@ impl XrEnv {
                 cx.redraw_all();
             }
             Event::VideoTextureUpdated(ev) if ev.video_id == Self::passthrough_video_id() => {
-                self.passthrough.camera_video = ev.yuv;
-                self.passthrough.camera_has_frame = true;
+                self.world.passthrough.camera_video = ev.yuv;
+                self.world.passthrough.camera_has_frame = true;
                 cx.redraw_all();
             }
             Event::VideoPlaybackPrepared(ev) if ev.video_id == Self::passthrough_video_id() => {
-                self.passthrough.camera_source_size =
+                self.world.passthrough.camera_source_size =
                     vec2f(ev.video_width as f32, ev.video_height as f32);
                 cx.redraw_all();
             }
             Event::VideoPlaybackResourcesReleased(ev)
                 if ev.video_id == Self::passthrough_video_id() =>
             {
-                self.passthrough.reset_camera_state();
+                self.world.passthrough.reset_camera_state();
                 cx.redraw_all();
             }
             Event::VideoDecodingError(ev) if ev.video_id == Self::passthrough_video_id() => {
                 crate::warning!("XR passthrough camera error: {}", ev.error);
-                self.passthrough.camera_playback_requested = false;
-                self.passthrough.camera_failed = true;
-                self.passthrough.camera_has_frame = false;
+                self.world.passthrough.camera_playback_requested = false;
+                self.world.passthrough.camera_failed = true;
+                self.world.passthrough.camera_has_frame = false;
                 cx.redraw_all();
             }
             _ => {}
@@ -918,7 +925,7 @@ impl XrEnv {
         children: &[(LiveId, WidgetRef)],
     ) -> Vec<CollectedXrCube> {
         let mut cubes = Vec::new();
-        let (root_pos, root_ori) = if let Some(root_pose) = self.physics.root_pose {
+        let (root_pos, root_ori) = if let Some(root_pose) = self.world.physics.root_pose {
             (root_pose.position, root_pose.orientation)
         } else {
             (vec3f(0.0, 0.0, 0.0), Quat::default())
@@ -931,20 +938,21 @@ impl XrEnv {
     }
 
     fn ensure_physics_worker(&mut self, cx: &mut Cx) -> &mut XrPhysicsWorker {
-        self.physics
+        self.world
+            .physics
             .worker
             .get_or_insert_with(|| XrPhysicsWorker::new(cx.xr_tsdf()))
     }
 
     fn apply_physics_worker_result(&mut self, result: XrPhysicsWorkerResult) -> bool {
-        if result.revision != self.physics.revision {
+        if result.revision != self.world.physics.revision {
             return false;
         }
-        self.physics.runtime_bodies = Rc::new(result.runtime_bodies);
+        self.world.physics.runtime_bodies = Rc::new(result.runtime_bodies);
         if let Some(retained_hits) = result.depth_query_retained_hits {
-            self.depth.query_retained_hits = retained_hits;
+            self.world.depth.query_retained_hits = retained_hits;
         }
-        self.physics.metrics = XrPhysicsMetrics {
+        self.world.physics.metrics = XrPhysicsMetrics {
             compute_ms: result.physics_compute_ms,
             tsdf_query_ms: result.physics_tsdf_query_ms,
             rapier_step_ms: result.physics_rapier_step_ms,
@@ -956,6 +964,7 @@ impl XrEnv {
     fn poll_physics_worker(&mut self, cx: &mut Cx) {
         let mut applied = false;
         while let Some(result) = self
+            .world
             .physics
             .worker
             .as_mut()
@@ -970,9 +979,9 @@ impl XrEnv {
 
     fn request_physics_rebuild(&mut self, cx: &mut Cx, children: &[(LiveId, WidgetRef)]) {
         let cubes = self.collect_cubes_from_children(children);
-        self.depth.query_retained_hits.clear();
-        self.physics.revision = self.physics.revision.saturating_add(1);
-        let revision = self.physics.revision;
+        self.world.depth.query_retained_hits.clear();
+        self.world.physics.revision = self.world.physics.revision.saturating_add(1);
+        let revision = self.world.physics.revision;
         let gravity = self.gravity;
         let floor_y = self
             .world
@@ -981,12 +990,12 @@ impl XrEnv {
             .and_then(|state| state.floor_y);
         self.ensure_physics_worker(cx)
             .request_rebuild(revision, gravity, cubes);
-        self.physics.scene_dirty = false;
+        self.world.physics.scene_dirty = false;
     }
 
     pub fn ensure_physics(&mut self, cx: &mut Cx, children: &[(LiveId, WidgetRef)]) {
         self.poll_physics_worker(cx);
-        if self.physics.scene_dirty || self.physics.worker.is_none() {
+        if self.world.physics.scene_dirty || self.world.physics.worker.is_none() {
             self.request_physics_rebuild(cx, children);
             cx.redraw_all();
         }
@@ -995,38 +1004,38 @@ impl XrEnv {
 
     pub fn spawn_body(&mut self, cx: &mut Cx, spawn: XrBodySpawn) {
         self.poll_physics_worker(cx);
-        if self.physics.scene_dirty || self.physics.worker.is_none() {
+        if self.world.physics.scene_dirty || self.world.physics.worker.is_none() {
             return;
         }
-        let revision = self.physics.revision;
+        let revision = self.world.physics.revision;
         self.ensure_physics_worker(cx)
             .request_body_spawn(revision, spawn);
     }
 
     pub fn mark_scene_dirty(&mut self) {
-        self.physics.scene_dirty = true;
+        self.world.physics.scene_dirty = true;
     }
 
     pub fn set_root_pose(&mut self, cx: &mut Cx, pose: Option<Pose>) {
-        if self.physics.root_pose == pose {
+        if self.world.physics.root_pose == pose {
             return;
         }
-        self.physics.root_pose = pose;
-        self.physics.scene_dirty = true;
+        self.world.physics.root_pose = pose;
+        self.world.physics.scene_dirty = true;
         cx.redraw_all();
     }
 
     #[allow(dead_code)]
     fn has_dynamic_bodies(&self) -> bool {
-        !self.physics.runtime_bodies.is_empty()
+        !self.world.physics.runtime_bodies.is_empty()
     }
 
     pub fn step_physics(&mut self, cx: &mut Cx) {
         self.poll_physics_worker(cx);
-        let revision = self.physics.revision;
+        let revision = self.world.physics.revision;
         let physics_time_scale = self.physics_time_scale;
         let include_retained_hits = self.depth_query_hits_visible();
-        let (left_hand, right_hand, left_controller, right_controller, floor_y) = self
+        let (left_hand, right_hand) = self
             .world
             .last_xr_state
             .as_deref()
@@ -1061,14 +1070,14 @@ impl XrEnv {
     }
 
     pub fn reset_physics(&mut self, cx: &mut Cx) {
-        self.physics.revision = self.physics.revision.saturating_add(1);
-        if let Some(worker) = self.physics.worker.as_mut() {
-            worker.request_reset(self.physics.revision);
+        self.world.physics.revision = self.world.physics.revision.saturating_add(1);
+        if let Some(worker) = self.world.physics.worker.as_mut() {
+            worker.request_reset(self.world.physics.revision);
         }
-        self.physics.metrics = XrPhysicsMetrics::default();
-        self.depth.query_retained_hits.clear();
-        Rc::make_mut(&mut self.physics.runtime_bodies).clear();
-        self.physics.scene_dirty = true;
+        self.world.physics.metrics = XrPhysicsMetrics::default();
+        self.world.depth.query_retained_hits.clear();
+        Rc::make_mut(&mut self.world.physics.runtime_bodies).clear();
+        self.world.physics.scene_dirty = true;
         cx.redraw_all();
     }
 
@@ -1127,16 +1136,16 @@ impl XrEnv {
     // --- New API for XrRoot ---
 
     pub fn prepare_and_draw(&mut self, cx: &mut Cx2d) -> XrDrawScopeData {
-        let state = self.last_xr_state.clone();
+        let state = self.world.last_xr_state.clone();
         if let Some(state) = state.as_deref() {
             if self.depth_debug_enabled() {
                 self.prepare_depth_mesh(cx, state);
                 let show_depth_mesh = self.depth_mesh_visible();
                 let show_depth_query_hits = self.depth_query_hits_visible();
                 if show_depth_mesh {
-                    self.depth.poll_surface_mesh_worker(cx);
+                    self.world.depth.poll_surface_mesh_worker(cx);
                 }
-                self.depth.draw_surface_mesh(
+                self.world.depth.draw_surface_mesh(
                     &mut self.draw_depth_mesh,
                     cx,
                     show_depth_mesh,
@@ -1184,28 +1193,32 @@ impl XrEnv {
 
         let env_texture = if self.env_cube {
             state.as_deref().and_then(|state| {
-                self.passthrough
-                    .render_env_cube(&mut self.draw_passthrough_env_face, cx, state)
+                self.world.passthrough.render_env_cube(
+                    &mut self.draw_passthrough_env_face,
+                    cx,
+                    state,
+                )
             })
         } else {
             None
         };
 
         XrDrawScopeData {
-            runtime_bodies: self.physics.runtime_bodies.clone(),
+            runtime_bodies: self.world.physics.runtime_bodies.clone(),
             tracking_from_content: Mat4f::identity(),
             content_from_tracking: Mat4f::identity(),
             env_texture,
             camera_texture: self
+                .world
                 .passthrough
                 .camera_textures
                 .as_ref()
                 .map(|textures| textures.camera.clone()),
-            camera_source_size: self.passthrough.camera_source_size,
-            camera_rotation_steps: self.passthrough.camera_video.rotation_steps,
-            camera_center_offset_uv: self.passthrough.camera_center_offset_uv(),
-            camera_enabled: self.passthrough.camera_has_frame && state.is_some(),
-            hand_influence_points: Self::draw_scope_hand_influence_points(state.as_deref()),
+            camera_source_size: self.world.passthrough.camera_source_size,
+            camera_rotation_steps: self.world.passthrough.camera_video.rotation_steps,
+            camera_center_offset_uv: self.world.passthrough.camera_center_offset_uv(),
+            camera_enabled: self.world.passthrough.camera_has_frame && state.is_some(),
+            hand_influence_points: self.draw_scope_hand_influence_points(state.as_deref()),
         }
     }
 }

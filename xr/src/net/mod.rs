@@ -21,7 +21,7 @@ use self::{
     },
 };
 
-pub const XR_NET_PROTOCOL_VERSION: u16 = 11;
+pub const XR_NET_PROTOCOL_VERSION: u16 = 4;
 pub const XR_NET_DEFAULT_DISCOVERY_PORT: u16 = 41546;
 pub const XR_NET_DEFAULT_DATA_PORT: u16 = 41547;
 pub const XR_NET_DEFAULT_SYNC_PORT: u16 = 41548;
@@ -36,7 +36,6 @@ const XR_NET_SYNC_WRITE_BUDGET_BYTES_PER_POLL: usize = 256 * 1024;
 const XR_NET_SYNC_LZ4_ACCELERATION: usize = 4;
 const XR_NET_SYNC_FRAME_RAW_TAG: u8 = 0;
 const XR_NET_SYNC_FRAME_LZ4_TAG: u8 = 1;
-const XR_NET_UDP_SHARED_OBJECT_STATE_BATCH_MAX_BYTES: usize = 1200;
 // Alignment descriptors now carry full f32 heightmaps, so the old 256 KiB cap
 // is too small once the published map grows beyond modest extents.
 const XR_NET_SYNC_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
@@ -48,38 +47,6 @@ impl XrNetPeerId {
     pub fn to_live_id(self) -> LiveId {
         LiveId(self.0)
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, SerBin, DeBin)]
-pub struct XrActivityId(pub LiveId);
-
-impl XrActivityId {
-    pub fn to_live_id(self) -> LiveId {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, SerBin, DeBin)]
-pub struct XrSpawnableObjectId(pub u64);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, SerBin, DeBin)]
-pub struct XrSharedObjectCounter(pub u64);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, SerBin, DeBin)]
-pub struct XrSharedObjectId(pub u64);
-
-impl XrSharedObjectId {
-    pub fn to_live_id(self) -> LiveId {
-        LiveId(self.0)
-    }
-}
-
-pub fn xr_make_shared_object_id(
-    peer_id: XrNetPeerId,
-    counter: XrSharedObjectCounter,
-) -> Option<XrSharedObjectId> {
-    let live_id = peer_id.to_live_id().bytes_append(&counter.0.to_be_bytes());
-    Some(XrSharedObjectId(if live_id.0 == 0 { 1 } else { live_id.0 }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -105,190 +72,6 @@ pub struct XrNetStateFrame {
     pub seq: u32,
     pub sent_at: f64,
     pub state: XrState,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, SerBin, DeBin)]
-pub struct XrNetBodySpawn {
-    pub activity_id: XrActivityId,
-    pub object_id: XrSpawnableObjectId,
-    pub pose: Pose,
-    pub linvel: Vec3f,
-    pub angvel: Vec3f,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SerBin, DeBin)]
-pub enum XrSharedHand {
-    LeftHand,
-    RightHand,
-    LeftController,
-    RightController,
-    #[default]
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SerBin, DeBin)]
-pub enum XrSharedObjectFidelity {
-    #[default]
-    Interpolated,
-    ContactPredictive,
-    ImpactCritical,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, SerBin, DeBin)]
-pub enum XrSharedObjectMode {
-    #[default]
-    Dynamic,
-    ContactDominated {
-        authority: XrNetPeerId,
-        hand: XrSharedHand,
-    },
-    Sleeping,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, SerBin, DeBin)]
-pub enum XrSharedObjectShape {
-    ActivitySpawnable {
-        activity_id: XrActivityId,
-        spawnable_id: XrSpawnableObjectId,
-    },
-}
-
-impl Default for XrSharedObjectShape {
-    fn default() -> Self {
-        Self::ActivitySpawnable {
-            activity_id: XrActivityId(LiveId(0)),
-            spawnable_id: XrSpawnableObjectId(0),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, SerBin, DeBin)]
-pub struct XrNetSharedObjectState {
-    pub seq: u32,
-    pub sent_at: f64,
-    pub physics_tick: u32,
-    pub object_id: XrSharedObjectId,
-    pub epoch: u32,
-    pub authority: XrNetPeerId,
-    pub fidelity: XrSharedObjectFidelity,
-    pub mode: XrSharedObjectMode,
-    pub pose: Pose,
-    pub linvel: Vec3f,
-    pub angvel: Vec3f,
-}
-
-#[derive(Clone, Debug, PartialEq, SerBin, DeBin)]
-pub enum XrNetSharedObjectControl {
-    XrSpawnObject {
-        object_id: XrSharedObjectId,
-        epoch: u32,
-        authority: XrNetPeerId,
-        fidelity: XrSharedObjectFidelity,
-        shape: XrSharedObjectShape,
-        pose: Pose,
-        linvel: Vec3f,
-        angvel: Vec3f,
-    },
-    XrDespawnObject {
-        object_id: XrSharedObjectId,
-        epoch: u32,
-    },
-    XrTakeoverRequest {
-        object_id: XrSharedObjectId,
-        epoch: u32,
-        request_id: u32,
-        based_on_seq: u32,
-        based_on_tick: u32,
-        candidate_owner: XrNetPeerId,
-        hand: XrSharedHand,
-        hand_pose: Pose,
-        hand_linvel: Vec3f,
-    },
-    XrTakeoverAccept {
-        object_id: XrSharedObjectId,
-        epoch: u32,
-        request_id: u32,
-        new_authority: XrNetPeerId,
-        effective_at: f64,
-        effective_tick: u32,
-        pose: Pose,
-        linvel: Vec3f,
-        angvel: Vec3f,
-    },
-    XrTakeoverReject {
-        object_id: XrSharedObjectId,
-        epoch: u32,
-        request_id: u32,
-        authoritative_seq: u32,
-        authoritative_tick: u32,
-    },
-    XrContactImpulse {
-        object_id: XrSharedObjectId,
-        epoch: u32,
-        based_on_seq: u32,
-        based_on_tick: u32,
-        hand: XrSharedHand,
-        hand_pose: Pose,
-        point: Vec3f,
-        impulse: Vec3f,
-    },
-    XrResetObject {
-        object_id: XrSharedObjectId,
-        epoch: u32,
-        pose: Pose,
-        linvel: Vec3f,
-        angvel: Vec3f,
-    },
-    XrResetActivityPose {
-        activity_id: XrActivityId,
-        pose: Pose,
-    },
-    XrClockPing {
-        seq: u32,
-        sent_at: f64,
-    },
-    XrClockPong {
-        seq: u32,
-        echoed_at: f64,
-        replied_at: f64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, SerBin, DeBin)]
-pub struct XrNetActivityState {
-    pub activity_id: XrActivityId,
-    pub changed_at: f64,
-    pub changed_tick: u32,
-    pub changed_by: XrNetPeerId,
-}
-
-impl XrNetActivityState {
-    pub fn is_newer_than(&self, other: &Self) -> bool {
-        use std::cmp::Ordering;
-
-        match self.changed_tick.cmp(&other.changed_tick) {
-            Ordering::Greater => true,
-            Ordering::Less => false,
-            Ordering::Equal => match self.changed_at.total_cmp(&other.changed_at) {
-                Ordering::Greater => true,
-                Ordering::Less => false,
-                Ordering::Equal => self.changed_by.0 > other.changed_by.0,
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, SerBin, DeBin)]
-pub enum XrNetActivityControl {
-    XrSetActivity(XrNetActivityState),
-}
-
-impl XrNetActivityControl {
-    pub fn state(&self) -> XrNetActivityState {
-        match self {
-            Self::XrSetActivity(state) => *state,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, SerBin, DeBin)]
@@ -442,22 +225,6 @@ pub enum XrNetIncoming {
         peer: XrNetPeer,
         frame: XrNetAlignmentDescriptorFrame,
     },
-    Activity {
-        peer: XrNetPeer,
-        control: XrNetActivityControl,
-    },
-    BodySpawn {
-        peer: XrNetPeer,
-        spawn: XrNetBodySpawn,
-    },
-    SharedObjectControl {
-        peer: XrNetPeer,
-        control: XrNetSharedObjectControl,
-    },
-    SharedObjectState {
-        peer: XrNetPeer,
-        state: XrNetSharedObjectState,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -508,7 +275,6 @@ impl Default for XrNetConfig {
 
 #[derive(Debug)]
 pub struct XrNetNode {
-    node_id: XrNetPeerId,
     pub incoming_receiver: mpsc::Receiver<XrNetIncoming>,
     udp_outgoing_sender: mpsc::Sender<XrNetUdpOutgoing>,
     sync_outgoing_sender: mpsc::Sender<XrNetSyncOutgoing>,
@@ -518,8 +284,6 @@ pub struct XrNetNode {
     next_state_seq: u32,
     next_alignment_seq: u32,
     next_alignment_descriptor_seq: u32,
-    next_activity_tick: u32,
-    next_shared_object_state_seq: u32,
 }
 
 impl XrNetNode {
@@ -569,7 +333,6 @@ impl XrNetNode {
         ));
 
         Ok(Self {
-            node_id: config.node_id,
             incoming_receiver,
             udp_outgoing_sender,
             sync_outgoing_sender,
@@ -579,14 +342,9 @@ impl XrNetNode {
             next_state_seq: 0,
             next_alignment_seq: 0,
             next_alignment_descriptor_seq: 0,
-            next_activity_tick: 0,
-            next_shared_object_state_seq: 0,
         })
     }
 
-    pub fn node_id(&self) -> XrNetPeerId {
-        self.node_id
-    }
     pub fn send_state(&mut self, state: XrState) {
         let frame = XrNetStateFrame {
             seq: self.next_state_seq,
@@ -618,72 +376,6 @@ impl XrNetNode {
         let _ = self
             .sync_outgoing_sender
             .send(XrNetSyncOutgoing::AlignmentDescriptor(frame));
-    }
-
-    pub fn send_activity(
-        &mut self,
-        activity_id: XrActivityId,
-        changed_at: f64,
-    ) -> XrNetActivityState {
-        let state = XrNetActivityState {
-            activity_id,
-            changed_at,
-            changed_tick: self.next_activity_tick,
-            changed_by: self.node_id,
-        };
-        self.next_activity_tick = self.next_activity_tick.wrapping_add(1);
-        let _ = self.sync_outgoing_sender.send(XrNetSyncOutgoing::Activity(
-            XrNetActivityControl::XrSetActivity(state),
-        ));
-        state
-    }
-
-    pub fn send_body_spawn(&mut self, spawn: XrNetBodySpawn) {
-        let _ = self
-            .sync_outgoing_sender
-            .send(XrNetSyncOutgoing::BodySpawn(spawn));
-    }
-
-    pub fn send_shared_object_control(&mut self, control: XrNetSharedObjectControl) {
-        let _ = self
-            .sync_outgoing_sender
-            .send(XrNetSyncOutgoing::SharedObjectControl(control));
-    }
-
-    pub fn assign_shared_object_state_seqs(&mut self, states: &mut [XrNetSharedObjectState]) {
-        for state in states {
-            state.seq = self.next_shared_object_state_seq;
-            self.next_shared_object_state_seq = self.next_shared_object_state_seq.wrapping_add(1);
-        }
-    }
-
-    pub fn send_shared_object_states<I>(&mut self, states: I)
-    where
-        I: IntoIterator<Item = XrNetSharedObjectState>,
-    {
-        let mut batch = states.into_iter().collect::<Vec<_>>();
-        if batch.is_empty() {
-            return;
-        }
-        self.assign_shared_object_state_seqs(&mut batch);
-        self.send_prepared_shared_object_states(batch);
-    }
-
-    pub fn send_prepared_shared_object_states<I>(&mut self, states: I)
-    where
-        I: IntoIterator<Item = XrNetSharedObjectState>,
-    {
-        let batch = states.into_iter().collect::<Vec<_>>();
-        if batch.is_empty() {
-            return;
-        }
-        let _ = self
-            .udp_outgoing_sender
-            .send(XrNetUdpOutgoing::SharedObjectStates(batch));
-    }
-
-    pub fn send_shared_object_state(&mut self, state: XrNetSharedObjectState) {
-        self.send_shared_object_states([state]);
     }
 }
 
@@ -731,11 +423,9 @@ fn default_node_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use makepad_lz4::{compress_bound, compress_fast_into};
-    use std::{sync::Mutex, time::Instant};
+    use std::time::Instant;
 
     const TEST_IO_TIMEOUT: Duration = Duration::from_secs(3);
-    static NET_LOOPBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn wait_for_event<F>(node: &XrNetNode, mut predicate: F) -> Option<XrNetIncoming>
     where
@@ -754,30 +444,6 @@ mod tests {
             }
         }
         None
-    }
-
-    fn wait_for_matching_events<F>(
-        node: &XrNetNode,
-        expected: usize,
-        mut predicate: F,
-    ) -> Vec<XrNetIncoming>
-    where
-        F: FnMut(&XrNetIncoming) -> bool,
-    {
-        let start = Instant::now();
-        let mut matches = Vec::new();
-        while start.elapsed() < TEST_IO_TIMEOUT && matches.len() < expected {
-            match node
-                .incoming_receiver
-                .recv_timeout(Duration::from_millis(50))
-            {
-                Ok(event) if predicate(&event) => matches.push(event),
-                Ok(_) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        matches
     }
 
     fn localhost_config(
@@ -805,64 +471,11 @@ mod tests {
     }
 
     fn make_test_state(head_position: Vec3f) -> XrState {
-        fn make_test_hand(origin: Vec3f, aim_offset: Vec3f) -> XrHand {
-            let mut hand = XrHand::default();
-            hand.flags = XrHand::IN_VIEW | XrHand::AIM_VALID;
-            hand.tips_active = 0x1f;
-            for (index, joint) in hand.joints.iter_mut().enumerate() {
-                *joint = Pose::new(
-                    Quat::default(),
-                    origin + vec3f(index as f32 * 0.004, (index % 5) as f32 * 0.003, -0.02),
-                );
-            }
-            hand.tips = [0.026, 0.031, 0.033, 0.029, 0.027];
-            hand.aim_pose = Pose::new(Quat::default(), origin + aim_offset);
-            hand.pinch = [32, 96, 48, 12];
-            hand
-        }
-
         XrState {
             time: 1.0,
             head_pose: Pose::new(Quat::default(), head_position),
-            left_hand: make_test_hand(vec3f(-0.18, 1.34, -0.22), vec3f(0.03, 0.02, -0.08)),
-            right_hand: make_test_hand(vec3f(0.18, 1.36, -0.20), vec3f(-0.03, 0.02, -0.08)),
             ..XrState::default()
         }
-    }
-
-    #[test]
-    fn xr_state_packet_stays_within_udp_budget() {
-        let packet = XrNetDataPacket::state(
-            XrNetPeerId(99),
-            XrNetStateFrame {
-                seq: 7,
-                sent_at: 3.5,
-                state: make_test_state(vec3f(0.0, 1.6, 0.0)),
-            },
-        )
-        .to_bytes();
-        let bound = compress_bound(packet.len());
-        let mut compressed = vec![0u8; bound];
-        let compressed_len =
-            compress_fast_into(&packet, &mut compressed, XR_NET_SYNC_LZ4_ACCELERATION)
-                .expect("lz4 compression should succeed for state packet");
-
-        println!(
-            "xr_state_packet_bytes={} xr_state_packet_lz4_bytes={}",
-            packet.len(),
-            compressed_len
-        );
-
-        assert!(
-            packet.len() <= 1536,
-            "state packet grew past the current UDP budget: {} bytes",
-            packet.len()
-        );
-        assert!(
-            compressed_len <= packet.len(),
-            "lz4 should not expand the representative state packet: raw={} compressed={compressed_len}",
-            packet.len()
-        );
     }
 
     fn transform_point(mat: &Mat4f, point: Vec3f) -> Vec3f {
@@ -963,7 +576,6 @@ mod tests {
 
     #[test]
     fn peer_timeout_emits_leave_without_needing_more_packets() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
         let config = localhost_config(1, 42646, 42647, 42648, Vec::new());
         let node = XrNetNode::with_config(config).expect("node should bind localhost test ports");
 
@@ -1025,7 +637,6 @@ mod tests {
 
     #[test]
     fn two_test_clients_align_two_cubes_via_protocol() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
         let mut left =
             XrNetNode::with_config(localhost_config(11, 42746, 42747, 42748, vec![42756]))
                 .expect("left test client should bind");
@@ -1096,7 +707,6 @@ mod tests {
 
     #[test]
     fn cached_alignment_descriptor_is_sent_to_late_joiner() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
         let mut left =
             XrNetNode::with_config(localhost_config(101, 42846, 42847, 42848, vec![42856]))
                 .expect("left test client should bind");
@@ -1116,348 +726,6 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(received.descriptor, descriptor.descriptor);
-    }
-
-    #[test]
-    fn cached_activity_is_sent_to_late_joiner() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
-        let mut left =
-            XrNetNode::with_config(localhost_config(301, 42946, 42947, 42948, vec![42956]))
-                .expect("left test client should bind");
-        let right = XrNetNode::with_config(localhost_config(302, 42956, 42957, 42958, vec![42946]))
-            .expect("right test client should bind");
-
-        let sent = left.send_activity(XrActivityId(live_id!(tree_scene)), 3.5);
-
-        let event = wait_for_event(&right, |event| {
-            matches!(event, XrNetIncoming::Activity { .. })
-        })
-        .expect("late joiner should receive cached activity");
-
-        let received = match event {
-            XrNetIncoming::Activity { control, .. } => control.state(),
-            _ => unreachable!(),
-        };
-        assert_eq!(received, sent);
-    }
-
-    #[test]
-    fn body_spawn_is_sent_over_sync_channel() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
-        let mut left =
-            XrNetNode::with_config(localhost_config(311, 43046, 43047, 43048, vec![43056]))
-                .expect("left test client should bind");
-        let right = XrNetNode::with_config(localhost_config(312, 43056, 43057, 43058, vec![43046]))
-            .expect("right test client should bind");
-
-        let _ = left.send_activity(XrActivityId(live_id!(ico_shoot_scene)), 4.0);
-        let _ = wait_for_event(&right, |event| {
-            matches!(event, XrNetIncoming::Activity { .. })
-        })
-        .expect("sync channel should deliver an activity before body spawns");
-
-        let sent = XrNetBodySpawn {
-            activity_id: XrActivityId(live_id!(ico_shoot_scene)),
-            object_id: XrSpawnableObjectId(0xfeed_cafe_dead_beef),
-            pose: Pose::new(Quat::default(), vec3f(0.2, 1.1, -0.7)),
-            linvel: vec3f(1.0, 2.0, 3.0),
-            angvel: vec3f(-0.5, 0.0, 0.5),
-        };
-        left.send_body_spawn(sent);
-
-        let event = wait_for_event(&right, |event| {
-            matches!(event, XrNetIncoming::BodySpawn { .. })
-        })
-        .expect("body spawn should arrive over sync channel");
-
-        let received = match event {
-            XrNetIncoming::BodySpawn { spawn, .. } => spawn,
-            _ => unreachable!(),
-        };
-        assert_eq!(received, sent);
-    }
-
-    #[test]
-    fn shared_object_id_hashes_peer_and_counter_deterministically() {
-        let object_id = xr_make_shared_object_id(XrNetPeerId(42), XrSharedObjectCounter(123456))
-            .expect("hashed shared object id should allocate");
-        assert_ne!(object_id, XrSharedObjectId(0));
-        assert_eq!(
-            object_id,
-            xr_make_shared_object_id(XrNetPeerId(42), XrSharedObjectCounter(123456))
-                .expect("same seed should hash the same way")
-        );
-        assert_ne!(
-            object_id,
-            xr_make_shared_object_id(XrNetPeerId(42), XrSharedObjectCounter(123457))
-                .expect("different counters should hash differently")
-        );
-    }
-
-    #[test]
-    fn shared_object_id_depends_on_net_peer_id_not_socket_addr() {
-        let node_id = XrNetPeerId(0x1234);
-        let local_bind_id = xr_make_shared_object_id(node_id, XrSharedObjectCounter(9))
-            .expect("local bind should hash");
-        let remote_source_id = xr_make_shared_object_id(node_id, XrSharedObjectCounter(9))
-            .expect("remote source should hash");
-
-        assert_eq!(local_bind_id, remote_source_id);
-    }
-
-    #[test]
-    fn shared_object_control_is_sent_over_sync_channel() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
-        let mut left =
-            XrNetNode::with_config(localhost_config(321, 43146, 43147, 43148, vec![43156]))
-                .expect("left test client should bind");
-        let right = XrNetNode::with_config(localhost_config(322, 43156, 43157, 43158, vec![43146]))
-            .expect("right test client should bind");
-
-        let _ = left.send_activity(XrActivityId(live_id!(ico_shoot_scene)), 5.0);
-        let _ = wait_for_event(&right, |event| {
-            matches!(event, XrNetIncoming::Activity { .. })
-        })
-        .expect("sync channel should be ready before shared object control");
-
-        let sent = XrNetSharedObjectControl::XrSpawnObject {
-            object_id: xr_make_shared_object_id(XrNetPeerId(77), XrSharedObjectCounter(9))
-                .expect("counter should fit"),
-            epoch: 0,
-            authority: XrNetPeerId(77),
-            fidelity: XrSharedObjectFidelity::ImpactCritical,
-            shape: XrSharedObjectShape::ActivitySpawnable {
-                activity_id: XrActivityId(live_id!(ico_shoot_scene)),
-                spawnable_id: XrSpawnableObjectId(0x44),
-            },
-            pose: Pose::new(Quat::default(), vec3f(0.0, 1.2, -0.4)),
-            linvel: vec3f(3.0, 0.0, -9.0),
-            angvel: vec3f(0.0, 0.0, 0.0),
-        };
-        left.send_shared_object_control(sent.clone());
-
-        let event = wait_for_event(&right, |event| {
-            matches!(event, XrNetIncoming::SharedObjectControl { .. })
-        })
-        .expect("shared object control should arrive over sync channel");
-
-        let received = match event {
-            XrNetIncoming::SharedObjectControl { control, .. } => control,
-            _ => unreachable!(),
-        };
-        assert_eq!(received, sent);
-    }
-
-    #[test]
-    fn shared_object_state_is_sent_over_udp() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
-        let mut left =
-            XrNetNode::with_config(localhost_config(323, 43246, 43247, 43248, vec![43256]))
-                .expect("left test client should bind");
-        let right = XrNetNode::with_config(localhost_config(324, 43256, 43257, 43258, vec![43246]))
-            .expect("right test client should bind");
-
-        let _ = wait_for_event(&left, |event| matches!(event, XrNetIncoming::Join { .. }))
-            .expect("left test client should discover right before sending shared state");
-        let _ = wait_for_event(&right, |event| matches!(event, XrNetIncoming::Join { .. }))
-            .expect("right test client should discover left before receiving shared state");
-
-        let sent = XrNetSharedObjectState {
-            seq: 0,
-            sent_at: 7.5,
-            physics_tick: 42,
-            object_id: xr_make_shared_object_id(XrNetPeerId(77), XrSharedObjectCounter(9))
-                .expect("counter should fit"),
-            epoch: 3,
-            authority: XrNetPeerId(77),
-            fidelity: XrSharedObjectFidelity::ImpactCritical,
-            mode: XrSharedObjectMode::Dynamic,
-            pose: Pose::new(Quat::default(), vec3f(0.0, 1.2, -0.4)),
-            linvel: vec3f(3.0, 0.0, -9.0),
-            angvel: vec3f(0.0, 0.0, 0.0),
-        };
-        left.send_shared_object_state(sent);
-
-        let event = wait_for_event(&right, |event| {
-            matches!(event, XrNetIncoming::SharedObjectState { .. })
-        })
-        .expect("shared object state should arrive over udp");
-
-        let received = match event {
-            XrNetIncoming::SharedObjectState { state, .. } => state,
-            _ => unreachable!(),
-        };
-        assert_eq!(received.sent_at, sent.sent_at);
-        assert_eq!(received.physics_tick, sent.physics_tick);
-        assert_eq!(received.object_id, sent.object_id);
-        assert_eq!(received.epoch, sent.epoch);
-        assert_eq!(received.authority, sent.authority);
-        assert_eq!(received.fidelity, sent.fidelity);
-        assert_eq!(received.mode, sent.mode);
-        assert_eq!(received.pose, sent.pose);
-        assert_eq!(received.linvel, sent.linvel);
-        assert_eq!(received.angvel, sent.angvel);
-    }
-
-    #[test]
-    fn shared_object_state_batches_roundtrip_over_udp() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
-        let mut left =
-            XrNetNode::with_config(localhost_config(325, 43266, 43267, 43268, vec![43276]))
-                .expect("left test client should bind");
-        let right = XrNetNode::with_config(localhost_config(326, 43276, 43277, 43278, vec![43266]))
-            .expect("right test client should bind");
-
-        let _ = wait_for_event(&left, |event| matches!(event, XrNetIncoming::Join { .. }))
-            .expect("left test client should discover right before sending batched shared state");
-        let _ = wait_for_event(&right, |event| matches!(event, XrNetIncoming::Join { .. }))
-            .expect("right test client should discover left before receiving batched shared state");
-
-        let states = (0..24)
-            .map(|index| XrNetSharedObjectState {
-                seq: 0,
-                sent_at: 10.0 + index as f64 * 0.01,
-                physics_tick: 100 + index as u32,
-                object_id: xr_make_shared_object_id(
-                    XrNetPeerId(77),
-                    XrSharedObjectCounter(1000 + index as u64),
-                )
-                .expect("counter should fit"),
-                epoch: index as u32,
-                authority: XrNetPeerId(77),
-                fidelity: XrSharedObjectFidelity::ImpactCritical,
-                mode: XrSharedObjectMode::Dynamic,
-                pose: Pose::new(Quat::default(), vec3f(index as f32 * 0.01, 1.0, -0.4)),
-                linvel: vec3f(3.0 + index as f32, 0.0, -9.0),
-                angvel: vec3f(0.0, 0.1 * index as f32, 0.0),
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            XrNetDataPacket::shared_object_states(XrNetPeerId(11), states.clone())
-                .to_bytes()
-                .len()
-                > XR_NET_UDP_SHARED_OBJECT_STATE_BATCH_MAX_BYTES,
-            "test fixture should exceed the per-datagram shared-object budget to exercise batching",
-        );
-
-        left.send_shared_object_states(states.clone());
-        let received = wait_for_matching_events(&right, states.len(), |event| {
-            matches!(event, XrNetIncoming::SharedObjectState { .. })
-        });
-        assert_eq!(received.len(), states.len(), "{received:?}");
-
-        let received_states = received
-            .into_iter()
-            .map(|event| match event {
-                XrNetIncoming::SharedObjectState { state, .. } => state,
-                _ => unreachable!(),
-            })
-            .collect::<Vec<_>>();
-        for (received, expected) in received_states.iter().zip(states.iter()) {
-            assert_eq!(received.sent_at, expected.sent_at);
-            assert_eq!(received.physics_tick, expected.physics_tick);
-            assert_eq!(received.object_id, expected.object_id);
-            assert_eq!(received.epoch, expected.epoch);
-            assert_eq!(received.authority, expected.authority);
-            assert_eq!(received.fidelity, expected.fidelity);
-            assert_eq!(received.mode, expected.mode);
-            assert_eq!(received.pose, expected.pose);
-            assert_eq!(received.linvel, expected.linvel);
-            assert_eq!(received.angvel, expected.angvel);
-        }
-    }
-
-    #[test]
-    fn cached_shared_object_control_is_sent_to_late_joiner() {
-        let _guard = NET_LOOPBACK_TEST_LOCK.lock().unwrap();
-        let mut left =
-            XrNetNode::with_config(localhost_config(325, 43346, 43347, 43348, vec![43356]))
-                .expect("left test client should bind");
-
-        let _ = left.send_activity(XrActivityId(live_id!(ico_shoot_scene)), 8.0);
-        let sent = XrNetSharedObjectControl::XrSpawnObject {
-            object_id: xr_make_shared_object_id(XrNetPeerId(77), XrSharedObjectCounter(13))
-                .expect("counter should fit"),
-            epoch: 2,
-            authority: XrNetPeerId(77),
-            fidelity: XrSharedObjectFidelity::ImpactCritical,
-            shape: XrSharedObjectShape::ActivitySpawnable {
-                activity_id: XrActivityId(live_id!(ico_shoot_scene)),
-                spawnable_id: XrSpawnableObjectId(0x44),
-            },
-            pose: Pose::new(Quat::default(), vec3f(0.0, 1.2, -0.4)),
-            linvel: vec3f(3.0, 0.0, -9.0),
-            angvel: vec3f(0.0, 0.0, 0.0),
-        };
-        left.send_shared_object_control(sent.clone());
-
-        let right = XrNetNode::with_config(localhost_config(326, 43356, 43357, 43358, vec![43346]))
-            .expect("right test client should bind");
-
-        let start = Instant::now();
-        let mut received_activity = None;
-        let mut received_control = None;
-        while start.elapsed() < TEST_IO_TIMEOUT
-            && (received_activity.is_none() || received_control.is_none())
-        {
-            match right
-                .incoming_receiver
-                .recv_timeout(Duration::from_millis(50))
-            {
-                Ok(XrNetIncoming::Activity { control, .. }) => {
-                    received_activity = Some(control.state());
-                }
-                Ok(XrNetIncoming::SharedObjectControl { control, .. }) => {
-                    received_control = Some(control);
-                }
-                Ok(_) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        assert_eq!(
-            received_activity,
-            Some(XrNetActivityState {
-                activity_id: XrActivityId(live_id!(ico_shoot_scene)),
-                changed_at: 8.0,
-                changed_tick: 0,
-                changed_by: XrNetPeerId(325),
-            }),
-            "late joiner should receive the cached activity"
-        );
-        assert_eq!(
-            received_control,
-            Some(sent),
-            "late joiner should receive the cached shared object control"
-        );
-    }
-
-    #[test]
-    fn activity_order_prefers_tick_then_time_then_peer() {
-        let base = XrNetActivityState {
-            activity_id: XrActivityId(live_id!(ico_box_scene)),
-            changed_at: 10.0,
-            changed_tick: 4,
-            changed_by: XrNetPeerId(7),
-        };
-
-        assert!(XrNetActivityState {
-            changed_tick: 5,
-            ..base
-        }
-        .is_newer_than(&base));
-        assert!(XrNetActivityState {
-            changed_at: 11.0,
-            ..base
-        }
-        .is_newer_than(&base));
-        assert!(XrNetActivityState {
-            changed_by: XrNetPeerId(8),
-            ..base
-        }
-        .is_newer_than(&base));
-        assert!(!base.is_newer_than(&base));
     }
 
     #[test]
