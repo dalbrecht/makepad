@@ -14,7 +14,6 @@ use std::{
 #[derive(Debug)]
 pub(super) enum XrNetUdpOutgoing {
     State(XrNetStateFrame),
-    SharedObjectStates(Vec<XrNetSharedObjectState>),
     Break,
 }
 
@@ -29,9 +28,6 @@ pub(super) enum XrNetSyncOutgoing {
     },
     Alignment(XrNetAlignmentFrame),
     AlignmentDescriptor(XrNetAlignmentDescriptorFrame),
-    Activity(XrNetActivityControl),
-    BodySpawn(XrNetBodySpawn),
-    SharedObjectControl(XrNetSharedObjectControl),
     Break,
 }
 
@@ -40,7 +36,6 @@ struct UdpWorkerPeerState {
     sync_addr: SocketAddr,
     last_seen: Instant,
     last_state_seq: Option<u32>,
-    last_shared_object_state_seq: Option<u32>,
     last_alignment_seq: Option<u32>,
     last_alignment_descriptor_seq: Option<u32>,
 }
@@ -52,7 +47,6 @@ impl UdpWorkerPeerState {
             sync_addr,
             last_seen: now,
             last_state_seq: None,
-            last_shared_object_state_seq: None,
             last_alignment_seq: None,
             last_alignment_descriptor_seq: None,
         }
@@ -120,23 +114,6 @@ impl SyncWorkerPeerState {
                 }
                 self.last_alignment_descriptor_seq = Some(frame.seq);
                 let _ = incoming_sender.send(XrNetIncoming::AlignmentDescriptor { peer, frame });
-            }
-            XrNetDataPacket::ActivityControl { control, .. } => {
-                let _ = incoming_sender.send(XrNetIncoming::Activity { peer, control });
-            }
-            XrNetDataPacket::BodySpawn { spawn, .. } => {
-                let _ = incoming_sender.send(XrNetIncoming::BodySpawn { peer, spawn });
-            }
-            XrNetDataPacket::SharedObjectStates { states, .. } => {
-                for state in states {
-                    let _ = incoming_sender.send(XrNetIncoming::SharedObjectState { peer, state });
-                }
-            }
-            XrNetDataPacket::SharedObjectState { state, .. } => {
-                let _ = incoming_sender.send(XrNetIncoming::SharedObjectState { peer, state });
-            }
-            XrNetDataPacket::SharedObjectControl { control, .. } => {
-                let _ = incoming_sender.send(XrNetIncoming::SharedObjectControl { peer, control });
             }
             XrNetDataPacket::Leave(_) => {}
         }
@@ -329,14 +306,6 @@ impl XrNetUdpWorker {
                         let _ = self.data_socket.send_to(&buf, peer.peer.addr);
                     }
                 }
-                Ok(XrNetUdpOutgoing::SharedObjectStates(states)) => {
-                    let packets = self.shared_object_state_packets(states);
-                    for buf in &packets {
-                        for peer in peers.values() {
-                            let _ = self.data_socket.send_to(buf, peer.peer.addr);
-                        }
-                    }
-                }
                 Ok(XrNetUdpOutgoing::Break) => return true,
                 Err(mpsc::TryRecvError::Empty) => return false,
                 Err(mpsc::TryRecvError::Disconnected) => return true,
@@ -471,62 +440,9 @@ impl XrNetUdpWorker {
                                 .incoming_sender
                                 .send(XrNetIncoming::AlignmentDescriptor { peer, frame });
                         }
-                        XrNetDataPacket::SharedObjectState {
-                            node_id: remote_id,
-                            state,
-                            ..
-                        } => {
-                            let sync_addr = peers
-                                .get(&remote_id)
-                                .map(|peer_state| peer_state.sync_addr)
-                                .unwrap_or_else(|| {
-                                    SocketAddr::new(source_addr.ip(), XR_NET_DEFAULT_SYNC_PORT)
-                                });
-                            let (peer, _) =
-                                self.touch_peer(peers, remote_id, source_addr, sync_addr);
-                            let Some(peer_state) = peers.get_mut(&remote_id) else {
-                                continue;
-                            };
-                            if !accept_seq(peer_state.last_shared_object_state_seq, state.seq) {
-                                continue;
-                            }
-                            peer_state.last_shared_object_state_seq = Some(state.seq);
-                            let _ = self
-                                .incoming_sender
-                                .send(XrNetIncoming::SharedObjectState { peer, state });
-                        }
-                        XrNetDataPacket::SharedObjectStates {
-                            node_id: remote_id,
-                            states,
-                            ..
-                        } => {
-                            let sync_addr = peers
-                                .get(&remote_id)
-                                .map(|peer_state| peer_state.sync_addr)
-                                .unwrap_or_else(|| {
-                                    SocketAddr::new(source_addr.ip(), XR_NET_DEFAULT_SYNC_PORT)
-                                });
-                            let (peer, _) =
-                                self.touch_peer(peers, remote_id, source_addr, sync_addr);
-                            let Some(peer_state) = peers.get_mut(&remote_id) else {
-                                continue;
-                            };
-                            for state in states {
-                                if !accept_seq(peer_state.last_shared_object_state_seq, state.seq) {
-                                    continue;
-                                }
-                                peer_state.last_shared_object_state_seq = Some(state.seq);
-                                let _ = self
-                                    .incoming_sender
-                                    .send(XrNetIncoming::SharedObjectState { peer, state });
-                            }
-                        }
                         XrNetDataPacket::Leave(packet) => {
                             self.remove_peer(peers, packet.node_id, XrNetLeaveReason::Explicit);
                         }
-                        XrNetDataPacket::ActivityControl { .. } => {}
-                        XrNetDataPacket::BodySpawn { .. } => {}
-                        XrNetDataPacket::SharedObjectControl { .. } => {}
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
@@ -573,41 +489,6 @@ impl XrNetUdpWorker {
                 peer.addr,
             );
         }
-    }
-
-    fn shared_object_state_packets(&self, states: Vec<XrNetSharedObjectState>) -> Vec<Vec<u8>> {
-        let mut packets = Vec::new();
-        let mut batch = Vec::new();
-
-        for state in states {
-            batch.push(state);
-            let batch_bytes =
-                XrNetDataPacket::shared_object_states(self.node_id, batch.clone()).to_bytes();
-            if batch_bytes.len() <= XR_NET_UDP_SHARED_OBJECT_STATE_BATCH_MAX_BYTES {
-                continue;
-            }
-
-            let state = batch.pop().unwrap();
-            if !batch.is_empty() {
-                packets.push(
-                    XrNetDataPacket::shared_object_states(self.node_id, std::mem::take(&mut batch))
-                        .to_bytes(),
-                );
-            }
-
-            let single = XrNetDataPacket::shared_object_state(self.node_id, state).to_bytes();
-            if single.len() > XR_NET_UDP_SHARED_OBJECT_STATE_BATCH_MAX_BYTES {
-                packets.push(single);
-            } else {
-                batch.push(state);
-            }
-        }
-
-        if !batch.is_empty() {
-            packets.push(XrNetDataPacket::shared_object_states(self.node_id, batch).to_bytes());
-        }
-
-        packets
     }
 
     fn remove_peer(
@@ -657,17 +538,12 @@ impl XrNetSyncWorker {
         let mut pending_sync_connections = Vec::<XrNetSyncConnection>::new();
         let mut cached_alignment = None;
         let mut cached_alignment_descriptor = None;
-        let mut cached_activity = None;
-        let mut cached_shared_object_controls =
-            HashMap::<XrSharedObjectId, XrNetSharedObjectControl>::new();
 
         while self.thread_loop.load(Ordering::Relaxed) {
             let should_break = self.drain_outgoing_messages(
                 &mut peers,
                 &mut cached_alignment,
                 &mut cached_alignment_descriptor,
-                &mut cached_activity,
-                &mut cached_shared_object_controls,
             );
             self.accept_connections(&mut pending_sync_connections);
             self.ensure_outbound_connections(&mut peers);
@@ -676,16 +552,8 @@ impl XrNetSyncWorker {
                 &mut peers,
                 &cached_alignment,
                 &cached_alignment_descriptor,
-                &cached_activity,
-                &cached_shared_object_controls,
             );
-            self.process_connections(
-                &mut peers,
-                &cached_alignment,
-                &cached_alignment_descriptor,
-                &cached_activity,
-                &cached_shared_object_controls,
-            );
+            self.process_connections(&mut peers, &cached_alignment, &cached_alignment_descriptor);
 
             if should_break {
                 break;
@@ -706,8 +574,6 @@ impl XrNetSyncWorker {
         peers: &mut HashMap<XrNetPeerId, SyncWorkerPeerState>,
         cached_alignment: &mut Option<XrNetAlignmentFrame>,
         cached_alignment_descriptor: &mut Option<XrNetAlignmentDescriptorFrame>,
-        cached_activity: &mut Option<XrNetActivityControl>,
-        cached_shared_object_controls: &mut HashMap<XrSharedObjectId, XrNetSharedObjectControl>,
     ) -> bool {
         loop {
             match self.outgoing_receiver.try_recv() {
@@ -729,33 +595,6 @@ impl XrNetSyncWorker {
                 Ok(XrNetSyncOutgoing::AlignmentDescriptor(frame)) => {
                     *cached_alignment_descriptor = Some(frame.clone());
                     let packet = XrNetDataPacket::alignment_descriptor(self.node_id, frame);
-                    for peer_state in peers.values_mut() {
-                        if let Some(connection) = peer_state.sync_connection.as_mut() {
-                            connection.queue_packet(&XrNetSyncPacket::data(packet.clone()));
-                        }
-                    }
-                }
-                Ok(XrNetSyncOutgoing::Activity(control)) => {
-                    *cached_activity = Some(control.clone());
-                    cached_shared_object_controls.clear();
-                    let packet = XrNetDataPacket::activity_control(self.node_id, control);
-                    for peer_state in peers.values_mut() {
-                        if let Some(connection) = peer_state.sync_connection.as_mut() {
-                            connection.queue_packet(&XrNetSyncPacket::data(packet.clone()));
-                        }
-                    }
-                }
-                Ok(XrNetSyncOutgoing::BodySpawn(spawn)) => {
-                    let packet = XrNetDataPacket::body_spawn(self.node_id, spawn);
-                    for peer_state in peers.values_mut() {
-                        if let Some(connection) = peer_state.sync_connection.as_mut() {
-                            connection.queue_packet(&XrNetSyncPacket::data(packet.clone()));
-                        }
-                    }
-                }
-                Ok(XrNetSyncOutgoing::SharedObjectControl(control)) => {
-                    Self::cache_shared_object_control(cached_shared_object_controls, &control);
-                    let packet = XrNetDataPacket::shared_object_control(self.node_id, control);
                     for peer_state in peers.values_mut() {
                         if let Some(connection) = peer_state.sync_connection.as_mut() {
                             connection.queue_packet(&XrNetSyncPacket::data(packet.clone()));
@@ -849,8 +688,6 @@ impl XrNetSyncWorker {
         peers: &mut HashMap<XrNetPeerId, SyncWorkerPeerState>,
         cached_alignment: &Option<XrNetAlignmentFrame>,
         cached_alignment_descriptor: &Option<XrNetAlignmentDescriptorFrame>,
-        cached_activity: &Option<XrNetActivityControl>,
-        cached_shared_object_controls: &HashMap<XrSharedObjectId, XrNetSharedObjectControl>,
     ) {
         let pending_count = pending_sync_connections.len();
         for _ in 0..pending_count {
@@ -909,8 +746,6 @@ impl XrNetSyncWorker {
                 &mut connection,
                 cached_alignment,
                 cached_alignment_descriptor,
-                cached_activity,
-                cached_shared_object_controls,
             );
             peer_state.sync_connection = Some(connection);
 
@@ -925,8 +760,6 @@ impl XrNetSyncWorker {
         peers: &mut HashMap<XrNetPeerId, SyncWorkerPeerState>,
         cached_alignment: &Option<XrNetAlignmentFrame>,
         cached_alignment_descriptor: &Option<XrNetAlignmentDescriptorFrame>,
-        cached_activity: &Option<XrNetActivityControl>,
-        cached_shared_object_controls: &HashMap<XrSharedObjectId, XrNetSharedObjectControl>,
     ) {
         let peer_ids = peers.keys().copied().collect::<Vec<_>>();
         for peer_id in peer_ids {
@@ -982,8 +815,6 @@ impl XrNetSyncWorker {
                     &mut connection,
                     cached_alignment,
                     cached_alignment_descriptor,
-                    cached_activity,
-                    cached_shared_object_controls,
                 );
             }
             for data in queued_data {
@@ -998,8 +829,6 @@ impl XrNetSyncWorker {
         connection: &mut XrNetSyncConnection,
         cached_alignment: &Option<XrNetAlignmentFrame>,
         cached_alignment_descriptor: &Option<XrNetAlignmentDescriptorFrame>,
-        cached_activity: &Option<XrNetActivityControl>,
-        cached_shared_object_controls: &HashMap<XrSharedObjectId, XrNetSharedObjectControl>,
     ) {
         if let Some(frame) = cached_alignment {
             connection.queue_packet(&XrNetSyncPacket::data(XrNetDataPacket::alignment(
@@ -1011,86 +840,6 @@ impl XrNetSyncWorker {
             connection.queue_packet(&XrNetSyncPacket::data(
                 XrNetDataPacket::alignment_descriptor(self.node_id, frame.clone()),
             ));
-        }
-        if let Some(control) = cached_activity {
-            connection.queue_packet(&XrNetSyncPacket::data(XrNetDataPacket::activity_control(
-                self.node_id,
-                control.clone(),
-            )));
-        }
-        let mut object_ids = cached_shared_object_controls
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        object_ids.sort_by_key(|object_id| object_id.0);
-        for object_id in object_ids {
-            let Some(control) = cached_shared_object_controls.get(&object_id) else {
-                continue;
-            };
-            connection.queue_packet(&XrNetSyncPacket::data(
-                XrNetDataPacket::shared_object_control(self.node_id, control.clone()),
-            ));
-        }
-    }
-
-    fn cache_shared_object_control(
-        cached_shared_object_controls: &mut HashMap<XrSharedObjectId, XrNetSharedObjectControl>,
-        control: &XrNetSharedObjectControl,
-    ) {
-        match control {
-            XrNetSharedObjectControl::XrSpawnObject { object_id, .. } => {
-                cached_shared_object_controls.insert(*object_id, control.clone());
-            }
-            XrNetSharedObjectControl::XrTakeoverAccept {
-                object_id,
-                epoch,
-                new_authority,
-                pose,
-                linvel,
-                angvel,
-                ..
-            } => {
-                if let Some(XrNetSharedObjectControl::XrSpawnObject {
-                    epoch: cached_epoch,
-                    authority,
-                    pose: cached_pose,
-                    linvel: cached_linvel,
-                    angvel: cached_angvel,
-                    ..
-                }) = cached_shared_object_controls.get_mut(object_id)
-                {
-                    *cached_epoch = *epoch;
-                    *authority = *new_authority;
-                    *cached_pose = *pose;
-                    *cached_linvel = *linvel;
-                    *cached_angvel = *angvel;
-                }
-            }
-            XrNetSharedObjectControl::XrResetObject {
-                object_id,
-                epoch,
-                pose,
-                linvel,
-                angvel,
-            } => {
-                if let Some(XrNetSharedObjectControl::XrSpawnObject {
-                    epoch: cached_epoch,
-                    pose: cached_pose,
-                    linvel: cached_linvel,
-                    angvel: cached_angvel,
-                    ..
-                }) = cached_shared_object_controls.get_mut(object_id)
-                {
-                    *cached_epoch = *epoch;
-                    *cached_pose = *pose;
-                    *cached_linvel = *linvel;
-                    *cached_angvel = *angvel;
-                }
-            }
-            XrNetSharedObjectControl::XrDespawnObject { object_id, .. } => {
-                cached_shared_object_controls.remove(object_id);
-            }
-            _ => {}
         }
     }
 
