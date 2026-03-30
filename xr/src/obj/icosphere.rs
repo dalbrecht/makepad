@@ -1,6 +1,10 @@
-use crate::scene::{xr_widget_world_transform, XrDrawContext, XrNode};
-use makepad_widgets::{makepad_derive_widget::*, makepad_draw::*, widget::*};
+use crate::{makepad_derive_widget::*, makepad_draw::*, widget::*};
 use std::cell::RefCell;
+
+use super::{
+    xr_node::{xr_widget_world_transform, XrDrawContext},
+    XrNode,
+};
 
 const ICO_SPHERE_PHYSICS_DIAMETER_SCALE: f32 = 0.88;
 
@@ -104,8 +108,6 @@ script_mod! {
     mod.widgets.IcoSphereBase = #(IcoSphere::register_widget(vm))
     mod.widgets.IcoSphere = set_type_default() do mod.widgets.IcoSphereBase{
         body: mod.widgets.XrBodyKind.Dynamic
-        physics_shape: mod.widgets.XrPhysicsShape.Sphere
-        shared_object_policy: mod.widgets.XrSharedObjectPolicy.BootstrapShared
         radius: 0.037
         diffuse: vec4(0.63, 0.65, 0.69, 1.0)
         color: vec4(0.95, 0.62, 0.28, 1.0)
@@ -221,29 +223,6 @@ pub struct IcoSphere {
 impl IcoSphere {
     pub fn node(&self) -> &XrNode {
         &self.node
-    }
-
-    pub fn set_radius(&mut self, cx: &mut Cx, radius: f32) {
-        let radius = radius.max(0.001);
-        if (self.radius - radius).abs() <= f32::EPSILON {
-            return;
-        }
-        self.radius = radius;
-        let diameter = radius * 2.0;
-        self.node.set_implicit_physics_size(vec3f(
-            diameter * ICO_SPHERE_PHYSICS_DIAMETER_SCALE,
-            diameter * ICO_SPHERE_PHYSICS_DIAMETER_SCALE,
-            diameter * ICO_SPHERE_PHYSICS_DIAMETER_SCALE,
-        ));
-        self.node.redraw(cx);
-    }
-
-    pub fn set_pos(&mut self, cx: &mut Cx, pos: Vec3f) {
-        self.node.set_pos(cx, pos);
-    }
-
-    pub fn set_rot(&mut self, cx: &mut Cx, rot: Vec3f) {
-        self.node.set_rot(cx, rot);
     }
 }
 

@@ -1,7 +1,9 @@
-use crate::scene::{xr_widget_world_transform, XrDrawContext, XrNode};
-use makepad_widgets::{makepad_derive_widget::*, makepad_draw::*, widget::*};
+use crate::{makepad_derive_widget::*, makepad_draw::*, widget::*};
 
-use crate::util::scene_draw::{apply_scene_to_draw_pbr, scene_state_from_cx};
+use super::{
+    scene_draw::{apply_scene_to_draw_pbr, scene_state_from_cx},
+    xr_node::{xr_widget_world_transform, XrDrawContext, XrNode},
+};
 
 const XR_REFRACTIVE_CAMERA_FOV_Y_DEGREES: f32 = 92.0;
 const XR_REFRACTIVE_CAMERA_PROJECTION_SCALE: f32 = 0.6825;
@@ -15,8 +17,6 @@ script_mod! {
     mod.widgets.RefractiveCubeBase = #(RefractiveCube::register_widget(vm))
     mod.widgets.RefractiveCube = set_type_default() do mod.widgets.RefractiveCubeBase{
         body: mod.widgets.XrBodyKind.Dynamic
-        render_class: mod.widgets.XrRenderClass.Transparent
-        shared_object_policy: mod.widgets.XrSharedObjectPolicy.BootstrapShared
         size: vec3(0.12, 0.12, 0.12)
         color: vec4(0.80, 0.92, 1.0, 0.18)
         corner_radius: 0.024

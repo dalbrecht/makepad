@@ -1,5 +1,5 @@
-use super::xr_node::{xr_widget_world_transform, XrDrawContext, XrNode, XrRuntimeBodyState};
-use crate::prelude::*;
+use crate::xr_node::{xr_widget_world_transform, XrDrawContext, XrNode};
+use crate::*;
 use makepad_widgets::{
     animator::{Animator, AnimatorImpl},
     event::{
@@ -7,7 +7,7 @@ use makepad_widgets::{
         XR_TOUCH_DOWN_FRONT,
     },
 };
-use std::{cell::Cell, collections::HashMap, rc::Rc};
+use std::{cell::Cell, rc::Rc};
 
 script_mod! {
     use mod.pod.*
@@ -40,7 +40,6 @@ script_mod! {
     mod.widgets.XrViewBase = #(XrView::register_widget(vm))
     mod.widgets.XrView = set_type_default() do mod.widgets.XrViewBase{
         mode: XrViewMode.World
-        render_class: XrRenderClass.Transparent
         wrist_left: true
         show_in_non_xr: false
         fit_size: false
@@ -106,16 +105,9 @@ struct XrPanelRayHit {
     touch_z: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct XrViewEventScopeData {
     pub content_transform: Mat4f,
-    pub runtime_bodies: Rc<HashMap<WidgetUid, XrRuntimeBodyState>>,
-}
-
-impl XrViewEventScopeData {
-    pub fn runtime_body(&self, uid: WidgetUid) -> Option<XrRuntimeBodyState> {
-        self.runtime_bodies.get(&uid).cloned()
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Script, ScriptHook)]
@@ -202,6 +194,10 @@ impl XrView {
     const WRIST_PANEL_FACE_CULL_DOT: f32 = 0.0;
     const ARM_PANEL_MENU_SIDE_OFFSET: f32 = 0.15;
     const ARM_PANEL_MENU_BACK_OFFSET: f32 = 0.10;
+
+    pub(crate) fn node(&self) -> &XrNode {
+        &self.node
+    }
 
     fn scaled_pose_matrix(&self, pose: Pose) -> Mat4f {
         Mat4f::mul(
@@ -849,23 +845,6 @@ impl WidgetNode for XrView {
     fn widget_uid(&self) -> WidgetUid {
         self.uid
     }
-
-    fn cast_inner_any(&self, type_id: std::any::TypeId) -> Option<&dyn std::any::Any> {
-        if type_id == std::any::TypeId::of::<XrNode>() {
-            Some(&self.node)
-        } else {
-            None
-        }
-    }
-
-    fn cast_inner_any_mut(&mut self, type_id: std::any::TypeId) -> Option<&mut dyn std::any::Any> {
-        if type_id == std::any::TypeId::of::<XrNode>() {
-            Some(&mut self.node)
-        } else {
-            None
-        }
-    }
-
     fn walk(&mut self, _cx: &mut Cx) -> Walk {
         self.walk
     }
