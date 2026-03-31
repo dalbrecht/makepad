@@ -78,10 +78,9 @@ pub struct XrCamera {
     pub viewport_rect: Option<Rect>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum XrRootAction {
     PhysicsReset,
-    ContentPoseReset(Pose),
     #[default]
     None,
 }
@@ -521,6 +520,11 @@ pub struct XrRoot {
 }
 
 impl XrRoot {
+    fn reset_scene_physics_and_emit_action(&mut self, cx: &mut Cx) {
+        self.env.reset_physics(cx);
+        cx.widget_action(self.widget_uid(), XrRootAction::PhysicsReset);
+    }
+
     pub fn spawn_body(&mut self, cx: &mut Cx, spawn: XrBodySpawn) {
         self.env.spawn_body(cx, spawn);
     }
@@ -1186,12 +1190,6 @@ impl Widget for XrRoot {
             });
             return ScriptAsyncResult::Return(NIL);
         }
-        if method == live_id!(reset_activity_pose) || method == live_id!(pose_activity) {
-            vm.with_cx_mut(|cx| {
-                self.reset_scene_pose_to_headset_and_emit_action(cx);
-            });
-            return ScriptAsyncResult::Return(NIL);
-        }
         if method == live_id!(set_physics_time_scale) || method == live_id!(set_sim_time_scale) {
             let mut scale = self.physics_time_scale();
             if let Some(args_obj) = args.as_object() {
@@ -1288,7 +1286,7 @@ impl Widget for XrRoot {
                 }
                 self.runtime.last_xr_state = Some(augmented_state.clone());
                 if augmented_update.clicked_menu() {
-                    self.env.reset_physics(cx);
+                    self.reset_scene_physics_and_emit_action(cx);
                 }
                 self.env.ensure_physics(cx, &self.children);
                 self.env.step_physics(cx);

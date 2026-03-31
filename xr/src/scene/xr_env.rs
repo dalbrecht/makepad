@@ -216,7 +216,6 @@ struct CollectedXrCube {
     scale: Vec3f,
     half_extents: Vec3f,
     physics_shape: XrPhysicsShape,
-    depth_query_support: XrDepthQuerySupportRig,
     density: f32,
     friction: f32,
     restitution: f32,
@@ -918,7 +917,6 @@ impl XrEnv {
             return;
         }
         let Some(()) = xr_widget_with_scene_node(widget, |node| {
-            let is_sphere = widget.borrow::<IcoSphere>().is_some();
             let (pos, ori, scale) =
                 Self::transform_with_node(parent_pos, parent_ori, parent_scale, node);
             let half = node.physics_half_extents();
@@ -933,7 +931,7 @@ impl XrEnv {
                     pose: Pose::new(ori, pos),
                     scale,
                     half_extents: vec3f(half.x * scale.x, half.y * scale.y, half.z * scale.z),
-                    is_sphere,
+                    physics_shape: node.physics_shape(),
                     density: node.density(),
                     friction: node.friction(),
                     restitution: node.restitution(),

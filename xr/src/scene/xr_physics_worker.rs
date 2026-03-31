@@ -552,7 +552,7 @@ fn build_scene(gravity: f32, cubes: Vec<CollectedXrCube>) -> RapierScene {
             XrBodyKind::Disabled => {}
             XrBodyKind::Dynamic => {
                 if cube.physics_shape == XrPhysicsShape::Sphere {
-                    scene.spawn_dynamic_sphere_with_support(
+                    scene.spawn_dynamic_sphere(
                         cube.uid,
                         cube.pose,
                         cube.half_extents
