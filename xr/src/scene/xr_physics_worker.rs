@@ -26,7 +26,6 @@ const XR_WORKER_SIMULATION_DT_MAX: f32 = 1.0 / 45.0;
 const XR_WORKER_SIMULATION_DT_SMOOTHING: f32 = 0.35;
 const XR_WORKER_SIMULATION_DT_LADDER: [f32; 5] =
     [1.0 / 120.0, 1.0 / 90.0, 1.0 / 72.0, 1.0 / 60.0, 1.0 / 45.0];
-const XR_PHYSICS_WORKER_MAX_PENDING_BODY_SPAWNS: usize = 8;
 const XR_PHYSICS_WORKER_MAX_PENDING_BODY_DESPAWNS: usize = 8;
 const XR_PHYSICS_WORKER_MAX_PENDING_BODY_IMPULSES: usize = 8;
 
@@ -75,8 +74,7 @@ struct PhysicsWorkerMailbox {
     pending_reset_revision: Option<u64>,
     pending_rebuild: Option<PhysicsWorkerRebuild>,
     pending_step: Option<PhysicsWorkerStep>,
-    pending_body_spawns:
-        SmallVec<[PhysicsWorkerBodySpawn; XR_PHYSICS_WORKER_MAX_PENDING_BODY_SPAWNS]>,
+    pending_body_spawns: Vec<PhysicsWorkerBodySpawn>,
     pending_body_despawns:
         SmallVec<[PhysicsWorkerBodyDespawn; XR_PHYSICS_WORKER_MAX_PENDING_BODY_DESPAWNS]>,
     pending_body_impulses:
@@ -186,74 +184,6 @@ impl XrPhysicsWorker {
             }
             mailbox.version = mailbox.version.saturating_add(1);
             wake.notify_one();
-        }
-    }
-
-    pub(super) fn request_body_despawn(&mut self, revision: u64, widget_uid: WidgetUid) {
-        let (lock, wake) = &*self.mailbox;
-        if let Ok(mut mailbox) = lock.lock() {
-            if mailbox.pending_body_despawns.len() < XR_PHYSICS_WORKER_MAX_PENDING_BODY_DESPAWNS {
-                mailbox
-                    .pending_body_despawns
-                    .push(PhysicsWorkerBodyDespawn {
-                        revision,
-                        widget_uid,
-                    });
-                mailbox.version = mailbox.version.saturating_add(1);
-                wake.notify_one();
-            }
-        }
-    }
-
-    pub(super) fn request_body_impulse(&mut self, revision: u64, impulse: XrBodyImpulse) {
-        let (lock, wake) = &*self.mailbox;
-        if let Ok(mut mailbox) = lock.lock() {
-            if mailbox.pending_body_impulses.len() < XR_PHYSICS_WORKER_MAX_PENDING_BODY_IMPULSES {
-                mailbox
-                    .pending_body_impulses
-                    .push(PhysicsWorkerBodyImpulse { revision, impulse });
-                mailbox.version = mailbox.version.saturating_add(1);
-                wake.notify_one();
-            }
-        }
-    }
-
-    pub(super) fn request_body_wrench(&mut self, revision: u64, wrench: XrBodyWrench) {
-        let (lock, wake) = &*self.mailbox;
-        if let Ok(mut mailbox) = lock.lock() {
-            if mailbox.pending_body_wrenches.len() < XR_PHYSICS_WORKER_MAX_PENDING_BODY_WRENCHES {
-                mailbox
-                    .pending_body_wrenches
-                    .push(PhysicsWorkerBodyWrench { revision, wrench });
-                mailbox.version = mailbox.version.saturating_add(1);
-                wake.notify_one();
-            }
-        }
-    }
-
-    pub(super) fn request_body_drive(&mut self, revision: u64, drive: XrBodyDrive) {
-        let (lock, wake) = &*self.mailbox;
-        if let Ok(mut mailbox) = lock.lock() {
-            if mailbox.pending_body_drives.len() < XR_PHYSICS_WORKER_MAX_PENDING_BODY_DRIVES {
-                mailbox
-                    .pending_body_drives
-                    .push(PhysicsWorkerBodyDrive { revision, drive });
-                mailbox.version = mailbox.version.saturating_add(1);
-                wake.notify_one();
-            }
-        }
-    }
-
-    pub(super) fn request_car_control(&mut self, revision: u64, control: XrCarControl) {
-        let (lock, wake) = &*self.mailbox;
-        if let Ok(mut mailbox) = lock.lock() {
-            if mailbox.pending_car_controls.len() < XR_PHYSICS_WORKER_MAX_PENDING_CAR_CONTROLS {
-                mailbox
-                    .pending_car_controls
-                    .push(PhysicsWorkerCarControl { revision, control });
-                mailbox.version = mailbox.version.saturating_add(1);
-                wake.notify_one();
-            }
         }
     }
 
@@ -431,8 +361,7 @@ fn physics_worker_loop(
                     } else {
                         physics_body_spawn_miss_count =
                             physics_body_spawn_miss_count.saturating_add(1);
-                        total_body_spawn_miss_count =
-                            total_body_spawn_miss_count.saturating_add(1);
+                        total_body_spawn_miss_count = total_body_spawn_miss_count.saturating_add(1);
                     }
                     applied_spawn = true;
                 }
@@ -697,14 +626,20 @@ fn snapshot_runtime_bodies(
                 XrRuntimeBodyState {
                     pose: makepad_pose(body.position()),
                     scale: cube.scale,
-                    linvel: {
-                        let linvel = body.linvel();
-                        vec3f(linvel.x, linvel.y, linvel.z)
-                    },
-                    angvel: {
-                        let angvel = body.angvel();
-                        vec3f(angvel.x, angvel.y, angvel.z)
-                    },
+                    linvel: scene
+                        .shadow_body_motion_for_body(cube.body)
+                        .map(|(linvel, _)| linvel)
+                        .unwrap_or_else(|| {
+                            let linvel = body.linvel();
+                            vec3f(linvel.x, linvel.y, linvel.z)
+                        }),
+                    angvel: scene
+                        .shadow_body_motion_for_body(cube.body)
+                        .map(|(_, angvel)| angvel)
+                        .unwrap_or_else(|| {
+                            let angvel = body.angvel();
+                            vec3f(angvel.x, angvel.y, angvel.z)
+                        }),
                     sleeping: body.is_sleeping(),
                     held_by: scene.held_by_for_body(cube.body),
                 },

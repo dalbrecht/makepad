@@ -533,6 +533,12 @@ impl XrRoot {
         self.env.apply_body_impulse(cx, impulse);
     }
 
+    pub fn force_scene_rebuild(&mut self, cx: &mut Cx) {
+        self.env.mark_scene_dirty();
+        self.env.ensure_physics(cx, &self.children);
+        cx.redraw_all();
+    }
+
     fn set_depth_mesh_visible(&mut self, cx: &mut Cx, visible: bool) -> bool {
         self.env.set_depth_mesh_visible(visible);
         self.env.mark_scene_dirty();
