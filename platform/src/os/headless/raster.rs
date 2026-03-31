@@ -633,7 +633,9 @@ impl Cx {
                     let height = (size.y * dpi_factor).round().max(1.0) as usize;
 
                     // Set up pass uniforms
-                    self.passes[*draw_pass_id].set_ortho_matrix(dvec2(0.0, 0.0), size);
+                    if !self.passes[*draw_pass_id].keep_camera_matrix {
+                        self.passes[*draw_pass_id].set_ortho_matrix(dvec2(0.0, 0.0), size);
+                    }
                     self.passes[*draw_pass_id].set_dpi_factor(dpi_factor);
                     self.passes[*draw_pass_id].set_time(time as f32);
 
@@ -744,10 +746,16 @@ impl Cx {
             };
 
             if let Some(sub_list_id) = kind_tag {
+                let child_resets_zbias = self.draw_lists[sub_list_id].reset_zbias;
+                let mut child_zbias = 0.0f32;
                 self.headless_render_view(
                     draw_pass_id,
                     sub_list_id,
-                    zbias,
+                    if child_resets_zbias {
+                        &mut child_zbias
+                    } else {
+                        zbias
+                    },
                     zbias_step,
                     render_threads,
                     parallel_min_tris,

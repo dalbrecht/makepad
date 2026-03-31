@@ -87,6 +87,13 @@ impl ScriptHook for DrawVars {
                 self.options.depth_write = v != 0.0;
             }
 
+            let alpha_blend_value = vm.bx.heap.value(io_self, id!(alpha_blend).into(), NoTrap);
+            if let Some(v) = alpha_blend_value.as_bool() {
+                self.options.alpha_blend = v;
+            } else if let Some(v) = alpha_blend_value.as_f64() {
+                self.options.alpha_blend = v != 0.0;
+            }
+
             let backface_culling_value =
                 vm.bx
                     .heap
@@ -923,6 +930,7 @@ impl DrawVars {
 
             let mut output = ShaderOutput::default();
             output.backend = ShaderBackend::Glsl;
+            output.use_vulkan = false;
             output.pre_collect_rust_instance_io(vm, io_self);
             output.pre_collect_shader_io(vm, io_self);
 

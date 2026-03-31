@@ -31,6 +31,9 @@ use {
     std::sync::mpsc,
 };
 
+#[cfg(use_vulkan)]
+const OPENXR_DEPTH_MESH_READBACK_ENABLED: bool = true;
+
 impl Cx {
     pub(crate) fn openxr_render_loop(
         &mut self,
@@ -57,6 +60,7 @@ impl Cx {
     }
 
     pub(crate) fn openxr_handle_events(&mut self) {
+        let mut redraw_requested = false;
         let openxr = &mut self.os.openxr;
         loop {
             let mut event_buffer = XrEventDataBuffer {
@@ -89,6 +93,7 @@ impl Cx {
                                 self.os.activity_thread_id.unwrap(),
                                 self.os.render_thread_id.unwrap(),
                             );
+                            redraw_requested = true;
                         }
                         XrSessionState::STOPPING => {
                             openxr
@@ -102,6 +107,36 @@ impl Cx {
                         }
                         _ => (),
                     }
+                }
+                XrStructureType::EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB => {
+                    let event = &unsafe {
+                        *(&event_buffer as *const _
+                            as *const XrEventDataDisplayRefreshRateChangedFB)
+                    };
+                    if let Some(session) = &mut openxr.session {
+                        if event.to_display_refresh_rate.is_finite()
+                            && event.to_display_refresh_rate > 0.0
+                        {
+                            session.active_display_refresh_rate_hz =
+                                Some(event.to_display_refresh_rate);
+                            self.os.xr_display_refresh_rate_active_hz =
+                                Some(event.to_display_refresh_rate);
+                            crate::log!(
+                                "OpenXR display refresh changed: {:.1} Hz -> {:.1} Hz",
+                                event.from_display_refresh_rate,
+                                event.to_display_refresh_rate
+                            );
+                        }
+                    }
+                }
+                XrStructureType::EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING => {
+                    let reset_generation =
+                        crate::xr_depth_mesh::xr_depth_mesh_store().request_reset();
+                    redraw_requested = true;
+                    crate::log!(
+                        "OpenXR reference space changed, resetting depth mesh pipeline generation={}",
+                        reset_generation
+                    );
                 }
                 _ => {
                     if let Some(session) = &mut openxr.session {
@@ -126,6 +161,9 @@ impl Cx {
                     crate::log!("Unkown xr event {:?}",x);
                 }
             }*/
+        }
+        if redraw_requested {
+            self.redraw_all();
         }
     }
 
@@ -179,11 +217,11 @@ impl Cx {
             let openxr = &mut self.os.openxr;
             CxOpenXrFrame::begin_frame(
                 openxr.libxr.as_ref().unwrap(),
-                openxr.session.as_ref().unwrap(),
+                openxr.session.as_mut().unwrap(),
             )
         };
         if let Ok(frame) = frame {
-            let (event, last_state) = {
+            let (event, last_state, active_refresh_rate_hz, effective_frame_time_ms) = {
                 let openxr = &mut self.os.openxr;
                 let session = openxr.session.as_mut().unwrap();
                 session.depth_swap_chain_index = frame
@@ -191,11 +229,35 @@ impl Cx {
                     .map(|v| v.swapchain_index as usize)
                     .unwrap_or(0);
                 session.frame_state = frame.frame_state;
+                let effective_frame_time_ms =
+                    session.last_predicted_display_time.and_then(|last| {
+                        let delta_nanos =
+                            frame.frame_state.predicted_display_time.as_nanos() - last.as_nanos();
+                        (delta_nanos > 0).then_some(delta_nanos as f64 / 1_000_000.0)
+                    });
+                session.last_predicted_display_time =
+                    Some(frame.frame_state.predicted_display_time);
+                let active_refresh_rate_hz = session.active_display_refresh_rate_hz.or_else(|| {
+                    let predicted_period_nanos =
+                        frame.frame_state.predicted_display_period.as_nanos();
+                    if predicted_period_nanos > 0 {
+                        Some((1_000_000_000.0 / predicted_period_nanos as f64) as f32)
+                    } else {
+                        None
+                    }
+                });
                 (
                     session.new_xr_update_event(openxr.libxr.as_ref().unwrap(), &frame),
                     session.inputs.last_state.clone(),
+                    active_refresh_rate_hz,
+                    effective_frame_time_ms,
                 )
             };
+            self.os.xr_display_refresh_rate_active_hz = active_refresh_rate_hz;
+            self.os.xr_effective_frame_time_ms = effective_frame_time_ms;
+            self.os.xr_effective_frame_rate_hz = effective_frame_time_ms
+                .filter(|ms| *ms > 0.0)
+                .map(|ms| 1000.0 / ms);
             if let Some(event) = event {
                 self.call_event_handler(&Event::XrUpdate(event));
             }
@@ -213,14 +275,22 @@ impl Cx {
             self.openxr_handle_repaint(&frame);
 
             #[cfg(use_vulkan)]
-            if let Some(depth_image_index) = frame.depth_image.map(|v| v.swapchain_index as usize) {
-                let (openxr, vulkan) = (&mut self.os.openxr, &mut self.os.vulkan);
-                if let (Some(session), Some(vulkan)) = (openxr.session.as_mut(), vulkan.as_mut()) {
-                    if let Some(vulkan_session) = session.vulkan.as_mut() {
-                        if let Err(err) =
-                            vulkan_session.submit_depth_mesh_job(vulkan, &frame, depth_image_index)
-                        {
-                            crate::warning!("OpenXR depth mesh update failed: {err}");
+            if OPENXR_DEPTH_MESH_READBACK_ENABLED {
+                if let Some(depth_image_index) =
+                    frame.depth_image.map(|v| v.swapchain_index as usize)
+                {
+                    let (openxr, vulkan) = (&mut self.os.openxr, &mut self.os.vulkan);
+                    if let (Some(session), Some(vulkan)) =
+                        (openxr.session.as_mut(), vulkan.as_mut())
+                    {
+                        if let Some(vulkan_session) = session.vulkan.as_mut() {
+                            if let Err(err) = vulkan_session.submit_depth_mesh_job(
+                                vulkan,
+                                &frame,
+                                depth_image_index,
+                            ) {
+                                crate::warning!("OpenXR depth mesh update failed: {err}");
+                            }
                         }
                     }
                 }
@@ -233,6 +303,37 @@ impl Cx {
                     openxr.session.as_mut().unwrap(),
                 );
             }
+
+            #[cfg(use_vulkan)]
+            {
+                let requested_scale = self.os.xr_buffer_scale_requested;
+                let active_scale = self.os.xr_buffer_scale_active;
+                if (requested_scale - active_scale).abs() >= 0.0001 && self.os.in_xr_mode {
+                    let options = self.current_android_xr_options();
+                    let resize_result = {
+                        let (openxr, vulkan) = (&mut self.os.openxr, &mut self.os.vulkan);
+                        if let Some(vulkan) = vulkan.as_mut() {
+                            openxr.resize_projection_layer(vulkan, options)
+                        } else {
+                            Err(
+                                "Android XR projection resize failed: Vulkan backend unavailable"
+                                    .to_string(),
+                            )
+                        }
+                    };
+                    if let Err(err) = resize_result {
+                        crate::warning!(
+                            "Android XR render scale resize failed at scale {:.2}, keeping {:.2}: {}",
+                            requested_scale,
+                            active_scale,
+                            err
+                        );
+                        self.os.xr_buffer_scale_requested = active_scale;
+                    } else {
+                        self.os.xr_buffer_scale_active = requested_scale;
+                    }
+                }
+            }
         }
     }
 }
@@ -244,6 +345,7 @@ pub struct CxOpenXr {
     pub instance: Option<XrInstance>,
     system_id: Option<XrSystemId>,
     pub session: Option<CxOpenXrSession>,
+    pub(crate) logged_waiting_for_session: bool,
 }
 
 impl CxOpenXr {
@@ -299,6 +401,38 @@ impl CxOpenXr {
 
         #[cfg(use_vulkan)]
         {
+            let fixed_foveation_exts = [
+                "XR_FB_swapchain_update_state\0",
+                "XR_FB_foveation\0",
+                "XR_FB_foveation_configuration\0",
+                "XR_FB_foveation_vulkan\0",
+            ];
+            let missing_fixed_foveation_exts: Vec<&str> = fixed_foveation_exts
+                .iter()
+                .copied()
+                .filter(|name| !has_extension(name))
+                .collect();
+            if missing_fixed_foveation_exts.is_empty() {
+                exts_needed.extend_from_slice(&fixed_foveation_exts);
+            } else {
+                crate::warning!(
+                    "OpenXR fixed foveation extensions unavailable on this runtime: {:?}",
+                    missing_fixed_foveation_exts
+                );
+            }
+        }
+
+        #[cfg(use_vulkan)]
+        {
+            let display_refresh_rate_ext = "XR_FB_display_refresh_rate\0";
+            if has_extension(display_refresh_rate_ext) {
+                exts_needed.push(display_refresh_rate_ext);
+            } else {
+                crate::warning!(
+                    "OpenXR display refresh rate extension unavailable on this runtime"
+                );
+            }
+
             if !has_extension("XR_KHR_vulkan_enable2\0") {
                 return Err(
                     "OpenXR Vulkan: XR_KHR_vulkan_enable2 is required on this Quest path"
@@ -309,7 +443,7 @@ impl CxOpenXr {
         }
 
         #[cfg(not(use_vulkan))]
-        let exts_needed = vec![
+        let mut exts_needed = vec![
             "XR_KHR_opengl_es_enable\0",
             "XR_EXT_performance_settings\0",
             "XR_EXT_hand_tracking\0",
@@ -329,6 +463,30 @@ impl CxOpenXr {
             "XR_FB_spatial_entity\0",
             "XR_FB_spatial_entity_query\0",
         ];
+
+        #[cfg(not(use_vulkan))]
+        {
+            let display_refresh_rate_ext = "XR_FB_display_refresh_rate\0";
+            if has_extension(display_refresh_rate_ext) {
+                exts_needed.push(display_refresh_rate_ext);
+            } else {
+                crate::warning!(
+                    "OpenXR display refresh rate extension unavailable on this runtime"
+                );
+            }
+        }
+
+        let missing_exts: Vec<&str> = exts_needed
+            .iter()
+            .copied()
+            .filter(|name| !has_extension(name))
+            .collect();
+        if !missing_exts.is_empty() {
+            crate::warning!(
+                "OpenXR runtime missing requested extensions: {:?}",
+                missing_exts
+            );
+        }
 
         let ext_name_ptrs: Vec<*const std::os::raw::c_char> = exts_needed
             .iter()
@@ -370,14 +528,6 @@ impl CxOpenXr {
             loader.destroy_instance(instance);
             return Err(err);
         }
-        /*
-        crate::log!(
-            "OpenXR Runtime loaded: {}, Version: {}.{}.{}",
-            xr_string(&instance_props.runtime_name),
-            instance_props.runtime_version.major(),
-            instance_props.runtime_version.minor(),
-            instance_props.runtime_version.patch(),
-        );*/
 
         let mut sys_info = XrSystemGetInfo::default();
         sys_info.form_factor = XrFormFactor::HEAD_MOUNTED_DISPLAY;
@@ -397,20 +547,6 @@ impl CxOpenXr {
             loader.destroy_instance(instance);
             return Err(err);
         }
-
-        /*crate::log!("OpenXR System props name:{} vendor_id:{}",xr_string(&sys_props.system_name), sys_props.vendor_id);*/
-        /*
-        crate::log!(
-            "OpenXR System graphics max_width:{}, max_height:{}, max_layer:{}",
-            sys_props.graphics_properties.max_swapchain_image_height,
-            sys_props.graphics_properties.max_swapchain_image_width,
-            sys_props.graphics_properties.max_layer_count
-        );
-        crate::log!(
-            "OpenXR System tracking Orientation:{}, Position:{}",
-            sys_props.tracking_properties.orientation_tracking.to_bool(),
-            sys_props.tracking_properties.position_tracking.to_bool(),
-        );*/
 
         #[cfg(not(use_vulkan))]
         {
@@ -444,7 +580,7 @@ impl CxOpenXr {
         self.instance = Some(instance);
         self.system_id = Some(sys_id);
         self.libxr = Some(xr);
-
+        self.logged_waiting_for_session = false;
         Ok(())
     }
 
@@ -491,10 +627,48 @@ impl CxOpenXr {
             options,
         )?);
         if let Some(session) = &mut self.session {
+            let _ = session.update_active_display_refresh_rate(self.libxr.as_ref().unwrap());
             session.get_local_anchor(self.libxr.as_ref().unwrap(), os_type);
         }
+        self.logged_waiting_for_session = false;
         // self.get_local_anchor();
         Ok(())
+    }
+
+    pub fn destroy_session(
+        &mut self,
+        libgl: &LibGl,
+        #[cfg(use_vulkan)] vulkan: Option<&mut CxVulkan>,
+    ) -> Result<(), String> {
+        if let Some(session) = self.session.take() {
+            session.destroy_session(
+                self.libxr.as_ref().ok_or_else(|| {
+                    "OpenXR destroy_session failed: libxr unavailable".to_string()
+                })?,
+                libgl,
+                #[cfg(use_vulkan)]
+                vulkan,
+            )?;
+        }
+        self.logged_waiting_for_session = false;
+        Ok(())
+    }
+
+    #[cfg(use_vulkan)]
+    pub fn resize_projection_layer(
+        &mut self,
+        vulkan: &mut CxVulkan,
+        options: CxOpenXrOptions,
+    ) -> Result<(), String> {
+        let xr = self
+            .libxr
+            .as_ref()
+            .ok_or_else(|| "OpenXR projection resize failed: libxr unavailable".to_string())?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "OpenXR projection resize failed: session unavailable".to_string())?;
+        session.resize_projection_layer_vulkan(xr, vulkan, options)
     }
 
     pub fn destroy_instance(
@@ -503,15 +677,12 @@ impl CxOpenXr {
         #[cfg(use_vulkan)] vulkan: Option<&mut CxVulkan>,
     ) -> Result<(), String> {
         crate::log!("OPENXR DESTROY INSTANCE");
-        if let Some(session) = self.session.take() {
-            if let Err(e) = session.destroy_session(
-                self.libxr.as_ref().unwrap(),
-                libgl,
-                #[cfg(use_vulkan)]
-                vulkan,
-            ) {
-                crate::log!("OpenXR destroy destroy_session error: {e}")
-            }
+        if let Err(e) = self.destroy_session(
+            libgl,
+            #[cfg(use_vulkan)]
+            vulkan,
+        ) {
+            crate::log!("OpenXR destroy destroy_session error: {e}")
         }
 
         let xr = self.libxr.as_ref().ok_or("")?;
@@ -562,6 +733,8 @@ pub struct CxOpenXrSession {
     pub passthrough_layer: XrPassthroughLayerFB,
     pub width: u32,
     pub height: u32,
+    pub recommended_width: u32,
+    pub recommended_height: u32,
     pub head_space: XrSpace,
     pub local_space: XrSpace,
     pub handle: XrSession,
@@ -570,10 +743,13 @@ pub struct CxOpenXrSession {
 
     pub anchor: CxOpenXrAnchor,
     pub inputs: CxOpenXrInputs,
+    debug_inactive_begin_frame_logs: u32,
 
     // leaked from Frame onto state
     pub depth_swap_chain_index: usize,
     pub frame_state: XrFrameState,
+    pub active_display_refresh_rate_hz: Option<f32>,
+    last_predicted_display_time: Option<XrTime>,
 }
 
 #[derive(SerBin, DeBin)]
@@ -584,6 +760,21 @@ struct AnchorAdvertisement {
 }
 
 impl CxOpenXrSession {
+    fn update_active_display_refresh_rate(
+        &mut self,
+        xr: &LibOpenXr,
+    ) -> Result<Option<f32>, String> {
+        let Some(get_display_refresh_rate) = xr.xrGetDisplayRefreshRateFB else {
+            return Ok(self.active_display_refresh_rate_hz);
+        };
+        let mut refresh_rate_hz = 0.0f32;
+        unsafe { (get_display_refresh_rate)(self.handle, &mut refresh_rate_hz) }
+            .to_result("xrGetDisplayRefreshRateFB")?;
+        self.active_display_refresh_rate_hz =
+            (refresh_rate_hz.is_finite() && refresh_rate_hz > 0.0).then_some(refresh_rate_hz);
+        Ok(self.active_display_refresh_rate_hz)
+    }
+
     fn create_reference_space_with_fallback(
         xr: &LibOpenXr,
         session: XrSession,
@@ -616,7 +807,7 @@ impl CxOpenXrSession {
         system_id: XrSystemId,
         session: XrSession,
         options: CxOpenXrOptions,
-    ) -> Result<(XrSpace, XrSpace, u32, u32), String> {
+    ) -> Result<(XrSpace, XrSpace, u32, u32, u32, u32), String> {
         let configs = xr_array_fetch(XrViewConfigurationType::default(), |cap, len, buf| {
             unsafe { (xr.xrEnumerateViewConfigurations)(instance, system_id, cap, len, buf) }
                 .to_result("xrEnumerateViewConfigurations")
@@ -671,12 +862,19 @@ impl CxOpenXrSession {
                 XrReferenceSpaceType::LOCAL,
             ],
         )?;
-        let width =
-            ((config_views[0].recommended_image_rect_width as f32) * options.buffer_scale) as u32;
-        let height =
-            ((config_views[0].recommended_image_rect_height as f32) * options.buffer_scale) as u32;
+        let recommended_width = config_views[0].recommended_image_rect_width;
+        let recommended_height = config_views[0].recommended_image_rect_height;
+        let width = ((recommended_width as f32) * options.buffer_scale).max(1.0) as u32;
+        let height = ((recommended_height as f32) * options.buffer_scale).max(1.0) as u32;
 
-        Ok((head_space, local_space, width, height))
+        Ok((
+            head_space,
+            local_space,
+            recommended_width,
+            recommended_height,
+            width,
+            height,
+        ))
     }
 
     fn create_passthrough_and_depth(
@@ -785,10 +983,15 @@ impl CxOpenXrSession {
         #[cfg(use_vulkan)]
         let mut session = self;
         #[cfg(not(use_vulkan))]
-        let session = self;
+        let mut session = self;
+
+        if session.active {
+            unsafe { (xr.xrEndSession)(session.handle) }.log_error("xrEndSession");
+            session.active = false;
+        }
 
         #[cfg(use_vulkan)]
-        session.destroy_session_vulkan(vulkan);
+        session.destroy_session_vulkan(xr, vulkan);
         // alright lets destroy some things on the session
         unsafe { (xr.xrStopEnvironmentDepthProviderMETA)(session.depth_provider) }
             .log_error("xrStopEnvironmentDepthProviderMETA");
@@ -805,25 +1008,26 @@ impl CxOpenXrSession {
         unsafe { (xr.xrDestroySpace)(session.local_space) }.log_error("xrDestroySpace");
         unsafe { (xr.xrDestroySession)(session.handle) }.log_error("xrDestroySession");
         session.destroy_session_gles(gl);
+        session.inputs.destroy_input(xr);
 
         Ok(())
     }
 
     fn begin_session(&mut self, xr: &LibOpenXr, activity_thread: u64, render_thread: u64) {
         assert!(self.active == false);
-
         let session_begin_info = XrSessionBeginInfo {
             ty: XrStructureType::SESSION_BEGIN_INFO,
             next: 0 as *const _,
             primary_view_configuration_type: XrViewConfigurationType::PRIMARY_STEREO,
         };
 
-        if unsafe { (xr.xrBeginSession)(self.handle, &session_begin_info) } != XrResult::SUCCESS {
+        let begin_result = unsafe { (xr.xrBeginSession)(self.handle, &session_begin_info) };
+        if begin_result != XrResult::SUCCESS {
+            crate::error!("OpenXR begin_session failed: {:?}", begin_result);
             return;
         }
 
         self.active = true;
-
         unsafe {
             (xr.xrPerfSettingsSetPerformanceLevelEXT)(
                 self.handle,
@@ -859,9 +1063,18 @@ impl CxOpenXrSession {
             )
         }
         .log_error("xrSetAndroidApplicationThreadKHR");
+
+        if let Err(err) = self.update_active_display_refresh_rate(xr) {
+            crate::warning!("OpenXR failed to query active display refresh rate: {err}");
+        }
     }
 
     fn end_session(&mut self, xr: &LibOpenXr) {
+        crate::log!(
+            "OpenXR end_session handle={:?} active={}",
+            self.handle,
+            self.active
+        );
         unsafe { (xr.xrEndSession)(self.handle) }.log_error("xrEndSession");
         self.active = false;
     }
@@ -888,8 +1101,12 @@ pub struct CxOpenXrFrame {
 }
 
 impl CxOpenXrFrame {
-    fn begin_frame(xr: &LibOpenXr, session: &CxOpenXrSession) -> Result<CxOpenXrFrame, ()> {
+    fn begin_frame(xr: &LibOpenXr, session: &mut CxOpenXrSession) -> Result<CxOpenXrFrame, ()> {
         if !session.active {
+            if session.debug_inactive_begin_frame_logs < 5 {
+                crate::log!("OpenXR begin_frame skipped because session is not active yet");
+                session.debug_inactive_begin_frame_logs += 1;
+            }
             return Err(());
         }
 
@@ -954,13 +1171,15 @@ impl CxOpenXrFrame {
             timeout: XrDuration(1000000000),
             ..Default::default()
         };
+        let mut wait_retries = 0;
         loop {
             if unsafe { (xr.xrWaitSwapchainImage)(session.color_swap_chain, &wait_info) }
                 != XrResult::TIMEOUT_EXPIRED
             {
                 break;
             }
-            crate::log!("retry xrWaitSwapchainImage");
+            wait_retries += 1;
+            crate::log!("OpenXR retry xrWaitSwapchainImage retry={wait_retries}");
         }
 
         let environment_depth_acquire_info = XrEnvironmentDepthImageAcquireInfoMETA {
@@ -1036,7 +1255,7 @@ impl CxOpenXrFrame {
         //crate::log!("{:?}", fs);
     }
 
-    fn end_frame(self, xr: &LibOpenXr, session: &CxOpenXrSession) {
+    fn end_frame(self, xr: &LibOpenXr, session: &mut CxOpenXrSession) {
         let release_info = XrSwapchainImageReleaseInfo::default();
 
         unsafe { (xr.xrReleaseSwapchainImage)(session.color_swap_chain, &release_info) }
@@ -1103,4 +1322,5 @@ pub struct CxOpenXrOptions {
     pub buffer_scale: f32,
     pub multisamples: usize,
     pub remove_hands_from_depth: bool,
+    pub fixed_foveation_level: u8,
 }

@@ -22794,6 +22794,7 @@ pub struct D3D11_CRYPTO_SESSION_STATUS(pub i32);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct D3D11_CULL_MODE(pub i32);
 pub const D3D11_CULL_NONE: D3D11_CULL_MODE = D3D11_CULL_MODE(1i32);
+pub const D3D11_CULL_BACK: D3D11_CULL_MODE = D3D11_CULL_MODE(3i32);
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct D3D11_DEPTH_STENCILOP_DESC {
@@ -23162,6 +23163,7 @@ pub const D3D11_RESOURCE_MISC_TEXTURECUBE: D3D11_RESOURCE_MISC_FLAG = D3D11_RESO
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct D3D11_RTV_DIMENSION(pub i32);
+pub const D3D11_RTV_DIMENSION_TEXTURE2DARRAY: D3D11_RTV_DIMENSION = D3D11_RTV_DIMENSION(5i32);
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct D3D11_SAMPLER_DESC {
@@ -23196,6 +23198,8 @@ impl Default for D3D11_SHADER_RESOURCE_VIEW_DESC {
         unsafe { core::mem::zeroed() }
     }
 }
+#[cfg(feature = "Win32_Graphics_Direct3D")]
+pub const D3D11_SRV_DIMENSION_TEXTURECUBE: super::Direct3D::D3D_SRV_DIMENSION = super::Direct3D::D3D_SRV_DIMENSION(8i32);
 #[repr(C)]
 #[cfg(all(feature = "Win32_Graphics_Direct3D", feature = "Win32_Graphics_Dxgi_Common"))]
 #[derive(Clone, Copy)]
@@ -32863,6 +32867,7 @@ pub struct DXGI_COLOR_SPACE_TYPE(pub i32);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DXGI_FORMAT(pub i32);
+pub const DXGI_FORMAT_R8G8B8A8_UNORM: DXGI_FORMAT = DXGI_FORMAT(28i32);
 pub const DXGI_FORMAT_B8G8R8A8_UNORM: DXGI_FORMAT = DXGI_FORMAT(87i32);
 pub const DXGI_FORMAT_D32_FLOAT: DXGI_FORMAT = DXGI_FORMAT(40i32);
 pub const DXGI_FORMAT_R16_FLOAT: DXGI_FORMAT = DXGI_FORMAT(54i32);
@@ -44831,6 +44836,40 @@ pub struct XINPUT_STATE {
 }
 }
 pub mod Shell{
+pub const FOLDERID_LocalAppData: windows_core::GUID = windows_core::GUID::from_u128(0xf1b32785_6fba_4fcf_9d55_7b8e7f157091);
+pub const KF_FLAG_DEFAULT: KNOWN_FOLDER_FLAG = KNOWN_FOLDER_FLAG(0i32);
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KNOWN_FOLDER_FLAG(pub i32);
+impl KNOWN_FOLDER_FLAG {
+    pub const fn contains(&self, other: Self) -> bool { self.0 & other.0 == other.0 }
+}
+impl core::ops::BitOr for KNOWN_FOLDER_FLAG {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self { Self(self.0 | other.0) }
+}
+impl core::ops::BitAnd for KNOWN_FOLDER_FLAG {
+    type Output = Self;
+    fn bitand(self, other: Self) -> Self { Self(self.0 & other.0) }
+}
+impl core::ops::BitOrAssign for KNOWN_FOLDER_FLAG {
+    fn bitor_assign(&mut self, other: Self) { self.0.bitor_assign(other.0) }
+}
+impl core::ops::BitAndAssign for KNOWN_FOLDER_FLAG {
+    fn bitand_assign(&mut self, other: Self) { self.0.bitand_assign(other.0) }
+}
+impl core::ops::Not for KNOWN_FOLDER_FLAG {
+    type Output = Self;
+    fn not(self) -> Self { Self(self.0.not()) }
+}
+#[inline]
+pub unsafe fn SHGetKnownFolderPath(rfid: *const windows_core::GUID, dwflags: KNOWN_FOLDER_FLAG, htoken: Option<super::super::Foundation::HANDLE>) -> windows_core::Result<windows_core::PWSTR> {
+    windows_core::link!("shell32.dll" "system" fn SHGetKnownFolderPath(rfid : *const windows_core::GUID, dwflags : u32, htoken : super::super::Foundation::HANDLE, ppszpath : *mut windows_core::PWSTR) -> windows_core::HRESULT);
+    unsafe {
+        let mut result__ = core::mem::zeroed();
+        SHGetKnownFolderPath(rfid, dwflags.0 as _, htoken.unwrap_or(core::mem::zeroed()), &mut result__).map(|| result__)
+    }
+}
 pub mod PropertiesSystem{
 windows_core::imp::define_interface!(IPropertyStore, IPropertyStore_Vtbl, 0x886d8eeb_8cf2_4446_8d02_cdba1dbdcf99);
 windows_core::imp::interface_hierarchy!(IPropertyStore, windows_core::IUnknown);

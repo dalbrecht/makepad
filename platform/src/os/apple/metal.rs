@@ -176,10 +176,16 @@ impl Cx {
                 .kind
                 .sub_list()
             {
+                let child_resets_zbias = self.draw_lists[sub_list_id].reset_zbias;
+                let mut child_zbias = 0.0f32;
                 self.render_view(
                     draw_pass_id,
                     sub_list_id,
-                    zbias,
+                    if child_resets_zbias {
+                        &mut child_zbias
+                    } else {
+                        zbias
+                    },
                     zbias_step,
                     encoder,
                     metal_cx,
@@ -612,7 +618,9 @@ impl Cx {
             )
             .unwrap();
 
-        self.passes[draw_pass_id].set_ortho_matrix(pass_rect.pos, pass_rect.size);
+        if !self.passes[draw_pass_id].keep_camera_matrix {
+            self.passes[draw_pass_id].set_ortho_matrix(pass_rect.pos, pass_rect.size);
+        }
 
         self.passes[draw_pass_id].paint_dirty = false;
 
@@ -682,6 +690,10 @@ impl Cx {
                             setTexture: texture.as_id()
                         ]
                     };
+                    if let Some(cube_face) = color_texture.cube_face {
+                        let () = unsafe { msg_send![color_attachment, setSlice: cube_face as u64] };
+                    }
+                    let () = unsafe { msg_send![color_attachment, setLevel: 0u64] };
                 } else {
                     crate::error!("draw_pass_to_texture invalid render target");
                 }
@@ -1428,6 +1440,7 @@ impl DrawVars {
             // Not in function cache, need to compile
             let mut output = ShaderOutput::default();
             output.backend = ShaderBackend::Metal;
+            output.use_vulkan = false;
 
             output.pre_collect_rust_instance_io(vm, io_self);
             output.pre_collect_shader_io(vm, io_self);
@@ -2302,16 +2315,26 @@ impl CxTexture {
             let descriptor = RcObjcId::from_owned(
                 NonNull::new(unsafe { msg_send![class!(MTLTextureDescriptor), new] }).unwrap(),
             );
+            let is_cube = matches!(&self.format, TextureFormat::RenderCubeBGRAu8 { .. });
 
-            let _: () =
-                unsafe { msg_send![descriptor.as_id(), setTextureType: MTLTextureType::D2] };
+            let _: () = unsafe {
+                msg_send![
+                    descriptor.as_id(),
+                    setTextureType: if is_cube {
+                        MTLTextureType::Cube
+                    } else {
+                        MTLTextureType::D2
+                    }
+                ]
+            };
             let _: () = unsafe { msg_send![descriptor.as_id(), setWidth: alloc.width as u64] };
             let _: () = unsafe { msg_send![descriptor.as_id(), setHeight: alloc.height as u64] };
             let _: () = unsafe { msg_send![descriptor.as_id(), setDepth: 1u64] };
             let _: () =
                 unsafe { msg_send![descriptor.as_id(), setStorageMode: MTLStorageMode::Private] };
-            let _: () =
-                unsafe { msg_send![descriptor.as_id(), setUsage: MTLTextureUsage::RenderTarget] };
+            let _: () = unsafe {
+                msg_send![descriptor.as_id(), setUsage: (MTLTextureUsage::RenderTarget as u64 | MTLTextureUsage::ShaderRead as u64)]
+            };
             let _: () = unsafe {
                 msg_send![descriptor.as_id(),setPixelFormat: texture_pixel_to_mtl_pixel(&alloc.pixel)]
             };

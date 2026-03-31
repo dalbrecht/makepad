@@ -66,6 +66,7 @@ impl DrawVars {
 
             let mut output = ShaderOutput::default();
             output.backend = ShaderBackend::Glsl;
+            output.use_vulkan = cfg!(use_vulkan);
             output.pre_collect_rust_instance_io(vm, io_self);
             output.pre_collect_shader_io(vm, io_self);
 
@@ -111,26 +112,37 @@ impl DrawVars {
             output.assign_uniform_buffer_indices(&vm.bx.heap, 3);
 
             #[cfg(use_vulkan)]
-            let mut compiled_vulkan_shader: Option<CxVulkanShaderBinary> = None;
+            let mut compiled_vulkan_shader: [Option<CxVulkanShaderBinary>;
+                NUM_SHADER_VARIANTS] = std::array::from_fn(|_| None);
 
             #[cfg(use_vulkan)]
             {
-                match crate::os::linux::vulkan_naga::compile_draw_shader_wgsl_to_spirv(
-                    vm, io_self, &output,
-                ) {
-                    Ok(vk_shader) => compiled_vulkan_shader = Some(vk_shader),
-                    Err(err) => {
-                        use std::sync::atomic::{AtomicUsize, Ordering};
-                        static ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
-                        const MAX_ERROR_LOGS: usize = 1;
-                        let index = ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                        if index < MAX_ERROR_LOGS {
-                            crate::error!("Vulkan WGSL/SPIR-V compilation failed: {}", err);
-                        } else if index == MAX_ERROR_LOGS {
-                            crate::warning!(
-                                "Suppressing further Vulkan WGSL/SPIR-V compilation logs after {} errors",
-                                MAX_ERROR_LOGS
-                            );
+                for (shader_variant, xr_multiview) in [false, true].into_iter().enumerate() {
+                    match crate::os::linux::vulkan_naga::compile_draw_shader_wgsl_to_spirv(
+                        vm,
+                        io_self,
+                        &output,
+                        xr_multiview,
+                    ) {
+                        Ok(vk_shader) => compiled_vulkan_shader[shader_variant] = Some(vk_shader),
+                        Err(err) => {
+                            use std::sync::atomic::{AtomicUsize, Ordering};
+                            static ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
+                            const MAX_ERROR_LOGS: usize = 2;
+                            let index = ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+                            if index < MAX_ERROR_LOGS {
+                                let variant_name = if xr_multiview { "xr" } else { "window" };
+                                crate::error!(
+                                    "Vulkan WGSL/SPIR-V compilation failed for {} variant: {}",
+                                    variant_name,
+                                    err
+                                );
+                            } else if index == MAX_ERROR_LOGS {
+                                crate::warning!(
+                                    "Suppressing further Vulkan WGSL/SPIR-V compilation logs after {} errors",
+                                    MAX_ERROR_LOGS
+                                );
+                            }
                         }
                     }
                 }
@@ -208,21 +220,21 @@ impl DrawVars {
             let os_shader_id = {
                 #[cfg(use_vulkan)]
                 {
-                    if let Some(vk_shader) = compiled_vulkan_shader.clone() {
+                    if compiled_vulkan_shader.iter().any(|shader| shader.is_some()) {
                         let cx = vm.host.cx_mut();
                         let mut os_shader_id = None;
                         for (shader_index, os_shader) in
                             cx.draw_shaders.os_shaders.iter_mut().enumerate()
                         {
                             if os_shader.in_vertex == vertex && os_shader.in_pixel == fragment {
-                                os_shader.vulkan_shader = Some(vk_shader.clone());
+                                os_shader.vulkan_shader = compiled_vulkan_shader.clone();
                                 os_shader_id = Some(shader_index);
                                 break;
                             }
                         }
                         if os_shader_id.is_none() {
                             let mut os_shader = CxOsDrawShader::new_vulkan_only(&vertex, &fragment);
-                            os_shader.vulkan_shader = Some(vk_shader);
+                            os_shader.vulkan_shader = compiled_vulkan_shader;
                             os_shader_id = Some(cx.draw_shaders.os_shaders.len());
                             cx.draw_shaders.os_shaders.push(os_shader);
                         }
@@ -292,7 +304,18 @@ impl Cx {
                 .kind
                 .sub_list()
             {
-                self.render_view(draw_pass_id, sub_list_id, zbias, zbias_step);
+                let child_resets_zbias = self.draw_lists[sub_list_id].reset_zbias;
+                let mut child_zbias = 0.0f32;
+                self.render_view(
+                    draw_pass_id,
+                    sub_list_id,
+                    if child_resets_zbias {
+                        &mut child_zbias
+                    } else {
+                        zbias
+                    },
+                    zbias_step,
+                );
             } else {
                 let gl = self.os.gl();
 
@@ -314,6 +337,7 @@ impl Cx {
                     self.demo_time_repaint = true;
                 }
                 let shp = &mut self.draw_shaders.os_shaders[sh.os_shader_id.unwrap()];
+                shp.ensure_gl_shader_sources(self.os.gl(), &self.os_type);
 
                 let shader_variant = self.passes[draw_pass_id].os.shader_variant;
 
@@ -624,7 +648,10 @@ impl Cx {
                             let bind_target = match cxtexture.format {
                                 #[cfg(target_os = "android")]
                                 TextureFormat::VideoExternal => gl_sys::TEXTURE_EXTERNAL_OES,
-                                TextureFormat::VecCubeBGRAu8_32 { .. } => gl_sys::TEXTURE_CUBE_MAP,
+                                TextureFormat::VecCubeBGRAu8_32 { .. }
+                                | TextureFormat::RenderCubeBGRAu8 { .. } => {
+                                    gl_sys::TEXTURE_CUBE_MAP
+                                }
                                 _ => gl_sys::TEXTURE_2D,
                             };
                             if let Some(texture) = cxtexture.os.gl_texture {
@@ -715,7 +742,9 @@ impl Cx {
             return None;
         }
 
-        pass.set_ortho_matrix(pass_rect.pos, pass_rect.size);
+        if !pass.keep_camera_matrix {
+            pass.set_ortho_matrix(pass_rect.pos, pass_rect.size);
+        }
         pass.set_dpi_factor(dpi_factor);
 
         pass.os
@@ -763,6 +792,7 @@ impl Cx {
             [crate::draw_pass::CxDrawPassColorTexture {
                 clear_color: DrawPassClearColor::ClearWith(self.passes[draw_pass_id].clear_color),
                 texture: texture.clone(),
+                cube_face: None,
             }]
         });
         let color_textures = color_textures_from_fb_texture
@@ -793,10 +823,15 @@ impl Cx {
                 .gl_texture
             {
                 unsafe {
+                    let attachment_target = if let Some(cube_face) = color_texture.cube_face {
+                        gl_sys::TEXTURE_CUBE_MAP_POSITIVE_X + cube_face
+                    } else {
+                        gl_sys::TEXTURE_2D
+                    };
                     (gl.glFramebufferTexture2D)(
                         gl_sys::FRAMEBUFFER,
                         gl_sys::COLOR_ATTACHMENT0 + index as u32,
-                        gl_sys::TEXTURE_2D,
+                        attachment_target,
                         gl_texture,
                         0,
                     );
@@ -967,7 +1002,7 @@ pub struct CxOsDrawShader {
     //pub const_table_uniforms: OpenglBuffer,
     pub live_uniforms: OpenglBuffer,
     #[cfg(use_vulkan)]
-    pub vulkan_shader: Option<CxVulkanShaderBinary>,
+    pub vulkan_shader: [Option<CxVulkanShaderBinary>; NUM_SHADER_VARIANTS],
 }
 
 pub struct GlShaderUniforms {
@@ -1036,6 +1071,29 @@ pub struct GlShader {
 }
 
 impl GlShader {
+    fn shader_source_len(source: &str) -> i32 {
+        source
+            .as_bytes()
+            .strip_suffix(b"\0")
+            .map_or(source.len(), |bytes| bytes.len()) as i32
+    }
+
+    #[cfg(target_os = "android")]
+    fn shader_source_hash(source: &str) -> LiveId {
+        live_id!(glsl_source).str_append(source)
+    }
+
+    #[cfg(target_os = "android")]
+    fn shader_source_preview(source: &str) -> String {
+        source
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect()
+    }
+
     pub fn new(
         gl: &LibGl,
         vertex: &str,
@@ -1154,15 +1212,76 @@ impl GlShader {
             let program = if let Some(program) = read_cache(gl, &vertex, &pixel, os_type) {
                 program
             } else {
+                let vertex_len = Self::shader_source_len(vertex);
+                let pixel_len = Self::shader_source_len(pixel);
+                #[cfg(target_os = "android")]
+                let vertex_hash = Self::shader_source_hash(vertex);
+                #[cfg(target_os = "android")]
+                let pixel_hash = Self::shader_source_hash(pixel);
+
+                #[cfg(target_os = "android")]
+                if matches!(os_type, OsType::Android(_)) {
+                    crate::log!(
+                        "GL shader build start renderer={} vertex_hash={:016x} vertex_len={} fragment_hash={:016x} fragment_len={} vertex_preview={:?} fragment_preview={:?}",
+                        get_gl_string(gl, gl_sys::RENDERER),
+                        vertex_hash.0,
+                        vertex_len,
+                        pixel_hash.0,
+                        pixel_len,
+                        Self::shader_source_preview(vertex),
+                        Self::shader_source_preview(pixel)
+                    );
+                }
+
                 let vs = (gl.glCreateShader)(gl_sys::VERTEX_SHADER);
-                (gl.glShaderSource)(vs, 1, [vertex.as_ptr() as *const _].as_ptr(), ptr::null());
+                let vertex_ptr = vertex.as_ptr() as *const _;
+                let vertex_ptrs = [vertex_ptr];
+                let vertex_lengths = [vertex_len];
+                #[cfg(target_os = "android")]
+                if matches!(os_type, OsType::Android(_)) {
+                    crate::log!(
+                        "GL shader upload vertex shader={} hash={:016x} len={}",
+                        vs,
+                        vertex_hash.0,
+                        vertex_len
+                    );
+                }
+                (gl.glShaderSource)(vs, 1, vertex_ptrs.as_ptr(), vertex_lengths.as_ptr());
+                #[cfg(target_os = "android")]
+                if matches!(os_type, OsType::Android(_)) {
+                    crate::log!(
+                        "GL shader compile vertex shader={} hash={:016x}",
+                        vs,
+                        vertex_hash.0
+                    );
+                }
                 (gl.glCompileShader)(vs);
                 Self::opengl_log_shader_info(gl, true, vs as usize, "vertex", vertex);
                 if let Some(error) = Self::opengl_has_shader_error(gl, true, vs as usize, &vertex) {
                     panic!("ERROR::SHADER::VERTEX::COMPILATION_FAILED\n{}", error);
                 }
                 let fs = (gl.glCreateShader)(gl_sys::FRAGMENT_SHADER);
-                (gl.glShaderSource)(fs, 1, [pixel.as_ptr() as *const _].as_ptr(), ptr::null());
+                let pixel_ptr = pixel.as_ptr() as *const _;
+                let pixel_ptrs = [pixel_ptr];
+                let pixel_lengths = [pixel_len];
+                #[cfg(target_os = "android")]
+                if matches!(os_type, OsType::Android(_)) {
+                    crate::log!(
+                        "GL shader upload fragment shader={} hash={:016x} len={}",
+                        fs,
+                        pixel_hash.0,
+                        pixel_len
+                    );
+                }
+                (gl.glShaderSource)(fs, 1, pixel_ptrs.as_ptr(), pixel_lengths.as_ptr());
+                #[cfg(target_os = "android")]
+                if matches!(os_type, OsType::Android(_)) {
+                    crate::log!(
+                        "GL shader compile fragment shader={} hash={:016x}",
+                        fs,
+                        pixel_hash.0
+                    );
+                }
                 (gl.glCompileShader)(fs);
                 Self::opengl_log_shader_info(gl, true, fs as usize, "fragment", pixel);
                 if let Some(error) = Self::opengl_has_shader_error(gl, true, fs as usize, &pixel) {
@@ -1573,6 +1692,29 @@ impl GlShader {
 }
 
 impl CxOsDrawShader {
+    fn ensure_gl_shader_sources(&mut self, gl: &LibGl, os_type: &OsType) {
+        let has_gl_sources = self.vertex.iter().all(|source| !source.is_empty())
+            && self.pixel.iter().all(|source| !source.is_empty());
+        if has_gl_sources {
+            return;
+        }
+
+        crate::log!(
+            "GL fallback materializing shader sources from stored GLSL vertex_hash={:016x} fragment_hash={:016x}",
+            live_id!(glsl_source).str_append(&self.in_vertex).0,
+            live_id!(glsl_source).str_append(&self.in_pixel).0
+        );
+
+        let mut hydrated = CxOsDrawShader::new(gl, &self.in_vertex, &self.in_pixel, os_type);
+        #[cfg(use_vulkan)]
+        {
+            hydrated.vulkan_shader = self.vulkan_shader.clone();
+        }
+        hydrated.gl_shader = std::mem::take(&mut self.gl_shader);
+        hydrated.live_uniforms = std::mem::take(&mut self.live_uniforms);
+        *self = hydrated;
+    }
+
     #[cfg(use_vulkan)]
     pub fn new_vulkan_only(in_vertex: &str, in_pixel: &str) -> Self {
         CxOsDrawShader {
@@ -1582,7 +1724,7 @@ impl CxOsDrawShader {
             pixel: [String::new(), String::new()],
             gl_shader: [None, None],
             live_uniforms: Default::default(),
-            vulkan_shader: None,
+            vulkan_shader: [None, None],
         }
     }
 
@@ -1630,6 +1772,7 @@ impl CxOsDrawShader {
 
         //#extension GL_OVR_multiview2 : require
         // layout(num_views=2) in;
+        #[cfg(not(all(target_os = "android", not(use_vulkan))))]
         let depth_clip = "
             uniform sampler2DArray xr_depth_texture;
             vec4 depth_clip(vec4 world, vec4 color, float clip){
@@ -1741,7 +1884,7 @@ impl CxOsDrawShader {
             //const_table_uniforms: Default::default(),
             live_uniforms: Default::default(),
             #[cfg(use_vulkan)]
-            vulkan_shader: None,
+            vulkan_shader: [None, None],
         }
     }
 
@@ -2327,85 +2470,89 @@ impl CxTexture {
                     self.os.gl_texture_owned = true;
                 }
             }
-            unsafe { (gl.glBindTexture)(gl_sys::TEXTURE_2D, self.os.gl_texture.unwrap()) };
+            let is_cube = matches!(&self.format, TextureFormat::RenderCubeBGRAu8 { .. });
+            let texture_target = if is_cube {
+                gl_sys::TEXTURE_CUBE_MAP
+            } else {
+                gl_sys::TEXTURE_2D
+            };
+            unsafe { (gl.glBindTexture)(texture_target, self.os.gl_texture.unwrap()) };
             match &alloc.pixel {
-                TexturePixel::BGRAu8 => unsafe {
+                TexturePixel::BGRAu8 | TexturePixel::RGBAf16 | TexturePixel::RGBAf32 => unsafe {
                     (gl.glTexParameteri)(
-                        gl_sys::TEXTURE_2D,
+                        texture_target,
                         gl_sys::TEXTURE_MIN_FILTER,
                         gl_sys::NEAREST as i32,
                     );
                     (gl.glTexParameteri)(
-                        gl_sys::TEXTURE_2D,
+                        texture_target,
                         gl_sys::TEXTURE_MAG_FILTER,
                         gl_sys::NEAREST as i32,
                     );
-                    (gl.glTexImage2D)(
-                        gl_sys::TEXTURE_2D,
-                        0,
-                        gl_sys::RGBA as i32,
-                        width as i32,
-                        height as i32,
-                        0,
-                        gl_sys::RGBA,
-                        gl_sys::UNSIGNED_BYTE,
-                        ptr::null(),
+                    (gl.glTexParameteri)(
+                        texture_target,
+                        gl_sys::TEXTURE_WRAP_S,
+                        gl_sys::CLAMP_TO_EDGE as i32,
                     );
+                    (gl.glTexParameteri)(
+                        texture_target,
+                        gl_sys::TEXTURE_WRAP_T,
+                        gl_sys::CLAMP_TO_EDGE as i32,
+                    );
+                    if is_cube {
+                        (gl.glTexParameteri)(
+                            texture_target,
+                            gl_sys::TEXTURE_WRAP_R,
+                            gl_sys::CLAMP_TO_EDGE as i32,
+                        );
+                    }
+                    let data_type = match &alloc.pixel {
+                        TexturePixel::BGRAu8 => gl_sys::UNSIGNED_BYTE,
+                        TexturePixel::RGBAf16 => gl_sys::HALF_FLOAT,
+                        TexturePixel::RGBAf32 => gl_sys::FLOAT,
+                        _ => unreachable!(),
+                    };
+                    if is_cube {
+                        for target in [
+                            gl_sys::TEXTURE_CUBE_MAP_POSITIVE_X,
+                            gl_sys::TEXTURE_CUBE_MAP_NEGATIVE_X,
+                            gl_sys::TEXTURE_CUBE_MAP_POSITIVE_Y,
+                            gl_sys::TEXTURE_CUBE_MAP_NEGATIVE_Y,
+                            gl_sys::TEXTURE_CUBE_MAP_POSITIVE_Z,
+                            gl_sys::TEXTURE_CUBE_MAP_NEGATIVE_Z,
+                        ] {
+                            (gl.glTexImage2D)(
+                                target,
+                                0,
+                                gl_sys::RGBA as i32,
+                                width as i32,
+                                height as i32,
+                                0,
+                                gl_sys::RGBA,
+                                data_type,
+                                ptr::null(),
+                            );
+                        }
+                    } else {
+                        (gl.glTexImage2D)(
+                            gl_sys::TEXTURE_2D,
+                            0,
+                            gl_sys::RGBA as i32,
+                            width as i32,
+                            height as i32,
+                            0,
+                            gl_sys::RGBA,
+                            data_type,
+                            ptr::null(),
+                        );
+                    }
                 },
-                TexturePixel::RGBAf16 => unsafe {
-                    (gl.glTexParameteri)(
-                        gl_sys::TEXTURE_2D,
-                        gl_sys::TEXTURE_MIN_FILTER,
-                        gl_sys::NEAREST as i32,
-                    );
-                    (gl.glTexParameteri)(
-                        gl_sys::TEXTURE_2D,
-                        gl_sys::TEXTURE_MAG_FILTER,
-                        gl_sys::NEAREST as i32,
-                    );
-                    (gl.glTexImage2D)(
-                        gl_sys::TEXTURE_2D,
-                        0,
-                        gl_sys::RGBA as i32,
-                        width as i32,
-                        height as i32,
-                        0,
-                        gl_sys::RGBA,
-                        gl_sys::HALF_FLOAT,
-                        ptr::null(),
-                    );
-                },
-                TexturePixel::RGBAf32 => unsafe {
-                    (gl.glTexParameteri)(
-                        gl_sys::TEXTURE_2D,
-                        gl_sys::TEXTURE_MIN_FILTER,
-                        gl_sys::NEAREST as i32,
-                    );
-                    (gl.glTexParameteri)(
-                        gl_sys::TEXTURE_2D,
-                        gl_sys::TEXTURE_MAG_FILTER,
-                        gl_sys::NEAREST as i32,
-                    );
-                    (gl.glTexImage2D)(
-                        gl_sys::TEXTURE_2D,
-                        0,
-                        gl_sys::RGBA as i32,
-                        width as i32,
-                        height as i32,
-                        0,
-                        gl_sys::RGBA,
-                        gl_sys::FLOAT,
-                        ptr::null(),
-                    );
-                },
-                _ => {
-                    crate::error!(
-                        "Unsupported texture pixel format for OpenGL render target allocation"
-                    );
-                }
+                _ => crate::error!(
+                    "Unsupported texture pixel format for OpenGL render target allocation"
+                ),
             }
             unsafe {
-                (gl.glBindTexture)(gl_sys::TEXTURE_2D, 0);
+                (gl.glBindTexture)(texture_target, 0);
             }
         }
     }

@@ -1,4 +1,4 @@
-use crate::{cx_2d::Cx2d, draw_list_2d::ManyInstances, makepad_platform::*};
+use crate::{cx_draw::CxDraw, draw_list_2d::ManyInstances, makepad_platform::*};
 
 script_mod! {
     use mod.pod.*
@@ -8,6 +8,8 @@ script_mod! {
     use mod.geom
 
     mod.draw.DrawCube = mod.std.set_type_default() do #(DrawCube::script_shader(vm)){
+        alpha_blend: false
+        backface_culling: true
         vertex_pos: vertex_position(vec4f)
         fb0: fragment_output(0, vec4f)
         draw_call: uniform_buffer(draw.DrawCallUniforms)
@@ -44,14 +46,7 @@ script_mod! {
             let normal = normalize(normal4.xyz);
             self.world = model_view * vec4(pos.x, pos.y, pos.z, 1.0);
             let view_pos = self.draw_pass.camera_view * self.world;
-            let view_normal4 = self.draw_pass.camera_view * vec4(normal.x, normal.y, normal.z, 0.0);
-            let view_normal = normalize(view_normal4.xyz);
-            if dot(view_normal, -view_pos.xyz) <= 0.0 {
-                self.vertex_pos = vec4(2.0, 2.0, 2.0, 1.0);
-                return
-            }
-
-            let dp = max(dot(normal, normalize(vec3(0.35, 0.8, 0.45))), 0.0);
+            let dp = max(dot(normal, normalize(self.light_dir)), 0.0);
             self.lit_color = self.get_color(dp);
             self.vertex_pos = self.draw_pass.camera_projection * view_pos;
         }
@@ -75,6 +70,8 @@ pub struct DrawCube {
     pub draw_vars: DrawVars,
     #[live]
     pub color: Vec4f,
+    #[live(vec3(0.35, 0.8, 0.45))]
+    pub light_dir: Vec3f,
     #[live]
     pub transform: Mat4f,
     #[live(vec3(1.0, 1.0, 1.0))]
@@ -86,24 +83,29 @@ pub struct DrawCube {
 }
 
 impl DrawCube {
-    pub fn draw(&mut self, cx: &mut Cx2d) {
+    fn apply_draw_uniforms(&mut self, _cx: &mut CxDraw) {}
+
+    pub fn draw(&mut self, cx: &mut CxDraw) {
+        self.apply_draw_uniforms(cx);
         if let Some(mi) = &mut self.many_instances {
             mi.instances.extend_from_slice(self.draw_vars.as_slice());
         } else if self.draw_vars.can_instance() {
-            let new_area = cx.add_aligned_instance(&self.draw_vars);
+            let new_area = cx.add_instance(&self.draw_vars);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
         }
     }
 
-    pub fn new_draw_call(&mut self, cx: &mut Cx2d) {
+    pub fn new_draw_call(&mut self, cx: &mut CxDraw) {
+        self.apply_draw_uniforms(cx);
         cx.new_draw_call(&self.draw_vars);
     }
 
-    pub fn begin_many_instances(&mut self, cx: &mut Cx2d) {
-        self.many_instances = cx.begin_many_aligned_instances(&self.draw_vars);
+    pub fn begin_many_instances(&mut self, cx: &mut CxDraw) {
+        self.apply_draw_uniforms(cx);
+        self.many_instances = cx.begin_many_instances(&self.draw_vars);
     }
 
-    pub fn end_many_instances(&mut self, cx: &mut Cx2d) {
+    pub fn end_many_instances(&mut self, cx: &mut CxDraw) {
         if let Some(mi) = self.many_instances.take() {
             let new_area = cx.end_many_instances(mi);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);

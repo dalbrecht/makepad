@@ -26,6 +26,14 @@ impl DrawList {
     pub fn new(cx: &mut Cx) -> Self {
         cx.draw_lists.alloc()
     }
+
+    pub fn set_reset_zbias(&self, cx: &mut Cx, reset_zbias: bool) {
+        cx.draw_lists[self.id()].reset_zbias = reset_zbias;
+    }
+
+    pub fn reset_zbias(&self, cx: &Cx) -> bool {
+        cx.draw_lists[self.id()].reset_zbias
+    }
 }
 
 impl ScriptHook for DrawList {}
@@ -558,6 +566,7 @@ pub struct CxDrawList {
     pub debug_id: LiveId,
     pub debug_dump: bool,
     pub debug_dump_count: u32,
+    pub reset_zbias: bool,
 
     pub codeflow_parent_id: Option<DrawListId>, // the id of the parent we nest in, codeflow wise
 
@@ -848,6 +857,7 @@ impl CxDrawList {
     pub fn clear_draw_items(&mut self, redraw_id: u64) {
         self.redraw_id = redraw_id;
         self.draw_items.clear();
+        self.draw_item_reorder = None;
         self.rect_areas.clear();
         self.find_appendable_draw_shader_check.clear();
     }

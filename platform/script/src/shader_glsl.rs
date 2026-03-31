@@ -141,10 +141,7 @@ impl ShaderOutput {
             let field_name = self.backend.map_field_name(field.name);
             let type_name = self.glsl_type_name_inline(&field.ty);
             match field_name.as_str() {
-                "camera_projection"
-                | "camera_view"
-                | "depth_projection"
-                | "depth_view"
+                "camera_projection" | "camera_view" | "depth_projection" | "depth_view"
                 | "camera_inv" => {
                     writeln!(out, "    {} {}[2];", type_name, field_name).ok();
                 }
@@ -152,8 +149,7 @@ impl ShaderOutput {
                 | "camera_view_r"
                 | "depth_projection_r"
                 | "depth_view_r"
-                | "camera_inv_r" => {
-                }
+                | "camera_inv_r" => {}
                 _ => {
                     writeln!(out, "    {} {};", type_name, field_name).ok();
                 }
@@ -170,7 +166,7 @@ impl ShaderOutput {
                 writeln!(
                     out,
                     "uniform {} tex_{};",
-                    Self::glsl_sampler_type(tex_type),
+                    self.glsl_sampler_type(tex_type),
                     tex_name
                 )
                 .ok();
@@ -773,7 +769,7 @@ impl ShaderOutput {
         }
     }
 
-    fn glsl_sampler_type(tex_type: TextureType) -> &'static str {
+    fn glsl_sampler_type(&self, tex_type: TextureType) -> &'static str {
         match tex_type {
             TextureType::Texture1d => "sampler2D",
             TextureType::Texture1dArray => "sampler2DArray",
@@ -786,7 +782,7 @@ impl ShaderOutput {
             TextureType::TextureDepth => "sampler2D",
             TextureType::TextureDepthArray => "sampler2DArray",
             TextureType::TextureVideo => {
-                if cfg!(target_os = "android") && !cfg!(use_vulkan) {
+                if cfg!(target_os = "android") && !self.use_vulkan {
                     "samplerExternalOES"
                 } else {
                     "sampler2D"

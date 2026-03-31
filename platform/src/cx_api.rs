@@ -36,6 +36,69 @@ pub enum OpenUrlInPlace {
     Yes,
     No,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SystemBrowserId(pub LiveId);
+
+impl From<LiveId> for SystemBrowserId {
+    fn from(value: LiveId) -> Self {
+        Self(value)
+    }
+}
+
+pub struct CxSystemBrowser<'a> {
+    cx: &'a mut Cx,
+    id: SystemBrowserId,
+}
+
+impl<'a> CxSystemBrowser<'a> {
+    pub fn id(&self) -> SystemBrowserId {
+        self.id
+    }
+
+    pub fn spawn(&mut self, url: &str) {
+        self.cx.platform_ops.push(CxOsOp::SpawnSystemBrowser {
+            browser_id: self.id.0,
+            url: url.to_string(),
+        });
+    }
+
+    pub fn update(&mut self, area: Area, visible: bool) {
+        self.cx.platform_ops.push(CxOsOp::UpdateSystemBrowser {
+            browser_id: self.id.0,
+            area,
+            visible,
+        });
+    }
+
+    pub fn detach(&mut self) {
+        self.cx.platform_ops.push(CxOsOp::DetachSystemBrowser {
+            browser_id: self.id.0,
+        });
+    }
+
+    pub fn set_url(&mut self, url: &str, replace: bool) {
+        self.cx.platform_ops.push(CxOsOp::SetSystemBrowserUrl {
+            browser_id: self.id.0,
+            url: url.to_string(),
+            replace,
+        });
+    }
+
+    pub fn history_go(&mut self, delta: i32) {
+        self.cx.platform_ops.push(CxOsOp::SystemBrowserHistoryGo {
+            browser_id: self.id.0,
+            delta,
+        });
+    }
+
+    pub fn close(&mut self) {
+        self.cx.platform_ops.push(CxOsOp::CloseSystemBrowser {
+            browser_id: self.id.0,
+        });
+    }
+}
+
 pub trait CxOsApi {
     fn init_cx_os(&mut self);
 
@@ -70,6 +133,22 @@ pub trait CxOsApi {
 
     fn micro_zbias_step(&self) -> f32 {
         0.00001
+    }
+
+    fn xr_render_scale(&self) -> Option<f64> {
+        None
+    }
+
+    fn xr_gpu_frame_time_ms(&self) -> Option<f64> {
+        None
+    }
+
+    fn xr_display_refresh_rate_hz(&self) -> Option<f64> {
+        None
+    }
+
+    fn xr_effective_frame_rate_hz(&self) -> Option<f64> {
+        None
     }
 
     /*
@@ -195,6 +274,30 @@ pub enum CxOsOp {
     DetachCameraNativePreview {
         video_id: LiveId,
     },
+    SpawnSystemBrowser {
+        browser_id: LiveId,
+        url: String,
+    },
+    UpdateSystemBrowser {
+        browser_id: LiveId,
+        area: Area,
+        visible: bool,
+    },
+    DetachSystemBrowser {
+        browser_id: LiveId,
+    },
+    SetSystemBrowserUrl {
+        browser_id: LiveId,
+        url: String,
+        replace: bool,
+    },
+    SystemBrowserHistoryGo {
+        browser_id: LiveId,
+        delta: i32,
+    },
+    CloseSystemBrowser {
+        browser_id: LiveId,
+    },
     PrepareAudioPlayback(LiveId, VideoSource, bool, bool),
     BeginVideoPlayback(LiveId),
     PauseVideoPlayback(LiveId),
@@ -226,6 +329,7 @@ pub enum CxOsOp {
     SelectFolderDialog(FileDialog),
 
     XrStartPresenting,
+    XrSetRenderScale(f32),
     XrSetLocalAnchor(XrAnchor),
     XrAdvertiseAnchor(XrAnchor),
     XrDiscoverAnchor(u8),
@@ -281,6 +385,12 @@ impl std::fmt::Debug for CxOsOp {
             Self::AttachCameraNativePreview { .. } => write!(f, "AttachCameraNativePreview"),
             Self::UpdateCameraNativePreview { .. } => write!(f, "UpdateCameraNativePreview"),
             Self::DetachCameraNativePreview { .. } => write!(f, "DetachCameraNativePreview"),
+            Self::SpawnSystemBrowser { .. } => write!(f, "SpawnSystemBrowser"),
+            Self::UpdateSystemBrowser { .. } => write!(f, "UpdateSystemBrowser"),
+            Self::DetachSystemBrowser { .. } => write!(f, "DetachSystemBrowser"),
+            Self::SetSystemBrowserUrl { .. } => write!(f, "SetSystemBrowserUrl"),
+            Self::SystemBrowserHistoryGo { .. } => write!(f, "SystemBrowserHistoryGo"),
+            Self::CloseSystemBrowser { .. } => write!(f, "CloseSystemBrowser"),
             Self::PrepareAudioPlayback(..) => write!(f, "PrepareAudioPlayback"),
             Self::BeginVideoPlayback(..) => write!(f, "BeginVideoPlayback"),
             Self::PauseVideoPlayback(..) => write!(f, "PauseVideoPlayback"),
@@ -303,6 +413,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::RepositionWindow(..) => write!(f, "RepositionWindow"),
 
             Self::XrStartPresenting => write!(f, "XrStartPresenting"),
+            Self::XrSetRenderScale(_) => write!(f, "XrSetRenderScale"),
             Self::XrStopPresenting => write!(f, "XrStopPresenting"),
             Self::XrAdvertiseAnchor(_) => write!(f, "XrAdvertiseAnchor"),
             Self::XrSetLocalAnchor(_) => write!(f, "XrSetLocalAnchor"),
@@ -321,6 +432,22 @@ impl Cx {
 
     pub fn xr_depth_mesh(&self) -> crate::xr_depth_mesh::XrDepthMeshStore {
         crate::xr_depth_mesh::xr_depth_mesh_store()
+    }
+
+    pub fn xr_render_scale(&self) -> Option<f64> {
+        <Self as CxOsApi>::xr_render_scale(self)
+    }
+
+    pub fn xr_gpu_frame_time_ms(&self) -> Option<f64> {
+        <Self as CxOsApi>::xr_gpu_frame_time_ms(self)
+    }
+
+    pub fn xr_display_refresh_rate_hz(&self) -> Option<f64> {
+        <Self as CxOsApi>::xr_display_refresh_rate_hz(self)
+    }
+
+    pub fn xr_effective_frame_rate_hz(&self) -> Option<f64> {
+        <Self as CxOsApi>::xr_effective_frame_rate_hz(self)
     }
 
     pub fn get_ref(&self) -> CxRef {
@@ -492,6 +619,10 @@ impl Cx {
         self.platform_ops.push(CxOsOp::XrStartPresenting);
     }
 
+    pub fn xr_set_render_scale(&mut self, scale: f32) {
+        self.platform_ops.push(CxOsOp::XrSetRenderScale(scale));
+    }
+
     pub fn xr_advertise_anchor(&mut self, anchor: XrAnchor) {
         self.platform_ops.push(CxOsOp::XrAdvertiseAnchor(anchor));
     }
@@ -514,6 +645,13 @@ impl Cx {
 
     pub fn browser_history_go(&mut self, delta: i32) {
         <Self as CxOsApi>::browser_history_go(self, delta);
+    }
+
+    pub fn system_browser(&mut self, id: impl Into<SystemBrowserId>) -> CxSystemBrowser<'_> {
+        CxSystemBrowser {
+            cx: self,
+            id: id.into(),
+        }
     }
 
     // Determines whether to show your application in the dock when it runs. The default value is true.
@@ -1295,9 +1433,20 @@ fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::linux::android::android_video_playback::can_play_type(mime)
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios", target_os = "tvos"),
+    not(headless)
+))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::apple::apple_video_playback::can_play_type(mime)
+}
+
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios", target_os = "tvos"),
+    headless
+))]
+fn can_play_type_impl(_mime: &str) -> &'static str {
+    ""
 }
 
 #[cfg(target_os = "windows")]

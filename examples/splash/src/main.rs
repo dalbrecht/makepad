@@ -223,6 +223,26 @@ script_mod! {
 
             Hr{}
 
+            Label{text: "Press Hook Demo" draw_text.color: #fff draw_text.text_style.font_size: 13}
+            Label{text: "on_press fires on pointer down and can call widget methods directly" draw_text.color: #888 draw_text.text_style.font_size: 10}
+
+            View{width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}}
+            press_demo_button := Button{
+                text: "Run on_press"
+                on_press: || ui.press_status.set_text("Last press: Run on_press")
+            }
+            press_reset_button := ButtonFlat{
+                text: "Reset"
+                on_click: || ui.press_status.set_text("Last press: none")
+            }
+            press_status := Label{
+                text: "Last press: none"
+                draw_text.color: #8fd
+                draw_text.text_style.font_size: 10
+            }
+
+            Hr{}
+
             Label{text: "Bare Icons (with optional rotation)" draw_text.color: #888 draw_text.text_style.font_size: 10}
             View{width: Fill height: Fit flow: Right spacing: 15}
             Icon{
@@ -315,6 +335,11 @@ script_mod! {
             radio1 := RadioButton{text: "Option A"}
             radio2 := RadioButton{text: "Option B"}
             radio3 := RadioButton{text: "Option C"}
+
+            Hr{}
+
+            Label{text: "Quick Select" draw_text.color: #fff draw_text.text_style.font_size: 13}
+            smoke_dropdown := DropDown{labels: ["Option A" "Option B" "Option C"]}
         }
     }
 
@@ -1654,6 +1679,13 @@ impl MatchEvent for App {
             .selected(cx, actions)
         {
             log!("Radio button selected: {}", index);
+        }
+        if let Some(index) = self
+            .ui
+            .drop_down(cx, ids!(smoke_dropdown))
+            .selected(actions)
+        {
+            log!("Quick select changed: {}", index);
         }
 
         // ExpandablePanel test
