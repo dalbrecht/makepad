@@ -11,7 +11,8 @@ use {
         event::keyboard::CharOffset,
         event::xr::XrAnchor,
         event::{
-            video_playback::CameraPreviewMode, DragItem, NextFrame, Timer, Trigger, VideoSource,
+            video_playback::CameraPreviewMode, DragItem, NextFrame, Timer, Trigger,
+            VideoSource,
         },
         gpu_info::GpuInfo,
         ime::TextInputConfig,
@@ -469,30 +470,10 @@ impl Cx {
             return;
         };
         let widgets = vm.heap.module(id!(widgets));
-        vm.heap.set_value(
-            widgets,
-            id!(SAFE_INSET_PAD_TOP).into(),
-            insets.top.into(),
-            NoTrap,
-        );
-        vm.heap.set_value(
-            widgets,
-            id!(SAFE_INSET_PAD_BOTTOM).into(),
-            insets.bottom.into(),
-            NoTrap,
-        );
-        vm.heap.set_value(
-            widgets,
-            id!(SAFE_INSET_PAD_LEFT).into(),
-            insets.left.into(),
-            NoTrap,
-        );
-        vm.heap.set_value(
-            widgets,
-            id!(SAFE_INSET_PAD_RIGHT).into(),
-            insets.right.into(),
-            NoTrap,
-        );
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_TOP).into(), insets.top.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_BOTTOM).into(), insets.bottom.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_LEFT).into(), insets.left.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_RIGHT).into(), insets.right.into(), NoTrap);
     }
 
     pub fn xr_capabilities(&self) -> &XrCapabilities {

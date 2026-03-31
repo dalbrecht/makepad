@@ -283,15 +283,9 @@ impl Cx {
     /// It handles all incoming messages, processes other events, and manages drawing operations.
     pub fn main_loop(&mut self, from_java_rx: mpsc::Receiver<FromJavaMessage>) {
         self.gpu_info.performance = GpuPerformance::Tier1;
-        // Populate display_context and script heap with the initial display
-        // metrics BEFORE Startup, so app script_mod! definitions can use them.
+        // Populate display_context and script heap with safe area insets
+        // BEFORE Startup, so app script_mod! definitions can use them.
         let insets = self.os.safe_area_insets;
-        let dpi_factor = if self.os.dpi_factor > 0.0 {
-            self.os.dpi_factor
-        } else {
-            1.0
-        };
-        self.display_context.screen_size = self.os.display_size / dpi_factor;
         self.display_context.safe_area_insets = insets;
         self.update_safe_inset_script_values(insets);
         self.call_event_handler(&Event::Startup);
@@ -350,31 +344,7 @@ impl Cx {
                         self.call_event_handler(&Event::LiveEdit);
                         self.redraw_all();
                     }
-                    // Drop the frame entirely if the window surface has been
-                    // torn down (typically during background/foreground or a
-                    // rotation). Issuing GL calls without a current EGL context
-                    // — which is what `destroy_surface` leaves us in — is
-                    // undefined behavior and crashes Mali/Adreno drivers with
-                    // a SIGSEGV inside `render_view`.
-                    if self.os.has_drawable_surface() {
-                        // If we previously skipped frames because the surface
-                        // wasn't ready, the redraw request may have been consumed
-                        // by an earlier draw cycle that couldn't actually paint.
-                        // Force a full redraw on the first frame after the surface
-                        // becomes (or becomes again) drawable.
-                        if self.os.needs_first_draw {
-                            self.os.needs_first_draw = false;
-                            self.redraw_all();
-                        }
-                        self.handle_drawing();
-                    } else {
-                        // Surface not ready — remember that we need a full
-                        // redraw once it becomes available, since any pending
-                        // draw event may be consumed by handle_drawing() on
-                        // a future iteration when the surface is briefly valid
-                        // but immediately torn down again (rotation race).
-                        self.os.needs_first_draw = true;
-                    }
+                    self.handle_drawing();
                 }
                 Ok(message) => {
                     self.handle_message(message);
@@ -1281,18 +1251,8 @@ impl Cx {
                 let e = Event::ImeAction(ImeActionEvent { action });
                 self.call_event_handler(&e);
             }
-            FromJavaMessage::SafeAreaInsets {
-                top,
-                right,
-                bottom,
-                left,
-            } => {
-                let new_insets = crate::event::SafeAreaInsets {
-                    top,
-                    right,
-                    bottom,
-                    left,
-                };
+            FromJavaMessage::SafeAreaInsets { top, right, bottom, left } => {
+                let new_insets = crate::event::SafeAreaInsets { top, right, bottom, left };
                 if self.os.safe_area_insets != new_insets {
                     self.os.safe_area_insets = new_insets;
                     // Update the WindowGeom with the new safe area insets

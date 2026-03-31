@@ -622,20 +622,8 @@ impl Widget for Window {
                     // Splash code can reference mod.widgets.SAFE_INSET_PAD_*.
                     cx.update_safe_inset_script_values(ev.new_geom.safe_area_insets);
 
-                    // If the platform reports native chrome button geometry, derive
-                    // the caption bar height so the buttons are vertically centered:
-                    // height = top_margin * 2 + button_height = pos.y * 2 + size.y.
-                    let new_buttons = ev.new_geom.window_chrome_buttons;
-                    if new_buttons != Rect::default() {
-                        let h = (new_buttons.pos.y * 2.0 + new_buttons.size.y).ceil();
-                        if self.system_caption_bar_height != Some(h) {
-                            self.system_caption_bar_height = Some(h);
-                            self.view(cx, ids!(caption_bar)).redraw(cx);
-                        }
-                    }
-
-                    // If safe area insets changed, trigger a script re-apply
-                    // so widgets pick up new values.
+                    // If safe area insets changed (e.g., device rotation), trigger
+                    // a script re-apply so widgets pick up new values.
                     if old_insets != ev.new_geom.safe_area_insets {
                         cx.request_script_reapply();
                     }

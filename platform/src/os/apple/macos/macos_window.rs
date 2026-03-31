@@ -642,7 +642,6 @@ impl MacosWindow {
             outer_size: self.get_outer_size(),
             dpi_factor: self.get_dpi_factor(),
             position: self.get_position(),
-            window_chrome_buttons: self.traffic_lights_geom().unwrap_or_default(),
             ..Default::default()
         }
     }

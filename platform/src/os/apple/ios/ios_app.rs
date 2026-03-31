@@ -531,11 +531,24 @@ impl IosApp {
         Self::apply_new_window_geom(inner_size, dpi_factor, safe_area_insets);
     }
 
-    fn apply_new_window_geom(
-        inner_size: DVec2,
-        dpi_factor: f64,
-        safe_area_insets: crate::event::SafeAreaInsets,
-    ) {
+        // Query safe area insets from the MTKView (accounts for notch/Dynamic Island,
+        // home indicator, rounded corners, etc.)
+        let safe_area_insets = with_ios_app(|app| {
+            if let Some(mtk_view) = app.mtk_view {
+                unsafe {
+                    let insets: UIEdgeInsets = msg_send![mtk_view, safeAreaInsets];
+                    crate::event::SafeAreaInsets {
+                        top: insets.top,
+                        right: insets.right,
+                        bottom: insets.bottom,
+                        left: insets.left,
+                    }
+                }
+            } else {
+                crate::event::SafeAreaInsets::default()
+            }
+        });
+
         let new_geom = WindowGeom {
             xr_is_presenting: false,
             is_topmost: false,
@@ -546,7 +559,6 @@ impl IosApp {
             dpi_factor,
             position: dvec2(0.0, 0.0),
             safe_area_insets,
-            window_chrome_buttons: Rect::default(),
         };
 
         let first_draw = with_ios_app(|app| app.first_draw);
