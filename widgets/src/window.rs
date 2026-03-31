@@ -285,21 +285,6 @@ impl Window {
         }
     }
 
-    fn sync_caption_bar_height(&mut self, cx: &mut Cx) {
-        // Explicit DSL override takes priority, then system-calculated.
-        let height = self
-            .window
-            .caption_bar_height_override
-            .or(self.system_caption_bar_height);
-        if let Some(h) = height {
-            let caption_bar = self.view(cx, ids!(caption_bar));
-            if let Some(mut bar) = caption_bar.borrow_mut() {
-                bar.walk.height = Size::Fixed(h);
-            }
-            drop(caption_bar);
-        }
-    }
-
     /// Adjusts the caption label's left padding so that the title text appears
     /// centered in the full caption bar width when there's enough room.
     /// When the window is too narrow, the padding gracefully reduces to 0,
