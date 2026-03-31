@@ -47,7 +47,6 @@ fn build_metallib() {
             "macosx",
             "metal",
             "-O3",
-            "-fno-fast-math",
             "-c",
             &metal_src,
             "-I",
