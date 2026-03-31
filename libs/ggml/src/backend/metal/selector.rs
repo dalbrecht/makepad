@@ -19,14 +19,14 @@ const FC_FLASH_ATTN_EXT_VEC_REDUCE: i32 = 500;
 const FC_MUL_MV: i32 = 600;
 const FC_MUL_MM: i32 = 700;
 const FC_ROPE: i32 = 800;
-pub(super) const FC_SSM_CONV: i32 = 900;
+const FC_SSM_CONV: i32 = 900;
 const FC_SOLVE_TRI: i32 = 1000;
 const FC_COUNT_EQUAL: i32 = 1100;
 const FC_UNARY: i32 = 1200;
 const FC_BIN: i32 = 1300;
 const FC_SUM_ROWS: i32 = 1400;
 const FC_UPSCALE: i32 = 1500;
-pub(super) const FC_GATED_DELTA_NET: i32 = 1600;
+const FC_GATED_DELTA_NET: i32 = 1600;
 
 const OP_FLASH_ATTN_EXT_NQPSG: i32 = 8;
 const OP_FLASH_ATTN_EXT_NCPSG: i32 = 64;
@@ -148,7 +148,11 @@ pub struct MetalGraphPlan {
     pub total_output_tail_bytes: usize,
 }
 
-pub fn supports_program(tensors: &[Tensor], op: &Tensor, features: MetalDeviceFeatures) -> bool {
+pub fn supports_program(
+    tensors: &[Tensor],
+    op: &Tensor,
+    features: MetalDeviceFeatures,
+) -> bool {
     build_program(tensors, op, features).is_ok()
 }
 
@@ -234,9 +238,6 @@ pub fn build_graph_plan(
         let op = tensors
             .get(node_id)
             .ok_or_else(|| format!("graph references invalid tensor {}", node_id))?;
-        if is_metadata_only_op(op.op) {
-            continue;
-        }
         let program = build_program(tensors, op, features)?;
         total_output_tail_bytes = total_output_tail_bytes
             .checked_add(program.resources.output_tail_bytes)
@@ -248,10 +249,6 @@ pub fn build_graph_plan(
         nodes,
         total_output_tail_bytes,
     })
-}
-
-fn is_metadata_only_op(op: Op) -> bool {
-    matches!(op, Op::View | Op::Reshape | Op::Permute | Op::Transpose)
 }
 
 fn program_concat() -> Result<MetalOpProgram, String> {
@@ -314,9 +311,10 @@ fn program_get_rows(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProgram, S
 
 fn program_set_rows(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProgram, String> {
     let idx = src(tensors, op, 1)?;
+    let dst = src(tensors, op, 0)?;
     let base = format!(
         "kernel_set_rows_{}_{}",
-        op.desc.ty.name(),
+        dst.desc.ty.name(),
         idx.desc.ty.name()
     );
     Ok(program_with_stage(stage_simple(
@@ -445,9 +443,7 @@ fn program_cumsum(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProgram, Str
                 &format!("kernel_cumsum_add_{ty}"),
             ),
         ],
-        resources: MetalOpResources {
-            output_tail_bytes: op.nbytes(),
-        },
+        resources: MetalOpResources::default(),
     })
 }
 
@@ -526,7 +522,8 @@ fn program_ssm_scan(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProgram, S
         .map_err(|_| "ssm_scan nsg exceeds i32".to_string())?;
     let base = format!("kernel_ssm_scan_{}", src0.desc.ty.name());
     let cache = format!("{}_nsg={}", base, nsg);
-    let smem = usize::try_from(nsg).map_err(|_| "ssm_scan nsg exceeds usize".to_string())?
+    let smem = usize::try_from(nsg)
+        .map_err(|_| "ssm_scan nsg exceeds usize".to_string())?
         * (32 + 2)
         * std::mem::size_of::<f32>();
     Ok(program_with_stage(stage(
@@ -562,12 +559,9 @@ fn program_gated_delta_net(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpPro
     let src0 = src(tensors, op, 0)?;
     let src2 = src(tensors, op, 2)?;
     let src3 = src(tensors, op, 3)?;
-    let ne20 =
-        i16::try_from(src2.ne[0]).map_err(|_| "gated_delta_net ne20 exceeds i16".to_string())?;
-    let ne30 =
-        i16::try_from(src3.ne[0]).map_err(|_| "gated_delta_net ne30 exceeds i16".to_string())?;
-    let nsg = i32::try_from(src2.ne[0] / 32)
-        .map_err(|_| "gated_delta_net nsg exceeds i32".to_string())?;
+    let ne20 = i16::try_from(src2.ne[0]).map_err(|_| "gated_delta_net ne20 exceeds i16".to_string())?;
+    let ne30 = i16::try_from(src3.ne[0]).map_err(|_| "gated_delta_net ne30 exceeds i16".to_string())?;
+    let nsg = i32::try_from(src2.ne[0] / 32).map_err(|_| "gated_delta_net nsg exceeds i32".to_string())?;
     let base = format!("kernel_gated_delta_net_{}_{}", src0.desc.ty.name(), nsg);
     let cache = format!("{}_ne20={}_ne30={}", base, ne20, ne30);
     Ok(program_with_stage(stage(
@@ -595,10 +589,7 @@ fn program_solve_tri(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProgram, 
     let k = i16::try_from(src1.ne[0]).map_err(|_| "solve_tri k exceeds i16".to_string())?;
     let base = format!("kernel_solve_tri_{}", src0.desc.ty.name());
     let cache = format!("{}_nsg={}_n={}_k={}", base, nsg, n, k);
-    let smem = ggml_pad(
-        ggml_pad(n as usize, 32) * nsg as usize * std::mem::size_of::<f32>(),
-        16,
-    );
+    let smem = ggml_pad(ggml_pad(n as usize, 32) * nsg as usize * std::mem::size_of::<f32>(), 16);
     Ok(program_with_stage(stage(
         MetalStageKind::Main,
         &base,
@@ -680,7 +671,12 @@ fn program_mul_mat(
             src0.desc.ty.name(),
             src1.desc.ty.name()
         );
-        let cache = format!("{}_bci={}_bco={}", base, bool_num(bc_inp), bool_num(bc_out));
+        let cache = format!(
+            "{}_bci={}_bco={}",
+            base,
+            bool_num(bc_inp),
+            bool_num(bc_out)
+        );
         return Ok(program_with_stage(stage(
             MetalStageKind::Main,
             &base,
@@ -884,10 +880,7 @@ fn program_bin(tensors: &[Tensor], op: &Tensor, n_fuse: i16) -> Result<MetalOpPr
     };
     let is_c4 = (src0.ne[0] % 4 == 0) && (src1.ne[0] % 4 == 0);
     let is_cb = src0.ne[0] != src1.ne[0];
-    let is_rb = src0.is_contiguous()
-        && src1.is_contiguous()
-        && src1.nrows() == 1
-        && op.nelements() < 65_536;
+    let is_rb = src0.is_contiguous() && src1.is_contiguous() && src1.nrows() == 1 && op.nelements() < 65_536;
     let suffix = if is_c4 { "_4" } else { "" };
     let base = format!(
         "kernel_bin_fuse_{}_{}_{}{}",
@@ -1086,11 +1079,7 @@ fn program_conv_transpose_2d(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpP
 fn program_conv2d(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProgram, String> {
     let src0 = src(tensors, op, 0)?;
     let src1 = src(tensors, op, 1)?;
-    let base = format!(
-        "kernel_conv_2d_{}_{}",
-        src0.desc.ty.name(),
-        src1.desc.ty.name()
-    );
+    let base = format!("kernel_conv_2d_{}_{}", src0.desc.ty.name(), src1.desc.ty.name());
     Ok(program_with_stage(stage_simple(
         MetalStageKind::Main,
         &base,
@@ -1101,11 +1090,7 @@ fn program_conv2d(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProgram, Str
 fn program_conv3d(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProgram, String> {
     let src0 = src(tensors, op, 0)?;
     let src1 = src(tensors, op, 1)?;
-    let base = format!(
-        "kernel_conv_3d_{}_{}",
-        src0.desc.ty.name(),
-        src1.desc.ty.name()
-    );
+    let base = format!("kernel_conv_3d_{}_{}", src0.desc.ty.name(), src1.desc.ty.name());
     Ok(program_with_stage(stage_simple(
         MetalStageKind::Main,
         &base,
@@ -1294,7 +1279,12 @@ fn program_flash_attn_ext(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProg
         let has_kvpad = k.ne[1] % i64::from(ncpsg) != 0;
         if has_kvpad {
             let pad_base = "kernel_flash_attn_ext_pad";
-            let pad_cache = format!("{}_mask={}_ncpsg={}", pad_base, bool_num(has_mask), ncpsg);
+            let pad_cache = format!(
+                "{}_mask={}_ncpsg={}",
+                pad_base,
+                bool_num(has_mask),
+                ncpsg
+            );
             stages.push(stage(
                 MetalStageKind::Aux,
                 pad_base,
@@ -1321,12 +1311,7 @@ fn program_flash_attn_ext(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProg
         while 2 * i64::from(nwg) * i64::from(nsg) * i64::from(ncpsg) < k.ne[1] && nsg < 4 {
             nsg *= 2;
         }
-        let vec_base = format!(
-            "kernel_flash_attn_ext_vec_{}_dk{}_dv{}",
-            k.desc.ty.name(),
-            dk,
-            dv
-        );
+        let vec_base = format!("kernel_flash_attn_ext_vec_{}_dk{}_dv{}", k.desc.ty.name(), dk, dv);
         let vec_cache = format!(
             "{}_mask={}_sink={}_bias={}_scap={}_kvpad={}_ns10={}_ns20={}_nsg={}_nwg={}",
             vec_base,
@@ -1350,22 +1335,12 @@ fn program_flash_attn_ext(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProg
                 bool_const(FC_FLASH_ATTN_EXT_VEC + 2, has_bias),
                 bool_const(FC_FLASH_ATTN_EXT_VEC + 3, has_scap),
                 bool_const(FC_FLASH_ATTN_EXT_VEC + 4, has_kvpad),
-                i32_const(
-                    FC_FLASH_ATTN_EXT_VEC + 20,
-                    i32::try_from(ns10).map_err(|_| "flash_attn ns10 overflow".to_string())?,
-                ),
-                i32_const(
-                    FC_FLASH_ATTN_EXT_VEC + 21,
-                    i32::try_from(ns20).map_err(|_| "flash_attn ns20 overflow".to_string())?,
-                ),
+                i32_const(FC_FLASH_ATTN_EXT_VEC + 20, i32::try_from(ns10).map_err(|_| "flash_attn ns10 overflow".to_string())?),
+                i32_const(FC_FLASH_ATTN_EXT_VEC + 21, i32::try_from(ns20).map_err(|_| "flash_attn ns20 overflow".to_string())?),
                 i32_const(FC_FLASH_ATTN_EXT_VEC + 22, nsg),
                 i32_const(FC_FLASH_ATTN_EXT_VEC + 23, nwg),
             ],
-            flash_attn_vec_smem_bytes(
-                usize::try_from(dk).map_err(|_| "flash_attn dk overflow".to_string())?,
-                usize::try_from(dv).map_err(|_| "flash_attn dv overflow".to_string())?,
-                nsg,
-            ),
+            0,
             0,
             0,
             nsg,
@@ -1380,10 +1355,7 @@ fn program_flash_attn_ext(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProg
             &reduce_base,
             &reduce_cache,
             vec![
-                i32_const(
-                    FC_FLASH_ATTN_EXT_VEC_REDUCE + 0,
-                    i32::try_from(dv).map_err(|_| "flash_attn dv overflow".to_string())?,
-                ),
+                i32_const(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0, i32::try_from(dv).map_err(|_| "flash_attn dv overflow".to_string())?),
                 i32_const(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1, nwg),
             ],
             0,
@@ -1399,7 +1371,12 @@ fn program_flash_attn_ext(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProg
         let has_kvpad = k.ne[1] % i64::from(ncpsg) != 0;
         if has_kvpad {
             let pad_base = "kernel_flash_attn_ext_pad";
-            let pad_cache = format!("{}_mask={}_ncpsg={}", pad_base, bool_num(has_mask), ncpsg);
+            let pad_cache = format!(
+                "{}_mask={}_ncpsg={}",
+                pad_base,
+                bool_num(has_mask),
+                ncpsg
+            );
             stages.push(stage(
                 MetalStageKind::Aux,
                 pad_base,
@@ -1442,12 +1419,7 @@ fn program_flash_attn_ext(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProg
         let ns20 = v.nb[1] / v.nb[0];
         let bc_mask = has_mask && mask.unwrap().ne[1] % 8 != 0;
         let nsg = if q.ne[0] >= 512 { 8_i32 } else { 4_i32 };
-        let main_base = format!(
-            "kernel_flash_attn_ext_{}_dk{}_dv{}",
-            k.desc.ty.name(),
-            dk,
-            dv
-        );
+        let main_base = format!("kernel_flash_attn_ext_{}_dk{}_dv{}", k.desc.ty.name(), dk, dv);
         let main_cache = format!(
             "{}_mask={}_sinks={}_bias={}_scap={}_kvpad={}_bcm={}_ns10={}_ns20={}_nsg={}",
             main_base,
@@ -1472,21 +1444,11 @@ fn program_flash_attn_ext(tensors: &[Tensor], op: &Tensor) -> Result<MetalOpProg
                 bool_const(FC_FLASH_ATTN_EXT + 3, has_scap),
                 bool_const(FC_FLASH_ATTN_EXT + 4, has_kvpad),
                 bool_const(FC_FLASH_ATTN_EXT + 10, bc_mask),
-                i32_const(
-                    FC_FLASH_ATTN_EXT + 20,
-                    i32::try_from(ns10).map_err(|_| "flash_attn ns10 overflow".to_string())?,
-                ),
-                i32_const(
-                    FC_FLASH_ATTN_EXT + 21,
-                    i32::try_from(ns20).map_err(|_| "flash_attn ns20 overflow".to_string())?,
-                ),
+                i32_const(FC_FLASH_ATTN_EXT + 20, i32::try_from(ns10).map_err(|_| "flash_attn ns10 overflow".to_string())?),
+                i32_const(FC_FLASH_ATTN_EXT + 21, i32::try_from(ns20).map_err(|_| "flash_attn ns20 overflow".to_string())?),
                 i32_const(FC_FLASH_ATTN_EXT + 22, nsg),
             ],
-            flash_attn_smem_bytes(
-                usize::try_from(dk).map_err(|_| "flash_attn dk overflow".to_string())?,
-                usize::try_from(dv).map_err(|_| "flash_attn dv overflow".to_string())?,
-                nsg,
-            ),
+            0,
             0,
             0,
             nsg,
@@ -1585,11 +1547,7 @@ fn bool_const(idx: i32, value: bool) -> FunctionConstant {
 }
 
 fn bool_num(value: bool) -> i32 {
-    if value {
-        1
-    } else {
-        0
-    }
+    if value { 1 } else { 0 }
 }
 
 fn pool_name(value: i32) -> Result<&'static str, String> {
@@ -1705,11 +1663,7 @@ fn mul_mv_params(ty: TensorType, ne00: i64, allow_short: bool) -> Result<MulMvPa
             if allow_short && ne00 < 32 {
                 (1, 32, 1, 0, "_short")
             } else {
-                let nsg = i32::min(
-                    4,
-                    i32::try_from((ne00 + 127) / 128)
-                        .map_err(|_| "mul_mv nsg overflow".to_string())?,
-                );
+                let nsg = i32::min(4, i32::try_from((ne00 + 127) / 128).map_err(|_| "mul_mv nsg overflow".to_string())?);
                 let suffix = if ne00 % 4 == 0 { "_4" } else { "" };
                 (nsg, 2, 1, 32 * std::mem::size_of::<f32>() * 2, suffix)
             }
@@ -1725,13 +1679,7 @@ fn mul_mv_params(ty: TensorType, ne00: i64, allow_short: bool) -> Result<MulMvPa
             32 * std::mem::size_of::<f32>() * usize::try_from(N_R0_Q8_0).unwrap_or(0),
             "",
         ),
-        TensorType::MXFP4 => (
-            N_SG_MXFP4,
-            N_R0_MXFP4,
-            1,
-            32 * std::mem::size_of::<f32>(),
-            "",
-        ),
+        TensorType::MXFP4 => (N_SG_MXFP4, N_R0_MXFP4, 1, 32 * std::mem::size_of::<f32>(), ""),
         TensorType::Q2K => (N_SG_Q2_K, N_R0_Q2_K, 1, 0, ""),
         TensorType::Q3K => (N_SG_Q3_K, N_R0_Q3_K, 1, 0, ""),
         TensorType::Q4K => (N_SG_Q4_K, N_R0_Q4_K, 1, 0, ""),
@@ -1744,20 +1692,8 @@ fn mul_mv_params(ty: TensorType, ne00: i64, allow_short: bool) -> Result<MulMvPa
         TensorType::IQ2S => (N_SG_IQ2_S, N_R0_IQ2_S, 1, 0, ""),
         TensorType::IQ1S => (N_SG_IQ1_S, N_R0_IQ1_S, 1, 0, ""),
         TensorType::IQ1M => (N_SG_IQ1_M, N_R0_IQ1_M, 1, 0, ""),
-        TensorType::IQ4Nl => (
-            N_SG_IQ4_NL,
-            N_R0_IQ4_NL,
-            1,
-            32 * std::mem::size_of::<f32>(),
-            "",
-        ),
-        TensorType::IQ4Xs => (
-            N_SG_IQ4_XS,
-            N_R0_IQ4_XS,
-            1,
-            32 * std::mem::size_of::<f32>(),
-            "",
-        ),
+        TensorType::IQ4Nl => (N_SG_IQ4_NL, N_R0_IQ4_NL, 1, 32 * std::mem::size_of::<f32>(), ""),
+        TensorType::IQ4Xs => (N_SG_IQ4_XS, N_R0_IQ4_XS, 1, 32 * std::mem::size_of::<f32>(), ""),
         other => {
             return Err(format!(
                 "unsupported Metal mul_mv source type {}",
@@ -1777,32 +1713,6 @@ fn mul_mv_params(ty: TensorType, ne00: i64, allow_short: bool) -> Result<MulMvPa
 
 fn flash_attn_ext_use_vec(q: &Tensor) -> bool {
     q.ne[1] < 20 && q.ne[0] % 32 == 0
-}
-
-fn pad_to(v: usize, align: usize) -> usize {
-    if align == 0 {
-        return v;
-    }
-    let rem = v % align;
-    if rem == 0 {
-        v
-    } else {
-        v + (align - rem)
-    }
-}
-
-fn flash_attn_smem_bytes(dk: usize, dv: usize, _nsg: i32) -> usize {
-    let nqptg = OP_FLASH_ATTN_EXT_NQPSG as usize;
-    let ncpsg = OP_FLASH_ATTN_EXT_NCPSG as usize;
-    let words = nqptg.saturating_mul(dk + 2 * pad_to(dv, 64) + 2 * (2 * ncpsg));
-    pad_to(words.saturating_mul(std::mem::size_of::<f32>() / 2), 16)
-}
-
-fn flash_attn_vec_smem_bytes(dk: usize, dv: usize, nsg: i32) -> usize {
-    let ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG as usize;
-    let words =
-        (pad_to(dk, 128) + 4 * ncpsg + 2 * pad_to(dv, 128)).saturating_mul(nsg.max(1) as usize);
-    pad_to(words.saturating_mul(std::mem::size_of::<f32>() / 2), 16)
 }
 
 fn flash_attn_ext_extra_pad(
@@ -1828,16 +1738,12 @@ fn flash_attn_ext_extra_pad(
     } else {
         OP_FLASH_ATTN_EXT_NCPSG
     };
-    Ok(
-        usize::try_from(ncpsg).map_err(|_| "flash_attn ncpsg overflow".to_string())?
-            * (k.nb[1]
-                * usize::try_from(k.ne[2] * k.ne[3])
-                    .map_err(|_| "flash_attn k dims overflow".to_string())?
-                + v.nb[1]
-                    * usize::try_from(v.ne[2] * v.ne[3])
-                        .map_err(|_| "flash_attn v dims overflow".to_string())?
-                + mask_bytes),
-    )
+    Ok(usize::try_from(ncpsg).map_err(|_| "flash_attn ncpsg overflow".to_string())?
+        * (k.nb[1]
+            * usize::try_from(k.ne[2] * k.ne[3]).map_err(|_| "flash_attn k dims overflow".to_string())?
+            + v.nb[1]
+                * usize::try_from(v.ne[2] * v.ne[3]).map_err(|_| "flash_attn v dims overflow".to_string())?
+            + mask_bytes))
 }
 
 fn flash_attn_ext_extra_blk(q: &Tensor, mask: Option<&Tensor>) -> Result<usize, String> {
@@ -1885,16 +1791,12 @@ fn mul_mat_id_extra_ids(src0: &Tensor, src2: &Tensor) -> Result<usize, String> {
 mod tests {
     use super::*;
     use crate::context::Context;
-    use crate::core::{InitParams, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_NORMAL};
+    use crate::core::{InitParams, GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX};
     use crate::graph::Graph;
     use crate::tensor::{BufferUsage, TensorDesc, TensorLayout};
 
     fn ctx() -> Context {
-        Context::new(InitParams {
-            mem_size: 0,
-            mem_buffer: None,
-            no_alloc: true,
-        })
+        Context::new(InitParams::default())
     }
 
     fn tensor(ctx: &mut Context, ty: TensorType, ne: &[i64]) -> usize {
@@ -1915,10 +1817,7 @@ mod tests {
         op.set_unary_op(UnaryOp::Gelu);
 
         let program = build_program(&tensors, &op, MetalDeviceFeatures::default()).unwrap();
-        assert_eq!(
-            program.stages[0].descriptor.base_name,
-            "kernel_unary_f32_f32_4"
-        );
+        assert_eq!(program.stages[0].descriptor.base_name, "kernel_unary_f32_f32_4");
         assert_eq!(
             program.stages[0].descriptor.cache_name,
             "kernel_unary_f32_f32_4_op=103_cnt=1"
@@ -1939,10 +1838,7 @@ mod tests {
         op.set_op_param_i32(2, GGML_ROPE_TYPE_NEOX);
 
         let program = build_program(&tensors, &op, MetalDeviceFeatures::default()).unwrap();
-        assert_eq!(
-            program.stages[0].descriptor.base_name,
-            "kernel_rope_neox_f32"
-        );
+        assert_eq!(program.stages[0].descriptor.base_name, "kernel_rope_neox_f32");
     }
 
     #[test]
@@ -1959,10 +1855,7 @@ mod tests {
         op.set_op_param_i32(2, GGML_ROPE_TYPE_NORMAL);
 
         let program = build_program(&tensors, &op, MetalDeviceFeatures::default()).unwrap();
-        assert_eq!(
-            program.stages[0].descriptor.base_name,
-            "kernel_rope_norm_f32"
-        );
+        assert_eq!(program.stages[0].descriptor.base_name, "kernel_rope_norm_f32");
     }
 
     #[test]
@@ -1975,21 +1868,6 @@ mod tests {
         op.op = Op::Argsort;
         op.src[0] = Some(src);
         op.set_op_param_i32(0, SortOrder::Desc as i32);
-
-        let program = build_program(&tensors, &op, MetalDeviceFeatures::default()).unwrap();
-        assert_eq!(program.stages.len(), 2);
-        assert_eq!(program.resources.output_tail_bytes, op.nbytes());
-    }
-
-    #[test]
-    fn cumsum_selector_adds_temp_tail() {
-        let mut ctx = ctx();
-        let src = tensor(&mut ctx, TensorType::F32, &[257, 4, 1, 1]);
-        let dst = tensor(&mut ctx, TensorType::F32, &[257, 4, 1, 1]);
-        let tensors = ctx.tensors().to_vec();
-        let mut op = tensors[dst].clone();
-        op.op = Op::CumSum;
-        op.src[0] = Some(src);
 
         let program = build_program(&tensors, &op, MetalDeviceFeatures::default()).unwrap();
         assert_eq!(program.stages.len(), 2);
@@ -2017,10 +1895,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            program.stages[0].descriptor.base_name,
-            "kernel_mul_mm_f16_f32"
-        );
+        assert_eq!(program.stages[0].descriptor.base_name, "kernel_mul_mm_f16_f32");
     }
 
     #[test]
@@ -2068,26 +1943,6 @@ mod tests {
 
         let plan = build_graph_plan(&ctx, &graph, MetalDeviceFeatures::default()).unwrap();
         assert_eq!(plan.nodes.len(), 1);
-        assert_eq!(
-            plan.total_output_tail_bytes,
-            ctx.tensor(dst).unwrap().nbytes()
-        );
-    }
-
-    #[test]
-    fn graph_plan_skips_metadata_only_nodes() {
-        let mut ctx = ctx();
-        let src = tensor(&mut ctx, TensorType::F32, &[16, 8, 1, 1]);
-        let view = ctx
-            .view(src, TensorType::F32, &[8, 8], &[4, 64], 32)
-            .unwrap();
-        let cont = ctx.cont(view).unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, cont).unwrap();
-
-        let plan = build_graph_plan(&ctx, &graph, MetalDeviceFeatures::default()).unwrap();
-        assert_eq!(plan.nodes.len(), 1);
-        assert_eq!(plan.nodes[0].node_id, cont);
+        assert_eq!(plan.total_output_tail_bytes, ctx.tensor(dst).unwrap().nbytes());
     }
 }

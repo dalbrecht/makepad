@@ -237,7 +237,11 @@ impl TensorLayout {
             return Err(format!("invalid tensor rank {}", rank));
         }
         if extents.len() != rank {
-            return Err(format!("rank {} but got {} extents", rank, extents.len()));
+            return Err(format!(
+                "rank {} but got {} extents",
+                rank,
+                extents.len()
+            ));
         }
         if strides_bytes.len() != rank {
             return Err(format!(
@@ -251,17 +255,6 @@ impl TensorLayout {
         for i in 0..rank {
             padded_extents[i] = extents[i];
             padded_strides[i] = strides_bytes[i];
-        }
-        for i in rank..4 {
-            padded_strides[i] = padded_strides[i - 1]
-                .checked_mul(usize::try_from(padded_extents[i - 1]).map_err(|_| {
-                    format!(
-                        "extent {} at dimension {} does not fit in usize",
-                        padded_extents[i - 1],
-                        i - 1
-                    )
-                })?)
-                .ok_or_else(|| "overflow computing padded strides".to_string())?;
         }
         Ok(Self {
             rank,
@@ -478,7 +471,8 @@ impl Tensor {
 
     pub fn is_contiguously_allocated(&self) -> bool {
         self.nbytes()
-            == (self.nelements() as usize) * ggml_type_size_for_type(self.desc.ty)
+            == (self.nelements() as usize)
+                * ggml_type_size_for_type(self.desc.ty)
                 / ggml_blck_size_for_type(self.desc.ty)
     }
 
@@ -522,14 +516,8 @@ impl Tensor {
 
     pub fn op_desc(&self) -> &'static str {
         match self.op {
-            Op::Unary => self
-                .unary_op()
-                .map(UnaryOp::name)
-                .unwrap_or_else(|| self.op.name()),
-            Op::Glu => self
-                .glu_op()
-                .map(GluOp::name)
-                .unwrap_or_else(|| self.op.name()),
+            Op::Unary => self.unary_op().map(UnaryOp::name).unwrap_or_else(|| self.op.name()),
+            Op::Glu => self.glu_op().map(GluOp::name).unwrap_or_else(|| self.op.name()),
             op => op.name(),
         }
     }
@@ -638,15 +626,4 @@ pub fn ggml_ftype_to_tensor_type(ftype: Ftype) -> Option<TensorType> {
         Ftype::MostlyIq2S => TensorType::IQ2S,
         Ftype::Unknown | Ftype::MostlyQ4_1SomeF16 => return None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TensorLayout;
-
-    #[test]
-    fn from_parts_extrapolates_padded_strides_like_ggml() {
-        let layout = TensorLayout::from_parts(3, &[16, 8, 4], &[4, 128, 1024]).unwrap();
-        assert_eq!(layout.strides_bytes(), [4, 128, 1024, 4096]);
-    }
 }
