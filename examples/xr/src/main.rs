@@ -585,7 +585,7 @@ script_mod! {
                 }
             }
             xr_peer_sync := XrPeerSync{
-                auto_alignment_enabled: true
+                auto_alignment_enabled: false
             }
 
             control_strip := XrView{
@@ -839,6 +839,7 @@ script_mod! {
 
                                 debug_field := Label{
                                     width: Fill
+                                    height: Fit
                                     text: "Connected peers: 0"
                                     draw_text.color: #xe8f4ff
                                     draw_text.flow: Flow.Right{wrap: true}
@@ -895,18 +896,10 @@ script_mod! {
                         on_press: || ui.root.reset_activity_pose()
                     }
 
-                    wrist_auto_align_button := XrUiButton{
-                        width: Fill
-                        height: 40
-                        text: "Auto Align"
-                        draw_bg.border_radius: 12.0
-                        on_press: || ui.xr_peer_sync.set_auto_align(true)
-                    }
-
                     wrist_sync_status := Label{
                         width: Fill
                         height: Fit
-                        text: "Touch sync: idle"
+                        text: "P:0.0 C:0.0"
                         draw_text.color: #xe8f4ff
                         draw_text.flow: Flow.Right{wrap: true}
                     }
@@ -1220,6 +1213,7 @@ impl App {
                     peer_sync.shared_object_count(),
                     peer_sync.touch_sync_status_text(),
                     peer_sync.local_touch_signal_text(),
+                    peer_sync.remote_touch_signal_text(),
                     peer_sync.alignment_debug_text().to_string(),
                     peer_sync.alignment_state_text().to_string(),
                     peer_sync.peer_scene_text().to_string(),
@@ -1230,6 +1224,7 @@ impl App {
                 0,
                 "Touch sync: off".to_string(),
                 "TouchRaw: off".to_string(),
+                "TouchPeer: off".to_string(),
                 "AlignDbg: off".to_string(),
                 "AlignState: off".to_string(),
                 "PeerMap: off".to_string(),
@@ -1256,7 +1251,7 @@ impl App {
             .map(|gpu_ms| format!("{gpu_ms:.2} ms"))
             .unwrap_or_else(|| "waiting".to_string());
         let debug_text = format!(
-            "Connected peers: {}\nShared objects: {}\n{}\n{}\n{}\n{}\n{}\nPhysics planes: {surface_count}\nPhysics compute time: {compute_ms:.2} ms\nQuery time: {query_ms:.2} ms\nRapier time: {rapier_ms:.2} ms\nCPU frame time: {frame_cpu_ms:.2} ms\nUpdate time: {frame_update_cpu_ms:.2} ms\nDraw time: {frame_draw_cpu_ms:.2} ms\nTSDF size: {tsdf_memory_mb:.1} MB\nDepth frames kept: {depth_frames_kept}\nGPU time: {gpu_time_text}",
+            "Connected peers: {}\nShared objects: {}\n{}\n{}\n{}\n{}\n{}\n{}\nPhysics planes: {surface_count}\nPhysics compute time: {compute_ms:.2} ms\nQuery time: {query_ms:.2} ms\nRapier time: {rapier_ms:.2} ms\nCPU frame time: {frame_cpu_ms:.2} ms\nUpdate time: {frame_update_cpu_ms:.2} ms\nDraw time: {frame_draw_cpu_ms:.2} ms\nTSDF size: {tsdf_memory_mb:.1} MB\nDepth frames kept: {depth_frames_kept}\nGPU time: {gpu_time_text}",
             connected_peers.0,
             connected_peers.1,
             connected_peers.2,
@@ -1264,6 +1259,7 @@ impl App {
             connected_peers.4,
             connected_peers.5,
             connected_peers.6,
+            connected_peers.7,
         );
         if self.last_debug_text != debug_text {
             self.ui
@@ -1271,9 +1267,14 @@ impl App {
                 .set_text(cx, &debug_text);
             self.last_debug_text = debug_text;
         }
+        let wrist_perf_text = format!(
+            "P:{:.1} C:{:.1}",
+            compute_ms + query_ms + rapier_ms,
+            frame_cpu_ms,
+        );
         self.ui
             .widget(cx, ids!(wrist_sync_status))
-            .set_text(cx, &connected_peers.2);
+            .set_text(cx, &wrist_perf_text);
     }
 }
 
