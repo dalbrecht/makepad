@@ -168,6 +168,7 @@ pub use {
             VirtualKeyboardEvent,
             WindowCloseRequestedEvent,
             WindowClosedEvent,
+            SafeAreaInsets,
             WindowDragQueryEvent,
             WindowDragQueryResponse,
             WindowGeom,
