@@ -229,7 +229,7 @@ impl App {
         }
     }
 
-    pub(super) fn sync_mount_tab_bar_visibility(&mut self, cx: &mut Cx) {
+    fn sync_mount_tab_bar_visibility(&mut self, cx: &mut Cx) {
         let dock = self.ui.dock(cx, ids!(mount_dock));
         let Some(mut dock_items) = dock.clone_state() else {
             return;
@@ -392,7 +392,6 @@ impl App {
         match StudioHub::start_in_process(config) {
             Ok(studio) => {
                 self.data.studio = Some(studio);
-                let _ = self.ensure_ai_manager_tab(cx);
                 for mount in &mounts {
                     self.data.mounts.entry(mount.name.clone()).or_default().root =
                         mount.path.clone();
@@ -572,24 +571,6 @@ impl App {
                 dock.item(tab_id).redraw(cx);
                 dock.redraw_tab(cx, tab_id);
             }
-        }
-    }
-
-    pub(super) fn refresh_active_mount_terminal_panel(&mut self, cx: &mut Cx, path: &str) {
-        let Some(mount) = Self::mount_from_virtual_path(path) else {
-            return;
-        };
-        if self.data.active_mount.as_deref() != Some(mount) {
-            return;
-        }
-        let Some(tab_id) = self
-            .mount_state(mount)
-            .and_then(|state| state.terminal_path_to_tab.get(path).copied())
-        else {
-            return;
-        };
-        if let Some(dock) = self.mount_workspace_dock(cx, mount) {
-            dock.item(tab_id).redraw(cx);
         }
     }
 
@@ -1104,7 +1085,6 @@ impl App {
         self.sync_mount_terminal_tabs(_cx, mount, true);
         self.ensure_terminal_session_open(&path);
         self.set_status(_cx, &format!("created terminal {}", name));
-        self.refresh_ai_manager_report(_cx);
     }
 
     pub(super) fn delete_terminal_tab_file(&mut self, cx: &mut Cx, mount: &str, tab_id: LiveId) {
@@ -1135,7 +1115,6 @@ impl App {
         self.data.terminal_framebuffer_by_path.remove(&path);
         let _ = self.send_studio(ClientToHub::TerminalClose { path: path.clone() });
         let _ = self.send_studio(ClientToHub::DeleteFile { path });
-        self.refresh_ai_manager_report(cx);
     }
 
     pub(super) fn select_mount(&mut self, cx: &mut Cx, mount: &str) {
@@ -1161,6 +1140,5 @@ impl App {
         self.restart_log_query_for_mount(cx, mount);
         self.refresh_active_mount_run_list(cx);
         self.refresh_active_mount_log_panels(cx);
-        self.refresh_ai_manager_report(cx);
     }
 }

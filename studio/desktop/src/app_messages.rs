@@ -651,6 +651,9 @@ impl App {
                 self.apply_terminal_tab_title(cx, &path, title);
                 self.refresh_ai_manager_report(cx);
             }
+            HubToClient::TerminalTitle { path, title } => {
+                self.apply_terminal_tab_title(cx, &path, title);
+            }
             HubToClient::TerminalExited { path, code } => {
                 self.data.terminal_open_paths.remove(&path);
                 self.data.terminal_frame_id_by_path.remove(&path);
