@@ -2090,4 +2090,19 @@ mod tests {
         assert_eq!(plan.nodes.len(), 1);
         assert_eq!(plan.nodes[0].node_id, cont);
     }
+
+    #[test]
+    fn graph_plan_skips_metadata_only_nodes() {
+        let mut ctx = ctx();
+        let src = tensor(&mut ctx, TensorType::F32, &[16, 8, 1, 1]);
+        let view = ctx.view(src, TensorType::F32, &[8, 8], &[4, 64], 32).unwrap();
+        let cont = ctx.cont(view).unwrap();
+
+        let mut graph = Graph::new();
+        graph.build_forward_expand(&ctx, cont).unwrap();
+
+        let plan = build_graph_plan(&ctx, &graph, MetalDeviceFeatures::default()).unwrap();
+        assert_eq!(plan.nodes.len(), 1);
+        assert_eq!(plan.nodes[0].node_id, cont);
+    }
 }
