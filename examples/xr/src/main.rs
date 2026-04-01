@@ -226,7 +226,7 @@ script_mod! {
             scene_select := XrSelect{
                 pos: vec3(0.0, -0.02, -0.62)
                 scale: vec3(0.5, 0.5, 0.5)
-                active_child: @ico_shoot_scene
+                active_child: @tanks_scene
 
                 test_scene := XrNode{
                     on_render: ||{
@@ -470,54 +470,64 @@ script_mod! {
                     pos: vec3(0.0, -0.16, 0.0)
                     scale: vec3(0.62, 0.62, 0.62)
                     on_render: ||{
-                        tank_controller := Tank{}
-
                         Platform{
-                            pos: vec3(0.0, -0.06, 0.0)
-                            size: vec3(0.48387095, 0.08, 0.48387095)
-                            friction: 1.8
+                            pos: vec3(0.05, -0.06, -0.10)
+                            size: vec3(1.60, 0.08, 1.10)
                             color: #x283544
                         }
 
                         Cube{
                             body: mod.widgets.XrBodyKind.Fixed
-                            size: vec3(0.34, 0.05, 0.46)
-                            corner_radius: 0.018
+                            size: vec3(0.14, 0.12, 0.14)
+                            corner_radius: 0.02
                             roughness: 0.78
+                            metallic: 0.02
+                            color: #x516579
+                            pos: vec3(-0.34, 0.00, -0.26)
+                        }
+
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.18, 0.10, 0.18)
+                            corner_radius: 0.02
+                            roughness: 0.78
+                            metallic: 0.02
+                            color: #x516579
+                            pos: vec3(0.34, -0.01, -0.32)
+                        }
+
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.54, 0.08, 0.12)
+                            corner_radius: 0.018
+                            roughness: 0.82
                             metallic: 0.0
-                            friction: 1.6
-                            color: #x4b5f72
-                            pos: vec3(0.30, 0.01, -0.06)
-                            rot: vec3(0.24, 0.0, 0.0)
+                            color: #x1f2b37
+                            pos: vec3(0.05, -0.02, -0.48)
                         }
 
-                        tank_slots := XrNode{
-                            body: mod.widgets.XrBodyKind.Disabled
-                            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                            for index in 0..8 {
-                                TankSlot{
-                                    pos: vec3(-14.0 - index * 0.7, -8.0, 0.0)
-                                }
-                            }
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.12, 0.16, 0.42)
+                            corner_radius: 0.018
+                            roughness: 0.80
+                            metallic: 0.0
+                            color: #x202f3d
+                            pos: vec3(-0.48, 0.02, -0.02)
                         }
 
-                        tank_projectiles := XrNode{
-                            body: mod.widgets.XrBodyKind.Disabled
-                            shared_object_policy: mod.widgets.XrSharedObjectPolicy.None
-                            for index in 0..48 {
-                                IcoSphere{
-                                    spawn_pool: true
-                                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.PooledOnDemand
-                                    gravity_scale: 1.0
-                                    density: 0.65
-                                    friction: 0.08
-                                    restitution: 0.01
-                                    radius: 0.024
-                                    diffuse: #xa0a4aa
-                                    color: #xffc857
-                                    pos: vec3(-12.0, -12.0 - index * 0.01, 0.0)
-                                }
-                            }
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.12, 0.16, 0.42)
+                            corner_radius: 0.018
+                            roughness: 0.80
+                            metallic: 0.0
+                            color: #x202f3d
+                            pos: vec3(0.58, 0.02, -0.02)
+                        }
+
+                        Tank{
+                            pos: vec3(0.05, 0.03, -0.10)
                         }
                     }
                 }
@@ -738,7 +748,7 @@ script_mod! {
 
                         scene_status := Label{
                             width: Fill
-                            text: "Default scene: tank mode. Left stick steers, right trigger accelerates, left trigger reverses, right stick aims the turret, A/X fire shells, B resets the tank, and controller grip picks the tank up."
+                            text: "Default scene: tank mode. Drive with the right thumbstick in head-relative screen direction, and grab the tank directly with your hands."
                             draw_text.color: #xe8f4ff
                         }
                     }
