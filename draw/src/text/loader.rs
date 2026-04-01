@@ -136,16 +136,9 @@ impl Loader {
 
     fn load_font(&mut self, id: FontId) -> Option<Font> {
         let definition = self.font_definitions.remove(&id)?;
-        let FontDefinition {
-            data,
-            index,
-            ascender_fudge_in_ems,
-            descender_fudge_in_ems,
-            weight,
-            mut variations,
-        } = definition;
-        let mut face = FontFace::from_data_and_index(data, index)?;
-        if let Some(weight) = weight {
+        let mut face = FontFace::from_data_and_index(definition.data, definition.index)?;
+        let mut variations = definition.variations;
+        if let Some(weight) = definition.weight {
             const FONT_WEIGHT_AXIS_TAG: u32 = u32::from_be_bytes(*b"wght");
             if let Some(existing) = variations
                 .iter_mut()
@@ -163,8 +156,8 @@ impl Loader {
             id,
             self.rasterizer.clone(),
             face,
-            ascender_fudge_in_ems,
-            descender_fudge_in_ems,
+            definition.ascender_fudge_in_ems,
+            definition.descender_fudge_in_ems,
         ))
     }
 }
@@ -235,10 +228,7 @@ mod tests {
             .join("../widgets/resources/jetbrains_mono_variable.ttf")
     }
 
-    fn outline_signature(
-        font: &crate::text::font::Font,
-        glyph_id: crate::text::font::GlyphId,
-    ) -> u64 {
+    fn outline_signature(font: &crate::text::font::Font, glyph_id: crate::text::font::GlyphId) -> u64 {
         use crate::text::glyph_outline::Command;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
