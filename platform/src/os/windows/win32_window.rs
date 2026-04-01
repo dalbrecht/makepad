@@ -869,6 +869,10 @@ impl Win32Window {
             outer_size: self.get_outer_size(),
             dpi_factor: self.get_dpi_factor(),
             position: self.get_position(),
+            window_chrome_buttons: Rect {
+                pos: Vec2d { x: inner_size.x - BUTTONS_W, y: 0.0 },
+                size: Vec2d { x: BUTTONS_W, y: BUTTON_H },
+            },
             ..Default::default()
         }
     }

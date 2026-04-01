@@ -606,26 +606,14 @@ impl MacosWindow {
             let (t1, l1, r1, b1) = ns_to_rect(miniaturize);
             let (t2, l2, r2, b2) = ns_to_rect(zoom);
 
-            let top = t0.min(t1).min(t2);
+            let top  = t0.min(t1).min(t2);
             let left = l0.min(l1).min(l2);
-            let right = r0.max(r1).max(r2);
+            let right  = r0.max(r1).max(r2);
             let bottom = b0.max(b1).max(b2);
-
-            // During a fullscreen transition the content view resizes before
-            // the buttons' superview repositions, so the Y-flip can place the
-            // buttons near the bottom of the view.  Traffic-light buttons are
-            // always near the top of the window, so discard bogus geometry
-            // where they appear in the lower half of the content area.
-            if top > h * 0.5 {
-                return None;
-            }
 
             let rect = Rect {
                 pos: Vec2d { x: left, y: top },
-                size: Vec2d {
-                    x: right - left,
-                    y: bottom - top,
-                },
+                size: Vec2d { x: right - left, y: bottom - top },
             };
 
             Some(rect)
@@ -642,6 +630,7 @@ impl MacosWindow {
             outer_size: self.get_outer_size(),
             dpi_factor: self.get_dpi_factor(),
             position: self.get_position(),
+            window_chrome_buttons: self.traffic_lights_geom().unwrap_or_default(),
             ..Default::default()
         }
     }

@@ -285,6 +285,19 @@ impl Window {
         }
     }
 
+    fn sync_caption_bar_height(&mut self, cx: &mut Cx) {
+        // Explicit DSL override takes priority, then system-calculated.
+        let height = self.window.caption_bar_height_override
+            .or(self.system_caption_bar_height);
+        if let Some(h) = height {
+            let caption_bar = self.view(cx, ids!(caption_bar));
+            if let Some(mut bar) = caption_bar.borrow_mut() {
+                bar.walk.height = Size::Fixed(h);
+            }
+            drop(caption_bar);
+        }
+    }
+
     /// Adjusts the caption label's left padding so that the title text appears
     /// centered in the full caption bar width when there's enough room.
     /// When the window is too narrow, the padding gracefully reduces to 0,
@@ -607,8 +620,22 @@ impl Widget for Window {
                     // Splash code can reference mod.widgets.SAFE_INSET_PAD_*.
                     cx.update_safe_inset_script_values(ev.new_geom.safe_area_insets);
 
-                    // If safe area insets changed (e.g., device rotation), trigger
-                    // a script re-apply so widgets pick up new values.
+                    // If the platform reports native chrome button geometry, derive
+                    // the caption bar height so the buttons are vertically centered:
+                    // height = top_margin * 2 + button_height = pos.y * 2 + size.y.
+                    // If the platform reports native chrome button geometry, derive
+                    // the caption bar height so the buttons are vertically centered.
+                    let new_buttons = ev.new_geom.window_chrome_buttons;
+                    if new_buttons != Rect::default() {
+                        let h = (new_buttons.pos.y * 2.0 + new_buttons.size.y).ceil();
+                        if self.system_caption_bar_height != Some(h) {
+                            self.system_caption_bar_height = Some(h);
+                            self.view(cx, ids!(caption_bar)).redraw(cx);
+                        }
+                    }
+
+                    // If safe area insets changed, trigger a script re-apply
+                    // so widgets pick up new values.
                     if old_insets != ev.new_geom.safe_area_insets {
                         cx.request_script_reapply();
                     }
@@ -625,9 +652,7 @@ impl Widget for Window {
                         let buttons_rect = self.view(cx, ids!(windows_buttons)).area().rect(cx);
 
                         if caption_rect.contains(dq.abs) {
-                            if buttons_rect.size != Vec2d::default()
-                                && buttons_rect.contains(dq.abs)
-                            {
+                            if buttons_rect.size != Vec2d::default() && buttons_rect.contains(dq.abs) {
                                 dq.response.set(WindowDragQueryResponse::Client);
                             } else {
                                 dq.response.set(WindowDragQueryResponse::Caption);
