@@ -137,8 +137,20 @@ impl Loader {
     fn load_font(&mut self, id: FontId) -> Option<Font> {
         let definition = self.font_definitions.remove(&id)?;
         let mut face = FontFace::from_data_and_index(definition.data, definition.index)?;
-        if !definition.variations.is_empty() {
-            face.set_variations(&definition.variations);
+        let mut variations = definition.variations;
+        if let Some(weight) = definition.weight {
+            const FONT_WEIGHT_AXIS_TAG: u32 = u32::from_be_bytes(*b"wght");
+            if let Some(existing) = variations
+                .iter_mut()
+                .find(|(tag, _)| *tag == FONT_WEIGHT_AXIS_TAG)
+            {
+                existing.1 = weight;
+            } else {
+                variations.push((FONT_WEIGHT_AXIS_TAG, weight));
+            }
+        }
+        if !variations.is_empty() {
+            face.set_variations(&variations);
         }
         Some(Font::new(
             id,
@@ -216,10 +228,7 @@ mod tests {
             .join("../widgets/resources/jetbrains_mono_variable.ttf")
     }
 
-    fn outline_signature(
-        font: &crate::text::font::Font,
-        glyph_id: crate::text::font::GlyphId,
-    ) -> u64 {
+    fn outline_signature(font: &crate::text::font::Font, glyph_id: crate::text::font::GlyphId) -> u64 {
         use crate::text::glyph_outline::Command;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};

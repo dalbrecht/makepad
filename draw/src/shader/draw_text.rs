@@ -3060,6 +3060,9 @@ impl FontFamily {
         let mut font_ids = Vec::new();
 
         for member in &self.members {
+            if !font_member_is_needed_for_text(cx, member.handle, text) {
+                continue;
+            }
             let font_id = font_member_font_id(member);
 
             if !fonts.is_font_known(font_id) {
@@ -3130,6 +3133,34 @@ fn font_member_weight(member: &FontMemberDef) -> Option<f32> {
     }
 }
 
+fn is_cjk_fallback_font_path(path: &str) -> bool {
+    matches!(
+        resource_basename(path),
+        Some(name)
+            if name.eq_ignore_ascii_case("LXGWWenKaiRegular.ttf")
+                || name.eq_ignore_ascii_case("LXGWWenKaiBold.ttf")
+    )
+}
+
+fn is_emoji_fallback_font_path(path: &str) -> bool {
+    matches!(
+        resource_basename(path),
+        Some(name) if name.eq_ignore_ascii_case("NotoColorEmoji.ttf")
+    )
+}
+
+fn resource_basename(path: &str) -> Option<&str> {
+    path.rsplit(['/', '\\']).next()
+}
+
+fn font_member_weight(member: &FontMemberDef) -> Option<f32> {
+    if member.weight.is_finite() && member.weight > 0.0 {
+        Some(member.weight)
+    } else {
+        None
+    }
+}
+
 fn font_member_font_id(member: &FontMemberDef) -> FontId {
     let mut hasher = DefaultHasher::new();
     member.handle.index().hash(&mut hasher);
@@ -3137,6 +3168,42 @@ fn font_member_font_id(member: &FontMemberDef) -> FontId {
     member.desc.to_bits().hash(&mut hasher);
     member.weight.to_bits().hash(&mut hasher);
     FontId::from(hasher.finish())
+}
+
+fn text_has_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk_char)
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2E80..=0x2FFF
+            | 0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x3100..=0x312F
+            | 0x31A0..=0x31EF
+            | 0x1100..=0x11FF
+            | 0x3130..=0x318F
+            | 0xAC00..=0xD7AF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFFEF
+            | 0x20000..=0x2EE5F
+            | 0x2F800..=0x2FA1F
+    )
+}
+
+fn text_has_emoji(text: &str) -> bool {
+    text.chars().any(is_emoji_char)
+}
+
+fn is_emoji_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2600..=0x27BF | 0x200D | 0xFE0F | 0x1F000..=0x1FAFF | 0x1FB00..=0x1FBFF
+    )
 }
 
 fn row_span_x_bounds_in_lpxs(
