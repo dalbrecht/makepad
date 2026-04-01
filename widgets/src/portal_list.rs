@@ -1806,10 +1806,8 @@ impl Widget for PortalList {
         );
         if self.suppress_child_events || is_scroll_animating {
             match event {
-                Event::TouchUpdate(_)
-                | Event::MouseDown(_)
-                | Event::MouseMove(_)
-                | Event::MouseUp(_) => {
+                Event::TouchUpdate(_) | Event::MouseDown(_)
+                | Event::MouseMove(_) | Event::MouseUp(_) => {
                     pass_through_to_children = false;
                 }
                 _ => {}
@@ -2234,7 +2232,9 @@ impl Widget for PortalList {
 
                             // Check if the drag threshold has been exceeded.
                             if !*committed {
-                                if (new_abs - *initial_abs).abs() >= self.drag_scroll_threshold {
+                                if (new_abs - *initial_abs).abs()
+                                    >= self.drag_scroll_threshold
+                                {
                                     *committed = true;
                                     self.suppress_child_events = true;
                                 } else {
@@ -2307,7 +2307,8 @@ impl Widget for PortalList {
                                 }
                             }
                             scaled_delta *= self.flick_scroll_scaling;
-                            if self.first_id == self.range_start && self.first_scroll > 0.0 {
+                            if self.first_id == self.range_start && self.first_scroll > 0.0
+                            {
                                 self.scroll_state = ScrollState::Pulldown {
                                     next_frame: cx.new_next_frame(),
                                 };
