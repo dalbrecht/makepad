@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::{
     cx::Cx,
     draw_list::DrawListId,
@@ -999,6 +1000,13 @@ impl Cx {
         let mut draw_shader_ids = BTreeSet::new();
         self.webgl_collect_draw_list_shaders(draw_list_id, &mut draw_shader_ids);
 
+        // O(1) dedup of GLSL programs: a linear scan over os_shaders was
+        // O(n²) and hung Chrome on large apps with many draw types.
+        let mut shader_index: HashMap<(String, String), usize> = HashMap::new();
+        for (index, ds) in self.draw_shaders.os_shaders.iter().enumerate() {
+            shader_index.insert((ds.in_vertex.clone(), ds.in_pixel.clone()), index);
+        }
+
         for draw_shader_id in draw_shader_ids {
             if self.draw_shaders.shaders[draw_shader_id]
                 .os_shader_id
@@ -1063,16 +1071,11 @@ impl Cx {
 
             let mut os_shader_id = self.draw_shaders.shaders[draw_shader_id].os_shader_id;
             if os_shader_id.is_none() {
-                for (index, ds) in self.draw_shaders.os_shaders.iter().enumerate() {
-                    if ds.in_vertex == vertex && ds.in_pixel == pixel {
-                        os_shader_id = Some(index);
-                        break;
-                    }
-                }
+                os_shader_id = shader_index.get(&(vertex.clone(), pixel.clone())).copied();
             }
 
             if os_shader_id.is_none() {
-                let shp = CxOsDrawShader::new(vertex, pixel);
+                let shp = CxOsDrawShader::new(vertex.clone(), pixel.clone());
                 let shader_id = self.draw_shaders.os_shaders.len();
                 self.os.from_wasm(FromWasmCompileWebGLShader {
                     shader_id,
@@ -1086,6 +1089,7 @@ impl Cx {
                 });
                 self.draw_shaders.os_shaders.push(shp);
                 self.os.webgl_shaders_pending += 1;
+                shader_index.insert((vertex, pixel), shader_id);
                 os_shader_id = Some(shader_id);
             }
 
