@@ -593,7 +593,8 @@ impl PortalList {
                 // `last_item_pos` far short of the viewport bottom. Without
                 // this guard, `at_end` could become a false positive whenever
                 // a zero-size item appears in the middle of the visible range.
-                let drew_last_item = last_drawn_index == Some(self.range_end.saturating_sub(1));
+                let drew_last_item = last_drawn_index
+                    == Some(self.range_end.saturating_sub(1));
 
                 if list[0].index == self.range_start {
                     let mut total = 0.0;
