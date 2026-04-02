@@ -1310,7 +1310,14 @@ mod tests {
 
     #[test]
     fn no_merge_for_plain_words() {
+<<<<<<< HEAD
         assert_eq!(merged_segments("hello world"), vec!["hello", " ", "world"]);
+=======
+        assert_eq!(
+            merged_segments("hello world"),
+            vec!["hello", " ", "world"]
+        );
+>>>>>>> 0618a47b (Fix text wrapping breaking before trailing punctuation marks (#1006))
     }
 
     #[test]
@@ -1322,6 +1329,7 @@ mod tests {
     fn empty_text() {
         assert_eq!(merged_segments(""), Vec::<String>::new());
     }
+<<<<<<< HEAD
 
     #[test]
     fn skips_layout_cache_for_large_or_multiline_debug_text() {
@@ -1337,4 +1345,6 @@ mod tests {
         assert!(multiline.len() > LAYOUT_CACHE_MULTILINE_TEXT_LEN);
         assert!(!Layouter::should_cache_text(&multiline));
     }
+=======
+>>>>>>> 0618a47b (Fix text wrapping breaking before trailing punctuation marks (#1006))
 }
