@@ -1341,18 +1341,10 @@ impl PortalList {
         // When first_scroll is very negative, items with target_id > first_id
         // can still be above the viewport.
         let scroll_direction: f64 = if let Some(item_top) = item_top {
-            if item_top < 0.0 {
-                1.0
-            } else {
-                -1.0
-            }
+            if item_top < 0.0 { 1.0 } else { -1.0 }
         } else {
             // Height tree unavailable; fall back to index comparison.
-            if target_id > self.first_id {
-                -1.0
-            } else {
-                1.0
-            }
+            if target_id > self.first_id { -1.0 } else { 1.0 }
         };
 
         let starting_id: Option<usize>;
@@ -1953,8 +1945,7 @@ impl Widget for PortalList {
                             self.first_id = target_id;
                         }
 
-                        if let ScrollState::ScrollingTo { next_frame, .. } = &mut self.scroll_state
-                        {
+                        if let ScrollState::ScrollingTo { next_frame, .. } = &mut self.scroll_state {
                             *next_frame = cx.new_next_frame();
                         }
                         self.delta_top_scroll(cx, delta_val, true, false);
