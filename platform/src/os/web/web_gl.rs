@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::{
     cx::Cx,
     draw_list::DrawListId,
@@ -1143,6 +1144,22 @@ impl Cx {
         let mut draw_shader_ids = BTreeSet::new();
         self.webgl_collect_draw_list_shaders(draw_list_id, &mut draw_shader_ids);
 
+        // O(1) dedup of GLSL programs: a linear scan over os_shaders was
+        // O(n²) and hung Chrome on large apps with many draw types.
+        // Color format and blend op are part of the pipeline identity.
+        let mut shader_index: HashMap<(String, String, u8, u8), usize> = HashMap::new();
+        for (index, ds) in self.draw_shaders.os_shaders.iter().enumerate() {
+            shader_index.insert(
+                (
+                    ds.in_vertex.clone(),
+                    ds.in_pixel.clone(),
+                    ds.color_format as u8,
+                    ds.blend_op as u8,
+                ),
+                index,
+            );
+        }
+
         for draw_shader_id in draw_shader_ids {
             if self.draw_shaders.shaders[draw_shader_id]
                 .pipeline_id
@@ -1212,16 +1229,18 @@ impl Cx {
             let shader_name = shader.debug_id.to_string();
             let mut pipeline_id = shader.pipeline_id;
             if pipeline_id.is_none() {
-                for (index, ds) in self.draw_shaders.os_shaders.iter().enumerate() {
-                    if ds.in_vertex == vertex && ds.in_pixel == pixel && ds.color_format == color_format && ds.blend_op == blend_op {
-                        pipeline_id = Some(index);
-                        break;
-                    }
-                }
+                pipeline_id = shader_index
+                    .get(&(
+                        vertex.clone(),
+                        pixel.clone(),
+                        color_format as u8,
+                        blend_op as u8,
+                    ))
+                    .copied();
             }
 
             if pipeline_id.is_none() {
-                let shp = CxOsDrawShader::new(vertex, pixel, color_format, blend_op);
+                let shp = CxOsDrawShader::new(vertex.clone(), pixel.clone(), color_format, blend_op);
                 let shader_id = self.draw_shaders.os_shaders.len();
                 self.os.from_wasm(FromWasmCompileWebGLShader {
                     shader_id,
@@ -1246,6 +1265,10 @@ impl Cx {
                 });
                 self.draw_shaders.os_shaders.push(shp);
                 self.os.webgl_shaders_pending += 1;
+                shader_index.insert(
+                    (vertex, pixel, color_format as u8, blend_op as u8),
+                    shader_id,
+                );
                 pipeline_id = Some(shader_id);
             }
 
