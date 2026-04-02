@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::{
     cx::Cx,
     draw_list::DrawListId,
@@ -418,6 +419,14 @@ impl Cx {
     }
 
     pub fn webgl_compile_shaders(&mut self) {
+        // Build a hash index of existing shaders for O(1) dedup lookups.
+        // The previous linear scan was O(n²) in the number of shaders and
+        // caused Chrome to hang for large apps with many draw types.
+        let mut shader_index: HashMap<(String, String), usize> = HashMap::new();
+        for (index, ds) in self.draw_shaders.os_shaders.iter().enumerate() {
+            shader_index.insert((ds.in_vertex.clone(), ds.in_pixel.clone()), index);
+        }
+
         let compile_set: Vec<usize> = self.draw_shaders.compile_set.iter().copied().collect();
         for draw_shader_id in compile_set {
             let (vertex, pixel, geometry_slots, instance_slots, textures, debug_code) = {
@@ -453,16 +462,11 @@ impl Cx {
 
             let mut os_shader_id = self.draw_shaders.shaders[draw_shader_id].os_shader_id;
             if os_shader_id.is_none() {
-                for (index, ds) in self.draw_shaders.os_shaders.iter().enumerate() {
-                    if ds.in_vertex == vertex && ds.in_pixel == pixel {
-                        os_shader_id = Some(index);
-                        break;
-                    }
-                }
+                os_shader_id = shader_index.get(&(vertex.clone(), pixel.clone())).copied();
             }
 
             if os_shader_id.is_none() {
-                let shp = CxOsDrawShader::new(vertex, pixel);
+                let shp = CxOsDrawShader::new(vertex.clone(), pixel.clone());
                 let shader_id = self.draw_shaders.os_shaders.len();
                 self.os.from_wasm(FromWasmCompileWebGLShader {
                     shader_id,
@@ -473,6 +477,7 @@ impl Cx {
                     textures,
                 });
                 self.draw_shaders.os_shaders.push(shp);
+                shader_index.insert((vertex, pixel), shader_id);
                 os_shader_id = Some(shader_id);
             }
 
