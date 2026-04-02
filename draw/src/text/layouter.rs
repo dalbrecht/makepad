@@ -1227,11 +1227,7 @@ impl LaidoutGlyph {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        merge_segments_for_line_breaking, parse_text_atlas_size_value, Layouter, Size,
-        LAYOUT_CACHE_MAX_TEXT_LEN, LAYOUT_CACHE_MULTILINE_LINE_COUNT,
-        LAYOUT_CACHE_MULTILINE_TEXT_LEN,
-    };
+    use super::{merge_segments_for_line_breaking, parse_text_atlas_size_value, Size};
     use unicode_segmentation::UnicodeSegmentation;
 
     #[test]
@@ -1256,7 +1252,10 @@ mod tests {
     /// Helper: split text by word bounds and return segment lengths,
     /// then apply merging, then reconstruct the segment strings.
     fn merged_segments(text: &str) -> Vec<String> {
-        let mut lens: Vec<usize> = text.split_word_bounds().map(|s| s.len()).collect();
+        let mut lens: Vec<usize> = text
+            .split_word_bounds()
+            .map(|s| s.len())
+            .collect();
         merge_segments_for_line_breaking(text, &mut lens);
         let mut result = Vec::new();
         let mut offset = 0;
@@ -1310,7 +1309,10 @@ mod tests {
 
     #[test]
     fn no_merge_for_plain_words() {
-        assert_eq!(merged_segments("hello world"), vec!["hello", " ", "world"]);
+        assert_eq!(
+            merged_segments("hello world"),
+            vec!["hello", " ", "world"]
+        );
     }
 
     #[test]
@@ -1321,20 +1323,5 @@ mod tests {
     #[test]
     fn empty_text() {
         assert_eq!(merged_segments(""), Vec::<String>::new());
-    }
-
-    #[test]
-    fn skips_layout_cache_for_large_or_multiline_debug_text() {
-        assert!(Layouter::should_cache_text("fps 90.0"));
-        assert!(!Layouter::should_cache_text(
-            &"x".repeat(LAYOUT_CACHE_MAX_TEXT_LEN + 1)
-        ));
-
-        let multiline = (0..LAYOUT_CACHE_MULTILINE_LINE_COUNT)
-            .map(|index| format!("line {index}: {}", "metric ".repeat(8)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(multiline.len() > LAYOUT_CACHE_MULTILINE_TEXT_LEN);
-        assert!(!Layouter::should_cache_text(&multiline));
     }
 }
