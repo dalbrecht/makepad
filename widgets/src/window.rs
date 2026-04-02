@@ -623,8 +623,6 @@ impl Widget for Window {
                     // If the platform reports native chrome button geometry, derive
                     // the caption bar height so the buttons are vertically centered:
                     // height = top_margin * 2 + button_height = pos.y * 2 + size.y.
-                    // If the platform reports native chrome button geometry, derive
-                    // the caption bar height so the buttons are vertically centered.
                     let new_buttons = ev.new_geom.window_chrome_buttons;
                     if new_buttons != Rect::default() {
                         let h = (new_buttons.pos.y * 2.0 + new_buttons.size.y).ceil();
