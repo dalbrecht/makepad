@@ -537,6 +537,15 @@ impl CxDrawItems {
         self.used
     }
     pub fn clear(&mut self) {
+        // Mark all live entries as Empty so that stale draw_item_id references
+        // (held by Areas or reorder indices from previous frames) access an
+        // empty item instead of a stale DrawCall with invalid shader/instance
+        // data. Without this, WASM builds crash with OOB panics during
+        // render_view when shader compilation failures leave the draw list
+        // in an inconsistent state.
+        for i in 0..self.used {
+            self.buffer[i].kind = CxDrawKind::Empty;
+        }
         self.used = 0
     }
     pub fn push_item(&mut self, redraw_id: u64, kind: CxDrawKind) -> &mut CxDrawItem {
