@@ -31,6 +31,12 @@ impl Cx {
             else {
                 continue;
             };
+            // Guard: skip draw items that reference beyond the live buffer.
+            // This can happen when shader compilation fails and the draw list
+            // retains stale entries from a previous frame layout.
+            if draw_item_id >= self.draw_lists[draw_list_id].draw_items.buffer.len() {
+                continue;
+            }
             if let Some(sub_list_id) =
                 self.draw_lists[draw_list_id].draw_items[draw_item_id].sub_list()
             {
