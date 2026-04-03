@@ -3046,12 +3046,15 @@ export class WasmWebBrowser extends WasmBridge {
                 }
                 return;
             }
-            makepad_crash_reporter.mark_wasm_dead(error);
+            // Catch WASM RuntimeError traps (e.g., from corrupt shader mappings
+            // after Script VM property resolution failures) to prevent a single
+            // bad frame from killing the entire page. Subsequent frames recover
+            // because shader compilation is a one-time operation.
+            console.error("do_wasm_pump error (recovering):", error && error.message ? error.message : error);
             void makepad_crash_reporter.report("window.error", {
                 message: error && error.message ? String(error.message) : String(error),
                 stack: error && error.stack ? String(error.stack) : ""
             });
-            throw error;
         }
     }
 
