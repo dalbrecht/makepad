@@ -1406,7 +1406,7 @@ impl ShaderFnCompiler {
                             let type_name = if let Some(name) = vm.bx.heap.pod_type_name(ty) {
                                 output.backend.map_pod_name(name)
                             } else {
-                                id!(unknown)
+                                id!(float)
                             };
                             write!(self.out, "{} {} = {};\n", type_name, local_name, value).ok();
                         }
@@ -1414,7 +1414,7 @@ impl ShaderFnCompiler {
                             let type_name = if let Some(name) = vm.bx.heap.pod_type_name(ty) {
                                 output.backend.map_pod_name(name)
                             } else {
-                                id!(unknown)
+                                id!(float)
                             };
                             // All shader locals are potentially mutable in Rust backend
                             write!(
@@ -1459,7 +1459,7 @@ impl ShaderFnCompiler {
                             let type_name = if let Some(name) = vm.bx.heap.pod_type_name(ty) {
                                 output.backend.map_pod_name(name)
                             } else {
-                                id!(unknown)
+                                id!(float)
                             };
                             write!(self.out, "{} {} = {};\n", type_name, local_name, value).ok();
                         }
@@ -1467,7 +1467,7 @@ impl ShaderFnCompiler {
                             let type_name = if let Some(name) = vm.bx.heap.pod_type_name(ty) {
                                 output.backend.map_pod_name(name)
                             } else {
-                                id!(unknown)
+                                id!(float)
                             };
                             write!(
                                 self.out,
