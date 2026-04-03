@@ -819,8 +819,9 @@ impl TextInput {
     }
 
     fn layout_text(&mut self, cx: &mut Cx2d) {
-        let max_width_in_lpxs = if !cx.turtle().inner_rect().size.x.is_nan() {
-            Some(cx.turtle().inner_rect().size.x as f32)
+        let turtle_rect = cx.turtle().inner_rect();
+        let max_width_in_lpxs = if !turtle_rect.size.x.is_nan() {
+            Some(turtle_rect.size.x as f32)
         } else {
             None
         };
@@ -837,6 +838,7 @@ impl TextInput {
         } else {
             &self.text
         };
+
         let wrap = self.is_multiline && cx.turtle().layout().flow == Flow::right_wrap();
         self.laidout_width = max_width_in_lpxs;
         self.laidout_text = Some(self.draw_text.layout(
@@ -974,8 +976,8 @@ impl TextInput {
         rect(sel_x, sel_y, sel_width.max(10.0), sel_height.max(20.0))
     }
 
-    fn scroll_to_cursor(&mut self, cx: &mut Cx2d, content_clip_index: usize) {
-        // Compute the final size of the turtle, and obtain its inner dimensions.
+    fn scroll_to_cursor(&mut self, cx: &mut Cx2d, content_clip_index: Option<usize>) {
+        // Compute the final size of the turtle, and obtain its inner height.
         // For multiline inputs, also clamp to the tightest ancestor max height,
         // so that scrolling kicks in even when the TextInput's own walk height
         // is unbounded Fit (relying on ancestors for the constraint).
@@ -989,21 +991,8 @@ impl TextInput {
                 }
             }
         }
-        // For single-line inputs with Fit width, clamp to the tightest ancestor
-        // max width so that horizontal scrolling kicks in when the text overflows
-        // the available space (e.g., parent has a fixed width).
-        if !self.is_multiline && self.walk.width.is_fit() {
-            let ancestor_max = cx.compute_max_width_from_ancestors();
-            if ancestor_max < f64::MAX {
-                let turtle = cx.turtle_mut();
-                if turtle.width() > ancestor_max {
-                    turtle.set_width(ancestor_max);
-                }
-            }
-        }
         let inner_rect = cx.turtle().inner_rect();
         let height = inner_rect.size.y;
-        let width = inner_rect.size.x;
 
         // Only auto-scroll to keep the cursor visible when the cursor has actually
         // moved (typing, arrow keys, clicking). Don't do this on every redraw, as
@@ -1058,23 +1047,9 @@ impl TextInput {
         // also moves BeginClip entries. By setting the clip to inner_rect here,
         // we override whatever shift was applied, keeping the clip at the correct
         // absolute position (the inner area excluding padding).
-        cx.update_clip_rect_at(content_clip_index, inner_rect);
-    }
-
-    /// Draws the vertical scrollbar when the text content overflows the visible area.
-    fn draw_scroll_bar(&mut self, cx: &mut Cx2d) {
-        if !self.is_multiline {
-            return;
+        if let Some(clip_index) = content_clip_index {
+            cx.update_clip_rect_at(clip_index, inner_rect);
         }
-        let Some(laidout_text) = self.laidout_text.as_ref() else {
-            return;
-        };
-        let view_rect = cx.turtle().inner_rect();
-        let view_total = dvec2(view_rect.size.x, laidout_text.size_in_lpxs.height as f64);
-        // Sync scroll_y (which scroll_to_cursor may have updated) into the scrollbar.
-        self.scroll_bar.set_scroll_pos_no_action(cx, self.scroll_y);
-        self.scroll_bar
-            .draw_scroll_bar(cx, ScrollAxis::Vertical, view_rect, view_total);
     }
 
     /// Draws the vertical scrollbar when the text content overflows the visible area.
@@ -1511,25 +1486,30 @@ impl Widget for TextInput {
         self.draw_bg.begin(cx, walk, self.layout);
         self.draw_selection.append_to_draw_call(cx);
         self.draw_composition_underline.append_to_draw_call(cx);
-        // Push an inner clip rect to prevent scrolled text from bleeding into
-        // the padding area. For multiline, this clips vertically-scrolled content.
-        // For single-line, this clips horizontally-scrolled content that overflows.
-        // We use a placeholder rect here (inner_origin with large size);
-        // scroll_to_cursor will tighten the bounds after compute_final_size
-        // determines the actual dimensions.
-        let inner_origin = cx.turtle().inner_origin();
-        let content_clip_index = cx.push_clip_rect_tracked(rect(
-            inner_origin.x,
-            inner_origin.y,
-            f64::MAX,
-            f64::MAX,
-        ));
+        // For multiline inputs, push an inner clip rect to prevent scrolled text
+        // from bleeding into the padding area. We use a placeholder rect here
+        // (inner_origin with large size); scroll_to_cursor will tighten the
+        // bottom bound after compute_final_size determines the actual height.
+        let content_clip_index = if self.is_multiline {
+            let inner_origin = cx.turtle().inner_origin();
+            Some(cx.push_clip_rect_tracked(rect(
+                inner_origin.x,
+                inner_origin.y,
+                f64::MAX,
+                f64::MAX,
+            )))
+        } else {
+            None
+        };
         self.layout_text(cx);
         let text_rect = self.draw_text(cx);
         let cursor_rect = self.draw_cursor(cx, text_rect);
         self.draw_selection(cx, text_rect);
         self.draw_composition_underline(cx, text_rect);
-        self.scroll_to_cursor(cx);
+        self.scroll_to_cursor(cx, content_clip_index);
+        if content_clip_index.is_some() {
+            cx.pop_clip_rect();
+        }
         self.draw_scroll_bar(cx);
         self.draw_bg.end(cx);
         if cx.has_key_focus(self.draw_bg.area()) {
