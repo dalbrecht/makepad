@@ -946,3 +946,54 @@ impl CxDrawList {
         self.draw_list_uniforms.view_transform
     }*/
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn draw_item_id_at_order_index_returns_none_for_stale_indices() {
+        let mut draw_list = CxDrawList::default();
+
+        // Simulate Frame N: push 5 items
+        for _ in 0..5 {
+            draw_list.draw_items.push_item(1, CxDrawKind::Empty);
+        }
+        assert_eq!(draw_list.draw_items.len(), 5);
+        assert_eq!(draw_list.draw_item_order_len(), 5);
+
+        // Simulate Frame N+1: clear and push only 2 items
+        draw_list.clear_draw_items(2);
+        assert_eq!(draw_list.draw_items.len(), 0);
+        for _ in 0..2 {
+            draw_list.draw_items.push_item(2, CxDrawKind::Empty);
+        }
+        assert_eq!(draw_list.draw_items.len(), 2);
+
+        // Accessing index 0 and 1 should work
+        assert!(draw_list.draw_item_id_at_order_index(0).is_some());
+        assert!(draw_list.draw_item_id_at_order_index(1).is_some());
+
+        // Accessing index 2+ should return None (beyond current used count)
+        assert_eq!(draw_list.draw_item_id_at_order_index(2), None);
+        assert_eq!(draw_list.draw_item_id_at_order_index(4), None);
+
+        // Buffer still has capacity from Frame N
+        assert!(draw_list.draw_items.buffer.len() >= 5);
+    }
+
+    #[test]
+    fn clear_draw_items_resets_used_count() {
+        let mut draw_list = CxDrawList::default();
+        draw_list.draw_items.push_item(1, CxDrawKind::Empty);
+        draw_list.draw_items.push_item(1, CxDrawKind::Empty);
+        assert_eq!(draw_list.draw_items.len(), 2);
+
+        draw_list.clear_draw_items(2);
+        assert_eq!(draw_list.draw_items.len(), 0);
+        assert_eq!(draw_list.draw_item_order_len(), 0);
+
+        // Buffer preserved for reuse
+        assert_eq!(draw_list.draw_items.buffer.len(), 2);
+    }
+}
