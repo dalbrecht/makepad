@@ -825,10 +825,7 @@ impl TextInput {
 
     fn layout_text(&mut self, cx: &mut Cx2d) {
         let turtle_rect = cx.turtle().inner_rect();
-        // For single-line mode, don't constrain the max width so the text lays out
-        // at its natural width. This allows us to detect overflow and scroll horizontally.
-        // For multiline mode, constrain to the available width for proper wrapping.
-        let max_width_in_lpxs = if self.is_multiline && !turtle_rect.size.x.is_nan() {
+        let max_width_in_lpxs = if !turtle_rect.size.x.is_nan() {
             Some(turtle_rect.size.x as f32)
         } else {
             None
@@ -846,8 +843,7 @@ impl TextInput {
         } else {
             &self.text
         };
-
-        let wrap = self.is_multiline && cx.turtle().layout().flow == Flow::right_wrap();
+        let wrap = cx.turtle().layout().flow == Flow::right_wrap();
         self.laidout_width = max_width_in_lpxs;
         self.laidout_text = Some(self.draw_text.layout(
             cx,
