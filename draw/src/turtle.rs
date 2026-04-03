@@ -312,7 +312,7 @@ pub enum FitBound {
 }
 
 impl FitBound {
-    pub fn eval_width(self, cx: &Cx2d<'_, '_>) -> Option<f64> {
+    fn eval_width(self, cx: &Cx2d<'_, '_>) -> Option<f64> {
         match self {
             FitBound::Abs(abs) => Some(abs),
             FitBound::Rel { base, factor } => {
@@ -322,7 +322,7 @@ impl FitBound {
         }
     }
 
-    pub fn eval_height(self, cx: &Cx2d<'_, '_>) -> Option<f64> {
+    fn eval_height(self, cx: &Cx2d<'_, '_>) -> Option<f64> {
         match self {
             FitBound::Abs(abs) => Some(abs),
             FitBound::Rel { base, factor } => {
@@ -377,10 +377,6 @@ pub struct Layout {
     /// The spacing between each walk.
     #[live]
     pub spacing: f64,
-
-    /// The vertical spacing between rows when wrapping in a `Flow::Right { wrap: true }` layout.
-    #[live]
-    pub wrap_spacing: f64,
 
     /// The padding around the inner rectangle of each walk.
     #[live]
@@ -476,7 +472,6 @@ impl Default for Layout {
             align: Align::default(),
             flow: Flow::default(),
             spacing: 0.0,
-            wrap_spacing: 0.0,
         }
     }
 }
@@ -798,11 +793,6 @@ impl Turtle {
     /// If the height is unknown, then NaN is returned.
     pub fn height(&self) -> f64 {
         self.height
-    }
-
-    /// Sets the width of this turtle's rectangle.
-    pub fn set_width(&mut self, width: f64) {
-        self.width = width;
     }
 
     /// Sets the height of this turtle's rectangle.
@@ -1317,7 +1307,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 x: layout.padding.left,
                 y: layout.padding.top,
             },
-            wrap_spacing: layout.wrap_spacing,
+            wrap_spacing: 0.0,
             origin: dvec2(0.0, 0.0),
             width: size.x,
             height: size.y,
@@ -1414,7 +1404,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             finished_walks_start: self.finished_walks.len(),
             deferred_fills: Vec::new(),
             resolved_fills: Vec::new(),
-            wrap_spacing: layout.wrap_spacing,
+            wrap_spacing: 0.0,
             pos: Vec2d {
                 x: origin.x + layout.padding.left,
                 y: origin.y + layout.padding.top,
@@ -1471,9 +1461,8 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                         {
                             let finished_walk = &self.finished_walks[finished_walk_index];
 
-                            let inner_unused_height = (inner_effective_height
-                                - finished_walk.outer_size.y)
-                                .max(0.0);
+                            let inner_unused_height =
+                                inner_effective_height - finished_walk.outer_size.y;
 
                             let dx = turtle.align().x * inner_unused_width;
                             let dy = turtle.align().y * inner_unused_height;
@@ -1495,9 +1484,8 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                     for finished_walk_index in turtle_walks_start..self.finished_walks.len() {
                         let finished_walk = &self.finished_walks[finished_walk_index];
 
-                        let inner_unused_height = (inner_effective_height
-                            - finished_walk.outer_size.y)
-                            .max(0.0);
+                        let inner_unused_height =
+                            inner_effective_height - finished_walk.outer_size.y;
 
                         let dx =
                             turtle.total_resolved_length_to(finished_walk.deferred_before_count);
@@ -1530,9 +1518,8 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                         for finished_walk_index in turtle_walks_start..self.finished_walks.len() {
                             let finished_walk = &self.finished_walks[finished_walk_index];
 
-                            let inner_unused_width = (inner_effective_width
-                                - finished_walk.outer_size.x)
-                                .max(0.0);
+                            let inner_unused_width =
+                                inner_effective_width - finished_walk.outer_size.x;
 
                             let dx = turtle.align().x * inner_unused_width;
                             let dy = turtle.align().y * inner_unused_height;
@@ -1554,9 +1541,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                     for finished_walk_index in turtle_walks_start..self.finished_walks.len() {
                         let finished_walk = &self.finished_walks[finished_walk_index];
 
-                        let inner_unused_width = (inner_effective_width
-                            - finished_walk.outer_size.x)
-                            .max(0.0);
+                        let inner_unused_width = inner_effective_width - finished_walk.outer_size.x;
 
                         let dx = turtle.align().x * inner_unused_width;
                         let dy =
@@ -1580,12 +1565,9 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                     for finished_walk_index in turtle_walks_start..self.finished_walks.len() {
                         let finished_walk = &self.finished_walks[finished_walk_index];
 
-                        let inner_unused_width = (inner_effective_width
-                            - finished_walk.outer_size.x)
-                            .max(0.0);
-                        let inner_unused_height = (inner_effective_height
-                            - finished_walk.outer_size.y)
-                            .max(0.0);
+                        let inner_unused_width = inner_effective_width - finished_walk.outer_size.x;
+                        let inner_unused_height =
+                            inner_effective_height - finished_walk.outer_size.y;
 
                         let dx = turtle.align().x * inner_unused_width;
                         let dy = turtle.align().y * inner_unused_height;
@@ -1709,8 +1691,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             // If this ancestor has a known (non-NaN) height, it already constrains
             // children via layout, so we don't need to look further up.
             if !ancestor.height().is_nan() {
-                let available =
-                    ancestor.inner_height() - consumed_padding + current.padding().height();
+                let available = ancestor.inner_height() - consumed_padding + current.padding().height();
                 max_height = max_height.min(available);
                 break;
             }
@@ -1718,37 +1699,6 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             consumed_padding += ancestor.padding().height();
         }
         max_height
-    }
-
-    /// Walks up the turtle stack looking for the tightest `Fit { max }` width
-    /// constraint on any ancestor, accounting for padding/spacing consumed by
-    /// each ancestor layer. Returns `f64::MAX` if no ancestor has a max constraint.
-    ///
-    /// This is useful for widgets like TextInput that need to know when to start
-    /// horizontal scrolling, even when their own walk width is unbounded `Fit`.
-    pub fn compute_max_width_from_ancestors(&self) -> f64 {
-        let mut max_width = f64::MAX;
-        let current = self.turtles.last().unwrap();
-        let mut consumed_padding = current.padding().width();
-
-        // Walk ancestors (skip self)
-        for ancestor in self.turtles.iter().rev().skip(1) {
-            if let Size::Fit { max: Some(max), .. } = ancestor.walk.width {
-                if let Some(ancestor_max) = max.eval_width(self) {
-                    let available = ancestor_max - consumed_padding;
-                    max_width = max_width.min(available);
-                }
-            }
-
-            if !ancestor.width().is_nan() {
-                let available = ancestor.inner_width() - consumed_padding + current.padding().width();
-                max_width = max_width.min(available);
-                break;
-            }
-
-            consumed_padding += ancestor.padding().width();
-        }
-        max_width
     }
 
     /// Pushes a clip rect entry and returns the index of that entry in the align list.
@@ -2047,7 +1997,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     }
 
     fn wrap_turtle(&mut self, align_list_start: usize) {
-        let old_pos = self.turtle().pos() + self.turtle_next_walk_offset();
+        let old_pos = self.turtle().pos() - self.turtle_next_walk_offset();
         self.turtle_new_line_internal(self.turtle().wrap_spacing, align_list_start);
         let new_pos = self.turtle().pos();
         let shift = new_pos - old_pos;
