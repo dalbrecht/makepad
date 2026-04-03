@@ -17,7 +17,7 @@ use {
             *,
         },
         makepad_script::{ScriptFnRef, ScriptRefOptionExt},
-        scroll_bar::{ScrollAxis, ScrollBar},
+        scroll_bar::{ScrollBar, ScrollAxis},
         widget::*,
         widget_async::ScriptAsyncResult,
     },
@@ -564,14 +564,11 @@ pub struct TextInput {
     /// Set when the cursor/selection changes; cleared after scroll_to_cursor runs.
     #[rust(true)]
     needs_scroll_to_cursor: bool,
-    /// Cached maximum vertical scroll offset from the last draw pass. Used during event
+    /// Cached maximum scroll offset from the last draw pass. Used during event
     /// handling to ensure boundary checks match exactly (avoiding floating-point
     /// mismatch between draw-time and event-time computations).
     #[rust]
     cached_max_scroll_y: f64,
-    /// Cached maximum horizontal scroll offset from the last draw pass.
-    #[rust]
-    cached_max_scroll_x: f64,
     /// Skip finger move after long press to prevent selection changes
     #[rust]
     ignore_next_move: bool,
@@ -641,8 +638,6 @@ impl TextInput {
             self.scroll_y = 0.0;
             self.cached_max_scroll_y = 0.0;
         }
-        self.scroll_x = 0.0;
-        self.cached_max_scroll_x = 0.0;
         self.laidout_text = None;
         self.draw_bg.redraw(cx);
     }
@@ -824,9 +819,8 @@ impl TextInput {
     }
 
     fn layout_text(&mut self, cx: &mut Cx2d) {
-        let turtle_rect = cx.turtle().inner_rect();
-        let max_width_in_lpxs = if !turtle_rect.size.x.is_nan() {
-            Some(turtle_rect.size.x as f32)
+        let max_width_in_lpxs = if !cx.turtle().inner_rect().size.x.is_nan() {
+            Some(cx.turtle().inner_rect().size.x as f32)
         } else {
             None
         };
@@ -843,7 +837,7 @@ impl TextInput {
         } else {
             &self.text
         };
-        let wrap = cx.turtle().layout().flow == Flow::right_wrap();
+        let wrap = self.is_multiline && cx.turtle().layout().flow == Flow::right_wrap();
         self.laidout_width = max_width_in_lpxs;
         self.laidout_text = Some(self.draw_text.layout(
             cx,
@@ -1018,50 +1012,28 @@ impl TextInput {
             self.needs_scroll_to_cursor = false;
 
             let laidout_text = self.laidout_text.as_ref().unwrap();
+            let position = self.cursor_to_position(self.cursor()).unwrap();
+            let laidout_row = &laidout_text.rows[position.row_index];
+            let y_min = (laidout_row.origin_in_lpxs.y - laidout_row.ascender_in_lpxs) as f64;
+            let y_max = (laidout_row.origin_in_lpxs.y - laidout_row.descender_in_lpxs) as f64;
 
-            if self.is_multiline {
-                let position = self.cursor_to_position(self.cursor()).unwrap();
-                let laidout_row = &laidout_text.rows[position.row_index];
-                let y_min =
-                    (laidout_row.origin_in_lpxs.y - laidout_row.ascender_in_lpxs) as f64;
-                let y_max =
-                    (laidout_row.origin_in_lpxs.y - laidout_row.descender_in_lpxs) as f64;
+            // If the min y of the row is less than the scroll position, scroll up so
+            // that the top of the row appears at the top.
+            if y_min < self.scroll_y {
+                self.scroll_y = y_min;
+            }
 
-                // If the min y of the row is less than the scroll position, scroll up so
-                // that the top of the row appears at the top.
-                if y_min < self.scroll_y {
-                    self.scroll_y = y_min;
-                }
-
-                // If the max y of the row is greater than the scroll position, scroll
-                // down so that the bottom of the row appears at the bottom.
-                if y_max > self.scroll_y + height {
-                    self.scroll_y = y_max - height;
-                }
-            } else {
-                // Single-line: auto-scroll horizontally to keep the cursor visible.
-                let password_cursor =
-                    self.cursor_to_password_cursor(self.cursor());
-                let cursor_pos = laidout_text.cursor_to_position(password_cursor);
-                let cursor_x = cursor_pos.x_in_lpxs as f64;
-
-                // If the cursor is to the left of the visible area, scroll left.
-                if cursor_x < self.scroll_x {
-                    self.scroll_x = cursor_x;
-                }
-
-                // If the cursor is to the right of the visible area, scroll right.
-                if cursor_x > self.scroll_x + width {
-                    self.scroll_x = cursor_x - width;
-                }
+            // If the max y of the row is greater than the scroll position, scroll down
+            // so that the bottom of the row appears at the bottom.
+            if y_max > self.scroll_y + height {
+                self.scroll_y = y_max - height;
             }
         }
 
-        // Always clamp the scroll positions to valid bounds, and cache
-        // the max values so the event handler uses the exact same values
+        // Always clamp the scroll position to valid bounds, and cache
+        // max_scroll_y so the event handler uses the exact same value
         // (avoiding floating-point mismatch with relative Fit bounds).
-        let laidout_text = self.laidout_text.as_ref().unwrap();
-        let laidout_text_height = laidout_text.size_in_lpxs.height as f64;
+        let laidout_text_height = self.laidout_text.as_ref().unwrap().size_in_lpxs.height as f64;
         let max_scroll_y = (laidout_text_height - height).max(0.0);
         self.cached_max_scroll_y = max_scroll_y;
         self.scroll_y = self.scroll_y.max(0.0).min(max_scroll_y);
@@ -1099,6 +1071,25 @@ impl TextInput {
         };
         let view_rect = cx.turtle().inner_rect();
         let view_total = dvec2(view_rect.size.x, laidout_text.size_in_lpxs.height as f64);
+        // Sync scroll_y (which scroll_to_cursor may have updated) into the scrollbar.
+        self.scroll_bar.set_scroll_pos_no_action(cx, self.scroll_y);
+        self.scroll_bar
+            .draw_scroll_bar(cx, ScrollAxis::Vertical, view_rect, view_total);
+    }
+
+    /// Draws the vertical scrollbar when the text content overflows the visible area.
+    fn draw_scroll_bar(&mut self, cx: &mut Cx2d) {
+        if !self.is_multiline {
+            return;
+        }
+        let Some(laidout_text) = self.laidout_text.as_ref() else {
+            return;
+        };
+        let view_rect = cx.turtle().inner_rect();
+        let view_total = dvec2(
+            view_rect.size.x,
+            laidout_text.size_in_lpxs.height as f64,
+        );
         // Sync scroll_y (which scroll_to_cursor may have updated) into the scrollbar.
         self.scroll_bar.set_scroll_pos_no_action(cx, self.scroll_y);
         self.scroll_bar
@@ -1538,8 +1529,7 @@ impl Widget for TextInput {
         let cursor_rect = self.draw_cursor(cx, text_rect);
         self.draw_selection(cx, text_rect);
         self.draw_composition_underline(cx, text_rect);
-        self.scroll_to_cursor(cx, content_clip_index);
-        cx.pop_clip_rect();
+        self.scroll_to_cursor(cx);
         self.draw_scroll_bar(cx);
         self.draw_bg.end(cx);
         if cx.has_key_focus(self.draw_bg.area()) {
@@ -1631,7 +1621,9 @@ impl Widget for TextInput {
                     // with relative Fit bounds.
                     let max_scroll_y = self.cached_max_scroll_y;
                     if max_scroll_y > 0.0 {
-                        let new_scroll_y = (self.scroll_y + e.scroll.y).max(0.0).min(max_scroll_y);
+                        let new_scroll_y = (self.scroll_y + e.scroll.y)
+                            .max(0.0)
+                            .min(max_scroll_y);
                         if new_scroll_y != self.scroll_y {
                             self.scroll_y = new_scroll_y;
                             self.draw_bg.redraw(cx);
@@ -1644,7 +1636,11 @@ impl Widget for TextInput {
             // Handle clicking/dragging on the scrollbar handle itself.
             // We pass an empty callback because we sync scroll_y from the ScrollBar
             // below, only when the scrollbar has actually captured the finger.
-            self.scroll_bar.handle_event_with(cx, event, &mut |_, _| {});
+            self.scroll_bar.handle_event_with(
+                cx,
+                event,
+                &mut |_, _| {},
+            );
 
             // If the scrollbar has captured the finger (user is dragging the handle),
             // sync scroll_y from the ScrollBar (which is the source of truth during
@@ -1652,29 +1648,6 @@ impl Widget for TextInput {
             if self.scroll_bar.is_area_captured(cx) {
                 self.scroll_y = self.scroll_bar.get_scroll_pos();
                 self.draw_bg.redraw(cx);
-            }
-        }
-
-        // Handle horizontal scroll events for single-line text inputs.
-        // Only consume horizontal scroll (scroll.x), NOT vertical scroll —
-        // vertical scroll should propagate to parent containers.
-        if !self.is_multiline {
-            if let Event::Scroll(e) = event {
-                if !e.handled_x.get() && e.scroll.x != 0.0 {
-                    let bg_rect = self.draw_bg.area().rect(cx);
-                    if bg_rect.contains(e.abs) {
-                        let max_scroll_x = self.cached_max_scroll_x;
-                        if max_scroll_x > 0.0 {
-                            let new_scroll_x =
-                                (self.scroll_x + e.scroll.x).max(0.0).min(max_scroll_x);
-                            if new_scroll_x != self.scroll_x {
-                                self.scroll_x = new_scroll_x;
-                                self.draw_bg.redraw(cx);
-                                e.handled_x.set(true);
-                            }
-                        }
-                    }
-                }
             }
         }
 
