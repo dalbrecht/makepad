@@ -19,6 +19,16 @@ impl Cx {
         zbias: &mut f32,
         zbias_step: f32,
     ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOGGED_SIZES: AtomicBool = AtomicBool::new(false);
+        if !LOGGED_SIZES.swap(true, Ordering::Relaxed) {
+            crate::log!("DIAG sizeof CxDrawItem={} CxDrawKind={} CxDrawCall={} CxDrawItems={}",
+                std::mem::size_of::<crate::draw_list::CxDrawItem>(),
+                std::mem::size_of::<crate::draw_list::CxDrawKind>(),
+                std::mem::size_of::<crate::draw_list::CxDrawCall>(),
+                std::mem::size_of::<crate::draw_list::CxDrawItems>(),
+            );
+        }
         // tad ugly otherwise the borrow checker locks 'self' and we can't recur
         let draw_order_len = self.draw_lists[draw_list_id].draw_item_order_len();
         self.draw_lists[draw_list_id]
