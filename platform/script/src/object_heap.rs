@@ -760,7 +760,12 @@ impl ScriptHeap {
         key: ScriptValue,
         trap: ScriptTrap,
     ) -> ScriptValue {
-        return self.value_deep_map(ptr, key, trap);
+        // Use value_deep instead of value_deep_map so that properties
+        // stored in vec (not just map) are also found. On WASM, shader
+        // stage functions like vertex/fragment can end up in vec due to
+        // evaluation order differences, causing 'key vertex not found'
+        // errors when using map-only lookup.
+        return self.value_deep(ptr, key, trap);
     }
 
     pub fn value_path(&self, ptr: ScriptObject, keys: &[LiveId], trap: ScriptTrap) -> ScriptValue {
