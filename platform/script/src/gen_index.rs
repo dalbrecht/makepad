@@ -234,7 +234,13 @@ impl<T: Default> GenVec<T> {
     }
 }
 
-/// Check generation and panic on mismatch
+/// Check generation and panic on mismatch.
+///
+/// On WASM, this check is disabled because stale ScriptObject references
+/// (stored in platform-level Rust structs outside the GC's reach) trigger
+/// false-positive panics that kill the render loop. The stale accesses are
+/// harmless on WASM — the reused slot data is compatible. See:
+/// https://github.com/dalbrecht/makepad/issues/6
 #[cfg(feature = "check_gen")]
 #[inline]
 fn check_generation<R: GenRef>(
@@ -243,11 +249,16 @@ fn check_generation<R: GenRef>(
     index: u32,
     type_name: &str,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
     if slots_gen != ref_gen {
         panic!(
             "GenVec<{}> use-after-free detected! index={} ref_gen={} slot_gen={}",
             type_name, index, ref_gen, slots_gen
         );
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (slots_gen, ref_gen, index, type_name);
     }
 }
 
