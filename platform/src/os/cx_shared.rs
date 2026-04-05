@@ -748,9 +748,10 @@ impl Cx {
             || Cx::local_profile_capture_enabled()
         {
             let start = self.seconds_since_app_start();
-            let mut event_handler = self.event_handler.take().unwrap();
-            event_handler(self, event);
-            self.event_handler = Some(event_handler);
+            if let Some(mut event_handler) = self.event_handler.take() {
+                event_handler(self, event);
+                self.event_handler = Some(event_handler);
+            }
             let end = self.seconds_since_app_start();
             Cx::send_studio_message(AppToStudio::EventSample(EventSample {
                 event_u32: event.to_u32(),
@@ -763,9 +764,10 @@ impl Cx {
                 end: end,
             }))
         } else {
-            let mut event_handler = self.event_handler.take().unwrap();
-            event_handler(self, event);
-            self.event_handler = Some(event_handler);
+            if let Some(mut event_handler) = self.event_handler.take() {
+                event_handler(self, event);
+                self.event_handler = Some(event_handler);
+            }
         }
         if perf_timing {
             self.perf_monitor.event_depth -= 1;
