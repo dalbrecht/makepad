@@ -760,18 +760,7 @@ impl ScriptHeap {
         key: ScriptValue,
         trap: ScriptTrap,
     ) -> ScriptValue {
-        // On WASM, shader stage functions (vertex, fragment) can end up in
-        // vec instead of map due to evaluation order differences. Use
-        // value_deep (which checks both vec and map) instead of
-        // value_deep_map (map-only) so the lookup succeeds.
-        #[cfg(target_arch = "wasm32")]
-        {
-            return self.value_deep(ptr, key, trap);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            return self.value_deep_map(ptr, key, trap);
-        }
+        return self.value_deep_map(ptr, key, trap);
     }
 
     pub fn value_path(&self, ptr: ScriptObject, keys: &[LiveId], trap: ScriptTrap) -> ScriptValue {
