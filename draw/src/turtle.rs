@@ -1673,7 +1673,10 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     /// scrolling, even when their own walk height is unbounded `Fit`.
     pub fn compute_max_height_from_ancestors(&self) -> f64 {
         let mut max_height = f64::MAX;
-        let current = self.turtles.last().unwrap();
+        let current = match self.turtles.last() {
+            Some(t) => t,
+            None => return f64::MAX,
+        };
         let mut consumed_padding = current.padding().height();
 
         // Walk ancestors (skip self)
