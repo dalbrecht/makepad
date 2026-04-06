@@ -921,6 +921,15 @@ impl ScriptObjectData {
     }
 
     pub fn map_insert(&mut self, key: ScriptValue, value: ScriptValue) {
+        // DIAG: trace vertex key insertion on WASM
+        #[cfg(target_arch = "wasm32")]
+        {
+            use crate::makepad_live_id::*;
+            let vertex_sv: ScriptValue = id!(vertex).into();
+            if key == vertex_sv {
+                makepad_error_log::error!("DIAG map_insert vertex on obj (map_len={})", self.map.len());
+            }
+        }
         if self.tag.is_tracked() {
             let order = self.map.len() as u32;
             match self.map.entry(key) {
