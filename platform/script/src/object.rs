@@ -920,14 +920,17 @@ impl ScriptObjectData {
         );
     }
 
-    // On WASM, this function must NOT be inlined. Without this attribute,
-    // the WASM compiler (LLVM → wasm32) miscompiles the HashMap insertion
-    // when map_insert is inlined into the caller, causing certain LiveId
-    // keys (notably `vertex`) to be silently dropped. This manifests as
-    // shader compilation failures ("key vertex not found in prototype chain")
-    // and broken text rendering. See: https://github.com/dalbrecht/makepad/issues/6
-    #[cfg_attr(target_arch = "wasm32", inline(never))]
     pub fn map_insert(&mut self, key: ScriptValue, value: ScriptValue) {
+        // WASM codegen workaround: without this black_box hint, the WASM
+        // compiler (LLVM → wasm32) miscompiles this function, silently
+        // dropping certain LiveId keys (notably `vertex`) during HashMap
+        // insertion. This causes "key vertex not found in prototype chain"
+        // and breaks text rendering. The hint prevents the problematic
+        // optimization. See: https://github.com/dalbrecht/makepad/issues/6
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = std::hint::black_box(key);
+        }
         if self.tag.is_tracked() {
             let order = self.map.len() as u32;
             match self.map.entry(key) {
