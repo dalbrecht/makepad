@@ -117,7 +117,7 @@ script_mod! {
             if self.color.x >= 0.0 {
                 // Replace base RGB with the override color, preserving the
                 // vertex alpha (shape mask from tessellation).
-                return vec4(self.color.rgb * base.a, self.color.a * base.a)
+                return vec4(self.color.rgb * self.color.a * base.a, self.color.a * base.a)
             }
             return base
         }

@@ -313,14 +313,8 @@ mod tests {
             },
         );
 
-        let regular = loader
-            .get_or_load_font(regular_id)
-            .expect("regular font should load")
-            .clone();
-        let bold = loader
-            .get_or_load_font(bold_id)
-            .expect("bold font should load")
-            .clone();
+        let regular = loader.get_or_load_font(regular_id).expect("test font should load").clone();
+        let bold = loader.get_or_load_font(bold_id).expect("test font should load").clone();
         let glyph_id = regular.with_ttf_parser_face(|face| {
             face.glyph_index('B')
                 .expect("test glyph should exist in variable font")
