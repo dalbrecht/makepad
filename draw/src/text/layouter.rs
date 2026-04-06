@@ -80,7 +80,7 @@ impl Layouter {
         self.loader.define_font(id, definition);
     }
 
-    pub fn get_or_load_font_family(&mut self, id: FontFamilyId) -> Rc<FontFamily> {
+    pub fn get_or_load_font_family(&mut self, id: FontFamilyId) -> Option<Rc<FontFamily>> {
         self.loader.get_or_load_font_family_rc(id)
     }
 
@@ -106,8 +106,10 @@ impl Layouter {
     fn layout(&mut self, params: OwnedLayoutParams) -> LaidoutText {
         let font_family = self
             .loader
-            .get_or_load_font_family(params.style.font_family_id);
-        LayoutContext::new(font_family.clone(), params.text, params.style, params.options)
+            .get_or_load_font_family(params.style.font_family_id)
+            .cloned()
+            .expect("font family should be loaded before layout");
+        LayoutContext::new(font_family, params.text, params.style, params.options)
             .layout_multiline()
     }
 }

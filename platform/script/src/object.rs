@@ -921,6 +921,21 @@ impl ScriptObjectData {
     }
 
     pub fn map_insert(&mut self, key: ScriptValue, value: ScriptValue) {
+        // WASM codegen workaround: without this block, the WASM compiler
+        // (LLVM → wasm32) miscompiles this function, silently dropping
+        // certain LiveId keys (notably `vertex`) during HashMap insertion.
+        // The local variable + comparison + error!() side-effect prevents
+        // the problematic optimization path. Removing any part of this
+        // (the let binding, the error! level, the format args) breaks text
+        // rendering on WASM. See: https://github.com/dalbrecht/makepad/issues/6
+        #[cfg(target_arch = "wasm32")]
+        {
+            use crate::makepad_live_id::*;
+            let vertex_sv: ScriptValue = id!(vertex).into();
+            if key == vertex_sv {
+                makepad_error_log::error!("DIAG map_insert vertex on obj (map_len={})", self.map.len());
+            }
+        }
         if self.tag.is_tracked() {
             let order = self.map.len() as u32;
             match self.map.entry(key) {
