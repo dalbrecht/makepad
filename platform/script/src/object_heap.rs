@@ -668,6 +668,15 @@ impl ScriptHeap {
             if let Some(value) = object.map_get(&key) {
                 return value;
             }
+            // On WASM, shader stage functions (vertex, fragment) can end up
+            // in vec instead of map due to Script VM evaluation order
+            // differences. Check vec entries by key as a fallback.
+            #[cfg(target_arch = "wasm32")]
+            for entry in &object.vec {
+                if entry.key == key {
+                    return entry.value;
+                }
+            }
             if let Some(next_ptr) = object.proto.as_object() {
                 ptr = next_ptr
             } else {
