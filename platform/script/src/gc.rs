@@ -350,8 +350,6 @@ impl ScriptHeap {
             ScriptGcMark::Object(obj) => {
                 // Check flags and set mark
                 let object = &mut self.objects[obj];
-                // Static objects are assumed to only reference static values, so
-                // they do not need traversal during normal GC marking.
                 if object.tag.is_static() || object.tag.is_marked() || !object.tag.is_alloced() {
                     return;
                 }
@@ -998,7 +996,18 @@ impl ScriptHeap {
 
     #[inline]
     pub fn needs_gc(&self) -> bool {
-        self.heap_stat(HEAP_STAT_NEEDS_GC) != 0
+        // On WASM, disable automatic GC to work around stale ScriptObject
+        // references stored in platform-level Rust structs. The GC frees slots
+        // that are still referenced, causing memory access violations.
+        // See: https://github.com/dalbrecht/makepad/issues/6
+        #[cfg(target_arch = "wasm32")]
+        {
+            return false;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.heap_stat(HEAP_STAT_NEEDS_GC) != 0
+        }
     }
 
     pub(crate) fn needs_gc_impl(&self) -> bool {
