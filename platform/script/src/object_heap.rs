@@ -683,6 +683,19 @@ impl ScriptHeap {
                 break;
             }
         }
+        // DIAG: on WASM, dump prototype chain when vertex lookup fails
+        #[cfg(target_arch = "wasm32")]
+        if key == makepad_live_id::id!(vertex).into() {
+            let mut chain_info = Vec::new();
+            let mut p = obj_ptr;
+            for _ in 0..20 {
+                let o = &self.objects[p];
+                let map_keys: Vec<String> = o.map.keys().map(|k| format!("{:?}", k)).collect();
+                chain_info.push(format!("obj{}[map=[{}] proto={:?}]", p.index, map_keys.join(","), o.proto));
+                if let Some(next) = o.proto.as_object() { p = next; } else { break; }
+            }
+            makepad_error_log::error!("DIAG vertex miss chain: {}", chain_info.join(" -> "));
+        }
         script_err_not_found!(
             trap,
             "key {:?} not found in prototype chain{}",
