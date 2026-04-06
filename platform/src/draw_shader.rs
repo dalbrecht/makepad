@@ -838,8 +838,6 @@ impl CxDrawShaderMapping {
                 break;
             }
             let (source_obj, key) = self.scope_uniform_sources[i];
-
-            // Read the value from the heap
             let value = heap.scope_value(source_obj, key, *trap);
 
             // Write value to buffer at the input's offset
