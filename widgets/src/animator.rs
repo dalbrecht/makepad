@@ -237,7 +237,17 @@ pub struct AnimatorState {
     pub redraw: bool,
 }
 
-impl ScriptHook for AnimatorState {}
+impl ScriptHook for AnimatorState {
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, _apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        // Fix: mark the apply object as static so GC doesn't free it.
+        // AnimatorState stores a raw ScriptObject (not ScriptObjectRef) in `apply`,
+        // which lives outside the GC's reach. Without this, GC can free the object
+        // and subsequent render frames trigger use-after-free panics.
+        if let Some(obj) = self.apply {
+            vm.bx.heap.set_static(obj.into());
+        }
+    }
+}
 
 /// Runtime state for a single animation track
 struct AnimatorTrack {

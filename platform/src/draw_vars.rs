@@ -1025,6 +1025,12 @@ impl DrawVars {
                 &output,
                 geometry_id,
             );
+            // Fix: mark scope uniform source objects as static so GC doesn't
+            // free them. These raw ScriptObject refs live in platform structs
+            // outside the GC's reach and are accessed every render frame.
+            for &(source_obj, _) in &mapping.scope_uniform_sources {
+                vm.bx.heap.set_static(source_obj.into());
+            }
             mapping.fill_scope_uniforms_buffer(&vm.bx.heap, &vm.thread().trap.pass());
 
             self.dyn_instance_start = self.dyn_instances.len() - mapping.dyn_instances.total_slots;
