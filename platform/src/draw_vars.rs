@@ -1356,6 +1356,13 @@ impl DrawVars {
             desc,
             geometry_id,
         );
+        // Scope uniform sources are raw ScriptObject refs held by the mapping,
+        // outside the GC's reach, and read every frame. Pin them.
+        for slot in &mapping.scope_uniform_sources {
+            if let crate::draw_shader::ScopeUniformSlot::Scope(source_obj, _) = *slot {
+                vm.heap_mut().set_static(source_obj.into());
+            }
+        }
         mapping.fill_scope_uniforms_buffer(vm.heap(), &vm.trap());
 
         if !self.bind_dyn_instances(vm, io_self, &mapping) {

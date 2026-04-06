@@ -75,6 +75,13 @@ impl DrawVars {
         });
         let source = vm.new_object_ref(io_self);
         let mut mapping = CxDrawShaderMapping::from_shader_output(source, code.clone(), vm, &output, geometry_id);
+        // Scope uniform sources are raw ScriptObject refs held by the mapping,
+        // outside the GC's reach, and read every frame. Pin them.
+        for slot in &mapping.scope_uniform_sources {
+            if let crate::draw_shader::ScopeUniformSlot::Scope(source_obj, _) = *slot {
+                vm.heap_mut().set_static(source_obj.into());
+            }
+        }
         mapping.pick_code = output.pick_code().map(str::to_owned);
         if vulkan {
             let payload = |result: &crate::makepad_script::shader_ir_draw::IrDrawSpirvResult, multiview: bool| -> Result<Vec<u8>, String> {
