@@ -683,6 +683,7 @@ impl DrawGlyph {
             bounds,
             flags: self.pending_flags,
         });
+        self.pending_flags = 0;
     }
 
     pub fn add_curves_layer(&mut self, color: Vec4f, curves: &[(Vec2f, Vec2f, Vec2f)]) {
