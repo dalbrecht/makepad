@@ -312,15 +312,38 @@ pub fn define_shader_module(heap: &mut ScriptHeap, native: &mut ScriptNative) {
                 output.pre_collect_rust_instance_io(vm, io_self);
                 output.pre_collect_shader_io(vm, io_self);
 
-                if let Some(fnobj) = vm
+                let vertex_result = vm
                     .bx
                     .heap
                     .object_method(
                         io_self,
                         id!(vertex).into(),
                         vm.bx.threads.cur_ref().trap.pass(),
-                    )
-                    .as_object()
+                    );
+                // DIAG: dump prototype chain when vertex lookup fails on WASM
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let is_obj = vertex_result.as_object().is_some();
+                    makepad_error_log::error!("DIAG vertex lookup for io_self={}: is_object={}", io_self.index, is_obj);
+                    if !is_obj {
+                        let mut chain = Vec::new();
+                        let mut ptr = io_self;
+                        for _ in 0..20 {
+                            let obj = &vm.bx.heap.objects[ptr];
+                            let keys: Vec<String> = obj.map.keys().map(|k| format!("{:?}", k)).collect();
+                            let vec_keys: Vec<String> = obj.vec.iter().map(|v| format!("{:?}", v.key)).collect();
+                            chain.push(format!("obj{}[map=[{}] vec=[{}]]", ptr.index, keys.join(","), vec_keys.join(",")));
+                            if let Some(next) = obj.proto.as_object() {
+                                ptr = next;
+                            } else {
+                                chain.push(format!("END proto={:?}", obj.proto));
+                                break;
+                            }
+                        }
+                        makepad_error_log::error!("DIAG vertex-not-found chain: {}", chain.join(" -> "));
+                    }
+                }
+                if let Some(fnobj) = vertex_result.as_object()
                 {
                     output.mode = ShaderMode::Vertex;
                     // Entry point shaders don't have script-level arguments to validate, use NoTrap
