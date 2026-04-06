@@ -1,8 +1,11 @@
-use crate::xr_node::{xr_widget_world_transform, XrNode};
-use crate::*;
+use super::xr_node::{xr_widget_world_transform, XrDrawContext, XrNode};
+use crate::prelude::*;
 use makepad_widgets::{
     animator::{Animator, AnimatorImpl},
-    event::XrFingerTip,
+    event::{
+        XrFingerTip, XR_TOUCH_CAPTURE_BACK, XR_TOUCH_CAPTURE_FRONT, XR_TOUCH_DOWN_BACK,
+        XR_TOUCH_DOWN_FRONT,
+    },
 };
 use std::{cell::Cell, rc::Rc};
 
@@ -37,6 +40,7 @@ script_mod! {
     mod.widgets.XrViewBase = #(XrView::register_widget(vm))
     mod.widgets.XrView = set_type_default() do mod.widgets.XrViewBase{
         mode: XrViewMode.World
+        render_class: XrRenderClass.Transparent
         wrist_left: true
         show_in_non_xr: false
         fit_size: false
@@ -184,8 +188,6 @@ impl XrView {
     const XR_CURSOR_HOVER_FRONT: f32 = 84.0;
     const XR_CURSOR_SIZE_NEAR: f64 = 30.0;
     const XR_CURSOR_SIZE_FAR: f64 = 16.0;
-    const XR_TOUCH_DOWN_FRONT: f32 = 6.0;
-    const XR_TOUCH_DOWN_BACK: f32 = -12.0;
     const FACE_PANEL_DISTANCE: f32 = 0.46;
     const FACE_PANEL_VERTICAL_OFFSET: f32 = -0.10;
     const WRIST_PANEL_SURFACE_OFFSET: f32 = 0.048;
@@ -193,10 +195,6 @@ impl XrView {
     const WRIST_PANEL_FACE_CULL_DOT: f32 = 0.0;
     const ARM_PANEL_MENU_SIDE_OFFSET: f32 = 0.15;
     const ARM_PANEL_MENU_BACK_OFFSET: f32 = 0.10;
-
-    pub(crate) fn node(&self) -> &XrNode {
-        &self.node
-    }
 
     fn scaled_pose_matrix(&self, pose: Pose) -> Mat4f {
         Mat4f::mul(
@@ -219,7 +217,8 @@ impl XrView {
     }
 
     fn event_world_transform(&self, scope: &mut Scope) -> Mat4f {
-        if let Some(runtime_body) = xr_runtime_body_from_scope(scope, self.uid) {
+        let draw_context = XrDrawContext::from_scope(scope);
+        if let Some(runtime_body) = draw_context.runtime_body(self.uid) {
             Mat4f::mul(
                 &runtime_body.pose.to_mat4(),
                 &Mat4f::nonuniform_scaled_translation(
@@ -249,7 +248,8 @@ impl XrView {
     }
 
     fn resolved_world_transform(&self, cx: &mut Cx3d, scope: &mut Scope) -> Mat4f {
-        if let Some(runtime_body) = xr_runtime_body_from_scope(scope, self.uid) {
+        let draw_context = XrDrawContext::from_scope(scope);
+        if let Some(runtime_body) = draw_context.runtime_body(self.uid) {
             Mat4f::mul(
                 &runtime_body.pose.to_mat4(),
                 &Mat4f::nonuniform_scaled_translation(
@@ -562,7 +562,11 @@ impl XrView {
     }
 
     fn tip_is_touching_for_down(touch_z: f32) -> bool {
-        touch_z <= Self::XR_TOUCH_DOWN_FRONT && touch_z >= Self::XR_TOUCH_DOWN_BACK
+        touch_z <= XR_TOUCH_DOWN_FRONT && touch_z >= XR_TOUCH_DOWN_BACK
+    }
+
+    fn tip_is_touching_for_capture(touch_z: f32) -> bool {
+        touch_z <= XR_TOUCH_CAPTURE_FRONT && touch_z >= XR_TOUCH_CAPTURE_BACK
     }
 
     fn fingertip_slot(is_left: bool, index: usize) -> usize {
@@ -711,12 +715,15 @@ impl XrView {
 
             if let Some(hit) = hit {
                 let tip_is_interactive = self.multitouch || tip.index == XrHand::INDEX_TIP;
-                let tip_is_down = tip.active
-                    && tip_is_interactive
-                    && self.contains_local(hit.projected)
-                    && Self::tip_is_touching_for_down(hit.touch_z);
                 let tip_slot = Self::fingertip_slot(tip.is_left, tip.index);
                 let was_tip_down = self.tip_down_state[tip_slot];
+                let tip_is_down = tip_is_interactive
+                    && self.contains_local(hit.projected)
+                    && if was_tip_down {
+                        Self::tip_is_touching_for_capture(hit.touch_z)
+                    } else {
+                        tip.active && Self::tip_is_touching_for_down(hit.touch_z)
+                    };
 
                 if let Some(mut cursor) = self.cursor_from_hit(hit, tip.is_left) {
                     cursor.index = tip.index;
@@ -835,6 +842,23 @@ impl WidgetNode for XrView {
     fn widget_uid(&self) -> WidgetUid {
         self.uid
     }
+
+    fn cast_inner_any(&self, type_id: std::any::TypeId) -> Option<&dyn std::any::Any> {
+        if type_id == std::any::TypeId::of::<XrNode>() {
+            Some(&self.node)
+        } else {
+            None
+        }
+    }
+
+    fn cast_inner_any_mut(&mut self, type_id: std::any::TypeId) -> Option<&mut dyn std::any::Any> {
+        if type_id == std::any::TypeId::of::<XrNode>() {
+            Some(&mut self.node)
+        } else {
+            None
+        }
+    }
+
     fn walk(&mut self, _cx: &mut Cx) -> Walk {
         self.walk
     }

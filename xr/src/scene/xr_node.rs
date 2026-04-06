@@ -1,15 +1,15 @@
-use crate::{
+use crate::prelude::XrSharedHand;
+use makepad_widgets::{
     makepad_derive_widget::*,
     makepad_draw::*,
     makepad_script::ScriptFnRef,
     widget::*,
     widget_async::{CxWidgetToScriptCallExt, ScriptAsyncCalls, ScriptAsyncId, ScriptAsyncResult},
     widget_tree::CxWidgetExt,
-    Cube, Gltf, IcoSphere, RefractiveCube, Tree, XrSelect, XrView,
 };
 use std::{cmp::Ordering, collections::HashMap, rc::Rc};
 
-use super::scene_draw::compose_scene_node_transform;
+use crate::util::scene_draw::compose_scene_node_transform;
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -17,10 +17,22 @@ script_mod! {
     let XrBodyKind = set_type_default() do #(XrBodyKind::script_api(vm))
     mod.widgets.XrBodyKind = XrBodyKind
 
+    let XrPhysicsShape = set_type_default() do #(XrPhysicsShape::script_api(vm))
+    mod.widgets.XrPhysicsShape = XrPhysicsShape
+
+    let XrRenderClass = set_type_default() do #(XrRenderClass::script_api(vm))
+    mod.widgets.XrRenderClass = XrRenderClass
+
+    let XrSharedObjectPolicy = set_type_default() do #(XrSharedObjectPolicy::script_api(vm))
+    mod.widgets.XrSharedObjectPolicy = XrSharedObjectPolicy
+
     mod.widgets.XrNodeBase = #(XrNode::register_widget(vm))
     mod.widgets.XrNode = set_type_default() do mod.widgets.XrNodeBase{
         body: XrBodyKind.Disabled
-        projectile_pool: false
+        physics_shape: XrPhysicsShape.Box
+        render_class: XrRenderClass.Opaque
+        shared_object_policy: XrSharedObjectPolicy.None
+        spawn_pool: false
         physics_size: vec3(0.0, 0.0, 0.0)
         density: 1.0
         friction: 0.8
@@ -42,6 +54,47 @@ impl Default for XrBodyKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Script, ScriptHook)]
+pub enum XrPhysicsShape {
+    #[pick]
+    Box,
+    Sphere,
+}
+
+impl Default for XrPhysicsShape {
+    fn default() -> Self {
+        Self::Box
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Script, ScriptHook)]
+pub enum XrRenderClass {
+    #[pick]
+    Opaque,
+    Transparent,
+}
+
+impl Default for XrRenderClass {
+    fn default() -> Self {
+        Self::Opaque
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Script, ScriptHook)]
+pub enum XrSharedObjectPolicy {
+    None,
+    #[pick]
+    BootstrapShared,
+    OnDemandShared,
+    PooledOnDemand,
+}
+
+impl Default for XrSharedObjectPolicy {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 pub const XR_HAND_INFLUENCE_POINTS_PER_HAND: usize = 6;
 pub const XR_HAND_INFLUENCE_POINT_COUNT: usize = XR_HAND_INFLUENCE_POINTS_PER_HAND * 2;
 
@@ -56,6 +109,17 @@ pub struct XrHandInfluencePoint {
 pub struct XrRuntimeBodyState {
     pub pose: Pose,
     pub scale: Vec3f,
+    pub linvel: Vec3f,
+    pub angvel: Vec3f,
+    pub sleeping: bool,
+    pub held_by: Option<XrSharedHand>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum XrNodeAction {
+    SceneChanged,
+    #[default]
+    None,
 }
 
 #[derive(Clone, Default)]
@@ -72,46 +136,6 @@ pub struct XrDrawScopeData {
     pub hand_influence_points: [Option<XrHandInfluencePoint>; XR_HAND_INFLUENCE_POINT_COUNT],
 }
 
-pub fn xr_runtime_body_from_scope(scope: &mut Scope, uid: WidgetUid) -> Option<XrRuntimeBodyState> {
-    scope
-        .data
-        .get::<XrDrawScopeData>()
-        .and_then(|scope_data| scope_data.runtime_bodies.get(&uid).cloned())
-}
-
-pub fn xr_tracking_from_content_from_scope(scope: &mut Scope) -> Mat4f {
-    scope
-        .data
-        .get::<XrDrawScopeData>()
-        .map(|scope_data| scope_data.tracking_from_content)
-        .unwrap_or_else(Mat4f::identity)
-}
-
-pub fn xr_content_from_tracking_from_scope(scope: &mut Scope) -> Mat4f {
-    scope
-        .data
-        .get::<XrDrawScopeData>()
-        .map(|scope_data| scope_data.content_from_tracking)
-        .unwrap_or_else(Mat4f::identity)
-}
-
-pub fn xr_hand_influence_points_from_scope(
-    scope: &mut Scope,
-) -> [Option<XrHandInfluencePoint>; XR_HAND_INFLUENCE_POINT_COUNT] {
-    scope
-        .data
-        .get::<XrDrawScopeData>()
-        .map(|scope_data| scope_data.hand_influence_points)
-        .unwrap_or([None; XR_HAND_INFLUENCE_POINT_COUNT])
-}
-
-pub fn xr_env_texture_from_scope(scope: &mut Scope) -> Option<Texture> {
-    scope
-        .data
-        .get::<XrDrawScopeData>()
-        .and_then(|scope_data| scope_data.env_texture.clone())
-}
-
 #[derive(Clone, Default)]
 pub struct XrPassthroughScopeData {
     pub camera_texture: Option<Texture>,
@@ -121,18 +145,53 @@ pub struct XrPassthroughScopeData {
     pub enabled: bool,
 }
 
-pub fn xr_passthrough_from_scope(scope: &mut Scope) -> XrPassthroughScopeData {
-    scope
-        .data
-        .get::<XrDrawScopeData>()
-        .map(|scope_data| XrPassthroughScopeData {
-            camera_texture: scope_data.camera_texture.clone(),
-            source_size: scope_data.camera_source_size,
-            rotation_steps: scope_data.camera_rotation_steps,
-            center_offset_uv: scope_data.camera_center_offset_uv,
-            enabled: scope_data.camera_enabled,
-        })
-        .unwrap_or_default()
+#[derive(Clone, Default)]
+pub struct XrDrawContext {
+    scope_data: XrDrawScopeData,
+}
+
+impl XrDrawContext {
+    pub fn from_scope(scope: &mut Scope) -> Self {
+        Self {
+            scope_data: scope
+                .data
+                .get::<XrDrawScopeData>()
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn runtime_body(&self, uid: WidgetUid) -> Option<XrRuntimeBodyState> {
+        self.scope_data.runtime_bodies.get(&uid).cloned()
+    }
+
+    pub fn tracking_from_content(&self) -> Mat4f {
+        self.scope_data.tracking_from_content
+    }
+
+    pub fn content_from_tracking(&self) -> Mat4f {
+        self.scope_data.content_from_tracking
+    }
+
+    pub fn hand_influence_points(
+        &self,
+    ) -> [Option<XrHandInfluencePoint>; XR_HAND_INFLUENCE_POINT_COUNT] {
+        self.scope_data.hand_influence_points
+    }
+
+    pub fn env_texture(&self) -> Option<Texture> {
+        self.scope_data.env_texture.clone()
+    }
+
+    pub fn passthrough(&self) -> XrPassthroughScopeData {
+        XrPassthroughScopeData {
+            camera_texture: self.scope_data.camera_texture.clone(),
+            source_size: self.scope_data.camera_source_size,
+            rotation_steps: self.scope_data.camera_rotation_steps,
+            center_offset_uv: self.scope_data.camera_center_offset_uv,
+            enabled: self.scope_data.camera_enabled,
+        }
+    }
 }
 
 #[derive(Script, WidgetRef, WidgetRegister)]
@@ -157,8 +216,14 @@ pub struct XrNode {
     scale: Vec3f,
     #[live]
     body: XrBodyKind,
+    #[live]
+    physics_shape: XrPhysicsShape,
+    #[live]
+    render_class: XrRenderClass,
+    #[live]
+    shared_object_policy: XrSharedObjectPolicy,
     #[live(false)]
-    projectile_pool: bool,
+    spawn_pool: bool,
     #[live(vec3(0.0, 0.0, 0.0))]
     physics_size: Vec3f,
     #[rust]
@@ -217,8 +282,31 @@ impl XrNode {
         self.body
     }
 
-    pub fn projectile_pool(&self) -> bool {
-        self.projectile_pool
+    pub fn physics_shape(&self) -> XrPhysicsShape {
+        self.physics_shape
+    }
+
+    pub fn render_class(&self) -> XrRenderClass {
+        self.render_class
+    }
+
+    pub fn shared_object_policy(&self) -> XrSharedObjectPolicy {
+        self.shared_object_policy
+    }
+
+    pub fn bootstrap_shared(&self) -> bool {
+        matches!(
+            self.shared_object_policy,
+            XrSharedObjectPolicy::BootstrapShared
+        )
+    }
+
+    pub fn is_transparent(&self) -> bool {
+        matches!(self.render_class, XrRenderClass::Transparent)
+    }
+
+    pub fn spawn_pool(&self) -> bool {
+        self.spawn_pool
     }
 
     pub fn set_implicit_physics_size(&mut self, size: Vec3f) {
@@ -259,35 +347,11 @@ impl XrNode {
     }
 
     fn child_world_sort_center(child: &WidgetRef) -> Option<Vec3f> {
-        if let Some(select) = child.borrow::<XrSelect>() {
-            return Some(select.node().pos());
-        }
-        if let Some(view) = child.borrow::<XrView>() {
-            return Some(view.node().pos());
-        }
-        if let Some(cube) = child.borrow::<Cube>() {
-            return Some(cube.node().pos());
-        }
-        if let Some(ico) = child.borrow::<IcoSphere>() {
-            return Some(ico.node().pos());
-        }
-        if let Some(refractive_cube) = child.borrow::<RefractiveCube>() {
-            return Some(refractive_cube.node().pos());
-        }
-        if let Some(gltf) = child.borrow::<Gltf>() {
-            return Some(gltf.node().pos());
-        }
-        if let Some(tree) = child.borrow::<Tree>() {
-            return Some(tree.node().pos());
-        }
-        if let Some(node) = child.borrow::<XrNode>() {
-            return Some(node.pos());
-        }
-        None
+        xr_widget_local_sort_center(child)
     }
 
     fn child_is_transparent(child: &WidgetRef) -> bool {
-        child.borrow::<RefractiveCube>().is_some() || child.borrow::<XrView>().is_some()
+        xr_widget_is_transparent(child)
     }
 
     fn transform_point(transform: &Mat4f, point: Vec3f) -> Vec3f {
@@ -295,39 +359,64 @@ impl XrNode {
             .transform_vec4(vec4f(point.x, point.y, point.z, 1.0))
             .to_vec3f()
     }
+}
 
-    fn draw_list_depth(scene_state: &SceneState3D, world_pos: Vec3f) -> f32 {
-        let view_pos =
-            scene_state
-                .view
-                .transform_vec4(vec4f(world_pos.x, world_pos.y, world_pos.z, 1.0));
-        if view_pos.w.abs() > 1.0e-6 {
-            view_pos.z / view_pos.w
-        } else {
-            view_pos.z
-        }
+pub fn xr_widget_with_scene_node<R>(
+    widget: &WidgetRef,
+    visit: impl FnOnce(&XrNode) -> R,
+) -> Option<R> {
+    if let Some(node) = widget.borrow::<XrNode>() {
+        return Some(visit(&node));
+    }
+    if let Some(node) = widget.cast_inner::<XrNode>() {
+        return Some(visit(&node));
+    }
+    None
+}
+
+pub fn xr_widget_children(widget: &WidgetRef, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
+    widget.children(visit);
+}
+
+pub fn xr_widget_local_sort_center(widget: &WidgetRef) -> Option<Vec3f> {
+    xr_widget_with_scene_node(widget, |node| node.pos())
+}
+
+pub fn xr_widget_is_transparent(widget: &WidgetRef) -> bool {
+    xr_widget_with_scene_node(widget, |node| node.is_transparent()).unwrap_or(false)
+}
+
+pub fn xr_draw_list_depth(scene_state: &SceneState3D, world_pos: Vec3f) -> f32 {
+    let view_pos =
+        scene_state
+            .view
+            .transform_vec4(vec4f(world_pos.x, world_pos.y, world_pos.z, 1.0));
+    if view_pos.w.abs() > 1.0e-6 {
+        view_pos.z / view_pos.w
+    } else {
+        view_pos.z
+    }
+}
+
+pub fn xr_sort_child_draw_order(draw_order_entries: &mut [(usize, f32, bool)]) {
+    if draw_order_entries.len() <= 1 {
+        return;
     }
 
-    fn sort_child_draw_order(draw_order_entries: &mut [(usize, f32, bool)]) {
-        if draw_order_entries.len() <= 1 {
-            return;
+    draw_order_entries.sort_by(|a, b| match (a.2, b.2) {
+        (false, true) => Ordering::Less,
+        (true, false) => Ordering::Greater,
+        (false, false) => {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
         }
-
-        draw_order_entries.sort_by(|a, b| match (a.2, b.2) {
-            (false, true) => Ordering::Less,
-            (true, false) => Ordering::Greater,
-            (false, false) => {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            }
-            (true, true) => {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            }
-        });
-    }
+        (true, true) => {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        }
+    });
 }
 
 pub fn xr_widget_world_transform(
@@ -336,7 +425,8 @@ pub fn xr_widget_world_transform(
     uid: WidgetUid,
     node: &XrNode,
 ) -> Mat4f {
-    if let Some(runtime_body) = xr_runtime_body_from_scope(scope, uid) {
+    let draw_context = XrDrawContext::from_scope(scope);
+    if let Some(runtime_body) = draw_context.runtime_body(uid) {
         Mat4f::mul(
             &runtime_body.pose.to_mat4(),
             &Mat4f::nonuniform_scaled_translation(
@@ -498,6 +588,8 @@ impl Widget for XrNode {
         if call.method() == id!(render) && !result.is_err() {
             if let Some(me_obj) = call.me().as_object() {
                 self.script_apply(vm, &Apply::Reload, &mut Scope::empty(), me_obj.into());
+                vm.cx_mut()
+                    .widget_action(self.uid, XrNodeAction::SceneChanged);
                 vm.cx_mut().redraw_all();
             }
         }
@@ -553,14 +645,14 @@ impl Widget for XrNode {
                 let child_center = Self::transform_point(&world_transform, child_center);
                 draw_order_entries.push((
                     index,
-                    Self::draw_list_depth(&scene_state, child_center),
+                    xr_draw_list_depth(&scene_state, child_center),
                     Self::child_is_transparent(&child),
                 ));
             } else {
                 draw_order_entries.push((index, 0.0, false));
             }
         }
-        Self::sort_child_draw_order(&mut draw_order_entries);
+        xr_sort_child_draw_order(&mut draw_order_entries);
 
         for (index, _, _) in draw_order_entries {
             let id = self.child_order[index];

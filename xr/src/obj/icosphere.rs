@@ -1,10 +1,6 @@
-use crate::{makepad_derive_widget::*, makepad_draw::*, widget::*};
+use crate::scene::{xr_widget_world_transform, XrDrawContext, XrNode};
+use makepad_widgets::{makepad_derive_widget::*, makepad_draw::*, widget::*};
 use std::cell::RefCell;
-
-use super::{
-    xr_node::{xr_env_texture_from_scope, xr_widget_world_transform},
-    XrNode,
-};
 
 const ICO_SPHERE_PHYSICS_DIAMETER_SCALE: f32 = 0.88;
 
@@ -108,6 +104,8 @@ script_mod! {
     mod.widgets.IcoSphereBase = #(IcoSphere::register_widget(vm))
     mod.widgets.IcoSphere = set_type_default() do mod.widgets.IcoSphereBase{
         body: mod.widgets.XrBodyKind.Dynamic
+        physics_shape: mod.widgets.XrPhysicsShape.Sphere
+        shared_object_policy: mod.widgets.XrSharedObjectPolicy.BootstrapShared
         radius: 0.037
         diffuse: vec4(0.63, 0.65, 0.69, 1.0)
         color: vec4(0.95, 0.62, 0.28, 1.0)
@@ -258,8 +256,8 @@ impl Widget for IcoSphere {
         self.draw_ico.diffuse = self.diffuse;
         self.draw_ico.color = self.color;
         self.draw_ico.depth_clip = 1.0;
-        self.draw_ico
-            .set_env_texture(xr_env_texture_from_scope(scope));
+        let draw_context = XrDrawContext::from_scope(scope);
+        self.draw_ico.set_env_texture(draw_context.env_texture());
         self.draw_ico.draw(cx, geometry_id);
 
         self.node.draw_3d(cx, scope)

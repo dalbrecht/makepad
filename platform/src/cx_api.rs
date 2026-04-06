@@ -11,7 +11,8 @@ use {
         event::keyboard::CharOffset,
         event::xr::XrAnchor,
         event::{
-            video_playback::CameraPreviewMode, DragItem, NextFrame, Timer, Trigger, VideoSource,
+            video_playback::CameraPreviewMode, DragItem, NextFrame, Timer, Trigger,
+            VideoSource,
         },
         gpu_info::GpuInfo,
         ime::TextInputConfig,
@@ -35,6 +36,15 @@ use {
 pub enum OpenUrlInPlace {
     Yes,
     No,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CxThreadPriority {
+    #[default]
+    Normal,
+    Utility,
+    Background,
+    Idle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -426,12 +436,34 @@ impl Cx {
         self.in_draw_event
     }
 
+    /// Updates the `mod.widgets.SAFE_INSET_PAD_*` values on the script heap
+    /// so that Splash code can reference them in widget definitions.
+    /// Requests a deferred re-application of all script/Splash widget definitions,
+    /// causing widgets to pick up updated values from the script heap.
+    /// The re-apply happens on the next event loop iteration (not synchronously),
+    /// to avoid re-entrancy issues when called from within an event handler.
+    pub fn request_script_reapply(&mut self) {
+        self.pending_script_reapply = true;
+    }
+
+    pub fn update_safe_inset_script_values(&mut self, insets: crate::event::SafeAreaInsets) {
+        use makepad_script::trap::NoTrap;
+        let Some(vm) = self.script_vm.as_mut() else {
+            return;
+        };
+        let widgets = vm.heap.module(id!(widgets));
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_TOP).into(), insets.top.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_BOTTOM).into(), insets.bottom.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_LEFT).into(), insets.left.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_RIGHT).into(), insets.right.into(), NoTrap);
+    }
+
     pub fn xr_capabilities(&self) -> &XrCapabilities {
         &self.xr_capabilities
     }
 
-    pub fn xr_depth_mesh(&self) -> crate::xr_depth_mesh::XrDepthMeshStore {
-        crate::xr_depth_mesh::xr_depth_mesh_store()
+    pub fn xr_tsdf(&self) -> crate::xr_tsdf::XrTsdfStore {
+        crate::xr_tsdf::xr_tsdf_store()
     }
 
     pub fn xr_render_scale(&self) -> Option<f64> {
@@ -448,6 +480,14 @@ impl Cx {
 
     pub fn xr_effective_frame_rate_hz(&self) -> Option<f64> {
         <Self as CxOsApi>::xr_effective_frame_rate_hz(self)
+    }
+
+    pub fn set_thread_priority(priority: CxThreadPriority) {
+        #[cfg(target_os = "android")]
+        crate::os::linux::android::android::set_current_thread_priority(priority);
+
+        #[cfg(not(target_os = "android"))]
+        let _ = priority;
     }
 
     pub fn get_ref(&self) -> CxRef {

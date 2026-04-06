@@ -1,12 +1,11 @@
-use crate::{
+use crate::prelude::XrSharedObjectMode;
+use crate::scene::{xr_widget_children, xr_widget_with_scene_node, XrBodySpawn, XrNode};
+use makepad_widgets::{
     makepad_derive_widget::*,
     makepad_draw::*,
     widget::*,
     widget_async::{ScriptAsyncId, ScriptAsyncResult},
-    XrBodySpawn,
 };
-
-use super::XrNode;
 
 #[derive(Clone, Copy, Debug)]
 pub struct XrProjectileEmitterConfig {
@@ -44,6 +43,16 @@ pub struct Shooter {
 
 const SHOOTER_MAX_EMITS_PER_UPDATE: usize = 2;
 const SHOOTER_PROJECTILE_SPAWN_OFFSET: f32 = 0.064;
+const SHOOTER_INDEX_BEND_MAX_DEGREES: f32 = 34.0;
+const SHOOTER_INDEX_STRAIGHTNESS_MIN: f32 = 0.78;
+const SHOOTER_INDEX_EXTENSION_RATIO_MIN: f32 = 0.90;
+
+#[derive(Clone, Copy)]
+struct ShooterHandEmitMetrics {
+    max_bend_angle_degrees: f32,
+    straightness: f32,
+    extension_ratio: f32,
+}
 
 impl Shooter {
     pub fn emitter_config(&self) -> XrProjectileEmitterConfig {
@@ -81,13 +90,16 @@ impl Shooter {
         if !widget.visible() {
             return;
         }
-        if let Some(node) = widget.cast_inner::<XrNode>() {
-            if node.projectile_pool() {
+        if let Some(node) = xr_widget_with_scene_node(widget, |node| {
+            if node.spawn_pool() {
                 projectile_pool_uids.push(widget.widget_uid());
             }
+        }) {
+            let _ = node;
         }
-        widget
-            .children(&mut |_, child| Self::collect_projectile_pool(&child, projectile_pool_uids));
+        xr_widget_children(widget, &mut |_, child| {
+            Self::collect_projectile_pool(&child, projectile_pool_uids)
+        });
     }
 
     fn next_projectile_widget_uid(&mut self) -> Option<WidgetUid> {
@@ -108,59 +120,83 @@ impl Shooter {
         (delta.length() > 0.0001).then_some(delta.normalize())
     }
 
-    fn hand_index_finger_straight(hand: &XrHand) -> bool {
-        if !hand.in_view() || !hand.tip_active(XrHand::INDEX_TIP) {
-            return false;
-        }
-
-        let base = hand.joints[XrHand::INDEX_BASE].position;
-        let knuckle1 = hand.joints[XrHand::INDEX_KNUCKLE1].position;
-        let knuckle2 = hand.joints[XrHand::INDEX_KNUCKLE2].position;
-        let knuckle3 = hand.joints[XrHand::INDEX_KNUCKLE3].position;
-        let tip = hand.tip_pos_index();
+    fn hand_index_finger_stretch_metrics(hand: &XrHand) -> Option<ShooterHandEmitMetrics> {
+        let points = hand.finger_chain_positions(XrHand::INDEX_TIP)?;
+        let [base, knuckle1, knuckle2, knuckle3, tip] =
+            [points[0], points[1], points[2], points[3], points[4]];
 
         let Some(seg0) = Self::normalized_segment_direction(base, knuckle1) else {
-            return false;
+            return None;
         };
         let Some(seg1) = Self::normalized_segment_direction(knuckle1, knuckle2) else {
-            return false;
+            return None;
         };
         let Some(seg2) = Self::normalized_segment_direction(knuckle2, knuckle3) else {
-            return false;
+            return None;
         };
         let Some(seg3) = Self::normalized_segment_direction(knuckle3, tip) else {
-            return false;
+            return None;
         };
 
         let chain_length = (knuckle1 - base).length()
             + (knuckle2 - knuckle1).length()
             + (knuckle3 - knuckle2).length()
             + (tip - knuckle3).length();
-        let direct_length = (tip - base).length();
         if chain_length <= 0.0001 {
+            return None;
+        }
+        let direct_length = (tip - base).length();
+        let segment_dots = [seg0.dot(seg1), seg1.dot(seg2), seg2.dot(seg3)];
+        let max_bend_angle_degrees = segment_dots
+            .into_iter()
+            .map(|dot| dot.clamp(-1.0, 1.0).acos().to_degrees())
+            .fold(0.0, f32::max);
+        let straightness = segment_dots.into_iter().fold(1.0, f32::min);
+        Some(ShooterHandEmitMetrics {
+            max_bend_angle_degrees,
+            straightness,
+            extension_ratio: direct_length / chain_length,
+        })
+    }
+
+    fn hand_index_forward_direction(hand: &XrHand) -> Option<Vec3f> {
+        let points = hand.finger_chain_positions(XrHand::INDEX_TIP)?;
+        let [base, knuckle1, knuckle2, knuckle3, tip] =
+            [points[0], points[1], points[2], points[3], points[4]];
+
+        let seg0 = Self::normalized_segment_direction(base, knuckle1)?;
+        let seg1 = Self::normalized_segment_direction(knuckle1, knuckle2)?;
+        let seg2 = Self::normalized_segment_direction(knuckle2, knuckle3)?;
+        let seg3 = Self::normalized_segment_direction(knuckle3, tip)?;
+
+        let blended = seg0 * 0.10 + seg1 * 0.20 + seg2 * 0.30 + seg3 * 0.40;
+        if blended.length() > 0.0001 {
+            return Some(blended.normalize());
+        }
+        Self::normalized_segment_direction(base, tip)
+    }
+
+    fn hand_emit_gesture_active(hand: &XrHand) -> bool {
+        // Shooter owns its own firing gesture semantics. Do not couple emission to the
+        // generic OpenXR hand-grab bit, which represents a broader whole-hand intent and
+        // can stay active across close/open transitions on device.
+        if !hand.in_view() {
             return false;
         }
-
-        let straightness = seg0.dot(seg1).min(seg1.dot(seg2)).min(seg2.dot(seg3));
-        let extension_ratio = direct_length / chain_length;
-        straightness >= 0.92 && extension_ratio >= 0.96
+        let Some(metrics) = Self::hand_index_finger_stretch_metrics(hand) else {
+            return false;
+        };
+        metrics.max_bend_angle_degrees <= SHOOTER_INDEX_BEND_MAX_DEGREES
+            && metrics.straightness >= SHOOTER_INDEX_STRAIGHTNESS_MIN
+            && metrics.extension_ratio >= SHOOTER_INDEX_EXTENSION_RATIO_MIN
     }
 
     fn projectile_emitter_pose(hand: &XrHand) -> Option<(Vec3f, Vec3f)> {
-        if !Self::hand_index_finger_straight(hand) {
+        if !Self::hand_emit_gesture_active(hand) {
             return None;
         }
-        let tip_position = hand.tip_pos_index();
-        let knuckle_position = hand.joints[XrHand::INDEX_KNUCKLE3].position;
-        let direction = tip_position - knuckle_position;
-        let direction = if direction.length() > 0.0001 {
-            direction.normalize()
-        } else {
-            hand.joints[XrHand::INDEX_KNUCKLE3]
-                .orientation
-                .rotate_vec3(&vec3f(0.0, 0.0, -1.0))
-                .normalize()
-        };
+        let tip_position = hand.tip_pos_checked(XrHand::INDEX_TIP)?;
+        let direction = Self::hand_index_forward_direction(hand)?;
         Some((tip_position, direction))
     }
 
@@ -207,6 +243,8 @@ impl Shooter {
                 self.widget_uid(),
                 XrBodySpawn {
                     widget_uid,
+                    shadow: false,
+                    mode: XrSharedObjectMode::Dynamic,
                     pose: Pose::new(
                         Quat::default(),
                         tip_position + direction * SHOOTER_PROJECTILE_SPAWN_OFFSET,
@@ -266,3 +304,6 @@ impl Widget for Shooter {
         DrawStep::done()
     }
 }
+
+#[cfg(test)]
+include!("../tests/obj/shooter.rs");

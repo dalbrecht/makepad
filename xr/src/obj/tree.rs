@@ -1,16 +1,12 @@
-use super::{
+use crate::scene::{
+    xr_widget_world_transform, XrDrawContext, XrHandInfluencePoint, XrNode,
+    XR_HAND_INFLUENCE_POINT_COUNT,
+};
+use crate::util::{
     mesh_generators::{stylized_leaf_mesh, tree_branch_segment_mesh},
     scene_draw::scene_state_from_cx,
 };
-use crate::{
-    makepad_derive_widget::*,
-    makepad_draw::*,
-    widget::*,
-    xr_node::{
-        xr_hand_influence_points_from_scope, xr_widget_world_transform, XrHandInfluencePoint,
-        XrNode, XR_HAND_INFLUENCE_POINT_COUNT,
-    },
-};
+use makepad_widgets::{makepad_derive_widget::*, makepad_draw::*, widget::*};
 use std::f32::consts::PI;
 
 pub const PYTHAGOREAN_TREE_ROOT_DROP: f32 = 0.60;
@@ -1050,7 +1046,8 @@ impl Widget for Tree {
             return DrawStep::done();
         };
         let world = xr_widget_world_transform(cx, scope, self.widget_uid(), &self.node);
-        let hand_influences = xr_hand_influence_points_from_scope(scope);
+        let draw_context = XrDrawContext::from_scope(scope);
+        let hand_influences = draw_context.hand_influence_points();
         let time = scene.time as f32;
         let template_config = self.template_config();
 

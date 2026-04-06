@@ -137,8 +137,20 @@ impl Loader {
     fn load_font(&mut self, id: FontId) -> Option<Font> {
         let definition = self.font_definitions.remove(&id)?;
         let mut face = FontFace::from_data_and_index(definition.data, definition.index)?;
-        if !definition.variations.is_empty() {
-            face.set_variations(&definition.variations);
+        let mut variations = definition.variations;
+        if let Some(weight) = definition.weight {
+            const FONT_WEIGHT_AXIS_TAG: u32 = u32::from_be_bytes(*b"wght");
+            if let Some(existing) = variations
+                .iter_mut()
+                .find(|(tag, _)| *tag == FONT_WEIGHT_AXIS_TAG)
+            {
+                existing.1 = weight;
+            } else {
+                variations.push((FONT_WEIGHT_AXIS_TAG, weight));
+            }
+        }
+        if !variations.is_empty() {
+            face.set_variations(&variations);
         }
         Some(Font::new(
             id,
@@ -168,6 +180,8 @@ pub struct FontDefinition {
     pub index: u32,
     pub ascender_fudge_in_ems: f32,
     pub descender_fudge_in_ems: f32,
+    /// Convenience mapping for the OpenType `wght` axis. `None` keeps the font default.
+    pub weight: Option<f32>,
     /// Font variation axis settings as (tag_u32, value) pairs.
     pub variations: Vec<(u32, f32)>,
 }
@@ -199,6 +213,7 @@ mod tests {
                 index: 0,
                 ascender_fudge_in_ems: -0.1,
                 descender_fudge_in_ems: 0.0,
+                weight: None,
                 variations: Vec::new(),
             },
         );
@@ -206,5 +221,101 @@ mod tests {
         let first = loader.get_or_load_font(font_id).expect("test font should load").clone();
         let second = loader.get_or_load_font(font_id).expect("test font should load").clone();
         assert!(std::rc::Rc::ptr_eq(&first, &second));
+    }
+
+    fn bundled_variable_font_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../widgets/resources/jetbrains_mono_variable.ttf")
+    }
+
+    fn outline_signature(font: &crate::text::font::Font, glyph_id: crate::text::font::GlyphId) -> u64 {
+        use crate::text::glyph_outline::Command;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let outline = font
+            .glyph_outline(glyph_id)
+            .expect("glyph outline should exist");
+        let mut hasher = DefaultHasher::new();
+        for command in outline.commands() {
+            match command {
+                Command::MoveTo(p) => {
+                    0u8.hash(&mut hasher);
+                    p.x.to_bits().hash(&mut hasher);
+                    p.y.to_bits().hash(&mut hasher);
+                }
+                Command::LineTo(p) => {
+                    1u8.hash(&mut hasher);
+                    p.x.to_bits().hash(&mut hasher);
+                    p.y.to_bits().hash(&mut hasher);
+                }
+                Command::QuadTo(c, p) => {
+                    2u8.hash(&mut hasher);
+                    c.x.to_bits().hash(&mut hasher);
+                    c.y.to_bits().hash(&mut hasher);
+                    p.x.to_bits().hash(&mut hasher);
+                    p.y.to_bits().hash(&mut hasher);
+                }
+                Command::CurveTo(c1, c2, p) => {
+                    3u8.hash(&mut hasher);
+                    c1.x.to_bits().hash(&mut hasher);
+                    c1.y.to_bits().hash(&mut hasher);
+                    c2.x.to_bits().hash(&mut hasher);
+                    c2.y.to_bits().hash(&mut hasher);
+                    p.x.to_bits().hash(&mut hasher);
+                    p.y.to_bits().hash(&mut hasher);
+                }
+                Command::Close => {
+                    4u8.hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    #[test]
+    fn variable_font_weight_changes_outline_shape() {
+        let mut loader = Loader::new(layouter::Settings::default().loader);
+        let font_data = SharedBytes::from_file_mmap_or_read(bundled_variable_font_path())
+            .expect("variable font bytes should load");
+        let regular_id: FontId = 0xD00D_0001_u64.into();
+        let bold_id: FontId = 0xD00D_0002_u64.into();
+
+        loader.define_font(
+            regular_id,
+            FontDefinition {
+                data: font_data.clone(),
+                index: 0,
+                ascender_fudge_in_ems: 0.0,
+                descender_fudge_in_ems: 0.0,
+                weight: Some(200.0),
+                variations: Vec::new(),
+            },
+        );
+        loader.define_font(
+            bold_id,
+            FontDefinition {
+                data: font_data,
+                index: 0,
+                ascender_fudge_in_ems: 0.0,
+                descender_fudge_in_ems: 0.0,
+                weight: Some(800.0),
+                variations: Vec::new(),
+            },
+        );
+
+        let regular = loader.get_or_load_font(regular_id).expect("test font should load").clone();
+        let bold = loader.get_or_load_font(bold_id).expect("test font should load").clone();
+        let glyph_id = regular.with_ttf_parser_face(|face| {
+            face.glyph_index('B')
+                .expect("test glyph should exist in variable font")
+                .0
+        });
+
+        assert_ne!(
+            outline_signature(regular.as_ref(), glyph_id),
+            outline_signature(bold.as_ref(), glyph_id),
+            "different weight masters should produce different outlines"
+        );
     }
 }

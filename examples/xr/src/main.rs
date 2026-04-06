@@ -1,9 +1,13 @@
 use makepad_widgets;
 
 use makepad_widgets::*;
-use makepad_xr::*;
+use makepad_xr::scene::*;
 
 app_main!(App);
+
+const ACTIVITY_POSE_SYNC_INTERVAL_SECONDS: f64 = 0.6;
+const ACTIVITY_POSE_SYNC_POSITION_EPSILON_METERS: f32 = 0.015;
+const ACTIVITY_POSE_SYNC_ROTATION_EPSILON_DEGREES: f32 = 1.5;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -61,7 +65,7 @@ script_mod! {
             scene_select := XrSelect{
                 pos: vec3(0.0, -0.02, -0.62)
                 scale: vec3(0.5, 0.5, 0.5)
-                active_child: @ico_box_scene
+                active_child: @tanks_scene
 
                 test_scene := XrNode{
                     on_render: ||{
@@ -271,7 +275,7 @@ script_mod! {
                             pos: vec3(0.05, 0.20, -0.42)
                         }
 
-                        for index in 0..160 {
+                        for index in 0..80 {
                             let diffuse = #xa0a4aa
                             let color = if index % 6 == 0 {
                                 #xff6f59
@@ -287,7 +291,8 @@ script_mod! {
                                 #xd58cff
                             }
                             IcoSphere{
-                                projectile_pool: true
+                                spawn_pool: true
+                                shared_object_policy: mod.widgets.XrSharedObjectPolicy.PooledOnDemand
                                 density: 0.75
                                 friction: 0.48
                                 restitution: 0.04
@@ -300,6 +305,72 @@ script_mod! {
                     }
                 }
 
+                tanks_scene := XrNode{
+                    pos: vec3(0.0, -0.16, 0.0)
+                    scale: vec3(0.62, 0.62, 0.62)
+                    on_render: ||{
+                        Platform{
+                            pos: vec3(0.05, -0.06, -0.10)
+                            size: vec3(1.60, 0.08, 1.10)
+                            color: #x283544
+                        }
+
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.14, 0.12, 0.14)
+                            corner_radius: 0.02
+                            roughness: 0.78
+                            metallic: 0.02
+                            color: #x516579
+                            pos: vec3(-0.34, 0.00, -0.26)
+                        }
+
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.18, 0.10, 0.18)
+                            corner_radius: 0.02
+                            roughness: 0.78
+                            metallic: 0.02
+                            color: #x516579
+                            pos: vec3(0.34, -0.01, -0.32)
+                        }
+
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.54, 0.08, 0.12)
+                            corner_radius: 0.018
+                            roughness: 0.82
+                            metallic: 0.0
+                            color: #x1f2b37
+                            pos: vec3(0.05, -0.02, -0.48)
+                        }
+
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.12, 0.16, 0.42)
+                            corner_radius: 0.018
+                            roughness: 0.80
+                            metallic: 0.0
+                            color: #x202f3d
+                            pos: vec3(-0.48, 0.02, -0.02)
+                        }
+
+                        Cube{
+                            body: mod.widgets.XrBodyKind.Fixed
+                            size: vec3(0.12, 0.16, 0.42)
+                            corner_radius: 0.018
+                            roughness: 0.80
+                            metallic: 0.0
+                            color: #x202f3d
+                            pos: vec3(0.58, 0.02, -0.02)
+                        }
+
+                        Tank{
+                            pos: vec3(0.05, 0.03, -0.10)
+                        }
+                    }
+                }
+
                 helmet_scene := XrNode{
                     on_render: ||{
                         Platform{pos: vec3(0.05, -0.06, -0.10)}
@@ -307,6 +378,7 @@ script_mod! {
                             for col in 0..1 {
                                 Gltf{
                                     body: mod.widgets.XrBodyKind.Dynamic
+                                    shared_object_policy: mod.widgets.XrSharedObjectPolicy.BootstrapShared
                                     physics_size: vec3(0.17, 0.21, 0.17)
                                     density: 0.9
                                     friction: 0.7
@@ -361,13 +433,15 @@ script_mod! {
                     }
                 }
             }
-            xr_people_debug := XrPeopleDebug{}
+            xr_peer_sync := XrPeerSync{
+                auto_alignment_enabled: false
+            }
 
             control_strip := XrView{
                 visible: false
                 show_in_non_xr: true
                 wrist_left: true
-                logical_size: vec2(920, 468)
+                logical_size: vec2(1220, 700)
                 pixel_scale: 0.000215
                 dpi_factor: 2.0
                 SolidView{
@@ -420,6 +494,12 @@ script_mod! {
                             width: 84
                             text: "Shooter"
                             on_press: || ui.scene_select.ico_shoot_scene()
+                        }
+
+                        tanks_scene_button := XrUiButton{
+                            width: 72
+                            text: "Tanks"
+                            on_press: || ui.scene_select.tanks_scene()
                         }
 
                         block_scene_button := XrUiButton{
@@ -500,7 +580,7 @@ script_mod! {
 
                         scene_status := Label{
                             width: Fill
-                            text: "Default scene: 160 faceted icosahedra with sphere colliders. Shooter mode fires pooled icos from the main index fingertip."
+                            text: "Default scene: tank mode. Drive with the right thumbstick in head-relative screen direction, and grab the tank directly with your hands."
                             draw_text.color: #xe8f4ff
                         }
                     }
@@ -516,6 +596,12 @@ script_mod! {
                             width: 104
                             text: "Depth Voxel"
                             draw_text.color: #xe8f4ff
+                        }
+
+                        depth_resolution_3_button := XrUiButton{
+                            width: 64
+                            text: "3 cm"
+                            on_press: || ui.root.set_depth_voxel_size(0.03)
                         }
 
                         depth_resolution_5_button := XrUiButton{
@@ -577,112 +663,35 @@ script_mod! {
 
                     View{
                         width: Fill
-                        height: Fit
-                        flow: Down
-                        spacing: 8
+                        height: Fill
+                        flow: Right
+                        spacing: 12
 
-                        SolidView{
-                            width: Fill
-                            height: 32
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            draw_bg.color: #x0d1824
+                        View{
+                            width: Fill{weight: 66.0}
+                            height: Fill
+                            flow: Down
+                            spacing: 8
 
-                            peer_sync_status_field := Label{
+                            SolidView{
                                 width: Fill
-                                text: "Peers: off"
-                                draw_text.color: #xe8f4ff
+                                height: Fit
+                                padding: Inset{left: 10 right: 10 top: 6 bottom: 6}
+                                draw_bg.color: #x0d1824
+
+                                debug_field := Label{
+                                    width: Fill
+                                    height: Fit
+                                    text: "Connected peers: 0"
+                                    draw_text.color: #xe8f4ff
+                                    draw_text.flow: Flow.Right{wrap: true}
+                                }
                             }
                         }
 
-                        SolidView{
-                            width: Fill
-                            height: 32
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            draw_bg.color: #x0d1824
-
-                            network_status_field := Label{
-                                width: Fill
-                                text: "Network: off"
-                                draw_text.color: #x9ec8e8
-                            }
-                        }
-
-                        SolidView{
-                            width: Fill
-                            height: 32
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            draw_bg.color: #x0d1824
-
-                            alignment_debug_field := Label{
-                                width: Fill
-                                text: "AlignDbg: off"
-                                draw_text.color: #xffd29a
-                            }
-                        }
-
-                        SolidView{
-                            width: Fill
-                            height: 32
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            draw_bg.color: #x0d1824
-
-                            plane_scan_field := Label{
-                                width: Fill
-                                text: "PlaneScan: off"
-                                draw_text.color: #x9af7c4
-                            }
-                        }
-
-                        SolidView{
-                            width: Fill
-                            height: 32
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            draw_bg.color: #x0d1824
-
-                            physics_geom_field := Label{
-                                width: Fill
-                                text: "Physics geometry: waiting for frame"
-                                draw_text.color: #xe8f4ff
-                            }
-                        }
-
-                        SolidView{
-                            width: Fill
-                            height: 32
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            draw_bg.color: #x0d1824
-
-                            physics_timing_field := Label{
-                                width: Fill
-                                text: "Physics compute: waiting for frame"
-                                draw_text.color: #xe8f4ff
-                            }
-                        }
-
-                        SolidView{
-                            width: Fill
-                            height: 32
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            draw_bg.color: #x0d1824
-
-                            frame_cpu_field := Label{
-                                width: Fill
-                                text: "CPU frame: waiting for frame"
-                                draw_text.color: #xe8f4ff
-                            }
-                        }
-
-                        SolidView{
-                            width: Fill
-                            height: 32
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            draw_bg.color: #x0d1824
-
-                            xr_runtime_field := Label{
-                                width: Fill
-                                text: "XR render scale: waiting for XR session"
-                                draw_text.color: #xe8f4ff
-                            }
+                        View{
+                            width: Fill{weight: 34.0}
+                            height: Fill
                         }
                     }
                 }
@@ -692,7 +701,7 @@ script_mod! {
                 visible: false
                 mode: mod.widgets.XrViewMode.StuckToWrist
                 wrist_left: true
-                logical_size: vec2(112, 104)
+                logical_size: vec2(112, 188)
                 pixel_scale: 0.00030
                 dpi_factor: 1.6
                 depth_scale: 120.0
@@ -720,6 +729,22 @@ script_mod! {
                         draw_bg.border_radius: 12.0
                         on_press: || ui.root.reset_physics()
                     }
+
+                    wrist_pose_button := XrUiButton{
+                        width: Fill
+                        height: 40
+                        text: "Pose"
+                        draw_bg.border_radius: 12.0
+                        on_press: || ui.root.reset_activity_pose()
+                    }
+
+                    wrist_sync_status := Label{
+                        width: Fill
+                        height: Fit
+                        text: "P:0.0 C:0.0"
+                        draw_text.color: #xe8f4ff
+                        draw_text.flow: Flow.Right{wrap: true}
+                    }
                 }
             }
 
@@ -735,57 +760,232 @@ pub struct App {
     #[rust]
     network_started: bool,
     #[rust]
-    last_physics_geometry_text: String,
+    last_debug_text: String,
     #[rust]
-    last_physics_timing_text: String,
+    suppress_activity_broadcast: Option<XrActivityId>,
     #[rust]
-    last_frame_cpu_text: String,
+    pending_shared_scene_reset: bool,
     #[rust]
-    last_xr_runtime_text: String,
+    last_activity_pose_sync: Option<Pose>,
     #[rust]
-    last_peer_sync_status_text: String,
+    last_activity_pose_sync_activity: Option<XrActivityId>,
     #[rust]
-    last_network_status_text: String,
-    #[rust]
-    last_alignment_debug_text: String,
-    #[rust]
-    last_plane_scan_text: String,
+    last_activity_pose_sync_at: f64,
 }
 
 impl App {
+    fn poses_match(left: Pose, right: Pose) -> bool {
+        let translation_delta = (left.position - right.position).length();
+        let rotation_dot = left
+            .orientation
+            .dot(right.orientation)
+            .abs()
+            .clamp(0.0, 1.0);
+        let rotation_delta_degrees = (2.0 * rotation_dot.acos()).to_degrees();
+        translation_delta <= ACTIVITY_POSE_SYNC_POSITION_EPSILON_METERS
+            && rotation_delta_degrees <= ACTIVITY_POSE_SYNC_ROTATION_EPSILON_DEGREES
+    }
+
+    fn current_activity(&self, cx: &mut Cx) -> Option<XrActivityId> {
+        self.ui
+            .widget(cx, ids!(scene_select))
+            .borrow::<XrSelect>()
+            .map(|select| select.activity_id())
+    }
+
+    fn active_scene_widget(&self, cx: &mut Cx) -> Option<WidgetRef> {
+        self.ui
+            .widget(cx, ids!(scene_select))
+            .borrow::<XrSelect>()
+            .and_then(|select| select.active_child_widget_ref())
+    }
+
+    fn apply_activity(&mut self, cx: &mut Cx, activity_id: XrActivityId) -> Option<WidgetRef> {
+        self.ui
+            .widget(cx, ids!(scene_select))
+            .borrow_mut::<XrSelect>()
+            .and_then(|mut select| select.set_activity(cx, activity_id))
+    }
+
     fn ensure_network_started(&mut self, cx: &mut Cx) {
         if self.network_started {
             return;
         }
-        if let Some(mut people_debug) = self
+        if let Some(mut peer_sync) = self
             .ui
-            .widget(cx, ids!(xr_people_debug))
-            .borrow_mut::<XrPeopleDebug>()
+            .widget(cx, ids!(xr_peer_sync))
+            .borrow_mut::<XrPeerSync>()
         {
-            people_debug.set_enabled(cx, true);
+            peer_sync.set_enabled(cx, true);
             self.network_started = true;
+        }
+    }
+
+    fn ensure_activity_announced(&mut self, cx: &mut Cx) {
+        let Some(activity_id) = self.current_activity(cx) else {
+            return;
+        };
+        if let Some(mut peer_sync) = self
+            .ui
+            .widget(cx, ids!(xr_peer_sync))
+            .borrow_mut::<XrPeerSync>()
+        {
+            if peer_sync.enabled() && peer_sync.current_activity().is_none() {
+                let _ = peer_sync.set_local_activity(cx, activity_id);
+            }
+        }
+    }
+
+    fn sync_authoritative_activity_pose(&mut self, cx: &mut Cx) {
+        let Some(activity_id) = self.current_activity(cx) else {
+            self.last_activity_pose_sync = None;
+            self.last_activity_pose_sync_activity = None;
+            self.last_activity_pose_sync_at = 0.0;
+            return;
+        };
+
+        let should_sync = self
+            .ui
+            .widget(cx, ids!(xr_peer_sync))
+            .borrow::<XrPeerSync>()
+            .is_some_and(|peer_sync| {
+                peer_sync.enabled()
+                    && peer_sync.connected_peer_count() != 0
+                    && peer_sync.local_is_activity_authority()
+            });
+        if !should_sync {
+            self.last_activity_pose_sync = None;
+            self.last_activity_pose_sync_activity = None;
+            self.last_activity_pose_sync_at = 0.0;
+            return;
+        }
+
+        let Some(content_pose) = self.ui.borrow::<XrRoot>().and_then(|root| root.content_pose()) else {
+            return;
+        };
+        let now = Cx::time_now();
+        let activity_changed = self.last_activity_pose_sync_activity != Some(activity_id);
+        let pose_changed = self
+            .last_activity_pose_sync
+            .is_none_or(|previous| !Self::poses_match(previous, content_pose));
+        let interval_elapsed = now - self.last_activity_pose_sync_at
+            >= ACTIVITY_POSE_SYNC_INTERVAL_SECONDS;
+        if !(activity_changed || pose_changed || interval_elapsed) {
+            return;
+        }
+
+        if let Some(mut peer_sync) = self
+            .ui
+            .widget(cx, ids!(xr_peer_sync))
+            .borrow_mut::<XrPeerSync>()
+        {
+            if peer_sync.send_activity_pose_reset(content_pose) {
+                self.last_activity_pose_sync = Some(content_pose);
+                self.last_activity_pose_sync_activity = Some(activity_id);
+                self.last_activity_pose_sync_at = now;
+            }
+        }
+    }
+
+    fn refresh_spawnable_registry(&mut self, cx: &mut Cx, force: bool) {
+        let Some(activity_id) = self.current_activity(cx) else {
+            return;
+        };
+        let peer_sync_widget = self.ui.widget(cx, ids!(xr_peer_sync));
+        let should_refresh = force
+            || peer_sync_widget
+                .borrow::<XrPeerSync>()
+                .is_some_and(|peer_sync| peer_sync.spawnable_activity() != Some(activity_id));
+        if !should_refresh {
+            if let Some(mut peer_sync) = peer_sync_widget.borrow_mut::<XrPeerSync>() {
+                peer_sync.flush_pending_shared_object_controls(cx);
+            }
+            return;
+        }
+        let Some(scene_widget) = self.active_scene_widget(cx) else {
+            return;
+        };
+        let bindings = collect_scene_spawnable_objects(activity_id, &scene_widget);
+        {
+            if let Some(mut peer_sync) = peer_sync_widget.borrow_mut::<XrPeerSync>() {
+                peer_sync.set_spawnable_objects(activity_id, bindings);
+                peer_sync.flush_pending_shared_object_controls(cx);
+            };
+        }
+    }
+
+    fn apply_remote_body_spawn(&mut self, cx: &mut Cx, spawn: XrBodySpawn) {
+        if let Some(mut root) = self.ui.borrow_mut::<XrRoot>() {
+            root.spawn_body(cx, spawn);
+        }
+    }
+
+    fn apply_remote_body_despawn(&mut self, cx: &mut Cx, widget_uid: WidgetUid) {
+        if let Some(mut root) = self.ui.borrow_mut::<XrRoot>() {
+            root.despawn_body(cx, widget_uid);
+        }
+    }
+
+    fn apply_body_impulse(&mut self, cx: &mut Cx, impulse: XrBodyImpulse) {
+        if let Some(mut root) = self.ui.borrow_mut::<XrRoot>() {
+            root.apply_body_impulse(cx, impulse);
+        }
+    }
+
+    fn publish_local_shared_object_states(&mut self, cx: &mut Cx) {
+        let runtime_bodies = self.ui.borrow::<XrRoot>().map(|root| root.runtime_bodies());
+        let Some(runtime_bodies) = runtime_bodies else {
+            return;
+        };
+        let peer_sync_widget = self.ui.widget(cx, ids!(xr_peer_sync));
+        let maybe_peer_sync = peer_sync_widget.borrow_mut::<XrPeerSync>();
+        if let Some(mut peer_sync) = maybe_peer_sync {
+            peer_sync.publish_local_shared_object_states(cx, runtime_bodies.as_ref());
+        }
+    }
+
+    fn apply_pending_shared_scene_reset(&mut self, cx: &mut Cx) {
+        if !self.pending_shared_scene_reset {
+            return;
+        }
+        let runtime_bodies = self.ui.borrow::<XrRoot>().map(|root| root.runtime_bodies());
+        let Some(runtime_bodies) = runtime_bodies else {
+            return;
+        };
+        if runtime_bodies.is_empty() {
+            return;
+        }
+        let reset_applied = {
+            let peer_sync_widget = self.ui.widget(cx, ids!(xr_peer_sync));
+            let reset_applied =
+                if let Some(mut peer_sync) = peer_sync_widget.borrow_mut::<XrPeerSync>() {
+                    peer_sync.reset_local_shared_bootstrap_objects(runtime_bodies.as_ref());
+                    true
+                } else {
+                    false
+                };
+            reset_applied
+        };
+        if reset_applied {
+            self.pending_shared_scene_reset = false;
         }
     }
 
     fn refresh_debug_fields(&mut self, cx: &mut Cx) {
         let (
             surface_count,
-            vertex_count,
-            triangle_count,
             compute_ms,
-            physics_time_scale,
-            step_dt_ms,
+            query_ms,
+            rapier_ms,
             frame_cpu_ms,
             frame_update_cpu_ms,
             frame_draw_cpu_ms,
         ) = if let Some(root) = self.ui.borrow::<XrRoot>() {
             (
                 root.physics_depth_query_surface_count(),
-                root.physics_depth_query_vertex_count(),
-                root.physics_depth_query_triangle_count(),
                 root.physics_compute_ms(),
-                root.physics_time_scale(),
-                root.physics_step_dt_ms(),
+                root.physics_tsdf_query_ms(),
+                root.physics_rapier_step_ms(),
                 root.frame_cpu_ms(),
                 root.frame_update_cpu_ms(),
                 root.frame_draw_cpu_ms(),
@@ -793,158 +993,210 @@ impl App {
         } else {
             return;
         };
-        let peer_sync_status_text = self
+        let connected_peers = self
             .ui
-            .widget(cx, ids!(xr_people_debug))
-            .borrow::<XrPeopleDebug>()
-            .map(|people_debug| people_debug.status_text().to_string())
-            .unwrap_or_else(|| "Peers: unavailable".to_string());
-        let network_status_text = self
-            .ui
-            .widget(cx, ids!(xr_people_debug))
-            .borrow::<XrPeopleDebug>()
-            .map(|people_debug| people_debug.network_status_text().to_string())
-            .unwrap_or_else(|| "Network: unavailable".to_string());
-        let alignment_debug_text = self
-            .ui
-            .widget(cx, ids!(xr_people_debug))
-            .borrow::<XrPeopleDebug>()
-            .map(|people_debug| people_debug.alignment_debug_text().to_string())
-            .unwrap_or_else(|| "AlignDbg: unavailable".to_string());
-        let plane_scan_text = self
-            .ui
-            .widget(cx, ids!(xr_people_debug))
-            .borrow::<XrPeopleDebug>()
-            .map(|people_debug| people_debug.plane_scan_text().to_string())
-            .unwrap_or_else(|| "PlaneScan: unavailable".to_string());
-
-        if self.last_peer_sync_status_text != peer_sync_status_text {
-            self.ui
-                .widget(cx, ids!(peer_sync_status_field))
-                .set_text(cx, &peer_sync_status_text);
-            self.last_peer_sync_status_text = peer_sync_status_text;
-        }
-        if self.last_network_status_text != network_status_text {
-            self.ui
-                .widget(cx, ids!(network_status_field))
-                .set_text(cx, &network_status_text);
-            self.last_network_status_text = network_status_text;
-        }
-        if self.last_alignment_debug_text != alignment_debug_text {
-            self.ui
-                .widget(cx, ids!(alignment_debug_field))
-                .set_text(cx, &alignment_debug_text);
-            self.last_alignment_debug_text = alignment_debug_text;
-        }
-        if self.last_plane_scan_text != plane_scan_text {
-            self.ui
-                .widget(cx, ids!(plane_scan_field))
-                .set_text(cx, &plane_scan_text);
-            self.last_plane_scan_text = plane_scan_text;
-        }
-
-        let geometry_text = format!(
-            "Physics geometry: {} planes, {} vertices, {} triangles",
-            surface_count, vertex_count, triangle_count
-        );
-        if self.last_physics_geometry_text != geometry_text {
-            self.ui
-                .widget(cx, ids!(physics_geom_field))
-                .set_text(cx, &geometry_text);
-            self.last_physics_geometry_text = geometry_text;
-        }
-
-        let timing_text = if step_dt_ms > 0.0 {
-            format!(
-                "Physics compute: {:.2} ms | tick {:.2} ms ({:.0} Hz) | sim {:.2}x",
-                compute_ms,
-                step_dt_ms,
-                1000.0 / step_dt_ms,
-                physics_time_scale
-            )
-        } else {
-            format!(
-                "Physics compute: {:.2} ms | sim {:.2}x",
-                compute_ms, physics_time_scale
-            )
-        };
-        if self.last_physics_timing_text != timing_text {
-            self.ui
-                .widget(cx, ids!(physics_timing_field))
-                .set_text(cx, &timing_text);
-            self.last_physics_timing_text = timing_text;
-        }
-
-        let frame_cpu_text = format!(
-            "CPU frame: {:.2} ms total | update {:.2} ms | draw {:.2} ms",
-            frame_cpu_ms, frame_update_cpu_ms, frame_draw_cpu_ms
-        );
-        if self.last_frame_cpu_text != frame_cpu_text {
-            self.ui
-                .widget(cx, ids!(frame_cpu_field))
-                .set_text(cx, &frame_cpu_text);
-            self.last_frame_cpu_text = frame_cpu_text;
-        }
-
-        let xr_runtime_text = match (
-            cx.xr_render_scale(),
-            cx.xr_display_refresh_rate_hz(),
-            cx.xr_effective_frame_rate_hz(),
-            cx.xr_gpu_frame_time_ms(),
-        ) {
-            (Some(scale), Some(refresh_hz), Some(effective_hz), Some(gpu_ms)) => format!(
-                "Depth: {:.0} cm | XR scale: {:.2} | refresh {:.1} Hz | cadence {:.1} Hz | GPU {:.2} ms",
-                cx.xr_depth_mesh().voxel_size_meters() * 100.0,
-                scale,
-                refresh_hz,
-                effective_hz,
-                gpu_ms
-            ),
-            (Some(scale), Some(refresh_hz), Some(effective_hz), None) => format!(
-                "Depth: {:.0} cm | XR scale: {:.2} | refresh {:.1} Hz | cadence {:.1} Hz | GPU waiting",
-                cx.xr_depth_mesh().voxel_size_meters() * 100.0,
-                scale,
-                refresh_hz,
-                effective_hz
-            ),
-            (Some(scale), Some(refresh_hz), None, Some(gpu_ms)) => format!(
-                "Depth: {:.0} cm | XR scale: {:.2} | refresh {:.1} Hz | cadence waiting | GPU {:.2} ms",
-                cx.xr_depth_mesh().voxel_size_meters() * 100.0,
-                scale,
-                refresh_hz,
-                gpu_ms
-            ),
-            (Some(scale), Some(refresh_hz), None, None) => format!(
-                "Depth: {:.0} cm | XR scale: {:.2} | refresh {:.1} Hz | cadence waiting | GPU waiting",
-                cx.xr_depth_mesh().voxel_size_meters() * 100.0,
-                scale,
-                refresh_hz
-            ),
-            (Some(scale), None, _, Some(gpu_ms)) => {
-                format!(
-                    "Depth: {:.0} cm | XR scale: {:.2} | refresh waiting | GPU {:.2} ms",
-                    cx.xr_depth_mesh().voxel_size_meters() * 100.0,
-                    scale,
-                    gpu_ms
+            .widget(cx, ids!(xr_peer_sync))
+            .borrow::<XrPeerSync>()
+            .map(|peer_sync| {
+                (
+                    peer_sync.connected_peer_count(),
+                    peer_sync.shared_object_count(),
+                    peer_sync.touch_sync_status_text(),
+                    peer_sync.local_touch_signal_text(),
+                    peer_sync.remote_touch_signal_text(),
+                    peer_sync.alignment_debug_text().to_string(),
+                    peer_sync.alignment_state_text().to_string(),
+                    peer_sync.peer_scene_text().to_string(),
                 )
-            }
-            (Some(scale), None, _, None) => {
-                format!(
-                    "Depth: {:.0} cm | XR scale: {:.2} | refresh waiting | GPU waiting",
-                    cx.xr_depth_mesh().voxel_size_meters() * 100.0,
-                    scale
-                )
-            }
-            (None, _, _, _) => format!(
-                "Depth: {:.0} cm | XR render scale: not active",
-                cx.xr_depth_mesh().voxel_size_meters() * 100.0
-            ),
-        };
-        if self.last_xr_runtime_text != xr_runtime_text {
+            })
+            .unwrap_or((
+                0,
+                0,
+                "Touch sync: off".to_string(),
+                "TouchRaw: off".to_string(),
+                "TouchPeer: off".to_string(),
+                "AlignDbg: off".to_string(),
+                "AlignState: off".to_string(),
+                "PeerMap: off".to_string(),
+            ));
+        let tsdf_memory_mb = cx
+            .xr_tsdf()
+            .latest_tsdf_snapshot()
+            .as_ref()
+            .map(|snapshot| {
+                let grid = &snapshot.grid;
+                grid.heap_bytes() as f64 / 1_000_000.0
+            })
+            .unwrap_or(0.0);
+        let (depth_frames_seen, depth_frames_dropped) = cx
+            .xr_tsdf()
+            .state()
+            .read()
+            .ok()
+            .map(|state| (state.stats.frames_seen, state.stats.frames_dropped))
+            .unwrap_or((0, 0));
+        let depth_frames_kept = depth_frames_seen.saturating_sub(depth_frames_dropped);
+        let gpu_time_text = cx
+            .xr_gpu_frame_time_ms()
+            .map(|gpu_ms| format!("{gpu_ms:.2} ms"))
+            .unwrap_or_else(|| "waiting".to_string());
+        let debug_text = format!(
+            "Connected peers: {}\nShared objects: {}\n{}\n{}\n{}\n{}\n{}\n{}\nPhysics planes: {surface_count}\nPhysics compute time: {compute_ms:.2} ms\nQuery time: {query_ms:.2} ms\nRapier time: {rapier_ms:.2} ms\nCPU frame time: {frame_cpu_ms:.2} ms\nUpdate time: {frame_update_cpu_ms:.2} ms\nDraw time: {frame_draw_cpu_ms:.2} ms\nTSDF size: {tsdf_memory_mb:.1} MB\nDepth frames kept: {depth_frames_kept}\nGPU time: {gpu_time_text}",
+            connected_peers.0,
+            connected_peers.1,
+            connected_peers.2,
+            connected_peers.3,
+            connected_peers.4,
+            connected_peers.5,
+            connected_peers.6,
+            connected_peers.7,
+        );
+        if self.last_debug_text != debug_text {
             self.ui
-                .widget(cx, ids!(xr_runtime_field))
-                .set_text(cx, &xr_runtime_text);
-            self.last_xr_runtime_text = xr_runtime_text;
+                .widget(cx, ids!(debug_field))
+                .set_text(cx, &debug_text);
+            self.last_debug_text = debug_text;
+        }
+        let wrist_perf_text = format!(
+            "P:{:.1} C:{:.1}",
+            compute_ms + query_ms + rapier_ms,
+            frame_cpu_ms,
+        );
+        self.ui
+            .widget(cx, ids!(wrist_sync_status))
+            .set_text(cx, &wrist_perf_text);
+    }
+}
+
+impl MatchEvent for App {
+    fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        let root_uid = self.ui.widget_uid();
+        let scene_select_uid = self.ui.widget(cx, ids!(scene_select)).widget_uid();
+        let peer_sync_widget = self.ui.widget(cx, ids!(xr_peer_sync));
+        let peer_sync_uid = peer_sync_widget.widget_uid();
+
+        let mut remote_activity = None;
+        let mut remote_body_spawns = Vec::new();
+        let mut remote_body_impulses = Vec::new();
+        let mut remote_body_despawns = Vec::new();
+        let mut remote_activity_pose_reset = None;
+        let mut local_activity = None;
+        let mut local_body_spawns = Vec::new();
+        let mut local_activity_pose_reset = None;
+        let mut scene_changed = false;
+
+        for action in actions {
+            let Some(widget_action) = action.as_widget_action() else {
+                continue;
+            };
+            if widget_action.widget_uid == peer_sync_uid {
+                match widget_action.cast::<XrPeerSyncAction>() {
+                    XrPeerSyncAction::ActivityChanged(activity_id) => {
+                        remote_activity = Some(activity_id);
+                    }
+                    XrPeerSyncAction::ActivityPoseReset(pose) => {
+                        remote_activity_pose_reset = Some(pose);
+                    }
+                    XrPeerSyncAction::BodySpawn(spawn) => {
+                        remote_body_spawns.push(spawn);
+                    }
+                    XrPeerSyncAction::BodyImpulse(impulse) => {
+                        remote_body_impulses.push(impulse);
+                    }
+                    XrPeerSyncAction::BodyDespawn(widget_uid) => {
+                        remote_body_despawns.push(widget_uid);
+                    }
+                    XrPeerSyncAction::None => {}
+                }
+            }
+            if widget_action.widget_uid == root_uid
+            {
+                match widget_action.cast::<XrRootAction>() {
+                    XrRootAction::PhysicsReset => {
+                        self.pending_shared_scene_reset = true;
+                    }
+                    XrRootAction::ContentPoseReset(pose) => {
+                        local_activity_pose_reset = Some(pose);
+                    }
+                    XrRootAction::None => {}
+                }
+            }
+            if widget_action.widget_uid == scene_select_uid {
+                if let XrSelectAction::ActiveChildChanged(activity_id) =
+                    widget_action.cast::<XrSelectAction>()
+                {
+                    local_activity = Some(activity_id);
+                }
+            }
+            if let Some(body_spawn) = widget_action.action.downcast_ref::<XrBodySpawn>() {
+                local_body_spawns.push(*body_spawn);
+            }
+            if matches!(
+                widget_action.cast::<XrNodeAction>(),
+                XrNodeAction::SceneChanged
+            ) {
+                scene_changed = true;
+            }
+        }
+
+        if scene_changed {
+            self.refresh_spawnable_registry(cx, true);
+        }
+
+        if let Some(activity_id) = remote_activity {
+            if self.current_activity(cx) != Some(activity_id) {
+                self.suppress_activity_broadcast = Some(activity_id);
+                if self.apply_activity(cx, activity_id).is_none() {
+                    self.suppress_activity_broadcast = None;
+                }
+            }
+            self.refresh_spawnable_registry(cx, true);
+        }
+
+        if let Some(activity_id) = local_activity {
+            self.refresh_spawnable_registry(cx, true);
+            if self.suppress_activity_broadcast == Some(activity_id) {
+                self.suppress_activity_broadcast = None;
+            } else if let Some(mut peer_sync) = peer_sync_widget.borrow_mut::<XrPeerSync>() {
+                let _ = peer_sync.set_local_activity(cx, activity_id);
+            }
+        }
+
+        if let Some(pose) = remote_activity_pose_reset {
+            if let Some(mut root) = self.ui.borrow_mut::<XrRoot>() {
+                root.set_content_pose(cx, pose);
+            }
+            self.pending_shared_scene_reset = true;
+        }
+
+        if let Some(pose) = local_activity_pose_reset {
+            self.pending_shared_scene_reset = true;
+            if let Some(mut peer_sync) = peer_sync_widget.borrow_mut::<XrPeerSync>() {
+                let _ = peer_sync.send_activity_pose_reset(pose);
+            }
+        }
+
+        for widget_uid in remote_body_despawns {
+            self.apply_remote_body_despawn(cx, widget_uid);
+        }
+
+        for spawn in remote_body_spawns {
+            self.apply_remote_body_spawn(cx, spawn);
+        }
+
+        for impulse in remote_body_impulses {
+            self.apply_body_impulse(cx, impulse);
+        }
+
+        if !local_body_spawns.is_empty() {
+            self.refresh_spawnable_registry(cx, false);
+            if let Some(mut peer_sync) = peer_sync_widget.borrow_mut::<XrPeerSync>() {
+                for spawn in local_body_spawns {
+                    if let Some(spawn) = peer_sync.send_local_body_spawn(spawn) {
+                        self.apply_remote_body_spawn(cx, spawn);
+                    }
+                }
+            }
         }
     }
 }
@@ -957,9 +1209,19 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
         if matches!(event, Event::Startup) {
             self.ensure_network_started(cx);
+        }
+        self.ensure_activity_announced(cx);
+        self.sync_authoritative_activity_pose(cx);
+        self.refresh_spawnable_registry(cx, false);
+        self.apply_pending_shared_scene_reset(cx);
+        if matches!(event, Event::XrUpdate(_))
+            || (matches!(event, Event::NextFrame(_)) && !cx.in_xr_mode())
+        {
+            self.publish_local_shared_object_states(cx);
         }
         self.refresh_debug_fields(cx);
     }
