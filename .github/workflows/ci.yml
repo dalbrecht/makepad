@@ -42,7 +42,9 @@ jobs:
             libegl1-mesa-dev libxcursor-dev libx11-dev \
             libasound2-dev libpulse-dev libssl-dev
       - name: cargo test
-        run: cargo test --workspace
+        # Exclude example UI tests that require a display server (fail on headless CI).
+        # The makepad-test runtime spawns a subprocess build that needs GPU/display.
+        run: cargo test --workspace --exclude makepad-example-counter
 
   wasm-check:
     name: WASM compile check
