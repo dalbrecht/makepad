@@ -225,8 +225,8 @@ mod tests {
             },
         );
 
-        let first = loader.get_or_load_font(font_id).clone();
-        let second = loader.get_or_load_font(font_id).clone();
+        let first = loader.get_or_load_font(font_id).expect("test font should load").clone();
+        let second = loader.get_or_load_font(font_id).expect("test font should load").clone();
         assert!(std::rc::Rc::ptr_eq(&first, &second));
     }
 
