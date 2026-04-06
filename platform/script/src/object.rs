@@ -920,16 +920,14 @@ impl ScriptObjectData {
         );
     }
 
+    // On WASM, this function must NOT be inlined. Without this attribute,
+    // the WASM compiler (LLVM → wasm32) miscompiles the HashMap insertion
+    // when map_insert is inlined into the caller, causing certain LiveId
+    // keys (notably `vertex`) to be silently dropped. This manifests as
+    // shader compilation failures ("key vertex not found in prototype chain")
+    // and broken text rendering. See: https://github.com/dalbrecht/makepad/issues/6
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
     pub fn map_insert(&mut self, key: ScriptValue, value: ScriptValue) {
-        // DIAG: trace vertex key insertion on WASM
-        #[cfg(target_arch = "wasm32")]
-        {
-            use crate::makepad_live_id::*;
-            let vertex_sv: ScriptValue = id!(vertex).into();
-            if key == vertex_sv {
-                makepad_error_log::error!("DIAG map_insert vertex on obj (map_len={})", self.map.len());
-            }
-        }
         if self.tag.is_tracked() {
             let order = self.map.len() as u32;
             match self.map.entry(key) {
