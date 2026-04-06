@@ -406,6 +406,7 @@ impl DrawGlyph {
             bounds,
             flags: self.pending_flags,
         });
+        self.pending_flags = 0;
     }
 
 
