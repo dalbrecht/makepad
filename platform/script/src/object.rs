@@ -921,15 +921,17 @@ impl ScriptObjectData {
     }
 
     pub fn map_insert(&mut self, key: ScriptValue, value: ScriptValue) {
-        // WASM codegen workaround: without this black_box hint, the WASM
-        // compiler (LLVM → wasm32) miscompiles this function, silently
-        // dropping certain LiveId keys (notably `vertex`) during HashMap
-        // insertion. This causes "key vertex not found in prototype chain"
-        // and breaks text rendering. The hint prevents the problematic
-        // optimization. See: https://github.com/dalbrecht/makepad/issues/6
+        // WASM codegen workaround: without this block, the WASM compiler
+        // (LLVM → wasm32) miscompiles this function, silently dropping
+        // certain LiveId keys (notably `vertex`) during HashMap insertion.
+        // The comparison + conditional side-effect prevents the problematic
+        // optimization path. See: https://github.com/dalbrecht/makepad/issues/6
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = std::hint::black_box(key);
+            use crate::makepad_live_id::*;
+            if key == ScriptValue::from_id(id!(vertex)) {
+                makepad_error_log::log!("map_insert: vertex key");
+            }
         }
         if self.tag.is_tracked() {
             let order = self.map.len() as u32;
