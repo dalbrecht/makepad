@@ -1124,9 +1124,17 @@ export class WasmWebBrowser extends WasmBridge {
         this.buffer_upload_serial += 1;
         let to_wasm = this.to_wasm;
         this.to_wasm = this.new_to_wasm();
-        let from_wasm = this.wasm_process_msg(to_wasm);
-        from_wasm.dispatch_on_app();
-        from_wasm.free();
+        try {
+            let from_wasm = this.wasm_process_msg(to_wasm);
+            from_wasm.dispatch_on_app();
+            from_wasm.free();
+        } catch (e) {
+            // Catch WASM RuntimeError traps (e.g., from corrupt shader mappings
+            // after Script VM property resolution failures) to prevent a single
+            // bad frame from killing the entire page. Subsequent frames recover
+            // because shader compilation is a one-time operation.
+            console.error("do_wasm_pump error (recovering):", e.message);
+        }
         this.update_startup_loader(performance.now() - started);
     }
 

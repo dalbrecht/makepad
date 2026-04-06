@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, fix/wasm-shader-batching]
+  pull_request:
+    branches: [dev]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libgl1-mesa-dev \
+            libegl1-mesa-dev libxcursor-dev libx11-dev \
+            libasound2-dev libpulse-dev libssl-dev
+      - name: cargo check
+        run: cargo check --workspace
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libgl1-mesa-dev \
+            libegl1-mesa-dev libxcursor-dev libx11-dev \
+            libasound2-dev libpulse-dev libssl-dev
+      - name: cargo test
+        # Test only crates we maintain fixes for. The full workspace has
+        # pre-existing upstream failures (UI tests need display server,
+        # CRC32 SIMD failures, widget_tree test regressions).
+        run: cargo test -p makepad-script -p makepad-draw
+
+  wasm-check:
+    name: WASM compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev libxkbcommon-dev libgl1-mesa-dev \
+            libegl1-mesa-dev libxcursor-dev libx11-dev \
+            libasound2-dev libpulse-dev libssl-dev
+      - name: Check platform crate for WASM
+        run: cargo check -p makepad-platform --target wasm32-unknown-unknown
+      - name: Check script crate for WASM
+        run: cargo check -p makepad-script --target wasm32-unknown-unknown
+      - name: Check widgets crate for WASM
+        run: cargo check -p makepad-widgets --target wasm32-unknown-unknown

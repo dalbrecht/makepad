@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::{
     cx::Cx,
     draw_list::DrawListId,
@@ -30,6 +31,12 @@ impl Cx {
             else {
                 continue;
             };
+            // Guard: skip draw items that reference beyond the live buffer.
+            // This can happen when shader compilation fails and the draw list
+            // retains stale entries from a previous frame layout.
+            if draw_item_id >= self.draw_lists[draw_list_id].draw_items.buffer.len() {
+                continue;
+            }
             if let Some(sub_list_id) =
                 self.draw_lists[draw_list_id].draw_items[draw_item_id].sub_list()
             {
@@ -418,6 +425,14 @@ impl Cx {
     }
 
     pub fn webgl_compile_shaders(&mut self) {
+        // Build a hash index of existing shaders for O(1) dedup lookups.
+        // The previous linear scan was O(n²) in the number of shaders and
+        // caused Chrome to hang for large apps with many draw types.
+        let mut shader_index: HashMap<(String, String), usize> = HashMap::new();
+        for (index, ds) in self.draw_shaders.os_shaders.iter().enumerate() {
+            shader_index.insert((ds.in_vertex.clone(), ds.in_pixel.clone()), index);
+        }
+
         let compile_set: Vec<usize> = self.draw_shaders.compile_set.iter().copied().collect();
         for draw_shader_id in compile_set {
             let (vertex, pixel, geometry_slots, instance_slots, textures, debug_code) = {
@@ -453,16 +468,21 @@ impl Cx {
 
             let mut os_shader_id = self.draw_shaders.shaders[draw_shader_id].os_shader_id;
             if os_shader_id.is_none() {
-                for (index, ds) in self.draw_shaders.os_shaders.iter().enumerate() {
-                    if ds.in_vertex == vertex && ds.in_pixel == pixel {
-                        os_shader_id = Some(index);
-                        break;
-                    }
-                }
+                os_shader_id = shader_index.get(&(vertex.clone(), pixel.clone())).copied();
             }
 
             if os_shader_id.is_none() {
-                let shp = CxOsDrawShader::new(vertex, pixel);
+                let shp = CxOsDrawShader::new(vertex.clone(), pixel.clone());
+                // Guard: if the Script VM failed to resolve a property during
+                // shader code generation, the GLSL will contain the literal
+                // "unknown" which causes a WebGL compilation failure. Skip
+                // these shaders entirely to avoid setting os_shader_id on a
+                // shader whose mapping is corrupt.
+                if shp.vertex.contains("unknown") || shp.pixel.contains("unknown") {
+                    crate::error!("Skipping shader {} with unresolved 'unknown' in GLSL (vertex len={}, pixel len={})",
+                        draw_shader_id, shp.vertex.len(), shp.pixel.len());
+                    continue;
+                }
                 let shader_id = self.draw_shaders.os_shaders.len();
                 self.os.from_wasm(FromWasmCompileWebGLShader {
                     shader_id,
@@ -473,6 +493,7 @@ impl Cx {
                     textures,
                 });
                 self.draw_shaders.os_shaders.push(shp);
+                shader_index.insert((vertex, pixel), shader_id);
                 os_shader_id = Some(shader_id);
             }
 
