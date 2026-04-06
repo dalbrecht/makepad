@@ -44,7 +44,13 @@ jobs:
       - name: cargo test
         # Exclude example UI tests that require a display server (fail on headless CI).
         # The makepad-test runtime spawns a subprocess build that needs GPU/display.
-        run: cargo test --workspace --exclude makepad-example-counter
+        run: >-
+          cargo test --workspace
+          --exclude makepad-example-counter
+          --exclude makepad-example-floating-panel
+          --exclude makepad-example-splash
+          --exclude makepad-example-text-input
+          --exclude makepad-example-todo
 
   wasm-check:
     name: WASM compile check
