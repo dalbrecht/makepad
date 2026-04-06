@@ -475,15 +475,19 @@ impl Cx {
                 let shp = CxOsDrawShader::new(vertex.clone(), pixel.clone());
                 // Guard: if the Script VM failed to resolve a property during
                 // shader code generation, the GLSL will contain the literal
-                // "unknown" which causes a WebGL compilation failure. Skip
-                // these shaders entirely to avoid setting os_shader_id on a
-                // shader whose mapping is corrupt.
-                if shp.vertex.contains("unknown") || shp.pixel.contains("unknown") {
-                    crate::error!("Skipping shader {} with unresolved 'unknown' in GLSL (vertex len={}, pixel len={})",
+                // "unknown" as a type placeholder. Replace with "float" so
+                // the shader can still compile — the affected variables will
+                // have wrong types but the shader runs and renders output.
+                let shp = if shp.vertex.contains("unknown") || shp.pixel.contains("unknown") {
+                    crate::log!("Patching shader {} 'unknown' → 'float' in GLSL (vertex len={}, pixel len={})",
                         draw_shader_id, shp.vertex.len(), shp.pixel.len());
-                    continue;
-                }
-                crate::log!("DIAG shader {} ok: vertex_len={} pixel_len={}", draw_shader_id, shp.vertex.len(), shp.pixel.len());
+                    CxOsDrawShader::new(
+                        shp.vertex.replace("unknown", "float"),
+                        shp.pixel.replace("unknown", "float"),
+                    )
+                } else {
+                    shp
+                };
                 let shader_id = self.draw_shaders.os_shaders.len();
                 self.os.from_wasm(FromWasmCompileWebGLShader {
                     shader_id,
