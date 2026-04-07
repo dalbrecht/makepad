@@ -1,6 +1,18 @@
 export function init_env(env) {
     let _wasm = null;
 
+    // Provide calloc for C dependencies (tree-sitter) compiled to wasm32.
+    // dlmalloc provides malloc/free but not calloc.
+    env.calloc = (nmemb, size) => {
+        const total = nmemb * size;
+        if (total === 0) return 0;
+        const ptr = _wasm.exports.malloc(total);
+        if (ptr !== 0) {
+            new Uint8Array(_wasm._memory.buffer, ptr, total).fill(0);
+        }
+        return ptr;
+    };
+
     env.js_console_log = (u8_ptr, len) => _wasm._bridge.js_console_log(u8_ptr, len);
     env.js_console_error = (u8_ptr, len) => _wasm._bridge.js_console_error(u8_ptr, len);
     env.js_time_now = () => _wasm._bridge.js_time_now();
