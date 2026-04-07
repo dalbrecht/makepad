@@ -1086,6 +1086,21 @@ extern "C" {
     pub fn js_time_now() -> f64;
 }
 
+/// Provide `calloc` for C dependencies (tree-sitter) compiled to wasm32.
+/// The wasm32-unknown-unknown target's dlmalloc provides malloc/free but not
+/// calloc, so C code that references calloc gets an unresolved WASM import.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut u8 {
+    let total = nmemb.wrapping_mul(size);
+    if total == 0 {
+        return core::ptr::null_mut();
+    }
+    let layout = core::alloc::Layout::from_size_align_unchecked(total, 8);
+    extern crate alloc as alloc_crate;
+    alloc_crate::alloc::alloc_zeroed(layout)
+}
+
 #[export_name = "wasm_thread_entrypoint"]
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 pub unsafe extern "C" fn wasm_thread_entrypoint(closure_ptr: u32) {
