@@ -1,14 +1,25 @@
 use crate::makepad_live_id::LiveId;
 
-use std::{
-    collections::HashMap,
-    ops::{Index, IndexMut},
-};
+use std::ops::{Index, IndexMut};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashMap;
+
+// On wasm32, ValueMap never uses HashMap. LLVM's wasm32 backend miscompiles
+// HashMap::insert, silently dropping keys during Makepad's DSL evaluation
+// (notably `vertex` on shader prototype objects). Vec + linear scan is immune
+// because it uses only array indexing and equality comparison.
+// See: https://github.com/dalbrecht/makepad/issues/6
+//
+// On native targets, this is the upstream hybrid: small maps stay a Vec, and
+// past SPILL_AT they spill to a HashMap.
 
 // Idea taken from the `nohash_hasher` crate.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct ValueHasher(u64);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::hash::Hasher for ValueHasher {
     fn write(&mut self, _: &[u8]) {
         unreachable!();
@@ -50,9 +61,11 @@ impl std::hash::Hasher for ValueHasher {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Copy, Clone, Default)]
 pub struct ValueHasherBuilder {}
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::hash::BuildHasher for ValueHasherBuilder {
     type Hasher = ValueHasher;
 
@@ -68,21 +81,27 @@ impl std::hash::BuildHasher for ValueHasherBuilder {
 /// entries the map spills to a HashMap and stays spilled until cleared.
 /// Key order is not part of the map contract (callers track ordering via
 /// ScriptMapTag::order), matching the previous HashMap behavior.
+///
+/// On wasm32 the HashMap spill path is compiled out entirely so LLVM cannot
+/// miscompile HashMap::insert into the DSL evaluation path.
 #[derive(Clone, Debug)]
 pub struct ValueMap<K, V> {
     vec: Vec<(K, V)>,
+    #[cfg(not(target_arch = "wasm32"))]
     spill: Option<Box<HashMap<K, V, ValueHasherBuilder>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const SPILL_AT: usize = 16;
 
 impl<K, V> Default for ValueMap<K, V>
 where
-    K: std::cmp::Eq + std::hash::Hash + Copy + From<LiveId> + std::fmt::Debug,
+    K: std::cmp::Eq + Copy + From<LiveId> + std::fmt::Debug,
 {
     fn default() -> Self {
         Self {
             vec: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             spill: None,
         }
     }
@@ -90,11 +109,13 @@ where
 
 pub enum ValueMapIter<'a, K, V> {
     Vec(std::slice::Iter<'a, (K, V)>),
+    #[cfg(not(target_arch = "wasm32"))]
     Map(std::collections::hash_map::Iter<'a, K, V>),
 }
 
 pub enum ValueMapIterMut<'a, K, V> {
     Vec(std::slice::IterMut<'a, (K, V)>),
+    #[cfg(not(target_arch = "wasm32"))]
     Map(std::collections::hash_map::IterMut<'a, K, V>),
 }
 
@@ -104,12 +125,14 @@ impl<'a, K, V> Iterator for ValueMapIterMut<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Vec(it) => it.next().map(|(k, v)| (&*k, v)),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(it) => it.next(),
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             Self::Vec(it) => it.size_hint(),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(it) => it.size_hint(),
         }
     }
@@ -121,12 +144,14 @@ impl<'a, K, V> Iterator for ValueMapIter<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Vec(it) => it.next().map(|(k, v)| (k, v)),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(it) => it.next(),
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             Self::Vec(it) => it.size_hint(),
+            #[cfg(not(target_arch = "wasm32"))]
             Self::Map(it) => it.size_hint(),
         }
     }
@@ -134,10 +159,11 @@ impl<'a, K, V> Iterator for ValueMapIter<'a, K, V> {
 
 impl<K, V> ValueMap<K, V>
 where
-    K: std::cmp::Eq + std::hash::Hash + Copy,
+    K: std::cmp::Eq + Copy,
 {
     #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(spill) = &self.spill {
             return spill.get(key);
         }
@@ -151,6 +177,7 @@ where
 
     #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(spill) = &mut self.spill {
             return spill.get_mut(key);
         }
@@ -167,7 +194,11 @@ where
         self.get(key).is_some()
     }
 
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+    pub fn insert(&mut self, key: K, value: V) -> Option<V>
+    where
+        K: std::hash::Hash,
+    {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(spill) = &mut self.spill {
             return spill.insert(key, value);
         }
@@ -176,6 +207,7 @@ where
                 return Some(std::mem::replace(v, value));
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if self.vec.len() >= SPILL_AT {
             let mut map = Box::new(HashMap::with_capacity_and_hasher(
                 self.vec.len() + 1,
@@ -193,6 +225,7 @@ where
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(spill) = &mut self.spill {
             return spill.remove(key);
         }
@@ -206,6 +239,7 @@ where
 
     #[inline]
     pub fn len(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(spill) = &self.spill {
             return spill.len();
         }
@@ -221,11 +255,15 @@ where
     /// spilled hashmap so a reused slot starts in (cheap) linear mode again.
     pub fn clear(&mut self) {
         self.vec.clear();
-        self.spill = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.spill = None;
+        }
     }
 
     #[inline]
     pub fn iter(&self) -> ValueMapIter<'_, K, V> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(spill) = &self.spill {
             return ValueMapIter::Map(spill.iter());
         }
@@ -234,6 +272,7 @@ where
 
     #[inline]
     pub fn iter_mut(&mut self) -> ValueMapIterMut<'_, K, V> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(spill) = &mut self.spill {
             return ValueMapIterMut::Map(spill.iter_mut());
         }
@@ -251,7 +290,7 @@ where
 
 impl<'a, K, V> IntoIterator for &'a ValueMap<K, V>
 where
-    K: std::cmp::Eq + std::hash::Hash + Copy,
+    K: std::cmp::Eq + Copy,
 {
     type Item = (&'a K, &'a V);
     type IntoIter = ValueMapIter<'a, K, V>;
@@ -262,7 +301,7 @@ where
 
 impl<K, V> Index<K> for ValueMap<K, V>
 where
-    K: std::cmp::Eq + std::hash::Hash + Copy + From<LiveId>,
+    K: std::cmp::Eq + Copy + From<LiveId>,
 {
     type Output = V;
     fn index(&self, index: K) -> &Self::Output {
@@ -272,7 +311,7 @@ where
 
 impl<K, V> IndexMut<K> for ValueMap<K, V>
 where
-    K: std::cmp::Eq + std::hash::Hash + Copy + From<LiveId>,
+    K: std::cmp::Eq + Copy + From<LiveId>,
 {
     fn index_mut(&mut self, index: K) -> &mut Self::Output {
         self.get_mut(&index).unwrap()
