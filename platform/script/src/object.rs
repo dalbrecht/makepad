@@ -1107,13 +1107,6 @@ impl ScriptObjectData {
 
     pub fn vec_values(&self) -> &[ScriptVecValue] { &self.vec }
 
-    // On WASM, this function must NOT be inlined. Without this attribute,
-    // the WASM compiler (LLVM → wasm32) miscompiles the HashMap insertion
-    // when map_insert is inlined into the caller, causing certain LiveId
-    // keys (notably `vertex`) to be silently dropped. This manifests as
-    // shader compilation failures ("key vertex not found in prototype chain")
-    // and broken text rendering. See: https://github.com/dalbrecht/makepad/issues/6
-    #[cfg_attr(target_arch = "wasm32", inline(never))]
     pub fn map_insert(&mut self, key: ScriptValue, value: ScriptValue) {
         let order = self.map.len() as u32;
         if self.tag.is_tracked() {
