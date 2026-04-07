@@ -8,11 +8,10 @@ use crate::value::*;
 use crate::value_map::*;
 use crate::*;
 use ::std::cell::RefCell;
-use ::std::collections::hash_map::Entry;
+use ::std::collections::btree_map::Entry;
 use ::std::collections::HashMap;
 use ::std::fmt;
 use ::std::rc::Rc;
-//use std::collections::btree_map::BTreeMap;
 
 #[derive(Default)]
 pub struct ScriptObjectTag(u64);
@@ -44,11 +43,11 @@ impl Clone for ScriptObjectRef {
         if let Some(roots) = &self.roots {
             let mut roots = roots.borrow_mut();
             match roots.entry(self.obj) {
-                Entry::Occupied(mut occ) => {
+                std::collections::hash_map::Entry::Occupied(mut occ) => {
                     let value = occ.get_mut();
                     *value += 1;
                 }
-                Entry::Vacant(_vac) => {
+                std::collections::hash_map::Entry::Vacant(_vac) => {
                     eprintln!("ScriptObjectRef root is vacant!");
                 }
             }
@@ -90,7 +89,7 @@ impl Drop for ScriptObjectRef {
         if let Some(roots) = &self.roots {
             let mut roots = roots.borrow_mut();
             match roots.entry(self.obj) {
-                Entry::Occupied(mut occ) => {
+                std::collections::hash_map::Entry::Occupied(mut occ) => {
                     let value = occ.get_mut();
                     if *value >= 1 {
                         *value -= 1;
@@ -101,7 +100,7 @@ impl Drop for ScriptObjectRef {
                         occ.remove();
                     }
                 }
-                Entry::Vacant(_vac) => {
+                std::collections::hash_map::Entry::Vacant(_vac) => {
                     eprintln!("ScriptObjectRef root is vacant!");
                 }
             }
@@ -921,21 +920,6 @@ impl ScriptObjectData {
     }
 
     pub fn map_insert(&mut self, key: ScriptValue, value: ScriptValue) {
-        // WASM codegen workaround: without this block, the WASM compiler
-        // (LLVM → wasm32) miscompiles this function, silently dropping
-        // certain LiveId keys (notably `vertex`) during HashMap insertion.
-        // The local variable + comparison + error!() side-effect prevents
-        // the problematic optimization path. Removing any part of this
-        // (the let binding, the error! level, the format args) breaks text
-        // rendering on WASM. See: https://github.com/dalbrecht/makepad/issues/6
-        #[cfg(target_arch = "wasm32")]
-        {
-            use crate::makepad_live_id::*;
-            let vertex_sv: ScriptValue = id!(vertex).into();
-            if key == vertex_sv {
-                makepad_error_log::error!("DIAG map_insert vertex on obj (map_len={})", self.map.len());
-            }
-        }
         if self.tag.is_tracked() {
             let order = self.map.len() as u32;
             match self.map.entry(key) {
