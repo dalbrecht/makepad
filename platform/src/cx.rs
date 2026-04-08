@@ -903,13 +903,8 @@ impl Cx {
             SignalToUI::set_internal_signal();
         })));
 
-        let script_std = makepad_script_std::ScriptStd::with_network_runtime(net.clone());
-        let script_vm = Box::new(ScriptVmBase::new());
-        let crate_manifests = script_vm.code.crate_manifests.clone();
-        let script_mod_overrides = script_vm.code.script_mod_overrides.clone();
-
         let publications = crate::shared_instances::Publications::new(textures.1.serials.clone());
-        let mut cx = Self {
+        Self {
             package_root: None,
             #[cfg(not(target_arch = "wasm32"))]
             package_paths: crate::os::cx_native::load_package_paths(),
@@ -1025,21 +1020,34 @@ impl Cx {
             ai_callback: None,
             net,
 
-            script_data: CxScriptData {
-                std: script_std,
-                crate_manifests,
-                live_reload: crate::live_reload::CxLiveReloadState {
-                    script_mod_overrides,
-                    ..Default::default()
-                },
+            script_data: CxScriptData::default(),
+            script_vm: None,
+        }
+    }
+
+    /// Initialize the Script VM and populate `script_data`.
+    ///
+    /// This is separated from `Cx::new()` so that on WASM the expensive
+    /// `script_mod()` call can be deferred until the first event-loop pump,
+    /// letting Chrome's event loop regain control after loading the binary.
+    /// On native platforms this is called synchronously right after `Cx::new()`.
+    pub fn init_script_vm(&mut self) {
+        debug_assert!(self.script_vm.is_none(), "init_script_vm() called twice");
+        let script_std = makepad_script_std::ScriptStd::with_network_runtime(self.net.clone());
+        let script_vm = Box::new(ScriptVmBase::new());
+        let crate_manifests = script_vm.code.crate_manifests.clone();
+        let script_mod_overrides = script_vm.code.script_mod_overrides.clone();
+        self.script_data = CxScriptData {
+            std: script_std,
+            crate_manifests,
+            live_reload: crate::live_reload::CxLiveReloadState {
+                script_mod_overrides,
                 ..Default::default()
             },
-            script_vm: Some(script_vm),
+            ..Default::default()
         };
-
-        //todo!();
-        cx.with_vm(crate::script::script_mod);
-        cx
+        self.script_vm = Some(script_vm);
+        self.with_vm(crate::script::script_mod);
     }
 }
 
