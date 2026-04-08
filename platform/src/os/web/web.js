@@ -14,6 +14,10 @@ export class WasmWebBrowser extends WasmBridge {
             }
         }*/
 
+        this.wasm_app = this.wasm_create_app();
+
+        this.create_js_message_bridge(this.wasm_app);
+
         this.dispatch = dispatch;
         this.canvas = canvas;
         this.handlers = {};
@@ -41,15 +45,7 @@ export class WasmWebBrowser extends WasmBridge {
         this.midi_inputs = [];
         this.midi_outputs = [];
 
-        // Defer wasm_create_app() so the browser can paint the "Loading.."
-        // indicator before the synchronous WASM init blocks the main thread.
-        // Without this, Chrome hangs on large binaries (>10MB) with no visual
-        // feedback. See: https://github.com/dalbrecht/Trellis/issues/458
-        setTimeout(() => {
-            this.wasm_app = this.wasm_create_app();
-            this.create_js_message_bridge(this.wasm_app);
-            this.dispatch_first_msg();
-        }, 0);
+        this.dispatch_first_msg();
     }
 
     emit_location_change() {
