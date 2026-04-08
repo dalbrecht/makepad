@@ -322,6 +322,7 @@ macro_rules! app_main {
                     }
                 },
             ))));
+            cx.borrow_mut().init_script_vm();
             let studio_http = $crate::resolve_studio_http();
             cx.borrow_mut().init_websockets(&studio_http);
             if $crate::should_run_stdin_loop_from_env() {
@@ -420,6 +421,7 @@ macro_rules! app_main {
                         <dyn AppMain>::handle_event(app, cx, event);
                     }
                 })));
+                cx.init_script_vm();
                 cx.init_websockets(&studio_http);
                 cx.init_cx_os();
                 cx
@@ -489,6 +491,7 @@ macro_rules! app_main {
                         <dyn AppMain>::handle_event(app, cx, event);
                     }
                 })));
+                cx.init_script_vm();
                 let studio_http = $crate::resolve_studio_http();
                 cx.init_websockets(&studio_http);
                 cx.init_cx_os();
@@ -569,6 +572,12 @@ macro_rules! app_main {
         #[cfg(target_arch = "wasm32")]
         pub unsafe extern "C" fn wasm_process_msg(msg_ptr: u32, cx_ptr: u32) -> u32 {
             let cx = &mut *(cx_ptr as *mut Cx);
+            // Lazy-init the Script VM on the first event pump. This runs AFTER
+            // wasm_create_app() has returned and Chrome's event loop has yielded,
+            // avoiding the main-thread hang for large WASM binaries.
+            if cx.script_vm.is_none() {
+                cx.init_script_vm();
+            }
             cx.process_to_wasm(msg_ptr)
         }
 
