@@ -375,19 +375,6 @@ impl Cx {
             SignalToUI::set_ui_signal();
         })));
 
-        let mut script_std = makepad_script_std::ScriptStd::with_network_runtime(net.clone());
-        let mut script_host = 0;
-        let mut vm = ScriptVm {
-            host: &mut script_host,
-            std: &mut script_std,
-            bx: Box::new(ScriptVmBase::new()),
-        };
-
-        //todo!();
-        crate::script::script_mod(&mut vm);
-        let script_vm = std::mem::replace(&mut vm.bx, Box::new(ScriptVmBase::empty()));
-        drop(vm);
-
         Self {
             package_root: None,
             demo_time_repaint: false,
@@ -473,16 +460,40 @@ impl Cx {
             widget_snapshot_callback: None,
             net,
 
-            script_data: CxScriptData {
-                std: script_std,
-                crate_manifests: script_vm.code.crate_manifests.clone(),
-                live_reload: crate::live_reload::CxLiveReloadState {
-                    script_mod_overrides: script_vm.code.script_mod_overrides.clone(),
-                    ..Default::default()
-                },
+            script_data: CxScriptData::default(),
+            script_vm: None,
+        }
+    }
+
+    /// Initialize the Script VM and populate `script_data`.
+    ///
+    /// This is separated from `Cx::new()` so that on WASM the expensive
+    /// `script_mod()` call can be deferred until the first event-loop pump,
+    /// letting Chrome's event loop regain control after loading the binary.
+    /// On native platforms this is called synchronously right after `Cx::new()`.
+    pub fn init_script_vm(&mut self) {
+        debug_assert!(self.script_vm.is_none(), "init_script_vm() called twice");
+        let mut script_std =
+            makepad_script_std::ScriptStd::with_network_runtime(self.net.clone());
+        let mut script_host = 0;
+        let mut vm = ScriptVm {
+            host: &mut script_host,
+            std: &mut script_std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        crate::script::script_mod(&mut vm);
+        let script_vm = std::mem::replace(&mut vm.bx, Box::new(ScriptVmBase::empty()));
+        drop(vm);
+
+        self.script_data = CxScriptData {
+            std: script_std,
+            crate_manifests: script_vm.code.crate_manifests.clone(),
+            live_reload: crate::live_reload::CxLiveReloadState {
+                script_mod_overrides: script_vm.code.script_mod_overrides.clone(),
                 ..Default::default()
             },
-            script_vm: Some(script_vm),
-        }
+            ..Default::default()
+        };
+        self.script_vm = Some(script_vm);
     }
 }
