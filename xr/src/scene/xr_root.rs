@@ -1,12 +1,11 @@
 use super::xr_env::XrEnv;
-use super::xr_gesture::{floor_set_gesture_sample, XrFloorSetGestureSample};
 use super::xr_select::XrSelectAction;
 use super::{arm_pair_metrics, flat_head_forward, hand_closed_fist_contact_point};
 use crate::prelude::*;
 use crate::util::scene_draw::{ray_from_scene_viewport, SceneState3D};
 use makepad_widgets::event::{XrFingerTip, XrSyncAnchor, XrSyncAnchorExtrema};
 use makepad_widgets::makepad_script::ScriptFnRef;
-use std::{cell::Cell, collections::HashMap, fmt::Write as _, rc::Rc, time::Instant};
+use std::{cell::Cell, collections::HashMap, rc::Rc, time::Instant};
 
 const DESKTOP_TOUCH_DOWN_Z: f32 = 0.0;
 const DESKTOP_TOUCH_UP_Z: f32 = 64.0;
@@ -23,13 +22,6 @@ const SYNC_BOX_MAX_HAND_GAP_METERS: f32 = 0.78;
 const SYNC_BOX_MIN_CHEST_DISTANCE_METERS: f32 = 0.10;
 const SYNC_BOX_MAX_CHEST_DISTANCE_METERS: f32 = 1.05;
 const SYNC_BOX_MAX_ARM_ELEVATION_DEGREES: f32 = 60.0;
-const XR_FIXED_DEPTH_VOXEL_SIZE_METERS: f32 = 0.02;
-const XR_ROOT_TOP_CHILD_DRAW_METRIC_COUNT: usize = 4;
-const FLOOR_SET_HOLD_SECONDS: f64 = 2.0;
-const FLOOR_SET_SAMPLE_POSITION_TOLERANCE_METERS: f32 = 0.05;
-const FLOOR_SET_SAMPLE_GAP_TOLERANCE_METERS: f32 = 0.08;
-const FLOOR_SET_SAMPLE_FLOOR_TOLERANCE_METERS: f32 = 0.03;
-const FLOOR_SET_PREVIEW_SECONDS: f64 = 2.0;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -260,25 +252,6 @@ struct XrRootFrameMetrics {
     last_frame_update_cpu_ms: f64,
     last_frame_draw_cpu_ms: f64,
     last_frame_cpu_ms: f64,
-    last_draw_setup_cpu_ms: f64,
-    last_draw_env_prepare_cpu_ms: f64,
-    last_draw_sort_cpu_ms: f64,
-    last_draw_children_cpu_ms: f64,
-    last_draw_child_count: usize,
-    last_draw_transparent_child_count: usize,
-    last_draw_runtime_body_count: usize,
-    last_draw_geometry_pool_slots: usize,
-    last_draw_geometry_pool_live: usize,
-    last_draw_draw_list_pool_slots: usize,
-    last_draw_draw_list_pool_live: usize,
-    last_draw_texture_pool_slots: usize,
-    last_draw_texture_pool_live: usize,
-    last_draw_depth_mesh_chunk_count: usize,
-    last_draw_recycled_depth_mesh_geometry_count: usize,
-    last_draw_depth_mesh_pending_upsert_count: usize,
-    last_draw_depth_query_retained_hit_count: usize,
-    last_draw_top_children: [(LiveId, f64); XR_ROOT_TOP_CHILD_DRAW_METRIC_COUNT],
-    last_draw_top_child_count: usize,
 }
 
 impl XrRootFrameMetrics {
@@ -367,67 +340,6 @@ struct XrSyncAnchorRuntime {
     next_sync_anchor_id: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct XrFloorSetGestureCommit {
-    floor_y: f32,
-    preview_center: Vec3f,
-    anchor: Option<XrAnchor>,
-    visible_until_time: f64,
-}
-
-#[derive(Clone, Debug, Default)]
-struct XrFloorSetRuntime {
-    active_sample: Option<XrFloorSetGestureSample>,
-    active_since_time: Option<f64>,
-    committed_while_active: bool,
-}
-
-impl XrFloorSetRuntime {
-    fn reset(&mut self) {
-        self.active_sample = None;
-        self.active_since_time = None;
-        self.committed_while_active = false;
-    }
-
-    fn sample_matches(a: XrFloorSetGestureSample, b: XrFloorSetGestureSample) -> bool {
-        (a.midpoint - b.midpoint).length() <= FLOOR_SET_SAMPLE_POSITION_TOLERANCE_METERS
-            && (a.floor_y - b.floor_y).abs() <= FLOOR_SET_SAMPLE_FLOOR_TOLERANCE_METERS
-            && (a.hand_gap - b.hand_gap).abs() <= FLOOR_SET_SAMPLE_GAP_TOLERANCE_METERS
-    }
-
-    fn update(&mut self, state: &XrState) -> Option<XrFloorSetGestureCommit> {
-        let sample = floor_set_gesture_sample(state);
-        let Some(sample) = sample else {
-            self.reset();
-            return None;
-        };
-        if self
-            .active_sample
-            .is_none_or(|previous| !Self::sample_matches(previous, sample))
-        {
-            self.active_sample = Some(sample);
-            self.active_since_time = Some(state.time);
-            self.committed_while_active = false;
-            return None;
-        }
-        self.active_sample = Some(sample);
-        if self.committed_while_active {
-            return None;
-        }
-        let active_since_time = self.active_since_time.unwrap_or(state.time);
-        if state.time - active_since_time < FLOOR_SET_HOLD_SECONDS {
-            return None;
-        }
-        self.committed_while_active = true;
-        Some(XrFloorSetGestureCommit {
-            floor_y: sample.floor_y,
-            preview_center: sample.midpoint,
-            anchor: (!state.anchor_persisted).then_some(sample.anchor),
-            visible_until_time: state.time + FLOOR_SET_PREVIEW_SECONDS,
-        })
-    }
-}
-
 impl XrSyncAnchorRuntime {
     fn box_sync_pose_sample(state: &XrState) -> Option<BoxSyncPoseSample> {
         let forward = flat_head_forward(state.head_pose.orientation);
@@ -494,11 +406,8 @@ impl XrSyncAnchorRuntime {
                     BoxSyncMotionDirection::Falling
                 };
                 self.detector.direction = Some(next_direction);
-                self.detector.extreme_sample = Some(Self::more_extreme_sample(
-                    previous_sample,
-                    sample,
-                    next_direction,
-                ));
+                self.detector.extreme_sample =
+                    Some(Self::more_extreme_sample(previous_sample, sample, next_direction));
                 self.detector.previous_sample = Some(sample);
                 None
             }
@@ -654,25 +563,9 @@ pub struct XrRoot {
     content_rig: XrContentRig,
     #[rust]
     sync_runtime: XrSyncAnchorRuntime,
-    #[rust]
-    floor_runtime: XrFloorSetRuntime,
 }
 
 impl XrRoot {
-    fn write_debug_live_id_label(out: &mut String, id: LiveId) {
-        if id == LiveId(0) {
-            out.push('-');
-            return;
-        }
-        id.as_string(|name| {
-            if let Some(name) = name {
-                out.push_str(name);
-            } else {
-                let _ = write!(out, "{:x}", id.0);
-            }
-        });
-    }
-
     fn reset_scene_physics_and_emit_action(&mut self, cx: &mut Cx) {
         self.env.reset_physics(cx);
         cx.widget_action(self.widget_uid(), XrRootAction::PhysicsReset);
@@ -704,18 +597,6 @@ impl XrRoot {
 
     pub fn apply_body_impulse(&mut self, cx: &mut Cx, impulse: XrBodyImpulse) {
         self.env.apply_body_impulse(cx, impulse);
-    }
-
-    pub fn apply_body_wrench(&mut self, cx: &mut Cx, wrench: XrBodyWrench) {
-        self.env.apply_body_wrench(cx, wrench);
-    }
-
-    pub fn apply_body_drive(&mut self, cx: &mut Cx, drive: XrBodyDrive) {
-        self.env.apply_body_drive(cx, drive);
-    }
-
-    pub fn apply_car_control(&mut self, cx: &mut Cx, control: XrCarControl) {
-        self.env.apply_car_control(cx, control);
     }
 
     pub fn set_content_pose(&mut self, cx: &mut Cx, pose: Pose) {
@@ -754,10 +635,7 @@ impl XrRoot {
     }
 
     fn set_depth_voxel_size(&mut self, cx: &mut Cx, voxel_size_meters: f32) -> f32 {
-        let _ = voxel_size_meters;
-        let voxel_size_meters = cx
-            .xr_tsdf()
-            .set_voxel_size_meters(XR_FIXED_DEPTH_VOXEL_SIZE_METERS);
+        let voxel_size_meters = cx.xr_tsdf().set_voxel_size_meters(voxel_size_meters);
         self.env.reset_physics(cx);
         voxel_size_meters
     }
@@ -1016,14 +894,6 @@ impl XrRoot {
         }
 
         xr_sort_child_draw_order(&mut draw_order_entries);
-        self.frame_metrics.last_draw_sort_cpu_ms = sort_started.elapsed().as_secs_f64() * 1000.0;
-        self.frame_metrics.last_draw_child_count = draw_order_entries.len();
-        self.frame_metrics.last_draw_transparent_child_count = draw_order_entries
-            .iter()
-            .filter(|(_, _, transparent)| *transparent)
-            .count();
-        let children_draw_started = Instant::now();
-        let mut child_timings = Vec::with_capacity(draw_order_entries.len());
         for (index, _, _) in draw_order_entries {
             let child_id = self.children[index].0;
             let child = self.children[index].1.clone();
@@ -1180,10 +1050,6 @@ impl XrRoot {
         self.env.runtime_bodies()
     }
 
-    pub fn runtime_contacts(&self) -> Rc<Vec<(WidgetUid, WidgetUid)>> {
-        self.env.runtime_contacts()
-    }
-
     pub fn frame_cpu_ms(&self) -> f64 {
         self.frame_metrics.last_frame_cpu_ms
     }
@@ -1194,92 +1060,6 @@ impl XrRoot {
 
     pub fn frame_draw_cpu_ms(&self) -> f64 {
         self.frame_metrics.last_frame_draw_cpu_ms
-    }
-
-    pub fn draw_setup_cpu_ms(&self) -> f64 {
-        self.frame_metrics.last_draw_setup_cpu_ms
-    }
-
-    pub fn draw_env_prepare_cpu_ms(&self) -> f64 {
-        self.frame_metrics.last_draw_env_prepare_cpu_ms
-    }
-
-    pub fn draw_sort_cpu_ms(&self) -> f64 {
-        self.frame_metrics.last_draw_sort_cpu_ms
-    }
-
-    pub fn draw_children_cpu_ms(&self) -> f64 {
-        self.frame_metrics.last_draw_children_cpu_ms
-    }
-
-    pub fn draw_child_count(&self) -> usize {
-        self.frame_metrics.last_draw_child_count
-    }
-
-    pub fn draw_transparent_child_count(&self) -> usize {
-        self.frame_metrics.last_draw_transparent_child_count
-    }
-
-    pub fn draw_runtime_body_count(&self) -> usize {
-        self.frame_metrics.last_draw_runtime_body_count
-    }
-
-    pub fn draw_geometry_pool_slots(&self) -> usize {
-        self.frame_metrics.last_draw_geometry_pool_slots
-    }
-
-    pub fn draw_geometry_pool_live(&self) -> usize {
-        self.frame_metrics.last_draw_geometry_pool_live
-    }
-
-    pub fn draw_draw_list_pool_slots(&self) -> usize {
-        self.frame_metrics.last_draw_draw_list_pool_slots
-    }
-
-    pub fn draw_draw_list_pool_live(&self) -> usize {
-        self.frame_metrics.last_draw_draw_list_pool_live
-    }
-
-    pub fn draw_texture_pool_slots(&self) -> usize {
-        self.frame_metrics.last_draw_texture_pool_slots
-    }
-
-    pub fn draw_texture_pool_live(&self) -> usize {
-        self.frame_metrics.last_draw_texture_pool_live
-    }
-
-    pub fn draw_depth_mesh_chunk_count(&self) -> usize {
-        self.frame_metrics.last_draw_depth_mesh_chunk_count
-    }
-
-    pub fn draw_recycled_depth_mesh_geometry_count(&self) -> usize {
-        self.frame_metrics
-            .last_draw_recycled_depth_mesh_geometry_count
-    }
-
-    pub fn draw_depth_mesh_pending_upsert_count(&self) -> usize {
-        self.frame_metrics.last_draw_depth_mesh_pending_upsert_count
-    }
-
-    pub fn draw_depth_query_retained_hit_count(&self) -> usize {
-        self.frame_metrics.last_draw_depth_query_retained_hit_count
-    }
-
-    pub fn write_draw_top_children_text(&self, out: &mut String) {
-        out.clear();
-        for (index, (id, cpu_ms)) in self
-            .frame_metrics
-            .last_draw_top_children
-            .iter()
-            .take(self.frame_metrics.last_draw_top_child_count)
-            .enumerate()
-        {
-            if index != 0 {
-                out.push_str(" > ");
-            }
-            Self::write_debug_live_id_label(out, *id);
-            let _ = write!(out, " {:.2}", cpu_ms);
-        }
     }
 }
 
@@ -1567,25 +1347,7 @@ impl Widget for XrRoot {
                 }
             }
             Event::XrUpdate(update) => {
-                let mut augmented_state = self.augment_xr_state(update.state.as_ref());
-                if let Some(commit) = self.floor_runtime.update(augmented_state.as_ref()) {
-                    cx.xr_set_local_floor(commit.floor_y);
-                    if let Some(anchor) = commit.anchor {
-                        cx.xr_set_local_anchor(anchor);
-                    }
-                    self.env.show_debug_floor_preview(
-                        cx,
-                        commit.floor_y,
-                        commit.preview_center,
-                        commit.visible_until_time,
-                    );
-                    let state = Rc::make_mut(&mut augmented_state);
-                    state.floor_y = Some(commit.floor_y);
-                    if let Some(anchor) = commit.anchor {
-                        state.anchor = Some(anchor);
-                        state.anchor_persisted = true;
-                    }
-                }
+                let augmented_state = self.augment_xr_state(update.state.as_ref());
                 let last = self
                     .runtime
                     .last_dispatched_xr_state
@@ -1600,7 +1362,6 @@ impl Widget for XrRoot {
                     self.ensure_xr_content_pose(cx, &augmented_state);
                 }
                 self.runtime.last_xr_state = Some(augmented_state.clone());
-                self.env.set_runtime_xr_state(augmented_state.clone());
                 if augmented_update.clicked_menu() {
                     self.reset_scene_physics_and_emit_action(cx);
                 }
@@ -1608,7 +1369,6 @@ impl Widget for XrRoot {
                 self.env.step_physics(cx);
                 let mut event_scope_data = super::xr_view::XrViewEventScopeData {
                     content_transform: self.xr_content_transform(Some(&augmented_update.state)),
-                    runtime_bodies: self.env.runtime_bodies(),
                 };
                 let mut event_scope = Scope::with_data(&mut event_scope_data);
                 let augmented_event = Event::XrUpdate(augmented_update);

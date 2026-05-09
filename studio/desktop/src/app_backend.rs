@@ -600,24 +600,6 @@ impl App {
         }
     }
 
-    pub(super) fn refresh_active_mount_terminal_panel(&mut self, cx: &mut Cx, path: &str) {
-        let Some(mount) = Self::mount_from_virtual_path(path) else {
-            return;
-        };
-        if self.data.active_mount.as_deref() != Some(mount) {
-            return;
-        }
-        let Some(tab_id) = self
-            .mount_state(mount)
-            .and_then(|state| state.terminal_path_to_tab.get(path).copied())
-        else {
-            return;
-        };
-        if let Some(dock) = self.mount_terminal_dock(cx, mount) {
-            dock.item(tab_id).redraw(cx);
-        }
-    }
-
     pub(super) fn default_terminal_tab_title(path: &str) -> String {
         path.rsplit('/').next().unwrap_or("terminal").to_string()
     }
@@ -641,7 +623,7 @@ impl App {
         }) else {
             return;
         };
-        if let Some(dock) = self.mount_terminal_dock(cx, &mount) {
+        if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
             dock.set_tab_title(cx, tab_id, title);
             dock.redraw_tab(cx, tab_id);
         }
@@ -657,7 +639,7 @@ impl App {
         }) else {
             return;
         };
-        if let Some(dock) = self.mount_terminal_dock(cx, &mount) {
+        if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
             dock.set_tab_title(cx, tab_id, title);
             dock.redraw_tab(cx, tab_id);
         }

@@ -4,6 +4,7 @@ use {
     std::rc::Rc,
 };
 
+
 /// Safe area insets describing regions of the screen that should not contain
 /// interactive content (e.g., notch/Dynamic Island, home indicator, rounded corners).
 /// Values are in logical points (not physical pixels).

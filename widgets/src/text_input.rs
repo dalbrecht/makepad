@@ -17,7 +17,7 @@ use {
             *,
         },
         makepad_script::{ScriptFnRef, ScriptRefOptionExt},
-        scroll_bar::{ScrollAxis, ScrollBar},
+        scroll_bar::{ScrollBar, ScrollAxis},
         widget::*,
         widget_async::ScriptAsyncResult,
     },
@@ -548,6 +548,8 @@ pub struct TextInput {
     #[live]
     scroll_bar: ScrollBar,
     #[live]
+    scroll_bar: ScrollBar,
+    #[live]
     scroll_y: f64,
     /// Horizontal scroll offset for single-line mode (in logical pixels).
     #[rust]
@@ -579,14 +581,11 @@ pub struct TextInput {
     /// Set when the cursor/selection changes; cleared after scroll_to_cursor runs.
     #[rust(true)]
     needs_scroll_to_cursor: bool,
-    /// Cached maximum vertical scroll offset from the last draw pass. Used during event
+    /// Cached maximum scroll offset from the last draw pass. Used during event
     /// handling to ensure boundary checks match exactly (avoiding floating-point
     /// mismatch between draw-time and event-time computations).
     #[rust]
     cached_max_scroll_y: f64,
-    /// Cached maximum horizontal scroll offset from the last draw pass.
-    #[rust]
-    cached_max_scroll_x: f64,
     /// Skip finger move after long press to prevent selection changes
     #[rust]
     ignore_next_move: bool,
@@ -650,26 +649,12 @@ impl TextInput {
         self.is_multiline
     }
 
-    /// Returns whether this (multiline) text input emits `Returned` on plain
-    /// Enter. See the [`TextInput::submit_on_enter`] field for details.
-    pub fn submit_on_enter(&self) -> bool {
-        self.submit_on_enter
-    }
-
-    /// Sets whether this (multiline) text input emits `Returned` on plain
-    /// Enter. See the [`TextInput::submit_on_enter`] field for details.
-    pub fn set_submit_on_enter(&mut self, submit_on_enter: bool) {
-        self.submit_on_enter = submit_on_enter;
-    }
-
     pub fn set_is_multiline(&mut self, cx: &mut Cx, is_multiline: bool) {
         self.is_multiline = is_multiline;
         if !is_multiline {
             self.scroll_y = 0.0;
             self.cached_max_scroll_y = 0.0;
         }
-        self.scroll_x = 0.0;
-        self.cached_max_scroll_x = 0.0;
         self.laidout_text = None;
         self.draw_bg.redraw(cx);
     }
@@ -852,10 +837,7 @@ impl TextInput {
 
     fn layout_text(&mut self, cx: &mut Cx2d) {
         let turtle_rect = cx.turtle().inner_rect();
-        // For single-line mode, don't constrain the max width so the text lays out
-        // at its natural width. This allows us to detect overflow and scroll horizontally.
-        // For multiline mode, constrain to the available width for proper wrapping.
-        let max_width_in_lpxs = if self.is_multiline && !turtle_rect.size.x.is_nan() {
+        let max_width_in_lpxs = if !turtle_rect.size.x.is_nan() {
             Some(turtle_rect.size.x as f32)
         } else {
             None
@@ -1011,8 +993,8 @@ impl TextInput {
         rect(sel_x, sel_y, sel_width.max(10.0), sel_height.max(20.0))
     }
 
-    fn scroll_to_cursor(&mut self, cx: &mut Cx2d, content_clip_index: usize) {
-        // Compute the final size of the turtle, and obtain its inner dimensions.
+    fn scroll_to_cursor(&mut self, cx: &mut Cx2d, content_clip_index: Option<usize>) {
+        // Compute the final size of the turtle, and obtain its inner height.
         // For multiline inputs, also clamp to the tightest ancestor max height,
         // so that scrolling kicks in even when the TextInput's own walk height
         // is unbounded Fit (relying on ancestors for the constraint).
@@ -1026,21 +1008,8 @@ impl TextInput {
                 }
             }
         }
-        // For single-line inputs with Fit width, clamp to the tightest ancestor
-        // max width so that horizontal scrolling kicks in when the text overflows
-        // the available space (e.g., parent has a fixed width).
-        if !self.is_multiline && self.walk.width.is_fit() {
-            let ancestor_max = cx.compute_max_width_from_ancestors();
-            if ancestor_max < f64::MAX {
-                let turtle = cx.turtle_mut();
-                if turtle.width() > ancestor_max {
-                    turtle.set_width(ancestor_max);
-                }
-            }
-        }
         let inner_rect = cx.turtle().inner_rect();
         let height = inner_rect.size.y;
-        let width = inner_rect.size.x;
 
         // Only auto-scroll to keep the cursor visible when the cursor has actually
         // moved (typing, arrow keys, clicking). Don't do this on every redraw, as
@@ -1049,47 +1018,28 @@ impl TextInput {
             self.needs_scroll_to_cursor = false;
 
             let laidout_text = self.laidout_text.as_ref().unwrap();
+            let position = self.cursor_to_position(self.cursor()).unwrap();
+            let laidout_row = &laidout_text.rows[position.row_index];
+            let y_min = (laidout_row.origin_in_lpxs.y - laidout_row.ascender_in_lpxs) as f64;
+            let y_max = (laidout_row.origin_in_lpxs.y - laidout_row.descender_in_lpxs) as f64;
 
-            if self.is_multiline {
-                let position = self.cursor_to_position(self.cursor()).unwrap();
-                let laidout_row = &laidout_text.rows[position.row_index];
-                let y_min = (laidout_row.origin_in_lpxs.y - laidout_row.ascender_in_lpxs) as f64;
-                let y_max = (laidout_row.origin_in_lpxs.y - laidout_row.descender_in_lpxs) as f64;
+            // If the min y of the row is less than the scroll position, scroll up so
+            // that the top of the row appears at the top.
+            if y_min < self.scroll_y {
+                self.scroll_y = y_min;
+            }
 
-                // If the min y of the row is less than the scroll position, scroll up so
-                // that the top of the row appears at the top.
-                if y_min < self.scroll_y {
-                    self.scroll_y = y_min;
-                }
-
-                // If the max y of the row is greater than the scroll position, scroll
-                // down so that the bottom of the row appears at the bottom.
-                if y_max > self.scroll_y + height {
-                    self.scroll_y = y_max - height;
-                }
-            } else {
-                // Single-line: auto-scroll horizontally to keep the cursor visible.
-                let password_cursor = self.cursor_to_password_cursor(self.cursor());
-                let cursor_pos = laidout_text.cursor_to_position(password_cursor);
-                let cursor_x = cursor_pos.x_in_lpxs as f64;
-
-                // If the cursor is to the left of the visible area, scroll left.
-                if cursor_x < self.scroll_x {
-                    self.scroll_x = cursor_x;
-                }
-
-                // If the cursor is to the right of the visible area, scroll right.
-                if cursor_x > self.scroll_x + width {
-                    self.scroll_x = cursor_x - width;
-                }
+            // If the max y of the row is greater than the scroll position, scroll down
+            // so that the bottom of the row appears at the bottom.
+            if y_max > self.scroll_y + height {
+                self.scroll_y = y_max - height;
             }
         }
 
-        // Always clamp the scroll positions to valid bounds, and cache
-        // the max values so the event handler uses the exact same values
+        // Always clamp the scroll position to valid bounds, and cache
+        // max_scroll_y so the event handler uses the exact same value
         // (avoiding floating-point mismatch with relative Fit bounds).
-        let laidout_text = self.laidout_text.as_ref().unwrap();
-        let laidout_text_height = laidout_text.size_in_lpxs.height as f64;
+        let laidout_text_height = self.laidout_text.as_ref().unwrap().size_in_lpxs.height as f64;
         let max_scroll_y = (laidout_text_height - height).max(0.0);
         self.cached_max_scroll_y = max_scroll_y;
         self.scroll_y = self.scroll_y.max(0.0).min(max_scroll_y);
@@ -1114,7 +1064,9 @@ impl TextInput {
         // also moves BeginClip entries. By setting the clip to inner_rect here,
         // we override whatever shift was applied, keeping the clip at the correct
         // absolute position (the inner area excluding padding).
-        cx.update_clip_rect_at(content_clip_index, inner_rect);
+        if let Some(clip_index) = content_clip_index {
+            cx.update_clip_rect_at(clip_index, inner_rect);
+        }
     }
 
     /// Draws the vertical scrollbar when the text content overflows the visible area.
@@ -1126,7 +1078,10 @@ impl TextInput {
             return;
         };
         let view_rect = cx.turtle().inner_rect();
-        let view_total = dvec2(view_rect.size.x, laidout_text.size_in_lpxs.height as f64);
+        let view_total = dvec2(
+            view_rect.size.x,
+            laidout_text.size_in_lpxs.height as f64,
+        );
         // Sync scroll_y (which scroll_to_cursor may have updated) into the scrollbar.
         self.scroll_bar.set_scroll_pos_no_action(cx, self.scroll_y);
         self.scroll_bar
@@ -1548,22 +1503,30 @@ impl Widget for TextInput {
         self.draw_bg.begin(cx, walk, self.layout);
         self.draw_selection.append_to_draw_call(cx);
         self.draw_composition_underline.append_to_draw_call(cx);
-        // Push an inner clip rect to prevent scrolled text from bleeding into
-        // the padding area. For multiline, this clips vertically-scrolled content.
-        // For single-line, this clips horizontally-scrolled content that overflows.
-        // We use a placeholder rect here (inner_origin with large size);
-        // scroll_to_cursor will tighten the bounds after compute_final_size
-        // determines the actual dimensions.
-        let inner_origin = cx.turtle().inner_origin();
-        let content_clip_index =
-            cx.push_clip_rect_tracked(rect(inner_origin.x, inner_origin.y, f64::MAX, f64::MAX));
+        // For multiline inputs, push an inner clip rect to prevent scrolled text
+        // from bleeding into the padding area. We use a placeholder rect here
+        // (inner_origin with large size); scroll_to_cursor will tighten the
+        // bottom bound after compute_final_size determines the actual height.
+        let content_clip_index = if self.is_multiline {
+            let inner_origin = cx.turtle().inner_origin();
+            Some(cx.push_clip_rect_tracked(rect(
+                inner_origin.x,
+                inner_origin.y,
+                f64::MAX,
+                f64::MAX,
+            )))
+        } else {
+            None
+        };
         self.layout_text(cx);
         let text_rect = self.draw_text(cx);
         let cursor_rect = self.draw_cursor(cx, text_rect);
         self.draw_selection(cx, text_rect);
         self.draw_composition_underline(cx, text_rect);
         self.scroll_to_cursor(cx, content_clip_index);
-        cx.pop_clip_rect();
+        if content_clip_index.is_some() {
+            cx.pop_clip_rect();
+        }
         self.draw_scroll_bar(cx);
         self.draw_bg.end(cx);
         if cx.has_key_focus(self.draw_bg.area()) {
@@ -1658,7 +1621,9 @@ impl Widget for TextInput {
                     // with relative Fit bounds.
                     let max_scroll_y = self.cached_max_scroll_y;
                     if max_scroll_y > 0.0 {
-                        let new_scroll_y = (self.scroll_y + e.scroll.y).max(0.0).min(max_scroll_y);
+                        let new_scroll_y = (self.scroll_y + e.scroll.y)
+                            .max(0.0)
+                            .min(max_scroll_y);
                         if new_scroll_y != self.scroll_y {
                             self.scroll_y = new_scroll_y;
                             self.draw_bg.redraw(cx);
@@ -1671,7 +1636,11 @@ impl Widget for TextInput {
             // Handle clicking/dragging on the scrollbar handle itself.
             // We pass an empty callback because we sync scroll_y from the ScrollBar
             // below, only when the scrollbar has actually captured the finger.
-            self.scroll_bar.handle_event_with(cx, event, &mut |_, _| {});
+            self.scroll_bar.handle_event_with(
+                cx,
+                event,
+                &mut |_, _| {},
+            );
 
             // If the scrollbar has captured the finger (user is dragging the handle),
             // sync scroll_y from the ScrollBar (which is the source of truth during
@@ -1679,29 +1648,6 @@ impl Widget for TextInput {
             if self.scroll_bar.is_area_captured(cx) {
                 self.scroll_y = self.scroll_bar.get_scroll_pos();
                 self.draw_bg.redraw(cx);
-            }
-        }
-
-        // Handle horizontal scroll events for single-line text inputs.
-        // Only consume horizontal scroll (scroll.x), NOT vertical scroll —
-        // vertical scroll should propagate to parent containers.
-        if !self.is_multiline {
-            if let Event::Scroll(e) = event {
-                if !e.handled_x.get() && e.scroll.x != 0.0 {
-                    let bg_rect = self.draw_bg.area().rect(cx);
-                    if bg_rect.contains(e.abs) {
-                        let max_scroll_x = self.cached_max_scroll_x;
-                        if max_scroll_x > 0.0 {
-                            let new_scroll_x =
-                                (self.scroll_x + e.scroll.x).max(0.0).min(max_scroll_x);
-                            if new_scroll_x != self.scroll_x {
-                                self.scroll_x = new_scroll_x;
-                                self.draw_bg.redraw(cx);
-                                e.handled_x.set(true);
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -2367,22 +2313,6 @@ impl TextInputRef {
     pub fn set_is_multiline(&self, cx: &mut Cx, is_multiline: bool) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_is_multiline(cx, is_multiline);
-        }
-    }
-
-    /// Returns whether this (multiline) text input emits `Returned` on plain
-    /// Enter. See [`TextInput::submit_on_enter`] for details.
-    pub fn submit_on_enter(&self) -> bool {
-        self.borrow()
-            .map(|inner| inner.submit_on_enter())
-            .unwrap_or(false)
-    }
-
-    /// Sets whether this (multiline) text input emits `Returned` on plain
-    /// Enter. See [`TextInput::submit_on_enter`] for details.
-    pub fn set_submit_on_enter(&self, submit_on_enter: bool) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.set_submit_on_enter(submit_on_enter);
         }
     }
 

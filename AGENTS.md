@@ -140,6 +140,8 @@ Use direct shell cargo commands only for non-UI tasks such as library checks, te
 
 When those non-UI tasks are used for runtime behavior or performance measurements, prefer their release variants (`cargo run --release`, `cargo test --release`, `cargo build --release`).
 
+When those non-UI tasks are used for runtime behavior or performance measurements, prefer their release variants (`cargo run --release`, `cargo test --release`, `cargo build --release`).
+
 ## Cargo.toml Setup
 
 ```toml

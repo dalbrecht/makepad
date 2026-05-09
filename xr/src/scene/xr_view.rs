@@ -1,4 +1,4 @@
-use super::xr_node::{xr_widget_world_transform, XrDrawContext, XrNode, XrRuntimeBodyState};
+use super::xr_node::{xr_widget_world_transform, XrDrawContext, XrNode};
 use crate::prelude::*;
 use makepad_widgets::{
     animator::{Animator, AnimatorImpl},

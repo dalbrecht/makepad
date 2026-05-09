@@ -24,7 +24,6 @@ pub(crate) mod prelude {
 
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     scene::xr_node::script_mod(vm);
-    obj::car::script_mod(vm);
     obj::gltf::script_mod(vm);
     obj::icosphere::script_mod(vm);
     obj::cube::script_mod(vm);
@@ -39,9 +38,7 @@ pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     obj::view_splat::script_mod(vm);
     scene::xr_env::script_mod(vm);
     sync::xr_peer_sync::script_mod(vm);
-    sync::xr_scene_sync_controller::script_mod(vm);
     scene::xr_select::script_mod(vm);
     scene::xr_view::script_mod(vm);
-    scene::xr_root::script_mod(vm);
-    scene::xr_scene_view::script_mod(vm)
+    scene::xr_root::script_mod(vm)
 }

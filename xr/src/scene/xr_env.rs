@@ -1,12 +1,11 @@
 use super::xr_node::{
-    xr_widget_children, xr_widget_with_scene_node, XrBodyKind, XrDepthQuerySupportRig,
-    XrDrawScopeData, XrHandInfluencePoint, XrNode, XrRuntimeBodyState,
-    XR_HAND_INFLUENCE_POINTS_PER_HAND, XR_HAND_INFLUENCE_POINT_COUNT,
+    xr_widget_children, xr_widget_with_scene_node, XrBodyKind, XrDrawScopeData,
+    XrHandInfluencePoint, XrNode, XrRuntimeBodyState, XR_HAND_INFLUENCE_POINTS_PER_HAND,
+    XR_HAND_INFLUENCE_POINT_COUNT,
 };
 use crate::prelude::*;
 use crate::util::{
-    depth_debug_mesh::DebugDepthMeshChunk,
-    depth_debug_mesh_worker::{XrDepthDebugMeshSelection, XrDepthDebugMeshWorker},
+    depth_debug_mesh::DebugDepthMeshChunk, depth_debug_mesh_worker::XrDepthDebugMeshWorker,
 };
 use makepad_widgets::makepad_platform::{
     event::{CameraPreviewMode, VideoSource, VideoYuvMetadata},
@@ -24,16 +23,6 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-
-const XR_DEPTH_MESH_FOCUS_CUBE_SIZE_METERS: f32 = 0.96;
-const XR_DEPTH_MESH_FOCUS_GRID_METERS: f32 = 0.32;
-const XR_DEPTH_MESH_FOCUS_FADE_NEAR_METERS: f32 = 0.16;
-const XR_DEPTH_MESH_FOCUS_FADE_FAR_METERS: f32 = 0.82;
-const XR_DEPTH_MESH_FOCUS_FADE_FAR_ALPHA: f32 = 0.12;
-const XR_DEPTH_MESH_FOCUS_FADE_FAR_COLOR_SCALE: f32 = 0.28;
-const XR_DEBUG_FLOOR_PREVIEW_SIZE_METERS: f32 = 1.0;
-const XR_DEBUG_FLOOR_PREVIEW_THICKNESS_METERS: f32 = 0.004;
-const XR_DEBUG_FLOOR_PREVIEW_ALPHA: f32 = 0.18;
 
 #[path = "xr_depth.rs"]
 mod xr_depth;
@@ -70,15 +59,8 @@ script_mod! {
         draw_pass: uniform_buffer(draw.DrawPassUniforms)
         draw_list: uniform_buffer(draw.DrawListUniforms)
         geom: vertex_buffer(geom.DepthMeshVertex, geom.DepthMeshGeom)
-        u_focus_fade_enabled: uniform(float(0.0))
-        u_focus_fade_world: uniform(vec3(0.0, 0.0, 0.0))
-        u_focus_fade_near_m: uniform(float(0.16))
-        u_focus_fade_far_m: uniform(float(0.82))
-        u_focus_fade_far_alpha: uniform(float(0.12))
-        u_focus_fade_far_color_scale: uniform(float(0.28))
 
         v_barycentric: varying(vec3f)
-        v_world_pos: varying(vec3f)
 
         edge_distance_px: fn(bary: vec3f) -> f32 {
             let bary_fw = vec3(
@@ -102,20 +84,6 @@ script_mod! {
             return clamp(inner * outer, 0.0, 1.0)
         }
 
-        focus_fade_scales: fn(world_pos: vec3f) -> vec2f {
-            if self.u_focus_fade_enabled <= 0.5 {
-                return vec2(1.0, 1.0)
-            }
-            let fade_far = max(self.u_focus_fade_far_m, self.u_focus_fade_near_m + 0.0001);
-            let focus_delta = world_pos - self.u_focus_fade_world;
-            let dist = length(focus_delta);
-            let near_mix = 1.0 - smoothstep(self.u_focus_fade_near_m, fade_far, dist);
-            return vec2(
-                mix(self.u_focus_fade_far_color_scale, 1.0, near_mix),
-                mix(self.u_focus_fade_far_alpha, 1.0, near_mix)
-            )
-        }
-
         vertex: fn() {
             let world = vec4(
                 self.geom.pos.x,
@@ -130,18 +98,15 @@ script_mod! {
                 self.geom.barycentric.y,
                 self.geom.barycentric.z
             );
-            self.v_world_pos = vec3(world.x, world.y, world.z);
             self.vertex_pos = self.draw_pass.camera_projection * biased_view;
         }
 
         pixel: fn() {
-            let fade = self.focus_fade_scales(self.v_world_pos);
-            let wire_alpha = self.base_color.w * self.wire_band_alpha(self.v_barycentric) * fade.y;
-            let color_alpha = wire_alpha * fade.x;
+            let wire_alpha = self.base_color.w * self.wire_band_alpha(self.v_barycentric);
             return vec4(
-                self.base_color.x * color_alpha,
-                self.base_color.y * color_alpha,
-                self.base_color.z * color_alpha,
+                self.base_color.x * wire_alpha,
+                self.base_color.y * wire_alpha,
+                self.base_color.z * wire_alpha,
                 wire_alpha
             );
         }
@@ -251,7 +216,6 @@ struct CollectedXrCube {
     scale: Vec3f,
     half_extents: Vec3f,
     physics_shape: XrPhysicsShape,
-    depth_query_support: XrDepthQuerySupportRig,
     density: f32,
     friction: f32,
     restitution: f32,
@@ -408,6 +372,123 @@ struct XrWorld {
     debug_floor_preview: XrDebugFloorPreview,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct XrPhysicsMetrics {
+    compute_ms: f64,
+    tsdf_query_ms: f64,
+    rapier_step_ms: f64,
+    depth_query_surface_count: usize,
+    scene_body_count: usize,
+    body_spawn_apply_count: usize,
+    body_spawn_miss_count: usize,
+}
+
+struct XrPhysicsRuntime {
+    worker: Option<XrPhysicsWorker>,
+    runtime_bodies: Rc<HashMap<WidgetUid, XrRuntimeBodyState>>,
+    root_pose: Option<Pose>,
+    scene_dirty: bool,
+    revision: u64,
+    metrics: XrPhysicsMetrics,
+    pending_body_spawns: Vec<XrBodySpawn>,
+    pending_body_despawns: Vec<WidgetUid>,
+    pending_body_impulses: Vec<XrBodyImpulse>,
+}
+
+impl Default for XrPhysicsRuntime {
+    fn default() -> Self {
+        Self {
+            worker: None,
+            runtime_bodies: Rc::new(HashMap::new()),
+            root_pose: None,
+            scene_dirty: true,
+            revision: 0,
+            metrics: XrPhysicsMetrics::default(),
+            pending_body_spawns: Vec::new(),
+            pending_body_despawns: Vec::new(),
+            pending_body_impulses: Vec::new(),
+        }
+    }
+}
+
+struct XrDepthRuntime {
+    surface_mesh_generation: u64,
+    surface_mesh_update_sequence: u64,
+    requested_snapshot_grid: Option<Arc<SparseTsdGridReadSnapshot>>,
+    requested_head_pose: Option<Pose>,
+    snapshot_grid: Option<Arc<SparseTsdGridReadSnapshot>>,
+    visible_request_id: u64,
+    visible_chunks: HashSet<ChunkKey>,
+    mesh_chunks: HashMap<ChunkKey, (Geometry, DepthSurfaceMeshChunkHandle)>,
+    pending_upserts: VecDeque<(u64, DebugDepthMeshChunk)>,
+    query_hit_geometry: Option<Geometry>,
+    surface_mesh_worker: Option<XrDepthDebugMeshWorker>,
+    query_retained_hits: HashMap<u64, RetainedDepthQueryHit>,
+}
+
+impl Default for XrDepthRuntime {
+    fn default() -> Self {
+        Self {
+            surface_mesh_generation: 0,
+            surface_mesh_update_sequence: 0,
+            requested_snapshot_grid: None,
+            requested_head_pose: None,
+            snapshot_grid: None,
+            visible_request_id: 0,
+            visible_chunks: HashSet::new(),
+            mesh_chunks: HashMap::new(),
+            pending_upserts: VecDeque::new(),
+            query_hit_geometry: None,
+            surface_mesh_worker: None,
+            query_retained_hits: HashMap::new(),
+        }
+    }
+}
+
+struct XrPassthroughRuntime {
+    camera_choice: Option<XrPassthroughCameraChoice>,
+    camera_textures: Option<XrPassthroughCameraTextures>,
+    camera_video: VideoYuvMetadata,
+    camera_permission: Option<PermissionStatus>,
+    camera_source_size: Vec2f,
+    camera_playback_requested: bool,
+    camera_failed: bool,
+    camera_has_frame: bool,
+    camera_choice_wait_logged: bool,
+    env_face_quad: Option<Geometry>,
+    env_cube: Option<XrPassthroughEnvCube>,
+}
+
+impl Default for XrPassthroughRuntime {
+    fn default() -> Self {
+        Self {
+            camera_choice: None,
+            camera_textures: None,
+            camera_video: VideoYuvMetadata::disabled(),
+            camera_permission: None,
+            camera_source_size: Vec2f::default(),
+            camera_playback_requested: false,
+            camera_failed: false,
+            camera_has_frame: false,
+            camera_choice_wait_logged: false,
+            env_face_quad: None,
+            env_cube: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct XrHandSystem;
+
+#[derive(Default)]
+struct XrWorld {
+    last_xr_state: Option<Rc<XrState>>,
+    depth: XrDepthRuntime,
+    passthrough: XrPassthroughRuntime,
+    physics: XrPhysicsRuntime,
+    hands: XrHandSystem,
+}
+
 #[derive(Script, ScriptHook)]
 pub struct XrEnv {
     #[live]
@@ -553,32 +634,12 @@ impl XrEnv {
         self.world.physics.metrics.body_spawn_miss_count
     }
 
-    pub(crate) fn depth_mesh_chunk_count(&self) -> usize {
-        self.world.depth.mesh_chunks.len()
-    }
-
-    pub(crate) fn recycled_depth_mesh_geometry_count(&self) -> usize {
-        self.world.depth.recycled_mesh_geometries.len()
-    }
-
-    pub(crate) fn depth_mesh_pending_upsert_count(&self) -> usize {
-        self.world.depth.pending_upserts.len()
-    }
-
-    pub(crate) fn depth_query_retained_hit_count(&self) -> usize {
-        self.world.depth.query_retained_hits.len()
-    }
-
     pub(crate) fn physics_revision(&self) -> u64 {
         self.world.physics.revision
     }
 
     pub(crate) fn runtime_bodies(&self) -> Rc<HashMap<WidgetUid, XrRuntimeBodyState>> {
         self.world.physics.runtime_bodies.clone()
-    }
-
-    pub(crate) fn runtime_contacts(&self) -> Rc<Vec<(WidgetUid, WidgetUid)>> {
-        self.world.physics.runtime_contacts.clone()
     }
 
     fn passthrough_video_id() -> LiveId {
@@ -653,70 +714,23 @@ impl XrEnv {
             .requested_snapshot_grid
             .as_ref()
             .is_some_and(|previous| Arc::ptr_eq(previous, &snapshot.grid));
-        let (selection_mode, requested_head_pose, requested_focus_grid, request_selection) =
-            match self.world.depth.selection_mode {
-                XrDepthMeshSelectionMode::HeadView => {
-                    let pose_unchanged = self
-                        .world
-                        .depth
-                        .requested_head_pose
-                        .map(|previous| {
-                            !Self::depth_surface_mesh_request_pose_changed(
-                                previous,
-                                state.head_pose,
-                            )
-                        })
-                        .unwrap_or(false);
-                    let selection_unchanged = self.world.depth.requested_selection_mode
-                        == Some(XrDepthMeshSelectionMode::HeadView)
-                        && pose_unchanged;
-                    if snapshot_unchanged && selection_unchanged {
-                        return;
-                    }
-                    (
-                        XrDepthMeshSelectionMode::HeadView,
-                        Some(state.head_pose),
-                        None,
-                        XrDepthDebugMeshSelection::HeadView {
-                            head_pose: state.head_pose,
-                        },
-                    )
-                }
-                XrDepthMeshSelectionMode::FocusCube => {
-                    let Some(focus_grid) = self
-                        .world
-                        .depth
-                        .focus_point
-                        .and_then(Self::depth_mesh_focus_grid)
-                    else {
-                        self.world.depth.clear_surface_mesh();
-                        return;
-                    };
-                    let selection_unchanged = self.world.depth.requested_selection_mode
-                        == Some(XrDepthMeshSelectionMode::FocusCube)
-                        && self.world.depth.requested_focus_grid == Some(focus_grid);
-                    if snapshot_unchanged && selection_unchanged {
-                        return;
-                    }
-                    (
-                        XrDepthMeshSelectionMode::FocusCube,
-                        None,
-                        Some(focus_grid),
-                        XrDepthDebugMeshSelection::FocusCube {
-                            center: Self::depth_mesh_focus_point_for_grid(focus_grid),
-                            cube_size_meters: XR_DEPTH_MESH_FOCUS_CUBE_SIZE_METERS,
-                        },
-                    )
-                }
-            };
+        let pose_unchanged = self
+            .world
+            .depth
+            .requested_head_pose
+            .map(|previous| {
+                !Self::depth_surface_mesh_request_pose_changed(previous, state.head_pose)
+            })
+            .unwrap_or(false);
+        if snapshot_unchanged && pose_unchanged {
+            return;
+        }
         self.world
             .depth
             .ensure_surface_mesh_worker()
-            .request_snapshot(snapshot.clone(), request_selection);
+            .request_snapshot(snapshot.clone(), state.head_pose);
         self.world.depth.requested_snapshot_grid = Some(snapshot.grid.clone());
-        self.world.depth.requested_selection_mode = Some(selection_mode);
-        self.world.depth.requested_head_pose = requested_head_pose;
-        self.world.depth.requested_focus_grid = requested_focus_grid;
+        self.world.depth.requested_head_pose = Some(state.head_pose);
     }
 
     fn draw_pbr_rounded_cube(
@@ -918,11 +932,9 @@ impl XrEnv {
                     scale,
                     half_extents: vec3f(half.x * scale.x, half.y * scale.y, half.z * scale.z),
                     physics_shape: node.physics_shape(),
-                    depth_query_support: node.depth_query_support(),
                     density: node.density(),
                     friction: node.friction(),
                     restitution: node.restitution(),
-                    gravity_scale: node.gravity_scale(),
                 });
             }
 
@@ -966,7 +978,6 @@ impl XrEnv {
             return false;
         }
         self.world.physics.runtime_bodies = Rc::new(result.runtime_bodies);
-        self.world.physics.runtime_contacts = Rc::new(result.runtime_contacts);
         if let Some(retained_hits) = result.depth_query_retained_hits {
             self.world.depth.query_retained_hits = retained_hits;
         }
@@ -1010,7 +1021,7 @@ impl XrEnv {
             .as_deref()
             .and_then(|state| state.floor_y);
         self.ensure_physics_worker(cx)
-            .request_rebuild(revision, gravity, cubes, floor_y);
+            .request_rebuild(revision, gravity, cubes);
         self.world.physics.scene_dirty = false;
     }
 
@@ -1033,18 +1044,6 @@ impl XrEnv {
 
     pub fn apply_body_impulse(&mut self, _cx: &mut Cx, impulse: XrBodyImpulse) {
         self.world.physics.pending_body_impulses.push(impulse);
-    }
-
-    pub fn apply_body_wrench(&mut self, _cx: &mut Cx, wrench: XrBodyWrench) {
-        self.world.physics.pending_body_wrenches.push(wrench);
-    }
-
-    pub fn apply_body_drive(&mut self, _cx: &mut Cx, drive: XrBodyDrive) {
-        self.world.physics.pending_body_drives.push(drive);
-    }
-
-    pub fn apply_car_control(&mut self, _cx: &mut Cx, control: XrCarControl) {
-        self.world.physics.pending_car_controls.push(control);
     }
 
     pub fn mark_scene_dirty(&mut self) {
@@ -1071,7 +1070,7 @@ impl XrEnv {
         let revision = self.world.physics.revision;
         let physics_time_scale = self.physics_time_scale;
         let include_retained_hits = self.depth_query_hits_visible();
-        let (left_hand, right_hand, left_controller, right_controller, floor_y) = self
+        let (left_hand, right_hand) = self
             .world
             .last_xr_state
             .as_deref()
@@ -1113,13 +1112,9 @@ impl XrEnv {
         self.world.physics.metrics = XrPhysicsMetrics::default();
         self.world.depth.query_retained_hits.clear();
         Rc::make_mut(&mut self.world.physics.runtime_bodies).clear();
-        Rc::make_mut(&mut self.world.physics.runtime_contacts).clear();
         self.world.physics.pending_body_spawns.clear();
         self.world.physics.pending_body_despawns.clear();
         self.world.physics.pending_body_impulses.clear();
-        self.world.physics.pending_body_wrenches.clear();
-        self.world.physics.pending_body_drives.clear();
-        self.world.physics.pending_car_controls.clear();
         self.world.physics.scene_dirty = true;
         cx.redraw_all();
     }
@@ -1132,9 +1127,6 @@ impl XrEnv {
         if self.world.physics.pending_body_spawns.is_empty()
             && self.world.physics.pending_body_despawns.is_empty()
             && self.world.physics.pending_body_impulses.is_empty()
-            && self.world.physics.pending_body_wrenches.is_empty()
-            && self.world.physics.pending_body_drives.is_empty()
-            && self.world.physics.pending_car_controls.is_empty()
         {
             return;
         }
@@ -1142,9 +1134,6 @@ impl XrEnv {
         let pending_body_spawns = std::mem::take(&mut self.world.physics.pending_body_spawns);
         let pending_body_despawns = std::mem::take(&mut self.world.physics.pending_body_despawns);
         let pending_body_impulses = std::mem::take(&mut self.world.physics.pending_body_impulses);
-        let pending_body_wrenches = std::mem::take(&mut self.world.physics.pending_body_wrenches);
-        let pending_body_drives = std::mem::take(&mut self.world.physics.pending_body_drives);
-        let pending_car_controls = std::mem::take(&mut self.world.physics.pending_car_controls);
         let worker = self.ensure_physics_worker(cx);
         for spawn in pending_body_spawns {
             worker.request_body_spawn(revision, spawn);
@@ -1154,15 +1143,6 @@ impl XrEnv {
         }
         for impulse in pending_body_impulses {
             worker.request_body_impulse(revision, impulse);
-        }
-        for wrench in pending_body_wrenches {
-            worker.request_body_wrench(revision, wrench);
-        }
-        for drive in pending_body_drives {
-            worker.request_body_drive(revision, drive);
-        }
-        for control in pending_car_controls {
-            worker.request_car_control(revision, control);
         }
     }
 
@@ -1185,6 +1165,9 @@ impl XrEnv {
                 self.prepare_depth_mesh(cx, state);
                 let show_depth_mesh = self.depth_mesh_visible();
                 let show_depth_query_hits = self.depth_query_hits_visible();
+                if show_depth_mesh {
+                    self.world.depth.poll_surface_mesh_worker(cx);
+                }
                 self.world.depth.draw_surface_mesh(
                     &mut self.draw_depth_mesh,
                     cx,

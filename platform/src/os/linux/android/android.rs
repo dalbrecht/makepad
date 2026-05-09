@@ -283,15 +283,9 @@ impl Cx {
     /// It handles all incoming messages, processes other events, and manages drawing operations.
     pub fn main_loop(&mut self, from_java_rx: mpsc::Receiver<FromJavaMessage>) {
         self.gpu_info.performance = GpuPerformance::Tier1;
-        // Populate display_context and script heap with the initial display
-        // metrics BEFORE Startup, so app script_mod! definitions can use them.
+        // Populate display_context and script heap with safe area insets
+        // BEFORE Startup, so app script_mod! definitions can use them.
         let insets = self.os.safe_area_insets;
-        let dpi_factor = if self.os.dpi_factor > 0.0 {
-            self.os.dpi_factor
-        } else {
-            1.0
-        };
-        self.display_context.screen_size = self.os.display_size / dpi_factor;
         self.display_context.safe_area_insets = insets;
         self.update_safe_inset_script_values(insets);
         self.call_event_handler(&Event::Startup);
@@ -346,41 +340,14 @@ impl Cx {
                         continue;
                     }
                     self.os.openxr.logged_waiting_for_session = false;
-                    // After every event, drain any pending re-apply. The
-                    // cheap gate (both flags false) keeps the hot path
-                    // zero-cost; everything else — picking the right
-                    // `Event` variant for each flag, skipping shader-cache
-                    // reset for manual triggers, deferring a same-tick
-                    // `ScriptReapply` follow-up to keep rotation light —
-                    // is documented in `run_live_edit_if_needed`.
-                    if self.pending_script_reapply || self.pending_live_edit_request {
-                        self.run_live_edit_if_needed("android");
+                    // If a script re-apply was requested (e.g., safe area insets
+                    // changed on rotation), fire LiveEdit now.
+                    if self.pending_script_reapply {
+                        self.pending_script_reapply = false;
+                        self.call_event_handler(&Event::LiveEdit);
+                        self.redraw_all();
                     }
-                    // Drop the frame entirely if the window surface has been
-                    // torn down (typically during background/foreground or a
-                    // rotation). Issuing GL calls without a current EGL context
-                    // — which is what `destroy_surface` leaves us in — is
-                    // undefined behavior and crashes Mali/Adreno drivers with
-                    // a SIGSEGV inside `render_view`.
-                    if self.os.has_drawable_surface() {
-                        // If we previously skipped frames because the surface
-                        // wasn't ready, the redraw request may have been consumed
-                        // by an earlier draw cycle that couldn't actually paint.
-                        // Force a full redraw on the first frame after the surface
-                        // becomes (or becomes again) drawable.
-                        if self.os.needs_first_draw {
-                            self.os.needs_first_draw = false;
-                            self.redraw_all();
-                        }
-                        self.handle_drawing();
-                    } else {
-                        // Surface not ready — remember that we need a full
-                        // redraw once it becomes available, since any pending
-                        // draw event may be consumed by handle_drawing() on
-                        // a future iteration when the surface is briefly valid
-                        // but immediately torn down again (rotation race).
-                        self.os.needs_first_draw = true;
-                    }
+                    self.handle_drawing();
                 }
                 Ok(message) => {
                     self.handle_message(message);
@@ -1306,18 +1273,8 @@ impl Cx {
                 let e = Event::ImeAction(ImeActionEvent { action });
                 self.call_event_handler(&e);
             }
-            FromJavaMessage::SafeAreaInsets {
-                top,
-                right,
-                bottom,
-                left,
-            } => {
-                let new_insets = crate::event::SafeAreaInsets {
-                    top,
-                    right,
-                    bottom,
-                    left,
-                };
+            FromJavaMessage::SafeAreaInsets { top, right, bottom, left } => {
+                let new_insets = crate::event::SafeAreaInsets { top, right, bottom, left };
                 if self.os.safe_area_insets != new_insets {
                     self.os.safe_area_insets = new_insets;
                     // Update the WindowGeom with the new safe area insets
@@ -2827,9 +2784,7 @@ impl Cx {
                 CxOsOp::SetCursor(_) => {
                     // no need
                 }
-                CxOsOp::StartDragging(items) => {
-                    self.os.internal_drag_items = Some(Arc::new(items));
-                }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
@@ -3086,8 +3041,7 @@ impl Default for CxOs {
             display_size: dvec2(100., 100.),
             dpi_factor: 1.5,
             safe_area_insets: Default::default(),
-            last_ime_height: 0.0,
-            last_ime_visible: false,
+            keyboard_closed: 0.0,
             media: CxAndroidMedia::default(),
             display: None,
             surface_alive: false,
@@ -3166,14 +3120,7 @@ pub struct CxOs {
     pub display_size: Vec2d,
     pub dpi_factor: f64,
     pub safe_area_insets: crate::event::SafeAreaInsets,
-    /// Last reported soft-keyboard height in logical pixels. Used to dedup
-    /// repeated inset notifications from `onApplyWindowInsets` /
-    /// `onGlobalLayout` so we don't re-fire `VirtualKeyboardEvent`s on
-    /// unrelated layout passes.
-    pub last_ime_height: f64,
-    /// Whether the soft keyboard was visible the last time we dispatched a
-    /// `VirtualKeyboardEvent`. Pairs with `last_ime_height` for dedup.
-    pub last_ime_visible: bool,
+    pub keyboard_closed: f64,
     pub frame_time: i64,
     pub quit: bool,
     pub fullscreen: bool,

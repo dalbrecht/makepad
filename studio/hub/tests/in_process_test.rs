@@ -385,7 +385,7 @@ fn terminal_bell_sets_title_badge_until_next_input() {
         path: path.clone(),
         cols: 120,
         rows: 30,
-        env: terminal_test_shell_env(dir.path()),
+        env: std::collections::HashMap::new(),
     });
     let opened = wait_for_message(
         &connection,
@@ -425,7 +425,6 @@ fn terminal_bell_sets_title_badge_until_next_input() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-#[ignore = "manual diagnostic: depends on live shell tty startup timing for SIGWINCH delivery"]
 fn terminal_resize_delivers_sigwinch_with_updated_stty_size() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::os::unix::fs::PermissionsExt;

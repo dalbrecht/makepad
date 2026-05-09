@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 makepad-ggml = { path = "../ggml" }
 
+[workspace]
+
 [[bin]]
 name = "llama-load"
 path = "src/bin/llama_load.rs"
@@ -19,7 +21,3 @@ path = "src/bin/llama_compare.rs"
 [[bin]]
 name = "llama-generate"
 path = "src/bin/llama_generate.rs"
-
-[[bin]]
-name = "llama-tokenize"
-path = "src/bin/llama_tokenize.rs"

@@ -41,6 +41,39 @@ pub(crate) fn headless_draw_cycles_from_args() -> Option<usize> {
     None
 }
 
+fn normalize_studio_http_from_studio_var(studio: &str) -> String {
+    let studio = studio.trim().trim_end_matches('/');
+    if studio.is_empty() {
+        return String::new();
+    }
+
+    if studio.contains("://") {
+        studio.to_string()
+    } else {
+        format!("http://{studio}")
+    }
+}
+
+#[cfg(headless)]
+pub(crate) fn headless_draw_cycles_from_args() -> Option<usize> {
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--draws=") {
+            if let Ok(draws) = value.parse::<usize>() {
+                return Some(draws.max(1));
+            }
+        }
+        if arg == "--draws" {
+            if let Some(value) = args.next() {
+                if let Ok(draws) = value.parse::<usize>() {
+                    return Some(draws.max(1));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn normalize_studio_host(host: &str) -> String {
     let host = host.trim().trim_end_matches('/');
     if host.is_empty() {
@@ -340,12 +373,39 @@ macro_rules! app_main {
                 return;
             }
 
-            // The event-handler closure (which captures `app` and
-            // `app_value` Rcs internally) is shared across all four
-            // platform entry points via `_app_main_event_closure!`.
-            let mut cx = std::rc::Rc::new(std::cell::RefCell::new(Cx::new(
-                $crate::_app_main_event_closure!($app),
-            )));
+            let app = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let mut cx = std::rc::Rc::new(std::cell::RefCell::new(Cx::new(Box::new(
+                move |cx, event| {
+                    if let Event::Startup = event {
+                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
+                            let value = <$app as AppMain>::script_mod(vm);
+                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
+                            <$app as AppMain>::after_new_from_script(vm, &mut app);
+                            app
+                        }));
+                        cx.start_hot_reload_file_observer_if_requested();
+                    }
+                    if let Event::LiveEdit = event {
+                        let mut app_ref = app.borrow_mut();
+                        if let Some(app) = app_ref.as_mut() {
+                            cx.with_vm(|vm| {
+                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                                <$app as $crate::ScriptApply>::script_apply(
+                                    app,
+                                    vm,
+                                    &$crate::Apply::Reload,
+                                    &mut $crate::Scope::empty(),
+                                    value,
+                                );
+                            });
+                        }
+                    }
+                    if let Some(app) = &mut *app.borrow_mut() {
+                        <dyn AppMain>::handle_event(app, cx, event);
+                    }
+                },
+            ))));
+            cx.borrow_mut().init_script_vm();
             let studio_http = $crate::resolve_studio_http();
             cx.borrow_mut().init_websockets(&studio_http);
             if $crate::should_run_stdin_loop_from_env() {
@@ -388,7 +448,37 @@ macro_rules! app_main {
             $crate::os::linux::android::android_jni::apply_studio_env_from_activity(activity);
             Cx::android_entry(activity, || {
                 let studio_http = $crate::resolve_studio_http();
-                let mut cx = Box::new(Cx::new($crate::_app_main_event_closure!($app)));
+                let app = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let mut cx = Box::new(Cx::new(Box::new(move |cx, event| {
+                    if let Event::Startup = event {
+                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
+                            let value = <$app as AppMain>::script_mod(vm);
+                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
+                            <$app as AppMain>::after_new_from_script(vm, &mut app);
+                            app
+                        }));
+                        cx.start_hot_reload_file_observer_if_requested();
+                    }
+                    if let Event::LiveEdit = event {
+                        let mut app_ref = app.borrow_mut();
+                        if let Some(app) = app_ref.as_mut() {
+                            cx.with_vm(|vm| {
+                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                                <$app as $crate::ScriptApply>::script_apply(
+                                    app,
+                                    vm,
+                                    &$crate::Apply::Reload,
+                                    &mut $crate::Scope::empty(),
+                                    value,
+                                );
+                            });
+                        }
+                    }
+                    if let Some(app) = &mut *app.borrow_mut() {
+                        <dyn AppMain>::handle_event(app, cx, event);
+                    }
+                })));
+                cx.init_script_vm();
                 cx.init_websockets(&studio_http);
                 cx.init_cx_os();
                 cx
@@ -402,7 +492,37 @@ macro_rules! app_main {
             env: $crate::napi_ohos::Env,
         ) -> $crate::napi_ohos::Result<()> {
             Cx::ohos_init(exports, env, || {
-                let mut cx = Box::new(Cx::new($crate::_app_main_event_closure!($app)));
+                let app = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let mut cx = Box::new(Cx::new(Box::new(move |cx, event| {
+                    if let Event::Startup = event {
+                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
+                            let value = <$app as AppMain>::script_mod(vm);
+                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
+                            <$app as AppMain>::after_new_from_script(vm, &mut app);
+                            app
+                        }));
+                        cx.start_hot_reload_file_observer_if_requested();
+                    }
+                    if let Event::LiveEdit = event {
+                        let mut app_ref = app.borrow_mut();
+                        if let Some(app) = app_ref.as_mut() {
+                            cx.with_vm(|vm| {
+                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                                <$app as $crate::ScriptApply>::script_apply(
+                                    app,
+                                    vm,
+                                    &$crate::Apply::Reload,
+                                    &mut $crate::Scope::empty(),
+                                    value,
+                                );
+                            });
+                        }
+                    }
+                    if let Some(app) = &mut *app.borrow_mut() {
+                        <dyn AppMain>::handle_event(app, cx, event);
+                    }
+                })));
+                cx.init_script_vm();
                 let studio_http = $crate::resolve_studio_http();
                 cx.init_websockets(&studio_http);
                 cx.init_cx_os();
@@ -429,6 +549,12 @@ macro_rules! app_main {
         #[cfg(target_arch = "wasm32")]
         pub unsafe extern "C" fn wasm_process_msg(msg_ptr: u32, cx_ptr: u32) -> u32 {
             let cx = &mut *(cx_ptr as *mut Cx);
+            // Lazy-init the Script VM on the first event pump. This runs AFTER
+            // wasm_create_app() has returned and Chrome's event loop has yielded,
+            // avoiding the main-thread hang for large WASM binaries.
+            if cx.script_vm.is_none() {
+                cx.init_script_vm();
+            }
             cx.process_to_wasm(msg_ptr)
         }
 

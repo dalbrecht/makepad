@@ -11,8 +11,8 @@ use {
         event::keyboard::CharOffset,
         event::xr::XrAnchor,
         event::{
-            video_playback::CameraPreviewMode, DragItem, Event, NextFrame, QuitReason,
-            QuitRequestedEvent, Timer, Trigger, VideoSource,
+            video_playback::CameraPreviewMode, DragItem, NextFrame, Timer, Trigger,
+            VideoSource,
         },
         gpu_info::GpuInfo,
         ime::TextInputConfig,
@@ -45,42 +45,6 @@ pub enum CxThreadPriority {
     Utility,
     Background,
     Idle,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct XrFrameCpuBreakdown {
-    pub total_ms: f64,
-    pub wait_frame_ms: f64,
-    pub begin_frame_ms: f64,
-    pub locate_space_ms: f64,
-    pub locate_views_ms: f64,
-    pub acquire_swapchain_ms: f64,
-    pub wait_swapchain_ms: f64,
-    pub acquire_depth_ms: f64,
-    pub update_prepare_ms: f64,
-    pub update_dispatch_ms: f64,
-    pub next_frame_ms: f64,
-    pub draw_event_ms: f64,
-    pub compile_shaders_ms: f64,
-    pub repaint_ms: f64,
-    pub repaint_wait_inflight_ms: f64,
-    pub repaint_prepare_textures_ms: f64,
-    pub repaint_record_draw_ms: f64,
-    pub repaint_submit_ms: f64,
-    pub repaint_texture_upload_count: u32,
-    pub repaint_texture_upload_bytes: u64,
-    pub repaint_packet_buffer_count: u32,
-    pub repaint_packet_buffer_bytes: u64,
-    pub repaint_geometry_upload_bytes: u64,
-    pub repaint_descriptor_set_count: u32,
-    pub repaint_draw_items: u64,
-    pub repaint_draw_calls: u64,
-    pub repaint_packets: u64,
-    pub repaint_instances: u64,
-    pub repaint_indices: u64,
-    pub depth_readback_ms: f64,
-    pub end_frame_ms: f64,
-    pub resize_projection_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -253,6 +217,7 @@ pub enum CxOsOp {
     FullscreenWindow(WindowId),
     NormalizeWindow(WindowId),
     RestoreWindow(WindowId),
+    SetWindowTitle(WindowId, String),
     HideWindow(WindowId),
     HideWindowButtons(WindowId),
     ShowWindowButtons(WindowId),
@@ -410,6 +375,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::FullscreenWindow(..) => write!(f, "FullscreenWindow"),
             Self::NormalizeWindow(..) => write!(f, "NormalizeWindow"),
             Self::RestoreWindow(..) => write!(f, "RestoreWindow"),
+            Self::SetWindowTitle(..) => write!(f, "SetWindowTitle"),
             Self::HideWindow(..) => write!(f, "HideWindow"),
             Self::HideWindowButtons(..) => write!(f, "HideWindowButtons"),
             Self::ShowWindowButtons(..) => write!(f, "ShowWindowButtons"),
@@ -488,33 +454,14 @@ impl Cx {
         self.in_draw_event
     }
 
-    /// Requests a deferred `Event::ScriptReapply` on the next event-loop
-    /// iteration. The captured app value is re-applied with
-    /// `Apply::ScriptReapply` — no `script_mod` re-run, so runtime
-    /// `script_eval!` overrides on the heap are preserved. Widgets that
-    /// reference shared heap objects (e.g. `mod.widgets.IMG_MSG_FIT`) pick
-    /// up in-place mutations on this re-apply walk.
-    ///
-    /// Use this when the change you made is a runtime mutation of a shared
-    /// heap object — typically a `script_eval!` override.
+    /// Updates the `mod.widgets.SAFE_INSET_PAD_*` values on the script heap
+    /// so that Splash code can reference them in widget definitions.
+    /// Requests a deferred re-application of all script/Splash widget definitions,
+    /// causing widgets to pick up updated values from the script heap.
+    /// The re-apply happens on the next event loop iteration (not synchronously),
+    /// to avoid re-entrancy issues when called from within an event handler.
     pub fn request_script_reapply(&mut self) {
         self.pending_script_reapply = true;
-    }
-
-    /// Requests a deferred `Event::LiveEdit` on the next event-loop iteration.
-    /// The handler re-runs `script_mod` (re-evaluating any expressions that
-    /// reference primitive heap values like `mod.widgets.SAFE_INSET_PAD_TOP`)
-    /// and then re-applies the widget tree with `Apply::Reload`.
-    ///
-    /// Use this only when a primitive heap value has changed and that value
-    /// is consumed by `script_mod!` block expressions — those expressions are
-    /// not re-evaluated by `Apply::ScriptReapply`. `Apply::Reload` walks
-    /// clobber runtime widget state (animator values, dynamic instance
-    /// buffers, user-typed text in widgets that don't early-return on
-    /// LiveEdit), so prefer `request_script_reapply` when the change can be
-    /// modeled as a shared-heap-object mutation instead.
-    pub fn request_live_edit(&mut self) {
-        self.pending_live_edit_request = true;
     }
 
     pub fn update_safe_inset_script_values(&mut self, insets: crate::event::SafeAreaInsets) {
@@ -523,30 +470,10 @@ impl Cx {
             return;
         };
         let widgets = vm.heap.module(id!(widgets));
-        vm.heap.set_value(
-            widgets,
-            id!(SAFE_INSET_PAD_TOP).into(),
-            insets.top.into(),
-            NoTrap,
-        );
-        vm.heap.set_value(
-            widgets,
-            id!(SAFE_INSET_PAD_BOTTOM).into(),
-            insets.bottom.into(),
-            NoTrap,
-        );
-        vm.heap.set_value(
-            widgets,
-            id!(SAFE_INSET_PAD_LEFT).into(),
-            insets.left.into(),
-            NoTrap,
-        );
-        vm.heap.set_value(
-            widgets,
-            id!(SAFE_INSET_PAD_RIGHT).into(),
-            insets.right.into(),
-            NoTrap,
-        );
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_TOP).into(), insets.top.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_BOTTOM).into(), insets.bottom.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_LEFT).into(), insets.left.into(), NoTrap);
+        vm.heap.set_value(widgets, id!(SAFE_INSET_PAD_RIGHT).into(), insets.right.into(), NoTrap);
     }
 
     pub fn xr_capabilities(&self) -> &XrCapabilities {
@@ -587,30 +514,6 @@ impl Cx {
 
     pub fn xr_effective_frame_rate_hz(&self) -> Option<f64> {
         <Self as CxOsApi>::xr_effective_frame_rate_hz(self)
-    }
-
-    pub fn geometry_pool_slot_count(&self) -> usize {
-        self.geometries.0.slot_count()
-    }
-
-    pub fn geometry_pool_live_count(&self) -> usize {
-        self.geometries.0.live_count()
-    }
-
-    pub fn draw_list_pool_slot_count(&self) -> usize {
-        self.draw_lists.0.slot_count()
-    }
-
-    pub fn draw_list_pool_live_count(&self) -> usize {
-        self.draw_lists.0.live_count()
-    }
-
-    pub fn texture_pool_slot_count(&self) -> usize {
-        self.textures.0.slot_count()
-    }
-
-    pub fn texture_pool_live_count(&self) -> usize {
-        self.textures.0.live_count()
     }
 
     pub fn set_thread_priority(priority: CxThreadPriority) {
@@ -855,6 +758,10 @@ impl Cx {
     pub fn show_in_dock(&mut self, show: bool) {
         self.platform_ops.push(CxOsOp::ShowInDock(show));
     }
+    pub fn set_window_title(&mut self, window_id: WindowId, title: &str) {
+        self.push_unique_platform_op(CxOsOp::SetWindowTitle(window_id, title.to_string()));
+    }
+
     pub fn push_unique_platform_op(&mut self, op: CxOsOp) {
         if self.platform_ops.iter().find(|o| **o == op).is_none() {
             self.platform_ops.push(op);

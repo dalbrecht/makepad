@@ -789,24 +789,20 @@ class ResizingLayout
 
     @Override
     public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
-        // Report IME inset directly to native code. The in-app KeyboardView
-        // is the single source of truth for shifting content above the soft
-        // keyboard. We do not shrink the SurfaceView via setPadding; that
-        // would double-count the obstruction (system shrinks the surface
-        // *and* the KeyboardView shifts). The activity is configured with
-        // `windowSoftInputMode="adjustNothing"` in the manifest, so the
-        // system doesn't auto-resize either.
-        MakepadImeInsets.report(v, insets);
+        Insets imeInsets = insets.getInsets(WindowInsets.Type.ime());
+        v.setPadding(0, 0, 0, imeInsets.bottom);
 
         // Compute safe area insets from system bars and display cutout.
         // These are in physical pixels; convert to logical points by dividing by density.
         float density = getResources().getDisplayMetrics().density;
-        MakepadSystemInsets systemBarInsets = MakepadSystemInsets.from(insets, density);
+        Insets systemBarInsets = insets.getInsets(
+            WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
+        );
         MakepadNative.surfaceOnSafeAreaInsets(
-            systemBarInsets.top,
-            systemBarInsets.right,
-            systemBarInsets.bottom,
-            systemBarInsets.left
+            systemBarInsets.top / density,
+            systemBarInsets.right / density,
+            systemBarInsets.bottom / density,
+            systemBarInsets.left / density
         );
 
         return insets;

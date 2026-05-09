@@ -8,6 +8,7 @@ impl XrHandSystem {
         (controller.active() && pose.is_finite()).then_some(pose)
     }
 
+impl XrHandSystem {
     fn pose_point_world(pose: Pose, local: Vec3f) -> Vec3f {
         pose.to_mat4().transform_vec4(local.to_vec4()).to_vec3f()
     }
@@ -72,11 +73,7 @@ impl XrHandSystem {
         }
     }
 
-    pub(super) fn build_hand_colliders(
-        &self,
-        hand: &XrHand,
-        controller: &XrController,
-    ) -> Vec<HandCollider> {
+    pub(super) fn build_hand_colliders(&self, hand: &XrHand) -> Vec<HandCollider> {
         let mut colliders = Vec::with_capacity(XR_HAND_COLLIDER_SLOTS_PER_HAND);
         if let Some(grip_pose) = Self::controller_grip_pose(controller) {
             Self::append_box_collider(&mut colliders, grip_pose, vec3f(0.032, 0.030, 0.055));
@@ -373,10 +370,7 @@ impl XrEnv {
         let colliders = if let Some(physics_colliders) = physics_colliders {
             physics_colliders
         } else {
-            raw_colliders = self
-                .world
-                .hands
-                .build_hand_colliders(hand, &XrController::default());
+            raw_colliders = self.world.hands.build_hand_colliders(hand);
             &raw_colliders
         };
         self.draw_hand_shapes(cx, colliders, is_left);
@@ -389,11 +383,8 @@ impl XrEnv {
     }
 }
 
-pub(super) fn build_hand_colliders_for_physics(
-    hand: &XrHand,
-    controller: &XrController,
-) -> Vec<HandCollider> {
-    XrHandSystem.build_hand_colliders(hand, controller)
+pub(super) fn build_hand_colliders_for_physics(hand: &XrHand) -> Vec<HandCollider> {
+    XrHandSystem.build_hand_colliders(hand)
 }
 
 pub(super) fn sync_hands_on_scene(
@@ -422,5 +413,5 @@ pub(super) fn sync_hands_on_scene(
     } = scene;
     RapierScene::sync_hand_bodies(left_slots, &left, bodies, colliders);
     RapierScene::sync_hand_bodies(right_slots, &right, bodies, colliders);
-    scene.sync_tracked_hands(left_hand, right_hand, left_controller, right_controller);
+    scene.sync_tracked_hands(left_hand, right_hand);
 }

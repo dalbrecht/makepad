@@ -664,9 +664,14 @@ impl App {
                 self.refresh_ai_manager_preview(cx);
                 self.refresh_ai_manager_report(cx);
             }
+            HubToClient::TerminalTitle { path, title } => {
+                self.apply_terminal_tab_title(cx, &path, title);
+            }
             HubToClient::TerminalExited { path, code } => {
+                self.data.terminal_open_paths.remove(&path);
+                self.data.terminal_frame_id_by_path.remove(&path);
+                self.data.terminal_framebuffer_by_path.remove(&path);
                 self.reset_terminal_tab_title(cx, &path);
-                self.handle_terminal_exit_cleanup(cx, &path);
                 self.set_status(cx, &format!("terminal exited ({})", code));
                 self.refresh_ai_manager_report(cx);
             }

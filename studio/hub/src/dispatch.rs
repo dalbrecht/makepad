@@ -1745,9 +1745,45 @@ impl HubCore {
             ClientToHub::TerminalInput { path, data } => {
                 match self.terminal_manager.send_input(&path, data) {
                     Ok(()) => {
-                        self.set_terminal_bell_state(&path, false);
-                        self.process_ai_terminal_input_for_path(&path);
+                        let cols = cols.max(1);
+                        let rows = rows.max(1);
+                        let mut terminal = Terminal::new(cols as usize, rows as usize);
+                        if !history.is_empty() {
+                            terminal.process_bytes(&history);
+                            let _ = terminal.take_outbound();
+                        }
+                        self.terminal_sessions.insert(
+                            path.clone(),
+                            TerminalSession {
+                                terminal,
+                                cols,
+                                rows,
+                                applied_cols: cols,
+                                applied_rows: rows,
+                                frame_seq: 0,
+                                bell_pending: false,
+                                subscribers: HashMap::new(),
+                            },
+                        );
+                        self.send_ui_reply(
+                            client_id,
+                            HubToClient::TerminalOpened { path: path.clone() },
+                        );
+                        self.send_terminal_viewport_for_client(
+                            client_id,
+                            &path,
+                            cols,
+                            rows,
+                            rows,
+                            usize::MAX,
+                        );
                     }
+                    Err(err) => self.send_ui_error(client_id, err),
+                }
+            }
+            ClientToHub::TerminalInput { path, data } => {
+                match self.terminal_manager.send_input(&path, data) {
+                    Ok(()) => self.set_terminal_bell_state(&path, false),
                     Err(err) => self.send_ui_error(client_id, err),
                 }
             }
