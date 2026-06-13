@@ -4,18 +4,6 @@ fn run_preview_splitter_is_collapsed(align: SplitterAlign) -> bool {
     matches!(align, SplitterAlign::Weighted(w) if w >= 0.999)
 }
 
-fn run_preview_splitter_restore_target(
-    current: SplitterAlign,
-    has_runs: bool,
-    restore: Option<SplitterAlign>,
-) -> Option<SplitterAlign> {
-    if has_runs && run_preview_splitter_is_collapsed(current) {
-        Some(restore.unwrap_or(SplitterAlign::Weighted(0.62)))
-    } else {
-        None
-    }
-}
-
 impl App {
     pub(super) fn sync_run_preview_splitter(&mut self, cx: &mut Cx, mount: &str) {
         let Some(dock) = self.mount_workspace_dock(cx, mount) else {
@@ -35,16 +23,19 @@ impl App {
             return;
         };
         let collapsed = run_preview_splitter_is_collapsed(current);
-        if !collapsed {
+        if !has_runs && !collapsed {
             self.data
                 .run_panel_split_restore
                 .insert(mount.to_string(), current);
+            dock.set_splitter_align(cx, id!(editor_split), SplitterAlign::Weighted(1.0), false);
+            return;
         }
-        if let Some(align) = run_preview_splitter_restore_target(
-            current,
-            has_runs,
-            self.data.run_panel_split_restore.remove(mount),
-        ) {
+        if has_runs && collapsed {
+            let align = self
+                .data
+                .run_panel_split_restore
+                .remove(mount)
+                .unwrap_or(SplitterAlign::Weighted(0.62));
             dock.set_splitter_align(cx, id!(editor_split), align, false);
         }
     }
@@ -150,12 +141,6 @@ impl App {
     pub(super) fn close_editor_tab(&mut self, cx: &mut Cx, tab_id: LiveId) {
         if !self.data.tab_to_path.contains_key(&tab_id) {
             return;
-        }
-        if let Some(path) = self.data.tab_to_path.get(&tab_id).cloned() {
-            if Self::is_terminal_virtual_path(&path) {
-                self.delete_terminal_path(cx, &path);
-                return;
-            }
         }
         let mount = self
             .data
@@ -269,14 +254,6 @@ impl App {
     }
 
     pub(super) fn open_path_in_editor(&mut self, cx: &mut Cx, path: &str) {
-        if Self::is_terminal_virtual_path(path) {
-            self.reveal_terminal_path(cx, path);
-            self.set_status(
-                cx,
-                &format!("opened terminal {}", Self::default_terminal_tab_title(path)),
-            );
-            return;
-        }
         let path = path.to_string();
         let Some((tab_id, already_open)) = self.ensure_editor_tab_for_path(cx, &path, true) else {
             self.set_status(cx, "failed to create editor tab");
@@ -1149,28 +1126,22 @@ impl App {
         }
     }
 
-    fn active_mount_dock_containing_tab(&mut self, cx: &mut Cx, tab_id: LiveId) -> Option<DockRef> {
-        let active_mount = self.data.active_mount.clone()?;
-        if let Some(dock) = self.mount_workspace_dock(cx, &active_mount) {
-            if dock.find_tab_bar_of_tab(tab_id).is_some() {
-                return Some(dock);
-            }
-        }
-        let dock = self.mount_terminal_dock(cx, &active_mount)?;
-        if dock.find_tab_bar_of_tab(tab_id).is_some() {
-            Some(dock)
-        } else {
-            None
-        }
-    }
-
     pub(super) fn start_workspace_tab_drag(&mut self, cx: &mut Cx, tab_id: LiveId) {
-        if self.data.tab_to_mount.contains_key(&tab_id) {
+        if self.data.tab_to_mount.contains_key(&tab_id)
+            || tab_id == id!(terminal_add)
+            || tab_id == id!(bottom_terminal_tab)
+        {
             return;
         }
-        let Some(dock) = self.active_mount_dock_containing_tab(cx, tab_id) else {
+        let Some(active_mount) = self.data.active_mount.clone() else {
             return;
         };
+        let Some(dock) = self.mount_workspace_dock(cx, &active_mount) else {
+            return;
+        };
+        if dock.find_tab_bar_of_tab(tab_id).is_none() {
+            return;
+        }
 
         dock.tab_start_drag(
             cx,
@@ -1186,12 +1157,19 @@ impl App {
         let Some(source_tab_id) = Self::drag_source_tab_id(drag_event.items.as_ref()) else {
             return;
         };
-        if self.data.tab_to_mount.contains_key(&source_tab_id) {
+        if self.data.tab_to_mount.contains_key(&source_tab_id) || source_tab_id == id!(terminal_add)
+        {
             return;
         }
-        let Some(dock) = self.active_mount_dock_containing_tab(cx, source_tab_id) else {
+        let Some(active_mount) = self.data.active_mount.clone() else {
             return;
         };
+        let Some(dock) = self.mount_workspace_dock(cx, &active_mount) else {
+            return;
+        };
+        if dock.find_tab_bar_of_tab(source_tab_id).is_none() {
+            return;
+        }
 
         dock.accept_drag(cx, drag_event, DragResponse::Move);
     }
@@ -1200,12 +1178,19 @@ impl App {
         let Some(source_tab_id) = Self::drag_source_tab_id(drop_event.items.as_ref()) else {
             return;
         };
-        if self.data.tab_to_mount.contains_key(&source_tab_id) {
+        if self.data.tab_to_mount.contains_key(&source_tab_id) || source_tab_id == id!(terminal_add)
+        {
             return;
         }
-        let Some(dock) = self.active_mount_dock_containing_tab(cx, source_tab_id) else {
+        let Some(active_mount) = self.data.active_mount.clone() else {
             return;
         };
+        let Some(dock) = self.mount_workspace_dock(cx, &active_mount) else {
+            return;
+        };
+        if dock.find_tab_bar_of_tab(source_tab_id).is_none() {
+            return;
+        }
 
         dock.drop_move(cx, drop_event.abs, source_tab_id);
 
@@ -1260,53 +1245,5 @@ impl App {
         if let Some(dock) = self.mount_workspace_dock(cx, &state.mount) {
             dock.close_tab(cx, tab_id);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn assert_weighted(align: Option<SplitterAlign>, expected: f64) {
-        match align {
-            Some(SplitterAlign::Weighted(actual)) => {
-                assert!(
-                    (actual - expected).abs() < 0.0001,
-                    "expected {expected}, got {actual}"
-                );
-            }
-            Some(other) => panic!("expected weighted splitter align, got {:?}", other),
-            None => panic!("expected weighted splitter align, got none"),
-        }
-    }
-
-    #[test]
-    fn no_active_runs_do_not_auto_collapse_preview() {
-        assert!(run_preview_splitter_restore_target(
-            SplitterAlign::Weighted(0.62),
-            false,
-            Some(SplitterAlign::Weighted(0.4)),
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn collapsed_preview_restores_saved_align_when_run_starts() {
-        assert_weighted(
-            run_preview_splitter_restore_target(
-                SplitterAlign::Weighted(1.0),
-                true,
-                Some(SplitterAlign::Weighted(0.4)),
-            ),
-            0.4,
-        );
-    }
-
-    #[test]
-    fn collapsed_preview_uses_default_align_without_saved_state() {
-        assert_weighted(
-            run_preview_splitter_restore_target(SplitterAlign::Weighted(1.0), true, None),
-            0.62,
-        );
     }
 }

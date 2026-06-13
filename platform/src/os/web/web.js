@@ -48,67 +48,6 @@ export class WasmWebBrowser extends WasmBridge {
         this.dispatch_first_msg();
     }
 
-    emit_app_lifecycle(state) {
-        this.to_wasm.ToWasmAppLifecycle({ state });
-    }
-
-    emit_app_inactive() {
-        if (!this.lifecycle_is_visible) {
-            return;
-        }
-        this.lifecycle_is_visible = false;
-        this.emit_app_lifecycle(2);
-        this.emit_app_lifecycle(1);
-    }
-
-    emit_app_active() {
-        if (this.lifecycle_is_visible) {
-            return;
-        }
-        this.lifecycle_is_visible = true;
-        this.lifecycle_shutdown_sent = false;
-        this.emit_app_lifecycle(0);
-        this.emit_app_lifecycle(3);
-    }
-
-    emit_app_shutdown() {
-        if (this.lifecycle_shutdown_sent) {
-            return;
-        }
-        this.lifecycle_shutdown_sent = true;
-        this.emit_app_lifecycle(4);
-    }
-
-    bind_app_lifecycle() {
-        this.lifecycle_is_visible = !document.hidden;
-        this.lifecycle_shutdown_sent = false;
-
-        document.addEventListener("visibilitychange", () => {
-            if (document.hidden) {
-                this.emit_app_inactive();
-            } else {
-                this.emit_app_active();
-            }
-            this.do_wasm_pump();
-        });
-
-        window.addEventListener("pagehide", (event) => {
-            this.emit_app_inactive();
-            if (!event.persisted) {
-                this.emit_app_shutdown();
-            }
-            this.do_wasm_pump();
-        });
-
-        window.addEventListener("pageshow", (event) => {
-            if (event.persisted) {
-                this.emit_app_active();
-                this.do_wasm_pump();
-            }
-        });
-
-    }
-
     emit_location_change() {
         this.to_wasm.ToWasmLocationChange({
             pathname: location.pathname + "",
@@ -160,7 +99,6 @@ export class WasmWebBrowser extends WasmBridge {
         this.bind_mouse_and_touch();
         this.bind_keyboard();
         this.bind_screen_resize();
-        this.bind_app_lifecycle();
         window.addEventListener("popstate", () => {
             this.emit_location_change();
             this.do_wasm_pump();
@@ -1186,9 +1124,17 @@ export class WasmWebBrowser extends WasmBridge {
         this.buffer_upload_serial += 1;
         let to_wasm = this.to_wasm;
         this.to_wasm = this.new_to_wasm();
-        let from_wasm = this.wasm_process_msg(to_wasm);
-        from_wasm.dispatch_on_app();
-        from_wasm.free();
+        try {
+            let from_wasm = this.wasm_process_msg(to_wasm);
+            from_wasm.dispatch_on_app();
+            from_wasm.free();
+        } catch (e) {
+            // Catch WASM RuntimeError traps (e.g., from corrupt shader mappings
+            // after Script VM property resolution failures) to prevent a single
+            // bad frame from killing the entire page. Subsequent frames recover
+            // because shader compilation is a one-time operation.
+            console.error("do_wasm_pump error (recovering):", e.message);
+        }
         this.update_startup_loader(performance.now() - started);
     }
 

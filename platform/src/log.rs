@@ -2,17 +2,6 @@ use crate::cx::Cx;
 pub use crate::makepad_error_log::*;
 use makepad_studio_protocol::{AppToStudio, StudioLogItem};
 
-#[allow(unused)]
-fn log_level_prefix(level: LogLevel) -> &'static str {
-    match level {
-        LogLevel::Panic => "[!]",
-        LogLevel::Error => "[E]",
-        LogLevel::Warning => "[W]",
-        LogLevel::Log => "[I]",
-        LogLevel::Wait => "[.]",
-    }
-}
-
 #[cfg(target_os = "android")]
 fn android_logcat_write(
     file_name: &str,
@@ -60,7 +49,6 @@ pub(crate) fn log_with_level_makepad_platform(
     // lets send out our log message on the studio websocket
     #[cfg(target_arch = "wasm32")]
     {
-        #[link(wasm_import_module = "env")]
         extern "C" {
             pub fn js_console_log(u8_ptr: u32, len: u32);
             pub fn js_console_error(u8_ptr: u32, len: u32);
@@ -86,8 +74,7 @@ pub(crate) fn log_with_level_makepad_platform(
     if !studio_connected {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         println!(
-            "{} {}:{}:{} - {}",
-            log_level_prefix(level),
+            "{}:{}:{} - {}",
             file_name,
             line_start + 1,
             column_start + 1,
@@ -100,8 +87,7 @@ pub(crate) fn log_with_level_makepad_platform(
             }
             use crate::os::apple::apple_util::str_to_nsstring;
             let msg = format!(
-                "{} {}:{}:{} - {}",
-                log_level_prefix(level),
+                "{}:{}:{} - {}",
                 file_name,
                 line_start + 1,
                 column_start + 1,
@@ -112,12 +98,8 @@ pub(crate) fn log_with_level_makepad_platform(
         #[cfg(target_env = "ohos")]
         {
             let msg = format!(
-                "{} {}:{}:{} - {}\0",
-                log_level_prefix(level),
-                file_name,
-                line_start,
-                column_start,
-                message
+                "{}:{}:{} - {}\0",
+                file_name, line_start, column_start, message
             );
             let hilevel: hilog_sys::LogLevel = match level {
                 LogLevel::Warning => hilog_sys::LogLevel::LOG_WARN,

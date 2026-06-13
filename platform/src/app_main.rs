@@ -41,148 +41,51 @@ pub(crate) fn headless_draw_cycles_from_args() -> Option<usize> {
     None
 }
 
-fn normalize_studio_host(host: &str) -> String {
-    let host = host.trim().trim_end_matches('/');
-    if host.is_empty() {
+fn normalize_studio_http_from_studio_var(studio: &str) -> String {
+    let studio = studio.trim().trim_end_matches('/');
+    if studio.is_empty() {
         return String::new();
     }
 
-    let (scheme, rest) = if let Some((scheme, rest)) = host.split_once("://") {
-        (scheme, rest)
+    if studio.contains("://") {
+        studio.to_string()
     } else {
-        ("http", host)
-    };
-    let host_port = rest
-        .split_once(['/', '?', '#'])
-        .map(|(host_port, _)| host_port)
-        .unwrap_or(rest)
-        .trim();
-    if host_port.is_empty() {
-        return String::new();
+        format!("http://{studio}")
     }
-    format!("{scheme}://{host_port}")
 }
 
-fn studio_query_value(studio: &str, key: &str) -> Option<String> {
-    let query = studio.split_once('?')?.1;
-    for pair in query.split('&') {
-        let (pair_key, pair_value) = pair.split_once('=').unwrap_or((pair, ""));
-        if pair_key == key {
-            let pair_value = pair_value.trim();
-            if !pair_value.is_empty() {
-                return Some(pair_value.to_string());
-            }
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn extract_studio_build_id(studio: &str) -> Option<String> {
+    let studio = studio.trim().trim_end_matches('/');
+    if studio.is_empty() {
+        return None;
+    }
+
+    let without_scheme = studio
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(studio);
+    let path = without_scheme
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or("");
+
+    if let Some(rest) = path.strip_prefix("app/") {
+        let build_id = rest.split('/').next()?;
+        if !build_id.is_empty() {
+            return Some(build_id.to_string());
         }
     }
+
     None
 }
 
-pub(crate) fn extract_studio_build_id(studio: &str) -> Option<String> {
-    studio_query_value(studio, "build").or_else(|| {
-        let studio = studio.trim().trim_end_matches('/');
-        if studio.is_empty() {
-            return None;
-        }
-
-        let without_scheme = studio
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .unwrap_or(studio);
-        let path = without_scheme
-            .split_once('/')
-            .map(|(_, path)| path)
-            .unwrap_or("");
-
-        if let Some(rest) = path.strip_prefix("app/") {
-            let build_id = rest.split('/').next()?;
-            if !build_id.is_empty() {
-                return Some(build_id.to_string());
-            }
-        }
-
-        None
-    })
-}
-
-pub(crate) fn extract_studio_crate_name(studio: &str) -> Option<String> {
-    studio_query_value(studio, "crate")
-}
-
-pub(crate) fn resolve_studio_host() -> String {
-    std::env::var("STUDIO_HOST")
-        .ok()
-        .or_else(|| std::env::var("STUDIO").ok())
-        .map(|studio| normalize_studio_host(&studio))
-        .filter(|studio_host| !studio_host.is_empty())
-        .unwrap_or_default()
-}
-
-pub(crate) fn resolve_studio_build() -> Option<String> {
-    std::env::var("STUDIO_BUILD")
-        .ok()
-        .and_then(|build| {
-            let build = build.trim();
-            (!build.is_empty()).then(|| build.to_string())
-        })
-        .or_else(|| {
-            std::env::var("STUDIO")
-                .ok()
-                .and_then(|studio| extract_studio_build_id(&studio))
-        })
-}
-
-pub(crate) fn resolve_studio_crate() -> Option<String> {
-    std::env::var("STUDIO_CRATE")
-        .ok()
-        .and_then(|crate_name| {
-            let crate_name = crate_name.trim();
-            (!crate_name.is_empty()).then(|| crate_name.to_string())
-        })
-        .or_else(|| {
-            std::env::var("STUDIO")
-                .ok()
-                .and_then(|studio| extract_studio_crate_name(&studio))
-        })
-}
-
-fn build_studio_http(
-    studio_host: &str,
-    studio_build: Option<&str>,
-    studio_crate: Option<&str>,
-) -> String {
-    let studio_host = normalize_studio_host(studio_host);
-    if studio_host.is_empty() {
-        return String::new();
-    }
-
-    let studio_build = studio_build
-        .map(str::trim)
-        .filter(|build| !build.is_empty());
-    let studio_crate = studio_crate
-        .map(str::trim)
-        .filter(|crate_name| !crate_name.is_empty());
-
-    if studio_build.is_none() && studio_crate.is_none() {
-        return String::new();
-    }
-
-    let mut query = Vec::new();
-    if let Some(build) = studio_build {
-        query.push(format!("build={build}"));
-    }
-    if let Some(crate_name) = studio_crate {
-        query.push(format!("crate={crate_name}"));
-    }
-    format!("{studio_host}/app?{}", query.join("&"))
-}
-
 pub fn resolve_studio_http() -> String {
-    let studio_host = resolve_studio_host();
-    build_studio_http(
-        &studio_host,
-        resolve_studio_build().as_deref(),
-        resolve_studio_crate().as_deref(),
-    )
+    std::env::var("STUDIO")
+        .ok()
+        .map(|studio| normalize_studio_http_from_studio_var(&studio))
+        .filter(|studio_http| !studio_http.is_empty())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -198,28 +101,6 @@ mod tests {
         assert_eq!(
             extract_studio_build_id("http://127.0.0.1:8001/app/77"),
             Some("77".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_studio_build_and_crate_from_query_url() {
-        let studio = "http://127.0.0.1:8001/app?build=77&crate=makepad-example-xr";
-        assert_eq!(extract_studio_build_id(studio), Some("77".to_string()));
-        assert_eq!(
-            extract_studio_crate_name(studio),
-            Some("makepad-example-xr".to_string())
-        );
-    }
-
-    #[test]
-    fn build_studio_http_uses_query_identity() {
-        assert_eq!(
-            build_studio_http("127.0.0.1:8001", Some("77"), Some("makepad-example-xr"),),
-            "http://127.0.0.1:8001/app?build=77&crate=makepad-example-xr"
-        );
-        assert_eq!(
-            build_studio_http("127.0.0.1:8001", None, Some("makepad-example-xr")),
-            "http://127.0.0.1:8001/app?crate=makepad-example-xr"
         );
     }
 }
@@ -248,83 +129,6 @@ pub trait AppMain {
     }
 }
 
-/// Internal helper for [`app_main!`]. Emits the boxed event-handler
-/// closure that every platform entry point hands to `Cx::new`. Captures
-/// its own `app` and `app_value` `Rc<RefCell<…>>` slots, so the four
-/// platform entry points (desktop, Android activity, OHOS, wasm32) all
-/// share a single source of truth for `Event::Startup` / `LiveEdit` /
-/// `ScriptReapply` / `handle_event` dispatch.
-///
-/// `cx.start_hot_reload_file_observer_if_requested()` is called
-/// unconditionally — its body is `#[cfg]`-gated to desktop OSes, so on
-/// android / ohos / wasm32 it's a compile-time no-op.
-///
-/// Not part of the public API. Use [`app_main!`] instead.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! _app_main_event_closure {
-    ($app:ident) => {{
-        let app = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let app_value: std::rc::Rc<std::cell::RefCell<Option<$crate::ScriptObjectRef>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        Box::new(move |cx: &mut Cx, event: &Event| {
-            if let Event::Startup = event {
-                *app.borrow_mut() = Some(cx.with_vm(|vm| {
-                    let value = <$app as AppMain>::script_mod(vm);
-                    if let Some(obj) = value.as_object() {
-                        *app_value.borrow_mut() = Some(vm.heap_mut().new_object_ref(obj));
-                    }
-                    let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
-                    <$app as AppMain>::after_new_from_script(vm, &mut app);
-                    app
-                }));
-                cx.start_hot_reload_file_observer_if_requested();
-            }
-            if let Event::LiveEdit = event {
-                let mut app_ref = app.borrow_mut();
-                if let Some(app) = app_ref.as_mut() {
-                    cx.with_vm(|vm| {
-                        let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
-                        if let Some(obj) = value.as_object() {
-                            *app_value.borrow_mut() = Some(vm.heap_mut().new_object_ref(obj));
-                        }
-                        <$app as $crate::ScriptApply>::script_apply(
-                            app,
-                            vm,
-                            &$crate::Apply::Reload,
-                            &mut $crate::Scope::empty(),
-                            value,
-                        );
-                    });
-                }
-            }
-            if let Event::ScriptReapply = event {
-                let mut app_ref = app.borrow_mut();
-                if let Some(app) = app_ref.as_mut() {
-                    let value = app_value
-                        .borrow()
-                        .as_ref()
-                        .map(|r| $crate::ScriptValue::from(r.as_object()));
-                    if let Some(value) = value {
-                        cx.with_vm(|vm| {
-                            <$app as $crate::ScriptApply>::script_apply(
-                                app,
-                                vm,
-                                &$crate::Apply::ScriptReapply,
-                                &mut $crate::Scope::empty(),
-                                value,
-                            );
-                        });
-                    }
-                }
-            }
-            if let Some(app) = &mut *app.borrow_mut() {
-                <dyn AppMain>::handle_event(app, cx, event);
-            }
-        }) as Box<dyn FnMut(&mut Cx, &Event)>
-    }};
-}
-
 #[macro_export]
 macro_rules! app_main {
     ( $ app: ident) => {
@@ -340,12 +144,39 @@ macro_rules! app_main {
                 return;
             }
 
-            // The event-handler closure (which captures `app` and
-            // `app_value` Rcs internally) is shared across all four
-            // platform entry points via `_app_main_event_closure!`.
-            let mut cx = std::rc::Rc::new(std::cell::RefCell::new(Cx::new(
-                $crate::_app_main_event_closure!($app),
-            )));
+            let app = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let mut cx = std::rc::Rc::new(std::cell::RefCell::new(Cx::new(Box::new(
+                move |cx, event| {
+                    if let Event::Startup = event {
+                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
+                            let value = <$app as AppMain>::script_mod(vm);
+                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
+                            <$app as AppMain>::after_new_from_script(vm, &mut app);
+                            app
+                        }));
+                        cx.start_hot_reload_file_observer_if_requested();
+                    }
+                    if let Event::LiveEdit = event {
+                        let mut app_ref = app.borrow_mut();
+                        if let Some(app) = app_ref.as_mut() {
+                            cx.with_vm(|vm| {
+                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                                <$app as $crate::ScriptApply>::script_apply(
+                                    app,
+                                    vm,
+                                    &$crate::Apply::Reload,
+                                    &mut $crate::Scope::empty(),
+                                    value,
+                                );
+                            });
+                        }
+                    }
+                    if let Some(app) = &mut *app.borrow_mut() {
+                        <dyn AppMain>::handle_event(app, cx, event);
+                    }
+                },
+            ))));
+            cx.borrow_mut().init_script_vm();
             let studio_http = $crate::resolve_studio_http();
             cx.borrow_mut().init_websockets(&studio_http);
             if $crate::should_run_stdin_loop_from_env() {
@@ -388,7 +219,37 @@ macro_rules! app_main {
             $crate::os::linux::android::android_jni::apply_studio_env_from_activity(activity);
             Cx::android_entry(activity, || {
                 let studio_http = $crate::resolve_studio_http();
-                let mut cx = Box::new(Cx::new($crate::_app_main_event_closure!($app)));
+                let app = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let mut cx = Box::new(Cx::new(Box::new(move |cx, event| {
+                    if let Event::Startup = event {
+                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
+                            let value = <$app as AppMain>::script_mod(vm);
+                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
+                            <$app as AppMain>::after_new_from_script(vm, &mut app);
+                            app
+                        }));
+                        cx.start_hot_reload_file_observer_if_requested();
+                    }
+                    if let Event::LiveEdit = event {
+                        let mut app_ref = app.borrow_mut();
+                        if let Some(app) = app_ref.as_mut() {
+                            cx.with_vm(|vm| {
+                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                                <$app as $crate::ScriptApply>::script_apply(
+                                    app,
+                                    vm,
+                                    &$crate::Apply::Reload,
+                                    &mut $crate::Scope::empty(),
+                                    value,
+                                );
+                            });
+                        }
+                    }
+                    if let Some(app) = &mut *app.borrow_mut() {
+                        <dyn AppMain>::handle_event(app, cx, event);
+                    }
+                })));
+                cx.init_script_vm();
                 cx.init_websockets(&studio_http);
                 cx.init_cx_os();
                 cx
@@ -402,7 +263,37 @@ macro_rules! app_main {
             env: $crate::napi_ohos::Env,
         ) -> $crate::napi_ohos::Result<()> {
             Cx::ohos_init(exports, env, || {
-                let mut cx = Box::new(Cx::new($crate::_app_main_event_closure!($app)));
+                let app = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let mut cx = Box::new(Cx::new(Box::new(move |cx, event| {
+                    if let Event::Startup = event {
+                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
+                            let value = <$app as AppMain>::script_mod(vm);
+                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
+                            <$app as AppMain>::after_new_from_script(vm, &mut app);
+                            app
+                        }));
+                        cx.start_hot_reload_file_observer_if_requested();
+                    }
+                    if let Event::LiveEdit = event {
+                        let mut app_ref = app.borrow_mut();
+                        if let Some(app) = app_ref.as_mut() {
+                            cx.with_vm(|vm| {
+                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                                <$app as $crate::ScriptApply>::script_apply(
+                                    app,
+                                    vm,
+                                    &$crate::Apply::Reload,
+                                    &mut $crate::Scope::empty(),
+                                    value,
+                                );
+                            });
+                        }
+                    }
+                    if let Some(app) = &mut *app.borrow_mut() {
+                        <dyn AppMain>::handle_event(app, cx, event);
+                    }
+                })));
+                cx.init_script_vm();
                 let studio_http = $crate::resolve_studio_http();
                 cx.init_websockets(&studio_http);
                 cx.init_cx_os();
@@ -418,7 +309,35 @@ macro_rules! app_main {
         #[cfg(target_arch = "wasm32")]
         pub extern "C" fn create_wasm_app() -> u32 {
             Cx::init_log();
-            let mut cx = Box::new(Cx::new($crate::_app_main_event_closure!($app)));
+            let app = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let mut cx = Box::new(Cx::new(Box::new(move |cx, event| {
+                if let Event::Startup = event {
+                    *app.borrow_mut() = Some(cx.with_vm(|vm| {
+                        let value = <$app as AppMain>::script_mod(vm);
+                        let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
+                        <$app as AppMain>::after_new_from_script(vm, &mut app);
+                        app
+                    }));
+                }
+                if let Event::LiveEdit = event {
+                    let mut app_ref = app.borrow_mut();
+                    if let Some(app) = app_ref.as_mut() {
+                        cx.with_vm(|vm| {
+                            let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                            <$app as $crate::ScriptApply>::script_apply(
+                                app,
+                                vm,
+                                &$crate::Apply::Reload,
+                                &mut $crate::Scope::empty(),
+                                value,
+                            );
+                        });
+                    }
+                }
+                if let Some(app) = &mut *app.borrow_mut() {
+                    <dyn AppMain>::handle_event(app, cx, event);
+                }
+            })));
             let studio_http = $crate::resolve_studio_http();
             cx.init_websockets(&studio_http);
             cx.init_cx_os();
@@ -429,6 +348,12 @@ macro_rules! app_main {
         #[cfg(target_arch = "wasm32")]
         pub unsafe extern "C" fn wasm_process_msg(msg_ptr: u32, cx_ptr: u32) -> u32 {
             let cx = &mut *(cx_ptr as *mut Cx);
+            // Lazy-init the Script VM on the first event pump. This runs AFTER
+            // wasm_create_app() has returned and Chrome's event loop has yielded,
+            // avoiding the main-thread hang for large WASM binaries.
+            if cx.script_vm.is_none() {
+                cx.init_script_vm();
+            }
             cx.process_to_wasm(msg_ptr)
         }
 

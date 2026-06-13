@@ -23,12 +23,6 @@ pub struct GatewayHandle {
     pub http_thread: JoinHandle<()>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AppConnectInfo {
-    build_id: Option<QueryId>,
-    crate_name: Option<String>,
-}
-
 fn studio_hub_debug_enabled() -> bool {
     env::var_os("MAKEPAD_STUDIO_HUB_DEBUG").is_some()
 }
@@ -55,17 +49,10 @@ pub fn start_http_gateway(
                     headers,
                     response_sender,
                 } => {
-                    let request_path = if let Some(search) =
-                        headers.search.as_ref().filter(|search| !search.is_empty())
-                    {
-                        format!("{}?{}", headers.path, search)
-                    } else {
-                        headers.path.clone()
-                    };
                     if studio_hub_debug_enabled() {
                         eprintln!(
                             "studio hub debug: websocket connect id={} path={}",
-                            web_socket_id, request_path
+                            web_socket_id, headers.path
                         );
                     }
                     if headers.path == "/ui" {
@@ -83,19 +70,16 @@ pub fn start_http_gateway(
                         });
                         continue;
                     }
-                    if let Some(app_connect) = parse_app_path(&request_path) {
+                    if let Some(build_id) = parse_app_path(&headers.path) {
                         if studio_hub_debug_enabled() {
                             eprintln!(
-                                "studio hub debug: websocket id={} accepted as app build={:?} crate={:?}",
-                                web_socket_id,
-                                app_connect.build_id.map(|id| id.0),
-                                app_connect.crate_name
+                                "studio hub debug: websocket id={} accepted as app build={}",
+                                web_socket_id, build_id.0
                             );
                         }
                         socket_roles.insert(web_socket_id, SocketRole::App);
                         let _ = event_tx.send(HubEvent::AppConnected {
-                            build_id: app_connect.build_id,
-                            crate_name: app_connect.crate_name,
+                            build_id,
                             web_socket_id: web_socket_id,
                             sender: response_sender,
                         });
@@ -118,12 +102,12 @@ pub fn start_http_gateway(
                     if studio_hub_debug_enabled() {
                         eprintln!(
                             "studio hub debug: websocket id={} rejected path={}",
-                            web_socket_id, request_path
+                            web_socket_id, headers.path
                         );
                     }
                     let _ = response_sender.send(
                         HubToClient::Error {
-                            message: format!("invalid websocket path: {}", request_path),
+                            message: format!("invalid websocket path: {}", headers.path),
                         }
                         .serialize_bin(),
                     );
@@ -223,60 +207,17 @@ pub fn start_http_gateway(
     })
 }
 
-fn parse_app_path(path: &str) -> Option<AppConnectInfo> {
-    if let Some(rest) = path.strip_prefix("/app/") {
-        if rest.is_empty() || rest.contains('/') {
-            return None;
-        }
-        let Ok(id) = rest.parse::<u64>() else {
-            return None;
-        };
-        return Some(AppConnectInfo {
-            build_id: Some(QueryId(id)),
-            crate_name: None,
-        });
-    }
-
-    let (route, query) = path.split_once('?').unwrap_or((path, ""));
-    if route != "/app" {
+fn parse_app_path(path: &str) -> Option<QueryId> {
+    let Some(rest) = path.strip_prefix("/app/") else {
+        return None;
+    };
+    if rest.is_empty() || rest.contains('/') {
         return None;
     }
-
-    let mut build_id = None;
-    let mut crate_name = None;
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        let value = value.trim();
-        match key {
-            "build" => {
-                if value.is_empty() {
-                    continue;
-                }
-                let Ok(id) = value.parse::<u64>() else {
-                    return None;
-                };
-                build_id = Some(QueryId(id));
-            }
-            "crate" => {
-                if !value.is_empty() {
-                    crate_name = Some(value.to_string());
-                }
-            }
-            _ => {}
-        }
+    if let Ok(id) = rest.parse::<u64>() {
+        return Some(QueryId(id));
     }
-
-    if build_id.is_none() && crate_name.is_none() {
-        return None;
-    }
-
-    Some(AppConnectInfo {
-        build_id,
-        crate_name,
-    })
+    None
 }
 
 #[cfg(test)]
@@ -285,27 +226,7 @@ mod tests {
 
     #[test]
     fn parse_clean_app_path() {
-        assert_eq!(
-            parse_app_path("/app/42"),
-            Some(AppConnectInfo {
-                build_id: Some(QueryId(42)),
-                crate_name: None,
-            })
-        );
-        assert_eq!(
-            parse_app_path("/app?build=42&crate=makepad-example-xr"),
-            Some(AppConnectInfo {
-                build_id: Some(QueryId(42)),
-                crate_name: Some("makepad-example-xr".to_string()),
-            })
-        );
-        assert_eq!(
-            parse_app_path("/app?crate=makepad-example-xr"),
-            Some(AppConnectInfo {
-                build_id: None,
-                crate_name: Some("makepad-example-xr".to_string()),
-            })
-        );
+        assert_eq!(parse_app_path("/app/42"), Some(QueryId(42)));
     }
 
     #[test]
@@ -313,11 +234,6 @@ mod tests {
         assert_eq!(parse_app_path("/app/"), None);
         assert_eq!(parse_app_path("/app/not-a-number"), None);
         assert_eq!(parse_app_path("/app/77/extra"), None);
-        assert_eq!(parse_app_path("/app"), None);
-        assert_eq!(
-            parse_app_path("/app?build=nope&crate=makepad-example-xr"),
-            None
-        );
         assert_eq!(parse_app_path("/ui"), None);
     }
 }

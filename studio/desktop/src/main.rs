@@ -1,4 +1,3 @@
-pub mod ai_manager;
 pub mod app_data;
 pub mod app_ui;
 pub mod desktop_code_editor;
@@ -140,12 +139,6 @@ pub struct App {
     pub bottom_panel_animation: Option<BottomPanelAnimation>,
     #[rust]
     pub bottom_panel_animation_next_frame: NextFrame,
-    #[rust]
-    pub ai_chat_scroll_pending: bool,
-    #[rust]
-    pub ai_chat_scroll_next_frame: NextFrame,
-    #[rust]
-    pub ai_chat_scroll_frames_remaining: u8,
 }
 
 impl MatchEvent for App {
@@ -156,7 +149,6 @@ impl MatchEvent for App {
         for mount in self.data.mounts.keys().cloned().collect::<Vec<_>>() {
             self.sync_run_preview_splitter(cx, &mount);
         }
-        self.init_ai_manager(cx);
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
@@ -196,41 +188,6 @@ impl MatchEvent for App {
                 {
                     self.queue_mount_file_filter(cx, &active_mount, filter);
                 }
-                if let Some(index) = workspace
-                    .drop_down(cx, ids!(ai_agent_dropdown))
-                    .selected(actions)
-                {
-                    self.select_ai_manager_agent(&active_mount, index);
-                }
-                if workspace.button(cx, ids!(ai_new_button)).clicked(actions) {
-                    self.create_ai_manager_agent(&active_mount);
-                }
-                if workspace
-                    .button(cx, ids!(ai_delete_button))
-                    .clicked(actions)
-                {
-                    self.delete_ai_manager_agent(&active_mount);
-                }
-                if workspace.button(cx, ids!(ai_run_button)).clicked(actions) {
-                    if self.active_ai_agent_is_pending_for_mount(&active_mount) {
-                        self.cancel_ai_manager_prompt(&active_mount);
-                    } else {
-                        self.send_ai_manager_prompt(cx, &active_mount);
-                    }
-                }
-                if workspace
-                    .text_input(cx, ids!(ai_prompt_input))
-                    .escaped(actions)
-                {
-                    self.cancel_ai_manager_prompt(&active_mount);
-                }
-                if workspace
-                    .text_input(cx, ids!(ai_prompt_input))
-                    .returned(actions)
-                    .is_some()
-                {
-                    self.send_ai_manager_prompt(cx, &active_mount);
-                }
                 if let Some((mount, name)) = workspace
                     .desktop_run_list(cx, ids!(run_list))
                     .run_requested(actions)
@@ -253,11 +210,9 @@ impl MatchEvent for App {
                         .map(|state| state.log_tail)
                         .unwrap_or(true);
                     if was_tailing {
-                        workspace.check_box(cx, ids!(log_tail_toggle)).set_active(
-                            cx,
-                            false,
-                            Animate::Yes,
-                        );
+                        workspace
+                            .check_box(cx, ids!(log_tail_toggle))
+                            .set_active(cx, false);
                         self.set_mount_log_tail(cx, &active_mount, false);
                     }
                 }
@@ -282,14 +237,6 @@ impl MatchEvent for App {
                 {
                     self.open_profiler_for_mount(cx, &active_mount);
                 }
-                if workspace
-                    .button(cx, ids!(terminal_add_button))
-                    .clicked(actions)
-                {
-                    self.select_bottom_terminal_panel(cx, &active_mount);
-                    self.reveal_bottom_terminal_panel(cx, &active_mount);
-                    self.create_new_terminal_tab(cx, &active_mount);
-                }
             }
         }
 
@@ -304,11 +251,11 @@ impl MatchEvent for App {
                     DockAction::TabWasPressed(tab_id) => {
                         if let Some(mount) = self.data.tab_to_mount.get(&tab_id).cloned() {
                             self.select_mount(cx, &mount);
-                        } else if tab_id == id!(ai_tab) {
+                        } else if tab_id == id!(terminal_add) {
                             if let Some(mount) = self.data.active_mount.clone() {
-                                self.request_ai_mount_state(&mount);
+                                self.select_bottom_terminal_panel(cx, &mount);
+                                self.create_new_terminal_tab(cx, &mount);
                             }
-                            self.refresh_ai_manager_report(cx);
                         } else {
                             if let Some(state) = self.data.log_tab_state.get(&tab_id) {
                                 self.data
@@ -323,7 +270,7 @@ impl MatchEvent for App {
                                 || self.terminal_tab_mount_path(tab_id).is_some()
                             {
                                 if let Some(mount) = self.data.active_mount.clone() {
-                                    self.reveal_bottom_terminal_panel(cx, &mount);
+                                    self.select_bottom_terminal_panel(cx, &mount);
                                 }
                             }
                             if let Some((_mount, path)) = self.terminal_tab_mount_path(tab_id) {
@@ -336,16 +283,6 @@ impl MatchEvent for App {
                         if self.data.tab_to_mount.contains_key(&tab_id) {
                             continue;
                         }
-                        if tab_id == id!(tree_tab)
-                            || tab_id == id!(run_list_tab)
-                            || tab_id == id!(ai_tab)
-                            || tab_id == id!(editor_first)
-                            || tab_id == id!(run_first)
-                            || tab_id == id!(log_first)
-                            || tab_id == id!(terminal_first)
-                        {
-                            continue;
-                        }
                         if self.data.run_tab_state.contains_key(&tab_id) {
                             self.close_run_tab(cx, tab_id);
                         } else if self.data.log_tab_state.contains_key(&tab_id) {
@@ -354,10 +291,10 @@ impl MatchEvent for App {
                             self.close_profiler_tab(cx, tab_id);
                         } else if self.data.tab_to_path.contains_key(&tab_id) {
                             self.close_editor_tab(cx, tab_id);
-                        } else {
+                        } else if tab_id != id!(terminal_add) {
                             if let Some((mount, _path)) = self.terminal_tab_mount_path(tab_id) {
                                 self.delete_terminal_tab_file(cx, &mount, tab_id);
-                            } else {
+                            } else if tab_id != id!(terminal_first) {
                                 if let Some(mount) = self.data.active_mount.clone() {
                                     if let Some(dock) = self.mount_workspace_dock(cx, &mount) {
                                         dock.close_tab(cx, tab_id);
@@ -409,13 +346,6 @@ impl AppMain for App {
                 self.flush_queued_mount_file_filter(cx);
             }
         }
-        if let Event::KeyDown(key_event) = event {
-            if key_event.key_code == KeyCode::Escape && self.active_ai_agent_is_pending() {
-                if let Some(active_mount) = self.data.active_mount.clone() {
-                    self.cancel_ai_manager_prompt(&active_mount);
-                }
-            }
-        }
         self.match_event(cx, event);
         self.ui
             .handle_event(cx, event, &mut Scope::with_data(&mut self.data));
@@ -430,11 +360,6 @@ impl AppMain for App {
                 .is_some()
             {
                 self.step_bottom_panel_animation(cx, ne.time);
-            }
-            if self.ai_chat_scroll_pending
-                && self.ai_chat_scroll_next_frame.is_event(event).is_some()
-            {
-                self.flush_ai_chat_scroll_to_bottom(cx);
             }
         }
 

@@ -1480,14 +1480,12 @@ impl ShaderFnCompiler {
                     s,
                 );
             }
-            id!(sample) | id!(sample_as_bgra) | id!(sample_lod) | id!(sample_nearest) => {
+            id!(sample) | id!(sample_as_bgra) | id!(sample_lod) => {
                 // sample(coord) samples the texture at normalized coordinates.
                 // sample_as_bgra(coord) is identical except on WebGL GLSL, where it
                 // applies a BGRA->RGBA swizzle in the sampler helper.
                 let method_name = if method_id == id!(sample_as_bgra) {
                     "sample_as_bgra"
-                } else if method_id == id!(sample_nearest) {
-                    "sample_nearest"
                 } else if method_id == id!(sample_lod) {
                     "sample_lod"
                 } else {
@@ -1513,14 +1511,8 @@ impl ShaderFnCompiler {
                     let lod = args.get(1);
                     let mut s = self.stack.new_string();
 
-                    let sampler = if method_id == id!(sample_nearest) {
-                        ShaderSampler {
-                            filter: SamplerFilter::Nearest,
-                            ..ShaderSampler::default()
-                        }
-                    } else {
-                        ShaderSampler::default()
-                    };
+                    // Get or create the default sampler (linear, clamp_to_edge, normalized)
+                    let sampler = ShaderSampler::default();
                     let sampler_idx = output.get_or_create_sampler(sampler);
 
                     match output.backend {

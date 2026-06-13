@@ -330,12 +330,6 @@ pub struct CxVulkan {
 }
 
 impl CxVulkan {
-    pub(crate) fn has_drawable_surface(&self) -> bool {
-        !self.window.is_null()
-            && self.surface != vk::SurfaceKHR::null()
-            && self.swapchain != vk::SwapchainKHR::null()
-    }
-
     fn geometry_id_is_live(cx: &Cx, geometry_id: GeometryId) -> bool {
         let slot_index = geometry_id.slot_index();
         cx.geometries
@@ -2539,24 +2533,24 @@ impl CxVulkan {
         &mut self,
         cx: &mut Cx,
         draw_pass_id: DrawPassId,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         if self.surface == vk::SurfaceKHR::null() || self.swapchain == vk::SwapchainKHR::null() {
-            return Ok(false);
+            return Ok(());
         }
 
         let draw_list_id = if let Some(id) = cx.passes[draw_pass_id].main_draw_list_id {
             id
         } else {
-            return Ok(false);
+            return Ok(());
         };
 
         let dpi_factor = cx.passes[draw_pass_id].dpi_factor.unwrap_or(1.0);
         let pass_rect = match cx.get_pass_rect(draw_pass_id, dpi_factor) {
             Some(rect) => rect,
-            None => return Ok(false),
+            None => return Ok(()),
         };
         if pass_rect.size.x < 0.5 || pass_rect.size.y < 0.5 {
-            return Ok(false);
+            return Ok(());
         }
 
         {
@@ -2599,11 +2593,11 @@ impl CxVulkan {
             Ok(v) => v,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain()?;
-                return Ok(false);
+                return Ok(());
             }
             Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
                 self.suspend_surface();
-                return Ok(false);
+                return Ok(());
             }
             Err(err) => {
                 return Err(format!("acquire_next_image failed: {err:?}"));
@@ -2860,11 +2854,11 @@ impl CxVulkan {
             Ok(suboptimal) => suboptimal,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain()?;
-                return Ok(false);
+                return Ok(());
             }
             Err(vk::Result::ERROR_SURFACE_LOST_KHR) => {
                 self.suspend_surface();
-                return Ok(false);
+                return Ok(());
             }
             Err(err) => {
                 return Err(format!("queue_present failed: {err:?}"));
@@ -2875,7 +2869,7 @@ impl CxVulkan {
             self.recreate_swapchain()?;
         }
 
-        Ok(true)
+        Ok(())
     }
 
     fn ensure_pass_color_target(
@@ -5300,7 +5294,9 @@ impl CxVulkan {
             return Ok(());
         }
 
-        let force_full_upload = needs_recreate;
+        let force_full_upload = needs_recreate && !matches!(updated, TextureUpdated::Partial(_));
+        let clear_before_partial_upload =
+            needs_recreate && matches!(updated, TextureUpdated::Partial(_));
         let upload = {
             let cxtexture = &cx.textures[texture_id];
             Self::vec_texture_upload(&cxtexture.format, updated, force_full_upload)
@@ -5385,6 +5381,24 @@ impl CxVulkan {
                 &[],
                 &[to_transfer],
             );
+            if clear_before_partial_upload {
+                let clear_value = vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 0.0],
+                };
+                let clear_range = vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(layer_count);
+                self.device.cmd_clear_color_image(
+                    self.command_buffer,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &clear_value,
+                    &[clear_range],
+                );
+            }
             self.device.cmd_copy_buffer_to_image(
                 self.command_buffer,
                 staging.buffer,

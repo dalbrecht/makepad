@@ -21,7 +21,7 @@ script_mod! {
 
         // color: vec4(-1,-1,-1,-1) means "use original SVG colors"
         // Any non-negative color replaces the SVG color, preserving per-vertex alpha.
-        color: vec4(-1.0, -1.0, -1.0, -1.0)
+        color: instance(vec4(-1.0, -1.0, -1.0, -1.0))
 
         // GPU-side transform for cached SVG geometry
         svg_scale: uniform(vec2(1.0, 1.0))
@@ -115,6 +115,8 @@ script_mod! {
         get_color: fn() {
             let base = self.eval_gradient()
             if self.color.x >= 0.0 {
+                // Replace base RGB with the override color, preserving the
+                // vertex alpha (shape mask from tessellation).
                 return vec4(self.color.rgb * self.color.a * base.a, self.color.a * base.a)
             }
             return base
@@ -129,10 +131,8 @@ pub struct DrawSvg {
     pub svg: Option<ScriptHandleRef>,
     #[rust]
     pub svg_doc: Option<SvgDocument>,
-    // The svg handle currently parsed into `svg_doc`,
-    // so we can detect when the svg has been changed and reload it.
     #[rust]
-    loaded_handle: Option<ScriptHandle>,
+    pub svg_loaded: bool,
     // Content bounding box after viewbox transform at 1:1 scale.
     // This is the actual extent of rendered geometry.
     #[rust]
@@ -323,16 +323,16 @@ impl DrawSvg {
     }
 
     fn load_svg(&mut self, cx: &mut Cx) {
-        let current_handle = self.svg.as_ref().map(|h| h.as_handle());
-        // Do nothing if the SVG handle hasn't changed since it was last loaded.
-        if self.loaded_handle == current_handle {
+        if self.svg_loaded {
             return;
         }
 
-        let Some(handle) = current_handle else {
-            self.loaded_handle = None;
+        let Some(ref handle_ref) = self.svg else {
+            self.svg_loaded = true;
             return;
         };
+
+        let handle = handle_ref.as_handle();
 
         let data = if let Some(data) = cx.get_resource(handle) {
             data
@@ -340,13 +340,13 @@ impl DrawSvg {
             cx.load_script_resource(handle);
             match cx.get_resource(handle) {
                 Some(data) => data,
-                // Resource isn't yet available (may be loading via HTTP),
-                // so don't set loaded_handle to ensure we retry on the next draw after data arrives.
+                // Resource not yet available (may be loading via HTTP) - don't
+                // set svg_loaded so we retry on next draw after data arrives.
                 None => return,
             }
         };
 
-        self.loaded_handle = Some(handle);
+        self.svg_loaded = true;
 
         let svg_str = match std::str::from_utf8(&data) {
             Ok(s) => s,
@@ -365,8 +365,7 @@ impl DrawSvg {
         self.set_doc_bounds(&doc);
         self.has_animations = doc.has_animations();
         self.svg_doc = Some(doc);
-        // Loaded from a raw string, so the doc corresponds to no svg handle.
-        self.loaded_handle = None;
+        self.svg_loaded = true;
         self.cache_valid = false;
     }
 

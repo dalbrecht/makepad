@@ -113,7 +113,6 @@ impl Cx {
         Self::stdin_send_to_host(AppToStudio::BeforeStartup);
 
         let mut stdin_windows: Vec<StdinWindow> = Vec::new();
-        self.set_physical_keyboard_state(true);
         self.call_event_handler(&Event::Startup);
         Self::stdin_send_to_host(AppToStudio::AfterStartup);
 
@@ -292,7 +291,6 @@ impl Cx {
                     }
                 }
                 if SignalToUI::check_and_clear_ui_signal() {
-                    self.handle_termination_signal();
                     self.handle_media_signals();
                     self.handle_script_signals();
                     self.call_event_handler(&Event::Signal);

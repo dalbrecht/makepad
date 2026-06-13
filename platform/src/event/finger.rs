@@ -761,12 +761,6 @@ pub enum HitTouch {
 #[derive(Clone, Debug, Default)]
 pub struct HitOptions {
     pub margin: Option<Inset>,
-    /// Hit-test margin to use when the event came from a touch device.
-    /// Falls back to `margin` when `None`. Lets a widget widen its grab area
-    /// for fingers without enlarging the mouse hit zone — useful on hybrid
-    /// devices (e.g. touchscreen Windows/Linux laptops) where compile-time
-    /// platform detection isn't enough.
-    pub touch_margin: Option<Inset>,
     pub sweep_area: Area,
     pub capture_overload: bool,
 }
@@ -788,26 +782,10 @@ impl HitOptions {
             ..self
         }
     }
-    pub fn with_touch_margin(self, margin: Inset) -> Self {
-        Self {
-            touch_margin: Some(margin),
-            ..self
-        }
-    }
     pub fn with_capture_overload(self, capture_overload: bool) -> Self {
         Self {
             capture_overload,
             ..self
-        }
-    }
-
-    /// Returns the margin to apply for a hit-test against `device`.
-    /// Touch devices get `touch_margin` if set; everything else uses `margin`.
-    fn margin_for(&self, device: &DigitDevice) -> Option<Inset> {
-        if device.is_touch() && self.touch_margin.is_some() {
-            self.touch_margin
-        } else {
-            self.margin
         }
     }
 }
@@ -992,16 +970,19 @@ impl Event {
                             }
 
                             let rect = area.clipped_rect(&cx);
-                            // Hit-test against the touch centroid only — do NOT inflate the
-                            // widget rect by `t.radius`. UITouch.majorRadius (and the Android
-                            // equivalent) is the contact area's radius, not a "give me extra
-                            // hit padding" instruction, and inflating by it leads to surprising
-                            // captures: the iOS Simulator reports a `majorRadius` of ~25-40pt
-                            // for mouse-as-touch, which makes every button capture clicks ~30pt
-                            // outside its visible bounds. UIKit/AppKit hit-test on the centroid;
-                            // we match that. Apps that genuinely need a larger hit zone should
-                            // pass it explicitly via `HitOptions::margin`.
-                            if !hit_test(t.abs, &rect, &options.margin_for(&device)) {
+                            // Add touch radius to the margin to account for finger size
+                            let margin_with_radius = if t.radius.x > 0.0 || t.radius.y > 0.0 {
+                                let base_margin = options.margin.unwrap_or_default();
+                                Some(Inset {
+                                    left: base_margin.left + t.radius.x,
+                                    top: base_margin.top + t.radius.y,
+                                    right: base_margin.right + t.radius.x,
+                                    bottom: base_margin.bottom + t.radius.y,
+                                })
+                            } else {
+                                options.margin
+                            };
+                            if !hit_test(t.abs, &rect, &margin_with_radius) {
                                 continue;
                             }
 
@@ -1029,9 +1010,18 @@ impl Event {
                             let tap_count = cx.fingers.tap_count();
                             let rect = area.clipped_rect(&cx);
                             if let Some(capture) = cx.fingers.find_area_capture(area) {
-                                // See the note in TouchState::Start above: hit-test on the
-                                // touch centroid only, without inflating by `t.radius`.
-                                let rect_check = rect.contains(t.abs);
+                                // Check if finger is over the widget using touch radius if available
+                                let rect_check = if t.radius.x > 0.0 || t.radius.y > 0.0 {
+                                    let margin = Inset {
+                                        left: t.radius.x,
+                                        top: t.radius.y,
+                                        right: t.radius.x,
+                                        bottom: t.radius.y,
+                                    };
+                                    Inset::rect_contains_with_inset(t.abs, &rect, &Some(margin))
+                                } else {
+                                    rect.contains(t.abs)
+                                };
 
                                 // Layout shift fallback: also treat as "over" if finger didn't move
                                 // significantly from start (handles keyboard dismissal moving widgets)
@@ -1067,7 +1057,7 @@ impl Event {
                             if !options.sweep_area.is_empty() {
                                 if let Some(capture) = cx.fingers.find_digit_capture(digit_id) {
                                     if capture.switch_capture.is_none()
-                                        && hit_test(t.abs, &rect, &options.margin_for(&device))
+                                        && hit_test(t.abs, &rect, &options.margin)
                                     {
                                         if t.handled.get().is_empty() {
                                             t.handled.set(area);
@@ -1125,7 +1115,6 @@ impl Event {
                                     }
                                 }
                             } else if let Some(capture) = cx.fingers.find_area_capture(area) {
-                                let is_over = hit_test(t.abs, &rect, &options.margin_for(&device));
                                 return Hit::FingerMove(FingerMoveEvent {
                                     window_id: e.window_id,
                                     abs: t.abs,
@@ -1137,7 +1126,7 @@ impl Event {
                                     time: e.time,
                                     abs_start: capture.abs_start,
                                     rect,
-                                    is_over,
+                                    is_over: hit_test(t.abs, &rect, &options.margin),
                                 });
                             }
                         }

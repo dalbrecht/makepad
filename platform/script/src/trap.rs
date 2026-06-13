@@ -14,7 +14,6 @@ pub struct ScriptError {
 #[derive(Debug, Clone, Copy)]
 pub enum ScriptTrapOn {
     Pause,
-    TimeBudgetYield,
     Return(ScriptValue),
     Bail(ScriptValue),
 }

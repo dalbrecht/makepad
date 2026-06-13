@@ -594,13 +594,8 @@ impl Cx {
 
         let pool: ObjcId = unsafe { msg_send![class!(NSAutoreleasePool), new] };
 
-        let render_pass_descriptor: ObjcId = if let DrawPassMode::MTKView(view) = &mode {
-            let descriptor: ObjcId = unsafe { msg_send![*view, currentRenderPassDescriptor] };
-            if descriptor == nil {
-                let () = unsafe { msg_send![pool, release] };
-                return;
-            }
-            descriptor
+        let render_pass_descriptor: ObjcId = if let DrawPassMode::MTKView(view) = mode {
+            unsafe { msg_send![view, currentRenderPassDescriptor] }
         } else {
             unsafe {
                 msg_send![
@@ -627,19 +622,15 @@ impl Cx {
             self.passes[draw_pass_id].set_ortho_matrix(pass_rect.pos, pass_rect.size);
         }
 
+        self.passes[draw_pass_id].paint_dirty = false;
+
         if pass_rect.size.x < 0.5 || pass_rect.size.y < 0.5 {
-            if !matches!(&mode, DrawPassMode::MTKView(_)) {
-                self.passes[draw_pass_id].paint_dirty = false;
-            }
-            let () = unsafe { msg_send![pool, release] };
             return;
         }
 
-        self.passes[draw_pass_id].paint_dirty = false;
-
         self.passes[draw_pass_id].set_dpi_factor(dpi_factor);
 
-        if matches!(&mode, DrawPassMode::MTKView(_)) {
+        if let DrawPassMode::MTKView(_) = mode {
             let color_attachments: ObjcId =
                 unsafe { msg_send![render_pass_descriptor, colorAttachments] };
             let color_attachment: ObjcId =
@@ -1565,6 +1556,9 @@ impl DrawVars {
                 &output,
                 geometry_id,
             );
+            for &(source_obj, _) in &mapping.scope_uniform_sources {
+                vm.bx.heap.set_static(source_obj.into());
+            }
 
             // Fill the scope uniform buffer from current script values
             mapping.fill_scope_uniforms_buffer(&vm.bx.heap, &vm.thread().trap.pass());
@@ -2449,7 +2443,6 @@ impl CglRenderBridge {
         type CGLPixelFormatObj = *mut c_void;
         type CGLContextObj = *mut c_void;
 
-        #[link(name = "OpenGL", kind = "framework")]
         extern "C" {
             fn CGLChoosePixelFormat(
                 attribs: *const u32,
@@ -2515,7 +2508,6 @@ impl CglRenderBridge {
     }
 
     pub fn make_current(&self) {
-        #[link(name = "OpenGL", kind = "framework")]
         extern "C" {
             fn CGLSetCurrentContext(ctx: *mut std::ffi::c_void) -> i32;
         }
@@ -2568,7 +2560,6 @@ impl CglRenderBridge {
         type GlGenTexturesFn = unsafe extern "C" fn(GLsizei, *mut GLuint);
         type GlBindTextureFn = unsafe extern "C" fn(GLenum, GLuint);
 
-        #[link(name = "OpenGL", kind = "framework")]
         extern "C" {
             fn CGLTexImageIOSurface2D(
                 ctx: *mut c_void,

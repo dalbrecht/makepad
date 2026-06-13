@@ -62,7 +62,6 @@ impl WaylandCx {
             custom_window_chrome: true,
         });
         cx.borrow_mut().gpu_info.performance = GpuPerformance::Tier1;
-        cx.borrow_mut().set_physical_keyboard_state(true);
 
         let wayland_cx = Rc::new(RefCell::new(WaylandCx {
             cx: cx.clone(),
@@ -131,8 +130,6 @@ impl WaylandCx {
             }));
         }
         if let EventFlow::Exit = self.handle_platform_ops(state) {
-            let mut cx = self.cx.borrow_mut();
-            cx.call_event_handler(&Event::Shutdown);
             state.event_loop_running = false;
             return EventFlow::Exit;
         }
@@ -178,25 +175,13 @@ impl WaylandCx {
                 // When drawing our own window chrome (no server-side decorations),
                 // populate the chrome buttons bounding box: three buttons right-aligned
                 // at the top of the caption bar, matching the Makepad widget layout.
-                if matches!(
-                    cx.os_type(),
-                    OsType::LinuxWindow(LinuxWindowParams {
-                        custom_window_chrome: true,
-                        ..
-                    })
-                ) {
+                if matches!(cx.os_type(), OsType::LinuxWindow(LinuxWindowParams { custom_window_chrome: true, .. })) {
                     const BUTTONS_W: f64 = 46.0 * 3.0;
                     const BUTTONS_H: f64 = 29.0;
                     let w = re.new_geom.inner_size.x;
                     re.new_geom.window_chrome_buttons = Rect {
-                        pos: Vec2d {
-                            x: w - BUTTONS_W,
-                            y: 0.0,
-                        },
-                        size: Vec2d {
-                            x: BUTTONS_W,
-                            y: BUTTONS_H,
-                        },
+                        pos: Vec2d { x: w - BUTTONS_W, y: 0.0 },
+                        size: Vec2d { x: BUTTONS_W, y: BUTTONS_H },
                     };
                 }
 
@@ -205,19 +190,15 @@ impl WaylandCx {
                     .iter_mut()
                     .find(|w| w.window_id == re.window_id)
                 {
-                    {
-                        let cx_window = &mut cx.windows[re.window_id];
-                        cx_window.os_dpi_factor = Some(re.new_geom.dpi_factor);
-                        re.new_geom = cx_window.native_window_geom_to_layout(re.new_geom);
+                    if let Some(dpi_override) = cx.windows[re.window_id].dpi_override {
+                        re.new_geom.inner_size *= re.new_geom.dpi_factor / dpi_override;
+                        re.new_geom.dpi_factor = dpi_override;
                     }
 
                     window.window_geom = re.new_geom.clone();
                     cx.windows[re.window_id].window_geom = re.new_geom.clone();
-                    // Redraw this window root draw list when logical size or
-                    // backing scale changes.
-                    if re.old_geom.inner_size != re.new_geom.inner_size
-                        || re.old_geom.dpi_factor != re.new_geom.dpi_factor
-                    {
+                    // redraw just this windows root draw list
+                    if re.old_geom.inner_size != re.new_geom.inner_size {
                         if let Some(main_pass_id) = cx.windows[re.window_id].main_pass_id {
                             cx.redraw_pass_and_child_passes(main_pass_id);
                         }
@@ -227,16 +208,9 @@ impl WaylandCx {
                     .iter_mut()
                     .find(|w| w.window_id == re.window_id)
                 {
-                    {
-                        let cx_window = &mut cx.windows[re.window_id];
-                        cx_window.os_dpi_factor = Some(re.new_geom.dpi_factor);
-                        re.new_geom = cx_window.native_window_geom_to_layout(re.new_geom);
-                    }
                     window.window_geom = re.new_geom.clone();
                     cx.windows[re.window_id].window_geom = re.new_geom.clone();
-                    if re.old_geom.inner_size != re.new_geom.inner_size
-                        || re.old_geom.dpi_factor != re.new_geom.dpi_factor
-                    {
+                    if re.old_geom.inner_size != re.new_geom.inner_size {
                         if let Some(main_pass_id) = cx.windows[re.window_id].main_pass_id {
                             cx.redraw_pass_and_child_passes(main_pass_id);
                         }
@@ -246,10 +220,29 @@ impl WaylandCx {
                 cx.call_event_handler(&Event::WindowGeomChange(re));
             }
             XlibEvent::WindowClosed(wc) => {
-                if let EventFlow::Exit = self.handle_window_closed(state, wc) {
-                    let mut cx = self.cx.borrow_mut();
-                    cx.call_event_handler(&Event::Shutdown);
-                    return EventFlow::Exit;
+                let window_id = wc.window_id;
+                self.close_popup_children(state, window_id);
+
+                let mut cx = self.cx.borrow_mut();
+                cx.call_event_handler(&Event::WindowClosed(wc));
+                // lets remove the window from the set
+                cx.windows[window_id].is_created = false;
+                if state.pointer_window == Some(window_id) {
+                    state.pointer_window = None;
+                }
+                if state.keyboard_window == Some(window_id) {
+                    state.keyboard_window = None;
+                }
+                if let Some(index) = state.windows.iter().position(|w| w.window_id == window_id) {
+                    state.windows.remove(index);
+                    if state.windows.len() == 0 {
+                        cx.call_event_handler(&Event::Shutdown);
+                        return EventFlow::Exit;
+                    }
+                } else if let Some(index) =
+                    state.popups.iter().position(|w| w.window_id == window_id)
+                {
+                    state.popups.remove(index);
                 }
             }
             XlibEvent::PopupDismissed(event) => {
@@ -272,67 +265,38 @@ impl WaylandCx {
                 // ok here we send out to all our childprocesses
 
                 self.handle_repaint(state);
-
-                // Run script-VM garbage collection at a safe point after paint, matching
-                // the macOS backend. Without this the script object heap grows without
-                // bound: every `eval` / `script_apply_eval!` allocates script objects
-                // that are only reclaimed by `gc()`. `needs_gc()` gates the actual sweep.
-                {
-                    let mut cx = self.cx.borrow_mut();
-                    cx.with_vm(|vm| {
-                        if vm.heap().needs_gc() {
-                            vm.gc();
-                        }
-                    });
-                }
             }
-            XlibEvent::MouseMove(mut e) => {
+            XlibEvent::MouseMove(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.call_event_handler(&Event::MouseMove(e.into()));
                 cx.fingers.cycle_hover_area(live_id!(mouse).into());
                 cx.fingers.switch_captures();
             }
-            XlibEvent::MouseDown(mut e) => {
+            XlibEvent::MouseDown(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.fingers.process_tap_count(e.abs, e.time);
                 cx.fingers.mouse_down(e.button, e.window_id);
                 cx.call_event_handler(&Event::MouseDown(e.into()))
             }
-            XlibEvent::MouseUp(mut e) => {
+            XlibEvent::MouseUp(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 let button = e.button;
                 cx.call_event_handler(&Event::MouseUp(e.into()));
                 cx.fingers.mouse_up(button);
                 cx.fingers.cycle_hover_area(live_id!(mouse).into());
             }
-            XlibEvent::Scroll(mut e) => {
+            XlibEvent::Scroll(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.call_event_handler(&Event::Scroll(e.into()))
             }
-            XlibEvent::WindowDragQuery(mut e) => {
+            XlibEvent::WindowDragQuery(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.call_event_handler(&Event::WindowDragQuery(e))
             }
             XlibEvent::WindowCloseRequested(e) => {
-                let window_id = e.window_id;
-                let accept_close = e.accept_close.clone();
                 let mut cx = self.cx.borrow_mut();
-                cx.call_event_handler(&Event::WindowCloseRequested(e));
-                if accept_close.get() {
-                    drop(cx);
-                    if let EventFlow::Exit =
-                        self.handle_window_closed(state, WindowClosedEvent { window_id })
-                    {
-                        let mut cx = self.cx.borrow_mut();
-                        cx.call_event_handler(&Event::Shutdown);
-                        return EventFlow::Exit;
-                    }
-                }
+                state.windows.retain_mut(|win| win.window_id != e.window_id);
+                cx.call_event_handler(&Event::WindowCloseRequested(e))
             }
             XlibEvent::TextInput(e) => {
                 let mut cx = self.cx.borrow_mut();
@@ -385,7 +349,6 @@ impl WaylandCx {
                 let mut cx = self.cx.borrow_mut();
                 if e.timer_id == 0 {
                     if SignalToUI::check_and_clear_ui_signal() {
-                        cx.handle_termination_signal();
                         cx.handle_media_signals();
                         cx.handle_script_signals();
                         cx.call_event_handler(&Event::Signal);
@@ -487,16 +450,6 @@ impl WaylandCx {
                 }
 
                 cx.run_live_edit_if_needed("linux-wayland");
-                let has_platform_ops = !cx.platform_ops.is_empty();
-                drop(cx);
-                if has_platform_ops {
-                    if let EventFlow::Exit = self.handle_platform_ops(state) {
-                        let mut cx = self.cx.borrow_mut();
-                        cx.call_event_handler(&Event::Shutdown);
-                        state.event_loop_running = false;
-                        return EventFlow::Exit;
-                    }
-                }
                 return EventFlow::Wait;
             }
         }
@@ -545,39 +498,6 @@ impl WaylandCx {
         if let Some(index) = state.popups.iter().position(|w| w.window_id == window_id) {
             state.popups.remove(index);
         }
-    }
-
-    fn handle_window_closed(
-        &self,
-        state: &mut WaylandState,
-        event: WindowClosedEvent,
-    ) -> EventFlow {
-        let window_id = event.window_id;
-        if !state.windows.iter().any(|w| w.window_id == window_id)
-            && !state.popups.iter().any(|w| w.window_id == window_id)
-        {
-            return EventFlow::Poll;
-        }
-        self.close_popup_children(state, window_id);
-
-        let mut cx = self.cx.borrow_mut();
-        cx.call_event_handler(&Event::WindowClosed(event));
-        cx.windows[window_id].is_created = false;
-        if state.pointer_window == Some(window_id) {
-            state.pointer_window = None;
-        }
-        if state.keyboard_window == Some(window_id) {
-            state.keyboard_window = None;
-        }
-        if let Some(index) = state.windows.iter().position(|w| w.window_id == window_id) {
-            state.windows.remove(index);
-            if state.windows.is_empty() {
-                return EventFlow::Exit;
-            }
-        } else if let Some(index) = state.popups.iter().position(|w| w.window_id == window_id) {
-            state.popups.remove(index);
-        }
-        EventFlow::Poll
     }
 
     fn close_popup_children(&self, state: &mut WaylandState, parent_window_id: WindowId) {
@@ -684,9 +604,9 @@ impl WaylandCx {
                     }
                 }
                 CxOsOp::CloseWindow(window_id) => {
-                    drop(cx);
+                    self.close_popup_children(state, window_id);
                     if state.popups.iter().any(|w| w.window_id == window_id) {
-                        self.close_popup_children(state, window_id);
+                        drop(cx);
                         self.close_popup_window(state, window_id, None);
                         cx = self.cx.borrow_mut();
                         if state.windows.is_empty() {
@@ -695,13 +615,15 @@ impl WaylandCx {
                         continue;
                     }
 
-                    if let EventFlow::Exit =
-                        self.handle_window_closed(state, WindowClosedEvent { window_id })
-                    {
-                        ret = EventFlow::Exit;
-                        break;
+                    cx.call_event_handler(&Event::WindowClosed(WindowClosedEvent { window_id }));
+                    let windows = &mut state.windows;
+                    if let Some(index) = windows.iter().position(|w| w.window_id == window_id) {
+                        cx.windows[window_id].is_created = false;
+                        windows.remove(index);
+                        if windows.len() == 0 {
+                            ret = EventFlow::Exit
+                        }
                     }
-                    cx = self.cx.borrow_mut();
                 }
                 CxOsOp::Quit => ret = EventFlow::Exit,
                 CxOsOp::MinimizeWindow(window_id) => {
@@ -729,6 +651,7 @@ impl WaylandCx {
                         window.toplevel.unset_fullscreen();
                     }
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 CxOsOp::ResizeWindow(window_id, size) => {}
                 CxOsOp::RepositionWindow(window_id, size) => {}
                 CxOsOp::SetWindowVisuals(_window_id, visuals) => {
@@ -1095,12 +1018,6 @@ impl WaylandCx {
 
     pub(crate) fn handle_repaint(&self, state: &mut WaylandState) {
         let mut cx = self.cx.borrow_mut();
-        // Skip the eglMakeCurrent + full pass-list scan when there is nothing to draw.
-        // demo_time_repaint forces a redraw of time-animated passes (see
-        // compute_pass_repaint_order), so it must keep us rendering.
-        if !cx.any_passes_dirty() && !cx.demo_time_repaint {
-            return;
-        }
         cx.os.opengl_cx.as_ref().unwrap().make_current();
         let mut passes_todo = Vec::new();
         cx.compute_pass_repaint_order(&mut passes_todo);

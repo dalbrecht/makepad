@@ -85,19 +85,6 @@ extern "C" {
     pub static UIKeyboardAnimationDurationUserInfoKey: ObjcId;
     pub static UIKeyboardAnimationCurveUserInfoKey: ObjcId;
     pub static UITextInputCurrentInputModeDidChangeNotification: ObjcId;
-    pub static UIKeyInputUpArrow: ObjcId;
-    pub static UIKeyInputDownArrow: ObjcId;
-    pub static UIKeyInputLeftArrow: ObjcId;
-    pub static UIKeyInputRightArrow: ObjcId;
-    pub static UITextContentTypePassword: ObjcId;
-    pub static UITextContentTypeNone: ObjcId;
-    pub static UITextContentTypeUsername: ObjcId;
-    pub static UITextContentTypeNewPassword: ObjcId;
-    pub static UITextContentTypeEmailAddress: ObjcId;
-    pub static UITextContentTypeURL: ObjcId;
-    pub static UITextContentTypeFullStreetAddress: ObjcId;
-    pub static UITextContentTypeTelephoneNumber: ObjcId;
-    pub static UITextContentTypeOneTimeCode: ObjcId;
 }
 
 #[cfg(any(target_os = "ios", target_os = "tvos"))]
@@ -1771,8 +1758,9 @@ pub type IOHIDElementRef = *mut c_void;
 pub type IOHIDReportType = u32;
 
 #[cfg(target_os = "macos")]
-pub type IOHIDCallback =
-    Option<unsafe extern "C" fn(context: *mut c_void, result: IOReturn, sender: *mut c_void)>;
+pub type IOHIDCallback = Option<
+    unsafe extern "C" fn(context: *mut c_void, result: IOReturn, sender: *mut c_void),
+>;
 #[cfg(target_os = "macos")]
 pub type IOHIDDeviceCallback = Option<
     unsafe extern "C" fn(
@@ -1872,7 +1860,11 @@ extern "C" {
         theType: i32,
         valuePtr: *const c_void,
     ) -> CFNumberRef;
-    pub fn CFNumberGetValue(number: CFNumberRef, theType: i32, valuePtr: *mut c_void) -> Boolean;
+    pub fn CFNumberGetValue(
+        number: CFNumberRef,
+        theType: i32,
+        valuePtr: *mut c_void,
+    ) -> Boolean;
     pub fn CFStringCreateWithBytes(
         alloc: CFAllocatorRef,
         bytes: *const u8,
@@ -1891,7 +1883,10 @@ extern "C" {
 #[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
-    pub fn IOHIDManagerCreate(allocator: CFAllocatorRef, options: IOOptionBits) -> IOHIDManagerRef;
+    pub fn IOHIDManagerCreate(
+        allocator: CFAllocatorRef,
+        options: IOOptionBits,
+    ) -> IOHIDManagerRef;
     pub fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: IOOptionBits) -> IOReturn;
     pub fn IOHIDManagerClose(manager: IOHIDManagerRef, options: IOOptionBits) -> IOReturn;
     pub fn IOHIDManagerScheduleWithRunLoop(
@@ -1904,7 +1899,10 @@ extern "C" {
         run_loop: CFRunLoopRef,
         run_loop_mode: CFStringRef,
     );
-    pub fn IOHIDManagerSetDeviceMatchingMultiple(manager: IOHIDManagerRef, multiple: CFArrayRef);
+    pub fn IOHIDManagerSetDeviceMatchingMultiple(
+        manager: IOHIDManagerRef,
+        multiple: CFArrayRef,
+    );
     pub fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) -> CFSetRef;
     pub fn IOHIDManagerRegisterDeviceMatchingCallback(
         manager: IOHIDManagerRef,

@@ -227,26 +227,21 @@ impl XlibApp {
                 x11_sys::DestroyNotify => {
                     // our window got destroyed
                     let destroy_window = event.xdestroywindow;
-                    if let Some(window_ptr) = self.window_map.remove(&destroy_window.window) {
-                        let window = &mut (*window_ptr);
+                    if let Some(window_ptr) = self.window_map.get(&destroy_window.window) {
+                        let window = &mut (**window_ptr);
                         if self.active_popup == Some(destroy_window.window) {
                             self.release_popup_grab(destroy_window.window);
                         }
-                        window.window = None;
-                        let window_id = window.window_id;
                         window.do_callback(XlibEvent::WindowClosed(WindowClosedEvent {
-                            window_id,
+                            window_id: window.window_id,
                         }));
-                        if !self.event_loop_running {
-                            return;
-                        }
                     }
                 }
                 x11_sys::ConfigureNotify => {
                     let cfg = event.xconfigure;
                     if let Some(window_ptr) = self.window_map.get(&cfg.window) {
                         let window = &mut (**window_ptr);
-                        if window.window == Some(cfg.window) {
+                        if cfg.window == window.window.unwrap() {
                             window.send_change_event();
                         }
                     }
@@ -642,21 +637,10 @@ impl XlibApp {
                 }
                 x11_sys::ClientMessage => {
                     let event = event.xclient;
-                    if event.message_type == self.atoms.wm_protocols
-                        && event.data.l[0] as c_ulong == self.atoms.wm_delete_window
-                    {
-                        if let Some(window_ptr) = self.window_map.get(&event.window).copied() {
-                            let window = &mut (*window_ptr);
-                            let window_id = window.window_id;
-                            if window.send_close_requested_event() {
-                                window.close_window();
-                                window.do_callback(XlibEvent::WindowClosed(WindowClosedEvent {
-                                    window_id,
-                                }));
-                                if !self.event_loop_running {
-                                    return;
-                                }
-                            }
+                    if event.message_type == self.atoms.wm_protocols {
+                        if let Some(window_ptr) = self.window_map.get(&event.window) {
+                            let window = &mut (**window_ptr);
+                            window.close_window();
                         }
                     }
                     if event.message_type == self.dnd.atoms.enter {
@@ -721,9 +705,7 @@ impl XlibApp {
                 _ => {}
             }
         }
-        if self.event_loop_running && !self.display.is_null() {
-            self.do_callback(XlibEvent::Paint);
-        }
+        self.do_callback(XlibEvent::Paint);
     }
 
     pub fn event_loop(&mut self) {
@@ -1069,16 +1051,15 @@ impl XlibApp {
             x11_sys::XK_F12 => KeyCode::F12,
 
             x11_sys::XK_Print => KeyCode::PrintScreen,
-            x11_sys::XK_Home | x11_sys::XK_KP_Home => KeyCode::Home,
-            x11_sys::XK_Page_Up | x11_sys::XK_KP_Page_Up => KeyCode::PageUp,
-            x11_sys::XK_Delete | x11_sys::XK_KP_Delete => KeyCode::Delete,
-            x11_sys::XK_End | x11_sys::XK_KP_End => KeyCode::End,
-            x11_sys::XK_Page_Down | x11_sys::XK_KP_Page_Down => KeyCode::PageDown,
-            x11_sys::XK_Left | x11_sys::XK_KP_Left => KeyCode::ArrowLeft,
-            x11_sys::XK_Right | x11_sys::XK_KP_Right => KeyCode::ArrowRight,
-            x11_sys::XK_Down | x11_sys::XK_KP_Down => KeyCode::ArrowDown,
-            x11_sys::XK_Up | x11_sys::XK_KP_Up => KeyCode::ArrowUp,
-            x11_sys::XK_Insert | x11_sys::XK_KP_Insert => KeyCode::Insert,
+            x11_sys::XK_Home => KeyCode::Home,
+            x11_sys::XK_Page_Up => KeyCode::PageUp,
+            x11_sys::XK_Delete => KeyCode::Delete,
+            x11_sys::XK_End => KeyCode::End,
+            x11_sys::XK_Page_Down => KeyCode::PageDown,
+            x11_sys::XK_Left => KeyCode::ArrowLeft,
+            x11_sys::XK_Right => KeyCode::ArrowRight,
+            x11_sys::XK_Down => KeyCode::ArrowDown,
+            x11_sys::XK_Up => KeyCode::ArrowUp,
             _ => KeyCode::Unknown,
         }
     }

@@ -30,11 +30,7 @@ impl SelectTimers {
         let mut fds = mem::MaybeUninit::uninit();
         unsafe {
             libc_sys::FD_ZERO(fds.as_mut_ptr());
-            // NOTE: do NOT add stdin (fd 0) to the read set here.
-            //       Only X11 & Wayland event loops call this, and neither read stdin.
-            //       Only makepad-studio does that, but it doesn't use this function.
-            //       If we leave this here, it locks one CPU core to 100% when stdin is `/dev/null`,
-            //       which occurs any time an app is run from a DE/WM and not a terminal
+            libc_sys::FD_SET(0, fds.as_mut_ptr());
             libc_sys::FD_SET(fd, fds.as_mut_ptr());
         }
         //libc_sys::FD_SET(self.signal_fds[0], fds.as_mut_ptr());
@@ -85,11 +81,8 @@ impl SelectTimers {
             let timer = *self.timers.front().unwrap();
             select_time_used -= timer.delta_timeout;
 
-            // Remove the fired timer directly from the front of the queue.
-            // We intentionally do NOT use `stop_timer` here because `select_time_used`
-            // already accounts for the removed timer's delta — using `stop_timer` would
-            // double-count it by also adding the delta to the successor.
-            self.timers.pop_front();
+            // Stop the timer to remove it from the list.
+            self.stop_timer(timer.id);
             // If the timer is repeating, simply start it again.
             if timer.repeats {
                 self.start_timer(timer.id, timer.timeout, timer.repeats);
@@ -162,14 +155,8 @@ impl SelectTimers {
             return;
         };
 
-        // When removing a timer that has a successor, the successor's `delta_timeout` must be
-        // adjusted to account for the removed timer's delta, since deltas are relative to the
-        // predecessor in the queue.
-        let removed_delta = self.timers[index].delta_timeout;
-        if index + 1 < self.timers.len() {
-            self.timers[index + 1].delta_timeout += removed_delta;
-        }
-
+        // Remove the timer from the list.
+        // The timer being removed is always the first one in the queue, so it can just be removed directly.
         self.timers.remove(index);
     }
 }

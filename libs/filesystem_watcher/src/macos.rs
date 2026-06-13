@@ -5,7 +5,6 @@ use std::os::raw::{c_char, c_double};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
@@ -189,17 +188,10 @@ impl PlatformWatcher {
         let stop = Arc::new(AtomicBool::new(false));
         let run_loop_thread = Arc::clone(&run_loop);
         let stop_thread = Arc::clone(&stop);
-        let (ready_tx, ready_rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("fswatch-macos".to_string())
-            .spawn(move || {
-                run_loop_thread_main(roots, on_event, run_loop_thread, stop_thread, ready_tx)
-            })
+            .spawn(move || run_loop_thread_main(roots, on_event, run_loop_thread, stop_thread))
             .map_err(|err| format!("failed to spawn macos watcher thread: {}", err))?;
-
-        ready_rx
-            .recv()
-            .map_err(|_| "macos watcher thread exited before initialization".to_string())?;
 
         Ok(Self {
             run_loop,
@@ -227,7 +219,6 @@ fn run_loop_thread_main(
     on_event: WatchCallback,
     run_loop_slot: Arc<Mutex<usize>>,
     stop: Arc<AtomicBool>,
-    ready_tx: mpsc::Sender<()>,
 ) {
     let run_loop = unsafe { CFRunLoopGetCurrent() };
     if let Ok(mut slot) = run_loop_slot.lock() {
@@ -316,12 +307,10 @@ fn run_loop_thread_main(
     }
 
     if !streams.is_empty() {
-        let _ = ready_tx.send(());
         unsafe {
             CFRunLoopRun();
         }
     } else {
-        let _ = ready_tx.send(());
         poll_loop(roots_for_poll, on_event, stop);
     }
 

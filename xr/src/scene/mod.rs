@@ -4,17 +4,12 @@ mod xr_gesture;
 pub mod xr_node;
 pub mod xr_permissions_flow;
 pub mod xr_root;
-pub mod xr_scene_view;
 pub mod xr_select;
 pub mod xr_shared_object_sync;
 pub mod xr_view;
 
 pub mod xr_peer_sync {
     pub use crate::sync::xr_peer_sync::*;
-}
-
-pub mod xr_scene_sync_controller {
-    pub use crate::sync::xr_scene_sync_controller::*;
 }
 
 pub(crate) use xr_gesture::{
@@ -24,7 +19,6 @@ pub(crate) use xr_gesture::{
 
 pub use crate::net::{XrActivityId, XrSpawnableObjectId};
 pub use crate::sync::xr_peer_sync::{XrPeerSync, XrPeerSyncAction};
-pub use crate::sync::xr_scene_sync_controller::XrSceneSyncController;
 pub use xr_body_spawn::{XrBodyDrive, XrBodyImpulse, XrBodySpawn, XrBodyWrench, XrCarControl};
 pub use xr_env::{DrawDepthMeshBasic, XrEnv};
 pub use xr_node::{
@@ -37,7 +31,6 @@ pub use xr_node::{
 };
 pub use xr_permissions_flow::XrPermissionsFlow;
 pub use xr_root::{XrCamera, XrRoot, XrRootAction};
-pub use xr_scene_view::{DrawXrSceneTexture, XrSceneView};
 pub use xr_select::{XrSelect, XrSelectAction};
 pub use xr_shared_object_sync::{
     collect_scene_spawnable_objects, XrLocalSharedObjectSnapshot, XrRemoteSharedObjectSnapshot,

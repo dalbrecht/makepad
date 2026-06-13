@@ -43,10 +43,10 @@ use {
                     WindowsAndMessaging::{
                         DispatchMessageW, GetMessageW, IsGUIThread, IsProcessDPIAware, KillTimer,
                         LoadCursorW, LoadIconW, PeekMessageW, RegisterClassExW, SetCursor,
-                        SetTimer, ShowCursor, TranslateMessage, CS_OWNDC, HICON, IDC_ARROW,
-                        IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO, IDC_SIZEALL,
-                        IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDI_WINLOGO, PM_REMOVE,
-                        WM_QUIT, WNDCLASSEXW,
+                        SetTimer, ShowCursor, TranslateMessage, CS_HREDRAW, CS_OWNDC, CS_VREDRAW,
+                        HICON, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_HELP, IDC_IBEAM, IDC_NO,
+                        IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+                        IDI_WINLOGO, PM_REMOVE, WM_QUIT, WNDCLASSEXW,
                     },
                 },
             },
@@ -155,7 +155,7 @@ impl Win32App {
         let (hicon_big, hicon_small) = Self::create_default_icons();
         let class = WNDCLASSEXW {
             cbSize: mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_OWNDC,
+            style: CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
             lpfnWndProc: Some(Win32Window::window_class_proc),
             hInstance: unsafe { GetModuleHandleW(None).unwrap().into() },
             hIcon: hicon_big,
@@ -238,28 +238,22 @@ impl Win32App {
         }
     }
 
+    /// Create big/small default icons for the window class.
     fn create_default_icons() -> (HICON, HICON) {
         let icon = crate::app_icon::window_icon();
 
         let pick = |target: u32| icon.buffers.iter().min_by_key(|b| b.width.abs_diff(target));
 
-        let load_exe_or_default = || unsafe {
-            let from_exe = GetModuleHandleW(None).ok().and_then(
-                |h| LoadIconW(Some(h.into()), PCWSTR(1 as *const u16)).ok()
-            );
-            from_exe.unwrap_or_else(|| LoadIconW(None, IDI_WINLOGO).unwrap())
-        };
-
         let big = if let Some(buf) = pick(64).or_else(|| icon.buffers.first()) {
             Self::create_icon_from_rgba(buf.width, buf.height, &buf.data)
         } else {
-            load_exe_or_default()
+            unsafe { LoadIconW(None, IDI_WINLOGO).unwrap() }
         };
 
         let small = if let Some(buf) = pick(32).or_else(|| icon.buffers.first()) {
             Self::create_icon_from_rgba(buf.width, buf.height, &buf.data)
         } else {
-            load_exe_or_default()
+            unsafe { LoadIconW(None, IDI_WINLOGO).unwrap() }
         };
 
         (big, small)

@@ -43,12 +43,10 @@ impl WaylandApp {
                     let time = self.time_now();
                     self.state.timers.update_timers(&mut timer_ids);
                     for timer_id in &timer_ids {
-                        if !self.state.handle_key_repeat_timer(*timer_id) {
-                            self.do_callback(XlibEvent::Timer(TimerEvent {
-                                timer_id: *timer_id,
-                                time: Some(time),
-                            }));
-                        }
+                        self.do_callback(XlibEvent::Timer(TimerEvent {
+                            timer_id: *timer_id,
+                            time: Some(time),
+                        }));
                     }
                     if let Some(guard) = self.event_queue.prepare_read() {
                         self.state.timers.select(guard.connection_fd().as_raw_fd());
@@ -59,12 +57,10 @@ impl WaylandApp {
                     let time = self.time_now();
                     self.state.timers.update_timers(&mut timer_ids);
                     for timer_id in &timer_ids {
-                        if !self.state.handle_key_repeat_timer(*timer_id) {
-                            self.do_callback(XlibEvent::Timer(TimerEvent {
-                                timer_id: *timer_id,
-                                time: Some(time),
-                            }));
-                        }
+                        self.do_callback(XlibEvent::Timer(TimerEvent {
+                            timer_id: *timer_id,
+                            time: Some(time),
+                        }));
                     }
                     self.event_loop_poll();
                 }

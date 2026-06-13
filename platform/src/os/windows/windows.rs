@@ -46,7 +46,6 @@ impl Cx {
         // hack: store ID3D11Device in CxOs, so texture-related operations become possible on the makepad/studio side, yet don't completely destroy the code there
         cx.borrow_mut().os.d3d11_device = Some(d3d11_cx.borrow().device.clone());
 
-        cx.borrow_mut().set_physical_keyboard_state(true);
         if crate::app_main::should_run_stdin_loop_from_env() {
             let mut cx = cx.borrow_mut();
             cx.in_makepad_studio = true;
@@ -80,7 +79,6 @@ impl Cx {
         d3d11_windows: &mut Vec<D3d11Window>,
     ) -> EventFlow {
         if let EventFlow::Exit = self.handle_platform_ops(d3d11_windows, d3d11_cx) {
-            self.call_event_handler(&Event::Shutdown);
             return EventFlow::Exit;
         }
 
@@ -127,10 +125,9 @@ impl Cx {
                     .iter_mut()
                     .find(|w| w.window_id == re.window_id)
                 {
-                    {
-                        let cx_window = &mut self.windows[re.window_id];
-                        cx_window.os_dpi_factor = Some(re.new_geom.dpi_factor);
-                        re.new_geom = cx_window.native_window_geom_to_layout(re.new_geom);
+                    if let Some(dpi_override) = self.windows[re.window_id].dpi_override {
+                        re.new_geom.inner_size *= re.new_geom.dpi_factor / dpi_override;
+                        re.new_geom.dpi_factor = dpi_override;
                     }
 
                     window.window_geom = re.new_geom.clone();
@@ -262,50 +259,30 @@ impl Cx {
                 // ok here we send out to all our childprocesses
 
                 self.handle_repaint(d3d11_windows, d3d11_cx);
-
-                // Run script-VM garbage collection at a safe point after paint, matching
-                // the macOS backend, so the script object heap doesn't grow without bound:
-                // every `eval` / `script_apply_eval!` allocates script objects that are
-                // only reclaimed by `gc()`. `needs_gc()` gates the actual sweep.
-                self.with_vm(|vm| {
-                    if vm.heap().needs_gc() {
-                        vm.gc();
-                    }
-                });
             }
-            Win32Event::MouseDown(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
+            Win32Event::MouseDown(e) => {
                 self.fingers.process_tap_count(e.abs, e.time);
                 self.fingers.mouse_down(e.button, e.window_id);
                 self.call_event_handler(&Event::MouseDown(e.into()))
             }
-            Win32Event::MouseMove(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
+            Win32Event::MouseMove(e) => {
                 self.call_event_handler(&Event::MouseMove(e.into()));
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
                 self.fingers.switch_captures();
             }
-            Win32Event::MouseUp(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
+            Win32Event::MouseUp(e) => {
                 let button = e.button;
                 self.call_event_handler(&Event::MouseUp(e.into()));
                 self.fingers.mouse_up(button);
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
             }
-            Win32Event::MouseLeave(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
+            Win32Event::MouseLeave(e) => {
                 self.call_event_handler(&Event::MouseLeave(e.into()));
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
                 self.fingers.switch_captures();
             }
-            Win32Event::Scroll(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
-                self.call_event_handler(&Event::Scroll(e.into()))
-            }
-            Win32Event::WindowDragQuery(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
-                self.call_event_handler(&Event::WindowDragQuery(e))
-            }
+            Win32Event::Scroll(e) => self.call_event_handler(&Event::Scroll(e.into())),
+            Win32Event::WindowDragQuery(e) => self.call_event_handler(&Event::WindowDragQuery(e)),
             Win32Event::WindowCloseRequested(e) => {
                 self.call_event_handler(&Event::WindowCloseRequested(e))
             }
@@ -346,7 +323,6 @@ impl Cx {
             }
             Win32Event::Signal => {
                 if SignalToUI::check_and_clear_ui_signal() {
-                    self.handle_termination_signal();
                     self.handle_media_signals();
                     self.handle_script_signals();
                     self.call_event_handler(&Event::Signal);
@@ -359,14 +335,7 @@ impl Cx {
                 self.run_live_edit_if_needed("windows");
                 self.handle_networking_events();
 
-                // The recursive Paint pass drains `platform_ops` (e.g. a `CxOsOp::Quit`
-                // pushed by `handle_termination_signal` above). Propagate its `Exit` so
-                // that Ctrl+C/SIGTERM actually terminates the process.
-                if let EventFlow::Exit =
-                    self.win32_event_callback(Win32Event::Paint, d3d11_cx, d3d11_windows)
-                {
-                    return EventFlow::Exit;
-                }
+                self.win32_event_callback(Win32Event::Paint, d3d11_cx, d3d11_windows);
 
                 return EventFlow::Wait;
             }
@@ -400,9 +369,6 @@ impl Cx {
                         d3d11_windows.iter_mut().find(|w| w.window_id == window_id)
                     {
                         //let dpi_factor = window.window_geom.dpi_factor;
-                        if window.is_in_resize {
-                            window.sync_background_color(self.passes[*draw_pass_id].clear_color);
-                        }
                         window.resize_buffers(&d3d11_cx);
                         self.draw_pass_to_window(*draw_pass_id, false, window, d3d11_cx);
                     }
@@ -528,6 +494,7 @@ impl Cx {
                         d3d11_windows[index].win32_window.close_window();
                         d3d11_windows.remove(index);
                         if d3d11_windows.len() == 0 {
+                            self.call_event_handler(&Event::Shutdown);
                             ret = EventFlow::Exit
                         }
                     }
@@ -571,6 +538,7 @@ impl Cx {
                         window.win32_window.restore();
                     }
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 CxOsOp::Quit => ret = EventFlow::Exit,
                 CxOsOp::SetTopmost(window_id, is_topmost) => {
                     if d3d11_windows.len() == 0 {
@@ -623,8 +591,6 @@ impl Cx {
                 }
                 CxOsOp::ShowTextIME(area, pos, _config) => {
                     let pos = area.clipped_rect(self).pos + pos;
-                    let window_id = self.get_window_id_of(&area).unwrap_or(CxWindowPool::id_zero());
-                    let pos = self.windows[window_id].layout_vec2d_to_native_points(pos);
                     d3d11_windows.iter_mut().for_each(|w| {
                         w.win32_window.set_ime_active(true);
                         w.win32_window.set_ime_spot(pos);
@@ -832,10 +798,15 @@ impl CxGameInputApi for Cx {
 impl CxOsApi for Cx {
     fn init_cx_os(&mut self) {
         self.os.start_time = Some(Instant::now());
-        if let Some(item) = std::option_env!("MAKEPAD_PACKAGE_DIR") {
-            self.package_root = Some(item.to_string());
+        if let Some(_item) = std::option_env!("MAKEPAD_PACKAGE_DIR") {
+            //    self.live_registry.borrow_mut().package_root = Some(item.to_string());
         }
 
+        //self.live_expand();
+        //if std::env::args().find( | v | v == "--stdin-loop").is_none() {
+        //    self.start_disk_live_file_watcher(100);
+        //}
+        //self.live_scan_dependencies();
         self.native_load_dependencies();
 
         self.os.windows_game_input = Some(WindowsGameInput::init());
@@ -867,5 +838,4 @@ pub struct CxOs {
     pub(crate) game_input_events: GameInputEventChannel,
     pub(crate) windows_game_input: Option<WindowsGameInput>,
     pub(crate) video_players: HashMap<LiveId, WindowsUnifiedVideoPlayer>,
-    pub(crate) async_hlsl_compile: crate::os::windows::d3d11::AsyncHlslCompile,
 }

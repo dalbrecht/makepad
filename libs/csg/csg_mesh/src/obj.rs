@@ -1,7 +1,7 @@
 // OBJ file I/O (simple subset - vertices and faces only)
 
 use crate::mesh::TriMesh;
-use makepad_csg_math::dvec3;
+use makepad_csg_math::{dvec3, Vec3d};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 

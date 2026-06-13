@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::context::Context;
-use crate::core::{ggml_pad, GGML_MEM_ALIGN, GGML_SCALE_FLAG_ALIGN_CORNERS};
+use crate::core::{ggml_pad, GGML_MEM_ALIGN};
 use crate::graph::{Graph, NodeId};
 use crate::op::Op;
 use crate::tensor::{
@@ -443,19 +443,6 @@ struct KArgsL2Norm {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct KArgsGroupNorm {
-    ne00: i64,
-    ne01: i64,
-    ne02: i64,
-    nb00: u64,
-    nb01: u64,
-    nb02: u64,
-    ngrp: i32,
-    eps: f32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
 struct KArgsNorm {
     ne00: i32,
     ne00_t: i32,
@@ -563,56 +550,6 @@ struct KArgsFlashAttnExtPad {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct KArgsFlashAttnExtBlk {
-    ne01: i32,
-    ne30: i32,
-    ne31: i32,
-    ne32: i32,
-    ne33: i32,
-    nb31: u64,
-    nb32: u64,
-    nb33: u64,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct KArgsFlashAttnExt {
-    ne01: i32,
-    ne02: i32,
-    ne03: i32,
-    nb01: u64,
-    nb02: u64,
-    nb03: u64,
-    ne11: i32,
-    ne_12_2: i32,
-    ne_12_3: i32,
-    ns10: i32,
-    nb11: u64,
-    nb12: u64,
-    nb13: u64,
-    ns20: i32,
-    nb21: u64,
-    nb22: u64,
-    nb23: u64,
-    ne31: i32,
-    ne32: i32,
-    ne33: i32,
-    nb31: u64,
-    nb32: u64,
-    nb33: u64,
-    ne1: i32,
-    ne2: i32,
-    ne3: i32,
-    scale: f32,
-    max_bias: f32,
-    m0: f32,
-    m1: f32,
-    n_head_log2: i32,
-    logit_softcap: f32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
 struct KArgsFlashAttnExtVec {
     ne01: i32,
     ne02: i32,
@@ -673,107 +610,6 @@ struct KArgsSsmConv {
     nb0: u64,
     nb1: u64,
     nb2: u64,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct KArgsConvTranspose2d {
-    ic: i32,
-    ih: i32,
-    iw: i32,
-    kh: i32,
-    kw: i32,
-    oc: i32,
-    s0: i32,
-    nb0: u64,
-    nb1: u64,
-    nb2: u64,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct KArgsConv2d {
-    nb00: u64,
-    nb01: u64,
-    nb02: u64,
-    nb03: u64,
-    nb10: u64,
-    nb11: u64,
-    nb12: u64,
-    nb13: u64,
-    nb0: u64,
-    nb1: u64,
-    nb2: u64,
-    nb3: u64,
-    iw: i32,
-    ih: i32,
-    kw: i32,
-    kh: i32,
-    ic: i32,
-    oc: i32,
-    ow: i32,
-    oh: i32,
-    n: i32,
-    s0: i32,
-    s1: i32,
-    p0: i32,
-    p1: i32,
-    d0: i32,
-    d1: i32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct KArgsIm2col {
-    ofs0: u64,
-    ofs1: u64,
-    iw: i32,
-    ih: i32,
-    chw: i32,
-    s0: i32,
-    s1: i32,
-    p0: i32,
-    p1: i32,
-    d0: i32,
-    d1: i32,
-    n: i32,
-    kh: i32,
-    kw: i32,
-    khw: i32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct KArgsUpscale {
-    ne00: i64,
-    ne01: i64,
-    ne02: i64,
-    ne03: i64,
-    nb00: u64,
-    nb01: u64,
-    nb02: u64,
-    nb03: u64,
-    ne0: i64,
-    ne1: i64,
-    ne2: i64,
-    ne3: i64,
-    nb0: u64,
-    nb1: u64,
-    nb2: u64,
-    nb3: u64,
-    sf0: f32,
-    sf1: f32,
-    sf2: f32,
-    sf3: f32,
-    poffs: f32,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct KArgsTimestepEmbedding {
-    nb1: u64,
-    dim: i32,
-    max_period: i32,
 }
 
 #[repr(C)]
@@ -913,8 +749,6 @@ struct KArgsArgsortMerge {
 }
 
 const FC_FLASH_ATTN_EXT_PAD: i32 = 100;
-const OP_FLASH_ATTN_EXT_NQPSG: i32 = 8;
-const OP_FLASH_ATTN_EXT_NCPSG: i32 = 64;
 const OP_FLASH_ATTN_EXT_VEC_NQPSG: i32 = 1;
 const OP_FLASH_ATTN_EXT_VEC_NCPSG: i32 = 32;
 
@@ -922,13 +756,6 @@ const OP_FLASH_ATTN_EXT_VEC_NCPSG: i32 = 32;
 pub struct MetalGraphTensorWrite<'a> {
     pub tensor_id: TensorId,
     pub bytes: &'a [u8],
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct MetalGraphTensorBufferCopy<'a> {
-    pub tensor_id: TensorId,
-    pub source_buffer: &'a super::MetalBuffer,
-    pub source_offset_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1193,20 +1020,32 @@ pub fn execute_compiled_graph(
     inputs: &[MetalGraphTensorWrite<'_>],
     outputs: &[TensorId],
 ) -> Result<MetalGraphExecution, String> {
-    execute_compiled_graph_with_buffer_inputs(runtime, ctx, compiled, inputs, &[], outputs)
-}
-
-pub fn execute_compiled_graph_with_buffer_inputs(
-    runtime: &MetalRuntime,
-    ctx: &Context,
-    compiled: &MetalCompiledGraph,
-    inputs: &[MetalGraphTensorWrite<'_>],
-    buffer_inputs: &[MetalGraphTensorBufferCopy<'_>],
-    outputs: &[TensorId],
-) -> Result<MetalGraphExecution, String> {
     runtime.begin_command_batch()?;
-    let execute_result =
-        execute_compiled_graph_in_active_batch(runtime, ctx, compiled, inputs, buffer_inputs);
+    let execute_result = (|| -> Result<(), String> {
+        for input in inputs {
+            let binding = binding(compiled, input.tensor_id)?;
+            let tensor = ctx
+                .tensor(input.tensor_id)
+                .ok_or_else(|| format!("input references invalid tensor {}", input.tensor_id))?;
+            if input.bytes.len() != tensor.nbytes() {
+                return Err(format!(
+                    "input '{}' byte length mismatch: got {}, expected {}",
+                    tensor.name().unwrap_or("<unnamed>"),
+                    input.bytes.len(),
+                    tensor.nbytes()
+                ));
+            }
+            runtime.write_buffer(&compiled.main_buffer, binding.offset_bytes, input.bytes)?;
+        }
+
+        for node in &compiled.nodes {
+            let tensor = ctx.tensor(node.node_id).ok_or_else(|| {
+                format!("compiled graph references invalid tensor {}", node.node_id)
+            })?;
+            execute_node(runtime, ctx, compiled, tensor, node)?;
+        }
+        Ok(())
+    })();
 
     if let Err(err) = execute_result {
         let _ = runtime.discard_command_batch();
@@ -1227,52 +1066,6 @@ pub fn execute_compiled_graph_with_buffer_inputs(
         );
     }
     Ok(execution)
-}
-
-pub fn execute_compiled_graph_in_active_batch(
-    runtime: &MetalRuntime,
-    ctx: &Context,
-    compiled: &MetalCompiledGraph,
-    inputs: &[MetalGraphTensorWrite<'_>],
-    buffer_inputs: &[MetalGraphTensorBufferCopy<'_>],
-) -> Result<(), String> {
-    for input in inputs {
-        let binding = binding(compiled, input.tensor_id)?;
-        let tensor = ctx
-            .tensor(input.tensor_id)
-            .ok_or_else(|| format!("input references invalid tensor {}", input.tensor_id))?;
-        if input.bytes.len() != tensor.nbytes() {
-            return Err(format!(
-                "input '{}' byte length mismatch: got {}, expected {}",
-                tensor.name().unwrap_or("<unnamed>"),
-                input.bytes.len(),
-                tensor.nbytes()
-            ));
-        }
-        runtime.write_buffer(&compiled.main_buffer, binding.offset_bytes, input.bytes)?;
-    }
-    for input in buffer_inputs {
-        let binding = binding(compiled, input.tensor_id)?;
-        let tensor = ctx
-            .tensor(input.tensor_id)
-            .ok_or_else(|| format!("input references invalid tensor {}", input.tensor_id))?;
-        runtime.copy_buffer_range(
-            input.source_buffer,
-            input.source_offset_bytes,
-            &compiled.main_buffer,
-            binding.offset_bytes,
-            tensor.nbytes(),
-        )?;
-    }
-
-    for node in &compiled.nodes {
-        let tensor = ctx
-            .tensor(node.node_id)
-            .ok_or_else(|| format!("compiled graph references invalid tensor {}", node.node_id))?;
-        execute_node(runtime, ctx, compiled, tensor, node)?;
-        runtime.memory_barrier_buffers()?;
-    }
-    Ok(())
 }
 
 fn prepared_node_from_plan(
@@ -1456,16 +1249,10 @@ fn execute_node(
         Op::Norm => dispatch_norm(runtime, ctx, compiled, tensor, node, false),
         Op::RmsNorm => dispatch_norm(runtime, ctx, compiled, tensor, node, true),
         Op::L2Norm => dispatch_l2_norm(runtime, ctx, compiled, tensor, node),
-        Op::GroupNorm => dispatch_group_norm(runtime, ctx, compiled, tensor, node),
         Op::Rope => dispatch_rope(runtime, ctx, compiled, tensor, node),
         Op::FlashAttnExt => dispatch_flash_attn_ext(runtime, ctx, compiled, tensor, node),
         Op::SsmConv => dispatch_ssm_conv(runtime, ctx, compiled, tensor, node),
         Op::GatedDeltaNet => dispatch_gated_delta_net(runtime, ctx, compiled, tensor, node),
-        Op::Im2col => dispatch_im2col(runtime, ctx, compiled, tensor, node),
-        Op::Conv2d => dispatch_conv_2d(runtime, ctx, compiled, tensor, node),
-        Op::ConvTranspose2d => dispatch_conv_transpose_2d(runtime, ctx, compiled, tensor, node),
-        Op::Upscale => dispatch_upscale(runtime, ctx, compiled, tensor, node),
-        Op::TimestepEmbedding => dispatch_timestep_embedding(runtime, ctx, compiled, tensor, node),
         Op::MulMat => dispatch_mul_mat(runtime, ctx, compiled, tensor, node),
         Op::MulMatId => dispatch_mul_mat_id(runtime, ctx, compiled, tensor, node),
         Op::Argsort => dispatch_argsort_like(runtime, ctx, compiled, tensor, node, false),
@@ -2114,11 +1901,7 @@ fn dispatch_cumsum(
     runtime.dispatch_compute(
         &aux_stage.pipeline,
         bytes_of(&blk_args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            tmp_ref.clone(),
-            dst_ref.clone(),
-        ],
+        &[buffer_ref(compiled, 1, src0_id), tmp_ref.clone(), dst_ref.clone()],
         &[(0, smem)],
         MetalSize {
             width: u64::try_from(net0 * src0_layout.ne[1])
@@ -2252,10 +2035,7 @@ fn dispatch_diag(
     runtime.dispatch_compute(
         &stage.pipeline,
         bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, tensor.id),
-        ],
+        &[buffer_ref(compiled, 1, src0_id), buffer_ref(compiled, 2, tensor.id)],
         &[],
         MetalSize {
             width: dst_shape.ne[1].max(1) as u64,
@@ -2305,18 +2085,13 @@ fn dispatch_pad(
     runtime.dispatch_compute(
         &stage.pipeline,
         bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, tensor.id),
-        ],
+        &[buffer_ref(compiled, 1, src0_id), buffer_ref(compiled, 2, tensor.id)],
         &[],
         MetalSize {
-            width: u64::try_from(dst_layout.ne[1])
-                .map_err(|_| "pad width exceeds u64".to_string())?,
+            width: u64::try_from(dst_layout.ne[1]).map_err(|_| "pad width exceeds u64".to_string())?,
             height: u64::try_from(dst_layout.ne[2])
                 .map_err(|_| "pad height exceeds u64".to_string())?,
-            depth: u64::try_from(dst_layout.ne[3])
-                .map_err(|_| "pad depth exceeds u64".to_string())?,
+            depth: u64::try_from(dst_layout.ne[3]).map_err(|_| "pad depth exceeds u64".to_string())?,
         },
         MetalSize {
             width: u64::try_from(std::cmp::min(1024_i64, dst_layout.ne[0].max(1)))
@@ -2369,10 +2144,7 @@ fn dispatch_tri(
     runtime.dispatch_compute(
         &stage.pipeline,
         bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, tensor.id),
-        ],
+        &[buffer_ref(compiled, 1, src0_id), buffer_ref(compiled, 2, tensor.id)],
         &[],
         MetalSize {
             width: src0_shape.ne[1].max(1) as u64,
@@ -2498,10 +2270,7 @@ fn dispatch_repeat(
     runtime.dispatch_compute(
         &stage.pipeline,
         bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, tensor.id),
-        ],
+        &[buffer_ref(compiled, 1, src0_id), buffer_ref(compiled, 2, tensor.id)],
         &[],
         MetalSize {
             width: dst_shape.ne[1] as u64,
@@ -2825,486 +2594,6 @@ fn dispatch_l2_norm(
             width: src0.ne[1].max(1) as u64,
             height: src0.ne[2].max(1) as u64,
             depth: src0.ne[3].max(1) as u64,
-        },
-        MetalSize {
-            width: nth,
-            height: 1,
-            depth: 1,
-        },
-    )
-}
-
-fn dispatch_group_norm(
-    runtime: &MetalRuntime,
-    ctx: &Context,
-    compiled: &MetalCompiledGraph,
-    tensor: &Tensor,
-    node: &MetalCompiledNode,
-) -> Result<(), String> {
-    let stage = main_stage(node, tensor.op)?;
-    let src0_id = tensor_src(tensor, 0)?;
-    let src0 = ctx
-        .tensor(src0_id)
-        .ok_or_else(|| format!("group_norm src0 {} is invalid", src0_id))?;
-    if src0.desc.ty != TensorType::F32 || tensor.desc.ty != TensorType::F32 {
-        return Err("group_norm currently requires f32 input/output".to_string());
-    }
-    if src0.ne[3] != 1 || tensor.ne[3] != 1 {
-        return Err("group_norm currently requires ne[3] == 1".to_string());
-    }
-
-    let ngrp = tensor.op_param_i32(0);
-    if ngrp <= 0 {
-        return Err(format!("group_norm invalid group count {}", ngrp));
-    }
-
-    let args = KArgsGroupNorm {
-        ne00: src0.ne[0],
-        ne01: src0.ne[1],
-        ne02: src0.ne[2],
-        nb00: u64::try_from(src0.nb[0]).map_err(|_| "group_norm nb00 exceeds u64".to_string())?,
-        nb01: u64::try_from(src0.nb[1]).map_err(|_| "group_norm nb01 exceeds u64".to_string())?,
-        nb02: u64::try_from(src0.nb[2]).map_err(|_| "group_norm nb02 exceeds u64".to_string())?,
-        ngrp,
-        eps: tensor.op_param_f32(1),
-    };
-
-    runtime.dispatch_compute(
-        &stage.pipeline,
-        bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, tensor.id),
-        ],
-        &[(0, stage.pipeline.smem_bytes)],
-        MetalSize {
-            width: ngrp.max(1) as u64,
-            height: 1,
-            depth: 1,
-        },
-        MetalSize {
-            width: 32u64.min(stage.pipeline.max_threads_per_threadgroup.max(1)),
-            height: 1,
-            depth: 1,
-        },
-    )
-}
-
-fn dispatch_im2col(
-    runtime: &MetalRuntime,
-    ctx: &Context,
-    compiled: &MetalCompiledGraph,
-    tensor: &Tensor,
-    node: &MetalCompiledNode,
-) -> Result<(), String> {
-    let stage = main_stage(node, tensor.op)?;
-    let src1_id = tensor_src(tensor, 1)?;
-    let src1 = ctx
-        .tensor(src1_id)
-        .ok_or_else(|| format!("im2col src1 {} is invalid", src1_id))?;
-    if src1.desc.ty != TensorType::F32 {
-        return Err("im2col currently requires f32 source activations".to_string());
-    }
-    if !matches!(tensor.desc.ty, TensorType::F32 | TensorType::F16) {
-        return Err(format!(
-            "im2col currently requires f32/f16 destination, got {}",
-            tensor.desc.ty.name()
-        ));
-    }
-
-    let s0 = tensor.op_param_i32(0);
-    let s1 = tensor.op_param_i32(1);
-    let p0 = tensor.op_param_i32(2);
-    let p1 = tensor.op_param_i32(3);
-    let d0 = tensor.op_param_i32(4);
-    let d1 = tensor.op_param_i32(5);
-    let is_2d = tensor.op_param_i32(6) == 1;
-
-    let n_dim = if is_2d { 3 } else { 2 };
-    let ic_dim = if is_2d { 2 } else { 1 };
-    let ih = if is_2d { i32_dim(src1, 1)? } else { 1 };
-    let iw = i32_dim(src1, 0)?;
-    let n = i32_dim(src1, n_dim)?;
-    let ic = i32_dim(src1, ic_dim)?;
-    let kh = if is_2d {
-        i32_dim(
-            ctx.tensor(tensor_src(tensor, 0)?)
-                .ok_or_else(|| "im2col src0 is invalid".to_string())?,
-            1,
-        )?
-    } else {
-        1
-    };
-    let kw = i32_dim(
-        ctx.tensor(tensor_src(tensor, 0)?)
-            .ok_or_else(|| "im2col src0 is invalid".to_string())?,
-        0,
-    )?;
-    let oh = if is_2d { i32_dim(tensor, 2)? } else { 1 };
-    let ow = i32_dim(tensor, 1)?;
-    let chw = ic
-        .checked_mul(kh)
-        .and_then(|value| value.checked_mul(kw))
-        .ok_or_else(|| "im2col chw overflow".to_string())?;
-
-    let ofs0_bytes = src1.nb[n_dim];
-    let ofs1_bytes = src1.nb[ic_dim];
-    if ofs0_bytes % 4 != 0 || ofs1_bytes % 4 != 0 {
-        return Err("im2col requires float-aligned source strides".to_string());
-    }
-
-    let args = KArgsIm2col {
-        ofs0: u64::try_from(ofs0_bytes / 4).map_err(|_| "im2col ofs0 exceeds u64".to_string())?,
-        ofs1: u64::try_from(ofs1_bytes / 4).map_err(|_| "im2col ofs1 exceeds u64".to_string())?,
-        iw,
-        ih,
-        chw,
-        s0,
-        s1,
-        p0,
-        p1,
-        d0,
-        d1,
-        n,
-        kh,
-        kw,
-        khw: kh
-            .checked_mul(kw)
-            .ok_or_else(|| "im2col khw overflow".to_string())?,
-    };
-
-    let kh_kw = u64::try_from(
-        i64::from(kh)
-            .checked_mul(i64::from(kw))
-            .ok_or_else(|| "im2col kh*kw overflow".to_string())?,
-    )
-    .map_err(|_| "im2col kh*kw exceeds u64".to_string())?;
-    let max_threads = stage.pipeline.max_threads_per_threadgroup.max(1);
-    if kh_kw == 0 || kh_kw > max_threads {
-        return Err(format!(
-            "im2col requires kh*kw <= max_threads_per_threadgroup ({} > {})",
-            kh_kw, max_threads
-        ));
-    }
-    let ntptg0 = (max_threads / kh_kw).min(n.max(1) as u64).max(1);
-
-    runtime.dispatch_compute(
-        &stage.pipeline,
-        bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src1_id),
-            buffer_ref(compiled, 2, tensor.id),
-        ],
-        &[],
-        MetalSize {
-            width: ic.max(1) as u64,
-            height: oh.max(1) as u64,
-            depth: ow.max(1) as u64,
-        },
-        MetalSize {
-            width: ntptg0,
-            height: kh.max(1) as u64,
-            depth: kw.max(1) as u64,
-        },
-    )
-}
-
-fn dispatch_conv_2d(
-    runtime: &MetalRuntime,
-    ctx: &Context,
-    compiled: &MetalCompiledGraph,
-    tensor: &Tensor,
-    node: &MetalCompiledNode,
-) -> Result<(), String> {
-    let stage = main_stage(node, tensor.op)?;
-    let src0_id = tensor_src(tensor, 0)?;
-    let src1_id = tensor_src(tensor, 1)?;
-    let src0 = ctx
-        .tensor(src0_id)
-        .ok_or_else(|| format!("conv_2d src0 {} is invalid", src0_id))?;
-    let src1 = ctx
-        .tensor(src1_id)
-        .ok_or_else(|| format!("conv_2d src1 {} is invalid", src1_id))?;
-    if !src0.is_contiguous() {
-        return Err("conv_2d currently requires contiguous weights".to_string());
-    }
-    if src1.desc.ty != TensorType::F32 || tensor.desc.ty != TensorType::F32 {
-        return Err("conv_2d currently requires f32 activations/output".to_string());
-    }
-    if !matches!(src0.desc.ty, TensorType::F16 | TensorType::F32) {
-        return Err(format!(
-            "conv_2d currently requires f16/f32 weights, got {}",
-            src0.desc.ty.name()
-        ));
-    }
-
-    let args = KArgsConv2d {
-        nb00: u64::try_from(src0.nb[0]).map_err(|_| "conv_2d nb00 exceeds u64".to_string())?,
-        nb01: u64::try_from(src0.nb[1]).map_err(|_| "conv_2d nb01 exceeds u64".to_string())?,
-        nb02: u64::try_from(src0.nb[2]).map_err(|_| "conv_2d nb02 exceeds u64".to_string())?,
-        nb03: u64::try_from(src0.nb[3]).map_err(|_| "conv_2d nb03 exceeds u64".to_string())?,
-        nb10: u64::try_from(src1.nb[0]).map_err(|_| "conv_2d nb10 exceeds u64".to_string())?,
-        nb11: u64::try_from(src1.nb[1]).map_err(|_| "conv_2d nb11 exceeds u64".to_string())?,
-        nb12: u64::try_from(src1.nb[2]).map_err(|_| "conv_2d nb12 exceeds u64".to_string())?,
-        nb13: u64::try_from(src1.nb[3]).map_err(|_| "conv_2d nb13 exceeds u64".to_string())?,
-        nb0: u64::try_from(tensor.nb[0]).map_err(|_| "conv_2d nb0 exceeds u64".to_string())?,
-        nb1: u64::try_from(tensor.nb[1]).map_err(|_| "conv_2d nb1 exceeds u64".to_string())?,
-        nb2: u64::try_from(tensor.nb[2]).map_err(|_| "conv_2d nb2 exceeds u64".to_string())?,
-        nb3: u64::try_from(tensor.nb[3]).map_err(|_| "conv_2d nb3 exceeds u64".to_string())?,
-        iw: i32_dim(src1, 0)?,
-        ih: i32_dim(src1, 1)?,
-        kw: i32_dim(src0, 0)?,
-        kh: i32_dim(src0, 1)?,
-        ic: i32_dim(src0, 2)?,
-        oc: i32_dim(src0, 3)?,
-        ow: i32_dim(tensor, 0)?,
-        oh: i32_dim(tensor, 1)?,
-        n: i32_dim(tensor, 3)?,
-        s0: tensor.op_param_i32(0),
-        s1: tensor.op_param_i32(1),
-        p0: tensor.op_param_i32(2),
-        p1: tensor.op_param_i32(3),
-        d0: tensor.op_param_i32(4),
-        d1: tensor.op_param_i32(5),
-    };
-
-    let nth = std::cmp::min(256u64, stage.pipeline.max_threads_per_threadgroup).max(1);
-    let n_out = u64::try_from(tensor.nelements())
-        .map_err(|_| "conv_2d output size overflow".to_string())?;
-    let tg = ((n_out + nth - 1) / nth).max(1);
-
-    runtime.dispatch_compute(
-        &stage.pipeline,
-        bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, src1_id),
-            buffer_ref(compiled, 3, tensor.id),
-        ],
-        &[],
-        MetalSize {
-            width: tg,
-            height: 1,
-            depth: 1,
-        },
-        MetalSize {
-            width: nth,
-            height: 1,
-            depth: 1,
-        },
-    )
-}
-
-fn dispatch_conv_transpose_2d(
-    runtime: &MetalRuntime,
-    ctx: &Context,
-    compiled: &MetalCompiledGraph,
-    tensor: &Tensor,
-    node: &MetalCompiledNode,
-) -> Result<(), String> {
-    let stage = main_stage(node, tensor.op)?;
-    let src0_id = tensor_src(tensor, 0)?;
-    let src1_id = tensor_src(tensor, 1)?;
-    let src0 = ctx
-        .tensor(src0_id)
-        .ok_or_else(|| format!("conv_transpose_2d src0 {} is invalid", src0_id))?;
-    let src1 = ctx
-        .tensor(src1_id)
-        .ok_or_else(|| format!("conv_transpose_2d src1 {} is invalid", src1_id))?;
-    if src1.desc.ty != TensorType::F32 || tensor.desc.ty != TensorType::F32 {
-        return Err("conv_transpose_2d currently requires f32 activations/output".to_string());
-    }
-    if !matches!(src0.desc.ty, TensorType::F16 | TensorType::F32) {
-        return Err(format!(
-            "conv_transpose_2d currently requires f16/f32 weights, got {}",
-            src0.desc.ty.name()
-        ));
-    }
-    if src1.ne[3] != 1 || tensor.ne[3] != 1 {
-        return Err("conv_transpose_2d currently requires batch size 1".to_string());
-    }
-
-    let kw = i32_dim(src0, 0)?;
-    let kh = i32_dim(src0, 1)?;
-    let args = KArgsConvTranspose2d {
-        ic: i32_dim(src1, 2)?,
-        ih: i32_dim(src1, 1)?,
-        iw: i32_dim(src1, 0)?,
-        kh,
-        kw,
-        oc: i32_dim(tensor, 2)?,
-        s0: tensor.op_param_i32(0),
-        nb0: u64::try_from(tensor.nb[0])
-            .map_err(|_| "conv_transpose_2d nb0 exceeds u64".to_string())?,
-        nb1: u64::try_from(tensor.nb[1])
-            .map_err(|_| "conv_transpose_2d nb1 exceeds u64".to_string())?,
-        nb2: u64::try_from(tensor.nb[2])
-            .map_err(|_| "conv_transpose_2d nb2 exceeds u64".to_string())?,
-    };
-
-    let smem = ggml_pad(
-        usize::try_from(
-            i64::from(kw)
-                .checked_mul(i64::from(kh))
-                .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as i64))
-                .ok_or_else(|| "conv_transpose_2d shared memory size overflow".to_string())?,
-        )
-        .map_err(|_| "conv_transpose_2d shared memory size exceeds usize".to_string())?,
-        16,
-    );
-
-    runtime.dispatch_compute(
-        &stage.pipeline,
-        bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, src1_id),
-            buffer_ref(compiled, 3, tensor.id),
-        ],
-        &[(0, smem)],
-        MetalSize {
-            width: tensor.ne[0].max(1) as u64,
-            height: tensor.ne[1].max(1) as u64,
-            depth: tensor.ne[2].max(1) as u64,
-        },
-        MetalSize {
-            width: kw.max(1) as u64,
-            height: kh.max(1) as u64,
-            depth: 1,
-        },
-    )
-}
-
-fn dispatch_upscale(
-    runtime: &MetalRuntime,
-    ctx: &Context,
-    compiled: &MetalCompiledGraph,
-    tensor: &Tensor,
-    node: &MetalCompiledNode,
-) -> Result<(), String> {
-    let stage = main_stage(node, tensor.op)?;
-    let src0_id = tensor_src(tensor, 0)?;
-    let src0 = ctx
-        .tensor(src0_id)
-        .ok_or_else(|| format!("upscale src0 {} is invalid", src0_id))?;
-    if src0.desc.ty != TensorType::F32 || tensor.desc.ty != TensorType::F32 {
-        return Err("upscale currently requires f32 input/output".to_string());
-    }
-
-    let mut sf0 = tensor.ne[0] as f32 / src0.ne[0] as f32;
-    let mut sf1 = tensor.ne[1] as f32 / src0.ne[1] as f32;
-    let sf2 = tensor.ne[2] as f32 / src0.ne[2] as f32;
-    let sf3 = tensor.ne[3] as f32 / src0.ne[3] as f32;
-
-    let mode_flags = tensor.op_param_i32(0);
-    let mut poffs = 0.5f32;
-    if (mode_flags & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0 {
-        poffs = 0.0;
-        sf0 = if tensor.ne[0] > 1 && src0.ne[0] > 1 {
-            (tensor.ne[0] - 1) as f32 / (src0.ne[0] - 1) as f32
-        } else {
-            sf0
-        };
-        sf1 = if tensor.ne[1] > 1 && src0.ne[1] > 1 {
-            (tensor.ne[1] - 1) as f32 / (src0.ne[1] - 1) as f32
-        } else {
-            sf1
-        };
-    }
-
-    let args = KArgsUpscale {
-        ne00: src0.ne[0],
-        ne01: src0.ne[1],
-        ne02: src0.ne[2],
-        ne03: src0.ne[3],
-        nb00: u64::try_from(src0.nb[0]).map_err(|_| "upscale nb00 exceeds u64".to_string())?,
-        nb01: u64::try_from(src0.nb[1]).map_err(|_| "upscale nb01 exceeds u64".to_string())?,
-        nb02: u64::try_from(src0.nb[2]).map_err(|_| "upscale nb02 exceeds u64".to_string())?,
-        nb03: u64::try_from(src0.nb[3]).map_err(|_| "upscale nb03 exceeds u64".to_string())?,
-        ne0: tensor.ne[0],
-        ne1: tensor.ne[1],
-        ne2: tensor.ne[2],
-        ne3: tensor.ne[3],
-        nb0: u64::try_from(tensor.nb[0]).map_err(|_| "upscale nb0 exceeds u64".to_string())?,
-        nb1: u64::try_from(tensor.nb[1]).map_err(|_| "upscale nb1 exceeds u64".to_string())?,
-        nb2: u64::try_from(tensor.nb[2]).map_err(|_| "upscale nb2 exceeds u64".to_string())?,
-        nb3: u64::try_from(tensor.nb[3]).map_err(|_| "upscale nb3 exceeds u64".to_string())?,
-        sf0,
-        sf1,
-        sf2,
-        sf3,
-        poffs,
-    };
-
-    let nth = stage
-        .pipeline
-        .max_threads_per_threadgroup
-        .min(tensor.ne[0].max(1) as u64)
-        .max(1);
-
-    runtime.dispatch_compute(
-        &stage.pipeline,
-        bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, tensor.id),
-        ],
-        &[],
-        MetalSize {
-            width: tensor.ne[1].max(1) as u64,
-            height: tensor.ne[2].max(1) as u64,
-            depth: tensor.ne[3].max(1) as u64,
-        },
-        MetalSize {
-            width: nth,
-            height: 1,
-            depth: 1,
-        },
-    )
-}
-
-fn dispatch_timestep_embedding(
-    runtime: &MetalRuntime,
-    ctx: &Context,
-    compiled: &MetalCompiledGraph,
-    tensor: &Tensor,
-    node: &MetalCompiledNode,
-) -> Result<(), String> {
-    let stage = main_stage(node, tensor.op)?;
-    let src0_id = tensor_src(tensor, 0)?;
-    let src0 = ctx
-        .tensor(src0_id)
-        .ok_or_else(|| format!("timestep_embedding src0 {} is invalid", src0_id))?;
-    if src0.desc.ty != TensorType::F32 || tensor.desc.ty != TensorType::F32 {
-        return Err("timestep_embedding currently requires f32 input/output".to_string());
-    }
-
-    let dim = tensor.op_param_i32(0);
-    let max_period = tensor.op_param_i32(1);
-    let args = KArgsTimestepEmbedding {
-        nb1: u64::try_from(tensor.nb[1])
-            .map_err(|_| "timestep_embedding nb1 exceeds u64".to_string())?,
-        dim,
-        max_period,
-    };
-    let nth = stage
-        .pipeline
-        .max_threads_per_threadgroup
-        .min(std::cmp::max(1, dim / 2) as u64)
-        .max(1);
-
-    runtime.dispatch_compute(
-        &stage.pipeline,
-        bytes_of(&args),
-        &[
-            buffer_ref(compiled, 1, src0_id),
-            buffer_ref(compiled, 2, tensor.id),
-        ],
-        &[],
-        MetalSize {
-            width: src0.ne[0].max(1) as u64,
-            height: 1,
-            depth: 1,
         },
         MetalSize {
             width: nth,
@@ -3793,11 +3082,11 @@ fn dispatch_argsort_like(
     let src_nb1 = u64::try_from(src0.nb[1]).map_err(|_| "argsort nb01 exceeds u64".to_string())?;
     let src_nb2 = u64::try_from(src0.nb[2]).map_err(|_| "argsort nb02 exceeds u64".to_string())?;
     let src_nb3 = u64::try_from(src0.nb[3]).map_err(|_| "argsort nb03 exceeds u64".to_string())?;
-    let _dst_nb1 =
+    let dst_nb1 =
         u64::try_from(tensor.nb[1]).map_err(|_| "argsort dst nb1 exceeds u64".to_string())?;
-    let _dst_nb2 =
+    let dst_nb2 =
         u64::try_from(tensor.nb[2]).map_err(|_| "argsort dst nb2 exceeds u64".to_string())?;
-    let _dst_nb3 =
+    let dst_nb3 =
         u64::try_from(tensor.nb[3]).map_err(|_| "argsort dst nb3 exceeds u64".to_string())?;
     let tmp_row_bytes = ggml_type_size_for_type(TensorType::I32)
         * usize::try_from(src0.ne[0]).map_err(|_| "argsort temp row bytes overflow".to_string())?;
@@ -4301,17 +3590,46 @@ fn dispatch_flash_attn_ext(
     let dst_shape = shape4(tensor)?;
 
     let has_mask = mask.is_some();
-    let _has_sinks = sinks.is_some();
+    let has_sinks = sinks.is_some();
     let max_bias = tensor.op_param_f32(1);
     let logit_softcap = tensor.op_param_f32(2);
     let has_bias = max_bias != 0.0;
     let has_scap = logit_softcap != 0.0;
 
+    if !flash_attn_ext_use_vec(q) {
+        return Err(
+            "flash_attn_ext compiled executor currently only supports the Metal vec path"
+                .to_string(),
+        );
+    }
+
+    let stage_main = node
+        .stages
+        .iter()
+        .find(|stage| {
+            stage
+                .descriptor
+                .base_name
+                .starts_with("kernel_flash_attn_ext_vec_")
+        })
+        .ok_or_else(|| "flash_attn_ext is missing vec main stage".to_string())?;
+    let stage_reduce = node
+        .stages
+        .iter()
+        .find(|stage| stage.descriptor.base_name == "kernel_flash_attn_ext_vec_reduce")
+        .ok_or_else(|| "flash_attn_ext is missing vec reduce stage".to_string())?;
+    let stage_pad = node
+        .stages
+        .iter()
+        .find(|stage| stage.descriptor.base_name == "kernel_flash_attn_ext_pad");
+
     let pad_bytes = flash_attn_ext_extra_pad_bytes(q, k, v, mask)?;
     let blk_bytes = flash_attn_ext_extra_blk_bytes(q, mask)?;
     let tmp_bytes = flash_attn_ext_extra_tmp_bytes(q, v)?;
-    let use_vec = flash_attn_ext_use_vec(q);
 
+    let has_kvpad = k_shape.ne[1] % OP_FLASH_ATTN_EXT_VEC_NCPSG != 0;
+    let nsg = flash_attn_ext_vec_nsg(k);
+    let nwg = 32_i32;
     let n_head =
         usize::try_from(q_shape.ne[2]).map_err(|_| "flash_attn n_head overflow".to_string())?;
     let n_head_log2 = if n_head <= 1 {
@@ -4338,208 +3656,9 @@ fn dispatch_flash_attn_ext(
     let ns20 = i32::try_from(v_shape.nb[1] / v_shape.nb[0])
         .map_err(|_| "flash_attn ns20 overflow".to_string())?;
 
-    let stage_pad = node
-        .stages
-        .iter()
-        .find(|stage| stage.descriptor.base_name == "kernel_flash_attn_ext_pad");
-
-    if use_vec {
-        let stage_main = node
-            .stages
-            .iter()
-            .find(|stage| {
-                stage
-                    .descriptor
-                    .base_name
-                    .starts_with("kernel_flash_attn_ext_vec_")
-            })
-            .ok_or_else(|| "flash_attn_ext is missing vec main stage".to_string())?;
-        let stage_reduce = node
-            .stages
-            .iter()
-            .find(|stage| stage.descriptor.base_name == "kernel_flash_attn_ext_vec_reduce")
-            .ok_or_else(|| "flash_attn_ext is missing vec reduce stage".to_string())?;
-        let has_kvpad = k_shape.ne[1] % OP_FLASH_ATTN_EXT_VEC_NCPSG != 0;
-        let nsg = flash_attn_ext_vec_nsg(k);
-        let nwg = 32_i32;
-
-        if has_kvpad {
-            let stage_pad =
-                stage_pad.ok_or_else(|| "flash_attn_ext is missing vec pad stage".to_string())?;
-            let pad_ncpsg =
-                constant_i32(&stage_pad.descriptor.constants, FC_FLASH_ATTN_EXT_PAD + 25)?;
-            let args = KArgsFlashAttnExtPad {
-                ne11: k_shape.ne[1],
-                ne_12_2: k_shape.ne[2],
-                ne_12_3: k_shape.ne[3],
-                nb11: k_shape.nb[1],
-                nb12: k_shape.nb[2],
-                nb13: k_shape.nb[3],
-                nb21: v_shape.nb[1],
-                nb22: v_shape.nb[2],
-                nb23: v_shape.nb[3],
-                ne31: mask_shape.ne[1],
-                ne32: mask_shape.ne[2],
-                ne33: mask_shape.ne[3],
-                nb31: mask_shape.nb[1],
-                nb32: mask_shape.nb[2],
-                nb33: mask_shape.nb[3],
-            };
-
-            runtime.dispatch_compute(
-                &stage_pad.pipeline,
-                bytes_of(&args),
-                &[
-                    buffer_ref(compiled, 1, k_id),
-                    buffer_ref(compiled, 2, v_id),
-                    mask_id
-                        .map(|id| buffer_ref(compiled, 3, id))
-                        .unwrap_or_else(|| buffer_ref(compiled, 3, q_id)),
-                    tail_node_buffer_ref(compiled, node, 4, 0)?,
-                ],
-                &[],
-                MetalSize {
-                    width: pad_ncpsg as u64,
-                    height: k_shape.ne[2].max(mask_shape.ne[2]) as u64,
-                    depth: k_shape.ne[3].max(mask_shape.ne[3]) as u64,
-                },
-                MetalSize {
-                    width: 32,
-                    height: 1,
-                    depth: 1,
-                },
-            )?;
-            runtime.memory_barrier_buffers()?;
-        }
-
-        let args = KArgsFlashAttnExtVec {
-            ne01: q_shape.ne[1],
-            ne02: q_shape.ne[2],
-            ne03: q_shape.ne[3],
-            nb01: q_shape.nb[1],
-            nb02: q_shape.nb[2],
-            nb03: q_shape.nb[3],
-            ne11: k_shape.ne[1],
-            ne_12_2: k_shape.ne[2],
-            ne_12_3: k_shape.ne[3],
-            ns10,
-            nb11: k_shape.nb[1],
-            nb12: k_shape.nb[2],
-            nb13: k_shape.nb[3],
-            ns20,
-            nb21: v_shape.nb[1],
-            nb22: v_shape.nb[2],
-            nb23: v_shape.nb[3],
-            ne31: mask_shape.ne[1],
-            ne32: mask_shape.ne[2],
-            ne33: mask_shape.ne[3],
-            nb31: mask_shape.nb[1],
-            nb32: mask_shape.nb[2],
-            nb33: mask_shape.nb[3],
-            ne1: dst_shape.ne[1],
-            ne2: dst_shape.ne[2],
-            ne3: dst_shape.ne[3],
-            scale,
-            max_bias,
-            m0,
-            m1,
-            n_head_log2,
-            logit_softcap,
-        };
-
-        runtime.dispatch_compute(
-            &stage_main.pipeline,
-            bytes_of(&args),
-            &[
-                buffer_ref(compiled, 1, q_id),
-                buffer_ref(compiled, 2, k_id),
-                buffer_ref(compiled, 3, v_id),
-                mask_id
-                    .map(|id| buffer_ref(compiled, 4, id))
-                    .unwrap_or_else(|| buffer_ref(compiled, 4, q_id)),
-                sinks_id
-                    .map(|id| buffer_ref(compiled, 5, id))
-                    .unwrap_or_else(|| buffer_ref(compiled, 5, q_id)),
-                tail_node_buffer_ref(compiled, node, 6, 0)?,
-                tail_node_buffer_ref(compiled, node, 7, pad_bytes + blk_bytes)?,
-            ],
-            &[(0, stage_main.pipeline.smem_bytes)],
-            MetalSize {
-                width: ((q_shape.ne[1] + OP_FLASH_ATTN_EXT_VEC_NQPSG - 1)
-                    / OP_FLASH_ATTN_EXT_VEC_NQPSG) as u64,
-                height: q_shape.ne[2] as u64,
-                depth: (q_shape.ne[3] * nwg) as u64,
-            },
-            MetalSize {
-                width: 32,
-                height: nsg as u64,
-                depth: 1,
-            },
-        )?;
-        runtime.memory_barrier_buffers()?;
-
-        let args_reduce = KArgsFlashAttnExtVecReduce {
-            nrows: i32::try_from(
-                usize::try_from(dst_shape.ne[1])
-                    .map_err(|_| "flash_attn reduce ne1 overflow".to_string())?
-                    .checked_mul(
-                        usize::try_from(dst_shape.ne[2])
-                            .map_err(|_| "flash_attn reduce ne2 overflow".to_string())?,
-                    )
-                    .and_then(|v| v.checked_mul(usize::try_from(dst_shape.ne[3]).ok()?))
-                    .ok_or_else(|| "flash_attn reduce nrows overflow".to_string())?,
-            )
-            .map_err(|_| "flash_attn reduce nrows exceeds i32".to_string())?,
-        };
-
-        let _ = tmp_bytes;
-
-        return runtime.dispatch_compute(
-            &stage_reduce.pipeline,
-            bytes_of(&args_reduce),
-            &[
-                tail_node_buffer_ref(compiled, node, 1, pad_bytes + blk_bytes)?,
-                buffer_ref(compiled, 2, tensor.id),
-            ],
-            &[],
-            MetalSize {
-                width: args_reduce.nrows as u64,
-                height: 1,
-                depth: 1,
-            },
-            MetalSize {
-                width: (32 * nwg) as u64,
-                height: 1,
-                depth: 1,
-            },
-        );
-    }
-
-    let stage_main = node
-        .stages
-        .iter()
-        .find(|stage| {
-            stage
-                .descriptor
-                .base_name
-                .starts_with("kernel_flash_attn_ext_")
-                && !stage
-                    .descriptor
-                    .base_name
-                    .starts_with("kernel_flash_attn_ext_vec_")
-        })
-        .ok_or_else(|| "flash_attn_ext is missing main stage".to_string())?;
-    let stage_blk = node
-        .stages
-        .iter()
-        .find(|stage| stage.descriptor.base_name == "kernel_flash_attn_ext_blk");
-    let has_kvpad = k_shape.ne[1] % OP_FLASH_ATTN_EXT_NCPSG != 0;
-    let nsg = if q_shape.ne[0] >= 512 { 8_i32 } else { 4_i32 };
-    let bc_mask = has_mask && mask_shape.ne[1] % 8 != 0;
-
     if has_kvpad {
         let stage_pad =
-            stage_pad.ok_or_else(|| "flash_attn_ext is missing pad stage".to_string())?;
+            stage_pad.ok_or_else(|| "flash_attn_ext is missing vec pad stage".to_string())?;
         let pad_ncpsg = constant_i32(&stage_pad.descriptor.constants, FC_FLASH_ATTN_EXT_PAD + 25)?;
         let args = KArgsFlashAttnExtPad {
             ne11: k_shape.ne[1],
@@ -4585,48 +3704,7 @@ fn dispatch_flash_attn_ext(
         runtime.memory_barrier_buffers()?;
     }
 
-    if has_mask {
-        let stage_blk =
-            stage_blk.ok_or_else(|| "flash_attn_ext is missing blk stage".to_string())?;
-        let args_blk = KArgsFlashAttnExtBlk {
-            ne01: q_shape.ne[1],
-            ne30: i32::try_from(k_shape.ne[1])
-                .map_err(|_| "flash_attn k sequence exceeds i32".to_string())?,
-            ne31: mask_shape.ne[1],
-            ne32: mask_shape.ne[2],
-            ne33: mask_shape.ne[3],
-            nb31: mask_shape.nb[1],
-            nb32: mask_shape.nb[2],
-            nb33: mask_shape.nb[3],
-        };
-
-        runtime.dispatch_compute(
-            &stage_blk.pipeline,
-            bytes_of(&args_blk),
-            &[
-                mask_id
-                    .map(|id| buffer_ref(compiled, 1, id))
-                    .unwrap_or_else(|| buffer_ref(compiled, 1, q_id)),
-                tail_node_buffer_ref(compiled, node, 2, pad_bytes)?,
-            ],
-            &[],
-            MetalSize {
-                width: ((i64::from(args_blk.ne30) + i64::from(OP_FLASH_ATTN_EXT_NCPSG) - 1)
-                    / i64::from(OP_FLASH_ATTN_EXT_NCPSG)) as u64,
-                height: ((i64::from(args_blk.ne01) + i64::from(OP_FLASH_ATTN_EXT_NQPSG) - 1)
-                    / i64::from(OP_FLASH_ATTN_EXT_NQPSG)) as u64,
-                depth: i64::from(args_blk.ne32 * args_blk.ne33) as u64,
-            },
-            MetalSize {
-                width: 32,
-                height: 1,
-                depth: 1,
-            },
-        )?;
-        runtime.memory_barrier_buffers()?;
-    }
-
-    let args = KArgsFlashAttnExt {
+    let args = KArgsFlashAttnExtVec {
         ne01: q_shape.ne[1],
         ne02: q_shape.ne[2],
         ne03: q_shape.ne[3],
@@ -4661,10 +3739,6 @@ fn dispatch_flash_attn_ext(
         logit_softcap,
     };
 
-    let _ = tmp_bytes;
-    let _ = has_bias;
-    let _ = bc_mask;
-
     runtime.dispatch_compute(
         &stage_main.pipeline,
         bytes_of(&args),
@@ -4679,18 +3753,58 @@ fn dispatch_flash_attn_ext(
                 .map(|id| buffer_ref(compiled, 5, id))
                 .unwrap_or_else(|| buffer_ref(compiled, 5, q_id)),
             tail_node_buffer_ref(compiled, node, 6, 0)?,
-            tail_node_buffer_ref(compiled, node, 7, pad_bytes)?,
-            buffer_ref(compiled, 8, tensor.id),
+            tail_node_buffer_ref(compiled, node, 7, pad_bytes + blk_bytes)?,
         ],
         &[(0, stage_main.pipeline.smem_bytes)],
         MetalSize {
-            width: ((q_shape.ne[1] + OP_FLASH_ATTN_EXT_NQPSG - 1) / OP_FLASH_ATTN_EXT_NQPSG) as u64,
+            width: ((q_shape.ne[1] + OP_FLASH_ATTN_EXT_VEC_NQPSG - 1) / OP_FLASH_ATTN_EXT_VEC_NQPSG)
+                as u64,
             height: q_shape.ne[2] as u64,
-            depth: q_shape.ne[3] as u64,
+            depth: (q_shape.ne[3] * nwg) as u64,
         },
         MetalSize {
             width: 32,
             height: nsg as u64,
+            depth: 1,
+        },
+    )?;
+    runtime.memory_barrier_buffers()?;
+
+    let args_reduce = KArgsFlashAttnExtVecReduce {
+        nrows: i32::try_from(
+            usize::try_from(dst_shape.ne[1])
+                .map_err(|_| "flash_attn reduce ne1 overflow".to_string())?
+                .checked_mul(
+                    usize::try_from(dst_shape.ne[2])
+                        .map_err(|_| "flash_attn reduce ne2 overflow".to_string())?,
+                )
+                .and_then(|v| v.checked_mul(usize::try_from(dst_shape.ne[3]).ok()?))
+                .ok_or_else(|| "flash_attn reduce nrows overflow".to_string())?,
+        )
+        .map_err(|_| "flash_attn reduce nrows exceeds i32".to_string())?,
+    };
+
+    let _ = tmp_bytes;
+    let _ = has_mask;
+    let _ = has_sinks;
+    let _ = has_bias;
+
+    runtime.dispatch_compute(
+        &stage_reduce.pipeline,
+        bytes_of(&args_reduce),
+        &[
+            tail_node_buffer_ref(compiled, node, 1, pad_bytes + blk_bytes)?,
+            buffer_ref(compiled, 2, tensor.id),
+        ],
+        &[],
+        MetalSize {
+            width: args_reduce.nrows as u64,
+            height: 1,
+            depth: 1,
+        },
+        MetalSize {
+            width: (32 * nwg) as u64,
+            height: 1,
             depth: 1,
         },
     )
@@ -5042,7 +4156,6 @@ fn tail_node_buffer_ref<'a>(
     )
 }
 
-#[allow(dead_code)]
 fn dummy_buffer_ref<'a>(index: u64, buffer: &'a super::MetalBuffer) -> MetalBufferBindingRef<'a> {
     MetalBufferBindingRef {
         index,
@@ -5242,7 +4355,7 @@ fn bytes_of<T>(value: &T) -> &[u8] {
 mod tests {
     use super::*;
     use crate::context::Context;
-    use crate::core::{InitParams, ScaleMode, SortOrder};
+    use crate::core::{InitParams, SortOrder};
     use crate::f16_to_f32;
     use crate::f32_to_f16;
     use crate::graph::Graph;
@@ -5764,13 +4877,7 @@ mod tests {
             )
             .unwrap();
         let q_cont = ctx
-            .new_tensor_3d(
-                TensorType::F32,
-                d,
-                n_head,
-                n_tokens,
-                BufferUsage::Activations,
-            )
+            .new_tensor_3d(TensorType::F32, d, n_head, n_tokens, BufferUsage::Activations)
             .unwrap();
         let positions = ctx
             .new_tensor_1d(TensorType::I32, 4 * n_tokens, BufferUsage::Activations)
@@ -5899,13 +5006,7 @@ mod tests {
             )
             .unwrap();
         let q_cont = ctx
-            .new_tensor_3d(
-                TensorType::F32,
-                d,
-                n_head,
-                n_tokens,
-                BufferUsage::Activations,
-            )
+            .new_tensor_3d(TensorType::F32, d, n_head, n_tokens, BufferUsage::Activations)
             .unwrap();
         let q_interleaved = ctx
             .view_3d(
@@ -5949,11 +5050,8 @@ mod tests {
             BufferStorageMode::Shared,
         )
         .unwrap();
-        let execution = session
-            .execute(&ctx, &[], &[q_interleaved_dense, q_cont])
-            .unwrap();
-        let interleaved_values =
-            bytes_to_f32s(execution.outputs.get(&q_interleaved_dense).unwrap());
+        let execution = session.execute(&ctx, &[], &[q_interleaved_dense, q_cont]).unwrap();
+        let interleaved_values = bytes_to_f32s(execution.outputs.get(&q_interleaved_dense).unwrap());
         let cont_values = bytes_to_f32s(execution.outputs.get(&q_cont).unwrap());
 
         assert_eq!(interleaved_values.len(), cont_values.len());
@@ -5993,13 +5091,7 @@ mod tests {
             )
             .unwrap();
         let q_cont = ctx
-            .new_tensor_3d(
-                TensorType::F32,
-                d,
-                n_head,
-                n_tokens,
-                BufferUsage::Activations,
-            )
+            .new_tensor_3d(TensorType::F32, d, n_head, n_tokens, BufferUsage::Activations)
             .unwrap();
         let k_base = ctx
             .new_tensor_3d(
@@ -6097,9 +5189,14 @@ mod tests {
                 BufferUsage::Activations,
             )
             .unwrap();
-        let q_interleaved_attn =
-            build_flash_attn_like_mha(&mut ctx, q_interleaved_rope, k_rope, v_base, Some(mask))
-                .unwrap();
+        let q_interleaved_attn = build_flash_attn_like_mha(
+            &mut ctx,
+            q_interleaved_rope,
+            k_rope,
+            v_base,
+            Some(mask),
+        )
+        .unwrap();
         let q_cont_attn =
             build_flash_attn_like_mha(&mut ctx, q_cont_rope, k_rope, v_base, Some(mask)).unwrap();
 
@@ -6135,9 +5232,7 @@ mod tests {
         ctx.write_tensor_data(mask, &mask_bytes).unwrap();
 
         let mut graph = Graph::new();
-        graph
-            .build_forward_expand(&ctx, q_interleaved_attn)
-            .unwrap();
+        graph.build_forward_expand(&ctx, q_interleaved_attn).unwrap();
         graph.build_forward_expand(&ctx, q_cont_attn).unwrap();
 
         let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
@@ -6328,13 +5423,7 @@ mod tests {
             )
             .unwrap();
         let q_cont = full_ctx
-            .new_tensor_3d(
-                TensorType::F32,
-                d,
-                n_head,
-                n_tokens,
-                BufferUsage::Activations,
-            )
+            .new_tensor_3d(TensorType::F32, d, n_head, n_tokens, BufferUsage::Activations)
             .unwrap();
         let weight = full_ctx
             .new_tensor_1d(TensorType::F32, d, BufferUsage::Weights)
@@ -6387,15 +5476,11 @@ mod tests {
         full_graph
             .build_forward_expand(&full_ctx, interleaved_norm)
             .unwrap();
-        full_graph
-            .build_forward_expand(&full_ctx, cont_norm)
-            .unwrap();
+        full_graph.build_forward_expand(&full_ctx, cont_norm).unwrap();
         full_graph
             .build_forward_expand(&full_ctx, interleaved_scaled)
             .unwrap();
-        full_graph
-            .build_forward_expand(&full_ctx, cont_scaled)
-            .unwrap();
+        full_graph.build_forward_expand(&full_ctx, cont_scaled).unwrap();
 
         let full_prepared = prepare_graph(&full_ctx, &full_graph, runtime.features()).unwrap();
         let full_session = MetalGraphSession::from_runtime(
@@ -6473,23 +5558,13 @@ mod tests {
             .rms_norm_eps(q_interleaved_step, eps, BufferUsage::Activations)
             .unwrap();
         let interleaved_scaled_step = step_ctx
-            .binary_like_a(
-                Op::Mul,
-                interleaved_norm_step,
-                weight_step,
-                BufferUsage::Activations,
-            )
+            .binary_like_a(Op::Mul, interleaved_norm_step, weight_step, BufferUsage::Activations)
             .unwrap();
         let cont_norm_step = step_ctx
             .rms_norm_eps(q_cont_step, eps, BufferUsage::Activations)
             .unwrap();
         let cont_scaled_step = step_ctx
-            .binary_like_a(
-                Op::Mul,
-                cont_norm_step,
-                weight_step,
-                BufferUsage::Activations,
-            )
+            .binary_like_a(Op::Mul, cont_norm_step, weight_step, BufferUsage::Activations)
             .unwrap();
 
         let q_step_values = {
@@ -6563,12 +5638,8 @@ mod tests {
         let step_interleaved_norm =
             bytes_to_f32s(step_execution.outputs.get(&interleaved_norm_step).unwrap());
         let step_cont_norm = bytes_to_f32s(step_execution.outputs.get(&cont_norm_step).unwrap());
-        let step_interleaved = bytes_to_f32s(
-            step_execution
-                .outputs
-                .get(&interleaved_scaled_step)
-                .unwrap(),
-        );
+        let step_interleaved =
+            bytes_to_f32s(step_execution.outputs.get(&interleaved_scaled_step).unwrap());
         let step_cont = bytes_to_f32s(step_execution.outputs.get(&cont_scaled_step).unwrap());
 
         assert_eq!(step_interleaved_norm.len(), step_cont_norm.len());
@@ -6637,8 +5708,7 @@ mod tests {
             .unary(conv_full, UnaryOp::Silu, BufferUsage::Activations)
             .unwrap();
 
-        let src_full_values =
-            patterned_f32s((src_tokens * d_inner * n_seqs) as usize, -0.11, 0.0007);
+        let src_full_values = patterned_f32s((src_tokens * d_inner * n_seqs) as usize, -0.11, 0.0007);
         let kernel_values = patterned_f32s((d_conv * d_inner) as usize, 0.09, -0.0005);
         full_ctx
             .write_tensor_data(src_full, &f32s_to_bytes(&src_full_values))
@@ -6648,12 +5718,8 @@ mod tests {
             .unwrap();
 
         let mut full_graph = Graph::new();
-        full_graph
-            .build_forward_expand(&full_ctx, conv_full)
-            .unwrap();
-        full_graph
-            .build_forward_expand(&full_ctx, silu_full)
-            .unwrap();
+        full_graph.build_forward_expand(&full_ctx, conv_full).unwrap();
+        full_graph.build_forward_expand(&full_ctx, silu_full).unwrap();
 
         let full_prepared = prepare_graph(&full_ctx, &full_graph, runtime.features()).unwrap();
         let full_session = MetalGraphSession::from_runtime(
@@ -6702,12 +5768,8 @@ mod tests {
             .unwrap();
 
         let mut step_graph = Graph::new();
-        step_graph
-            .build_forward_expand(&step_ctx, conv_step)
-            .unwrap();
-        step_graph
-            .build_forward_expand(&step_ctx, silu_step)
-            .unwrap();
+        step_graph.build_forward_expand(&step_ctx, conv_step).unwrap();
+        step_graph.build_forward_expand(&step_ctx, silu_step).unwrap();
 
         let step_prepared = prepare_graph(&step_ctx, &step_graph, runtime.features()).unwrap();
         let step_session = MetalGraphSession::from_runtime(
@@ -6729,9 +5791,8 @@ mod tests {
                 let seq_base = seq * (src_tokens as usize) * (d_inner as usize);
                 for row in 0..(d_inner as usize) {
                     let row_base = seq_base + row * src_row_width;
-                    src_step_values.extend_from_slice(
-                        &src_full_values[row_base + token..row_base + token + d_conv as usize],
-                    );
+                    src_step_values
+                        .extend_from_slice(&src_full_values[row_base + token..row_base + token + d_conv as usize]);
                 }
             }
             let src_step_bytes = f32s_to_bytes(&src_step_values);
@@ -6811,7 +5872,9 @@ mod tests {
             )
             .unwrap();
         let qkv_t = ctx.transpose(qkv).unwrap();
-        let qkv_flat = ctx.cont_2d(qkv, qkv_dim * n_tokens, n_seqs).unwrap();
+        let qkv_flat = ctx
+            .cont_2d(qkv, qkv_dim * n_tokens, n_seqs)
+            .unwrap();
         let conv_input = ctx
             .concat(conv_states, qkv_t, 0, BufferUsage::Activations)
             .unwrap();
@@ -6902,15 +5965,15 @@ mod tests {
         let rows = ctx
             .new_tensor_1d(TensorType::I32, gather_rows, BufferUsage::Activations)
             .unwrap();
-        let gathered = ctx.get_rows(src, rows, BufferUsage::Activations).unwrap();
+        let gathered = ctx
+            .get_rows(src, rows, BufferUsage::Activations)
+            .unwrap();
         let gathered = ctx.cont_2d(gathered, width, gather_rows).unwrap();
 
         let src_values = patterned_f32s((width * source_rows) as usize, -0.31, 0.002);
         let row_values = [1_i32, 4_i32];
-        ctx.write_tensor_data(src, &f32s_to_bytes(&src_values))
-            .unwrap();
-        ctx.write_tensor_data(rows, &i32s_to_bytes(&row_values))
-            .unwrap();
+        ctx.write_tensor_data(src, &f32s_to_bytes(&src_values)).unwrap();
+        ctx.write_tensor_data(rows, &i32s_to_bytes(&row_values)).unwrap();
 
         let mut graph = Graph::new();
         graph.build_forward_expand(&ctx, gathered).unwrap();
@@ -6976,9 +6039,7 @@ mod tests {
             .unwrap();
 
         let mut full_graph = Graph::new();
-        full_graph
-            .build_forward_expand(&full_ctx, gathered_full)
-            .unwrap();
+        full_graph.build_forward_expand(&full_ctx, gathered_full).unwrap();
         let full_prepared = prepare_graph(&full_ctx, &full_graph, runtime.features()).unwrap();
         let full_session = MetalGraphSession::from_runtime(
             runtime,
@@ -6988,9 +6049,7 @@ mod tests {
             BufferStorageMode::Shared,
         )
         .unwrap();
-        let full_execution = full_session
-            .execute(&full_ctx, &[], &[gathered_full])
-            .unwrap();
+        let full_execution = full_session.execute(&full_ctx, &[], &[gathered_full]).unwrap();
         let full_values = bytes_to_f32s(full_execution.outputs.get(&gathered_full).unwrap());
 
         let runtime = match MetalRuntime::new() {
@@ -7019,9 +6078,7 @@ mod tests {
             .unwrap();
 
         let mut step_graph = Graph::new();
-        step_graph
-            .build_forward_expand(&step_ctx, gathered_step)
-            .unwrap();
+        step_graph.build_forward_expand(&step_ctx, gathered_step).unwrap();
         let step_prepared = prepare_graph(&step_ctx, &step_graph, runtime.features()).unwrap();
         let step_session = MetalGraphSession::from_runtime(
             runtime,
@@ -7088,7 +6145,9 @@ mod tests {
 
         let src_bytes = patterned_q5k_tensor_bytes(source_rows as usize, width as usize);
         let row_values = [1_i32, 4_i32];
-        full_ctx.write_tensor_data(src, &src_bytes).unwrap();
+        full_ctx
+            .write_tensor_data(src, &src_bytes)
+            .unwrap();
         full_ctx
             .write_tensor_data(rows_full, &i32s_to_bytes(&row_values))
             .unwrap();
@@ -7162,7 +6221,9 @@ mod tests {
             .unwrap();
         let gathered_step_cont = step_ctx.cont_2d(gathered_step_raw, width, 1).unwrap();
 
-        step_ctx.write_tensor_data(step_src, &src_bytes).unwrap();
+        step_ctx
+            .write_tensor_data(step_src, &src_bytes)
+            .unwrap();
 
         let mut step_graph = Graph::new();
         step_graph
@@ -7269,12 +6330,7 @@ mod tests {
         let top_k = 4_i64;
 
         let logits = ctx
-            .new_tensor_2d(
-                TensorType::F32,
-                source_rows,
-                tokens,
-                BufferUsage::Activations,
-            )
+            .new_tensor_2d(TensorType::F32, source_rows, tokens, BufferUsage::Activations)
             .unwrap();
         let sorted = ctx.argsort(logits, BufferUsage::Activations).unwrap();
         ctx.tensor_mut(sorted)
@@ -7296,25 +6352,20 @@ mod tests {
             .unwrap();
 
         let src = ctx
-            .new_tensor_3d(
-                TensorType::F32,
-                width,
-                source_rows,
-                tokens,
-                BufferUsage::Weights,
-            )
+            .new_tensor_3d(TensorType::F32, width, source_rows, tokens, BufferUsage::Weights)
             .unwrap();
-        let gathered = ctx.get_rows(src, ids, BufferUsage::Activations).unwrap();
+        let gathered = ctx
+            .get_rows(src, ids, BufferUsage::Activations)
+            .unwrap();
 
         let logits_values = vec![
-            0.1, 0.4, 1.2, -0.3, 0.9, 0.7, -0.2, 1.1, 0.6, 0.5, 0.3, 0.2, 1.0, -0.4, 0.8, 0.0, 0.2,
-            1.3, 0.7, 0.1, -0.2, 0.5, 1.1, 0.4, 0.9, 0.8, 0.6, 0.3, 0.0, -0.1, 1.2, 1.0,
+            0.1, 0.4, 1.2, -0.3, 0.9, 0.7, -0.2, 1.1, 0.6, 0.5, 0.3, 0.2, 1.0, -0.4, 0.8, 0.0,
+            0.2, 1.3, 0.7, 0.1, -0.2, 0.5, 1.1, 0.4, 0.9, 0.8, 0.6, 0.3, 0.0, -0.1, 1.2, 1.0,
         ];
         let src_values = patterned_f32s((width * source_rows * tokens) as usize, -0.21, 0.031);
         ctx.write_tensor_data(logits, &f32s_to_bytes(&logits_values))
             .unwrap();
-        ctx.write_tensor_data(src, &f32s_to_bytes(&src_values))
-            .unwrap();
+        ctx.write_tensor_data(src, &f32s_to_bytes(&src_values)).unwrap();
 
         let mut graph = Graph::new();
         graph.build_forward_expand(&ctx, gathered).unwrap();
@@ -7518,7 +6569,8 @@ mod tests {
             .mul_mat(weights, input, BufferUsage::Activations)
             .unwrap();
 
-        let weight_values = hashed_f32s((width * rows) as usize, 0x3b92dc1f, 0.45, 0.03, 0.9);
+        let weight_values =
+            hashed_f32s((width * rows) as usize, 0x3b92dc1f, 0.45, 0.03, 0.9);
         let input_values = hashed_f32s((width * tokens) as usize, 0x91e10da5, 0.65, -0.02, 0.6);
         ctx.write_tensor_data(weights, &f32s_to_bytes(&weight_values))
             .unwrap();
@@ -7609,15 +6661,8 @@ mod tests {
             .unwrap();
         let v_set = {
             let v_tensor = ctx.tensor(v_base).unwrap().clone();
-            ctx.set_inplace(
-                v_base,
-                o_ch,
-                v_tensor.nb[1],
-                v_tensor.nb[2],
-                v_tensor.nb[3],
-                0,
-            )
-            .unwrap()
+            ctx.set_inplace(v_base, o_ch, v_tensor.nb[1], v_tensor.nb[2], v_tensor.nb[3], 0)
+                .unwrap()
         };
         let output = ctx
             .view_4d(
@@ -7635,16 +6680,13 @@ mod tests {
         let output = ctx.permute(output, [0, 2, 1, 3]).unwrap();
         let output_cont = ctx.cont_2d(output, s_v * h_v, n_tokens * n_seqs).unwrap();
 
-        let v_base_values = patterned_f32s(
-            (s_v * chunk_size * n_chunks * h_v * n_seqs) as usize,
-            -0.15,
-            0.001,
-        );
-        let o_ch_values = patterned_f32s((s_v * chunk_size * h_v * n_seqs) as usize, 0.12, -0.0007);
+        let v_base_values =
+            patterned_f32s((s_v * chunk_size * n_chunks * h_v * n_seqs) as usize, -0.15, 0.001);
+        let o_ch_values =
+            patterned_f32s((s_v * chunk_size * h_v * n_seqs) as usize, 0.12, -0.0007);
         ctx.write_tensor_data(v_base, &f32s_to_bytes(&v_base_values))
             .unwrap();
-        ctx.write_tensor_data(o_ch, &f32s_to_bytes(&o_ch_values))
-            .unwrap();
+        ctx.write_tensor_data(o_ch, &f32s_to_bytes(&o_ch_values)).unwrap();
 
         let mut graph = Graph::new();
         graph.build_forward_expand(&ctx, v_set).unwrap();
@@ -7683,8 +6725,7 @@ mod tests {
                 for head in 0..(h_v as usize) {
                     let head_base = seq_base + head * head_stride;
                     let token_base = head_base + token * chunk_width;
-                    expected_output
-                        .extend_from_slice(&o_ch_values[token_base..token_base + chunk_width]);
+                    expected_output.extend_from_slice(&o_ch_values[token_base..token_base + chunk_width]);
                 }
             }
         }
@@ -7759,13 +6800,7 @@ mod tests {
         .unwrap();
         let execution = session.execute(&ctx, &[], &[out]).unwrap();
         let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-        let expected = cpu_solve_tri_f32(
-            &a_values,
-            &b_values,
-            n as usize,
-            k as usize,
-            batches as usize,
-        );
+        let expected = cpu_solve_tri_f32(&a_values, &b_values, n as usize, k as usize, batches as usize);
 
         assert_eq!(actual.len(), expected.len());
         for (a, e) in actual.iter().zip(expected.iter()) {
@@ -7844,20 +6879,8 @@ mod tests {
         let execution = session.execute(&ctx, &[], &[out_dim1, out_dim0]).unwrap();
         let actual_dim1 = bytes_to_f32s(execution.outputs.get(&out_dim1).unwrap());
         let actual_dim0 = bytes_to_f32s(execution.outputs.get(&out_dim0).unwrap());
-        let expected_dim1 = cpu_broadcast_mul_dim1(
-            &a_dim1_values,
-            &b_dim1_values,
-            cs as usize,
-            s as usize,
-            h as usize,
-        );
-        let expected_dim0 = cpu_broadcast_mul_dim0(
-            &a_dim0_values,
-            &b_dim0_values,
-            s as usize,
-            cs as usize,
-            h as usize,
-        );
+        let expected_dim1 = cpu_broadcast_mul_dim1(&a_dim1_values, &b_dim1_values, cs as usize, s as usize, h as usize);
+        let expected_dim0 = cpu_broadcast_mul_dim0(&a_dim0_values, &b_dim0_values, s as usize, cs as usize, h as usize);
 
         assert_eq!(actual_dim1.len(), expected_dim1.len());
         for (a, e) in actual_dim1.iter().zip(expected_dim1.iter()) {
@@ -8784,15 +7807,15 @@ mod tests {
             .glu_split(gate, up, GluOp::Swiglu, BufferUsage::Activations)
             .unwrap();
         let gate_values = vec![
-            -2.0, -0.5, 0.0, 0.5, 1.0, 1.5, -1.2, 2.0, 0.3, -1.1, 2.2, -0.7, 1.8, -2.4, 0.9, 0.4,
+            -2.0, -0.5, 0.0, 0.5, 1.0, 1.5, -1.2, 2.0,
+            0.3, -1.1, 2.2, -0.7, 1.8, -2.4, 0.9, 0.4,
         ];
         let up_values = vec![
-            1.0, -0.3, 0.8, 1.1, -1.4, 0.2, 2.0, -0.6, -0.7, 1.3, -1.5, 0.4, 0.9, -0.8, 1.7, -2.1,
+            1.0, -0.3, 0.8, 1.1, -1.4, 0.2, 2.0, -0.6,
+            -0.7, 1.3, -1.5, 0.4, 0.9, -0.8, 1.7, -2.1,
         ];
-        ctx.write_tensor_data(gate, &f32s_to_bytes(&gate_values))
-            .unwrap();
-        ctx.write_tensor_data(up, &f32s_to_bytes(&up_values))
-            .unwrap();
+        ctx.write_tensor_data(gate, &f32s_to_bytes(&gate_values)).unwrap();
+        ctx.write_tensor_data(up, &f32s_to_bytes(&up_values)).unwrap();
 
         let mut graph = Graph::new();
         graph.build_forward_expand(&ctx, out).unwrap();
@@ -8862,9 +7885,7 @@ mod tests {
             .unwrap();
 
         let mut full_graph = Graph::new();
-        full_graph
-            .build_forward_expand(&full_ctx, out_full)
-            .unwrap();
+        full_graph.build_forward_expand(&full_ctx, out_full).unwrap();
         let full_prepared = prepare_graph(&full_ctx, &full_graph, runtime.features()).unwrap();
         let full_session = MetalGraphSession::from_runtime(
             runtime,
@@ -8907,9 +7928,7 @@ mod tests {
             .unwrap();
 
         let mut step_graph = Graph::new();
-        step_graph
-            .build_forward_expand(&step_ctx, out_step)
-            .unwrap();
+        step_graph.build_forward_expand(&step_ctx, out_step).unwrap();
         let step_prepared = prepare_graph(&step_ctx, &step_graph, runtime.features()).unwrap();
         let step_session = MetalGraphSession::from_runtime(
             runtime,
@@ -9282,12 +8301,7 @@ mod tests {
         let tokens = 2_i64;
 
         let logits = ctx
-            .new_tensor_2d(
-                TensorType::F32,
-                expert_count,
-                tokens,
-                BufferUsage::Activations,
-            )
+            .new_tensor_2d(TensorType::F32, expert_count, tokens, BufferUsage::Activations)
             .unwrap();
         let sorted = ctx.argsort(logits, BufferUsage::Activations).unwrap();
         ctx.tensor_mut(sorted)
@@ -9309,13 +8323,7 @@ mod tests {
             .unwrap();
 
         let experts = ctx
-            .new_tensor_3d(
-                TensorType::F32,
-                in_dim,
-                out_dim,
-                expert_count,
-                BufferUsage::Weights,
-            )
+            .new_tensor_3d(TensorType::F32, in_dim, out_dim, expert_count, BufferUsage::Weights)
             .unwrap();
         let input = ctx
             .new_tensor_3d(TensorType::F32, in_dim, 1, tokens, BufferUsage::Activations)
@@ -9325,8 +8333,8 @@ mod tests {
             .unwrap();
 
         let logits_values = vec![
-            0.1, 0.4, 1.2, -0.3, 0.9, 0.7, -0.2, 1.1, 0.6, 0.5, 0.3, 0.2, 1.0, -0.4, 0.8, 0.0, 0.2,
-            1.3, 0.7, 0.1, -0.2, 0.5, 1.1, 0.4, 0.9, 0.8, 0.6, 0.3, 0.0, -0.1, 1.2, 1.0,
+            0.1, 0.4, 1.2, -0.3, 0.9, 0.7, -0.2, 1.1, 0.6, 0.5, 0.3, 0.2, 1.0, -0.4, 0.8, 0.0,
+            0.2, 1.3, 0.7, 0.1, -0.2, 0.5, 1.1, 0.4, 0.9, 0.8, 0.6, 0.3, 0.0, -0.1, 1.2, 1.0,
         ];
         let expert_values = patterned_f32s((in_dim * out_dim * expert_count) as usize, -0.3, 0.05);
         let input_values = vec![
@@ -9556,587 +8564,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn executes_conv_2d_graph_on_metal_when_available() {
-        let runtime = match MetalRuntime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => return,
-        };
-
-        let mut ctx = Context::new(InitParams {
-            mem_size: 1 << 20,
-            mem_buffer: None,
-            no_alloc: false,
-        });
-
-        let kernel = ctx
-            .new_tensor_4d(TensorType::F32, 3, 3, 2, 3, BufferUsage::Weights)
-            .unwrap();
-        let input = ctx
-            .new_tensor_4d(TensorType::F32, 4, 3, 2, 1, BufferUsage::Activations)
-            .unwrap();
-        let out = ctx
-            .conv_2d(kernel, input, 1, 1, 1, 1, 1, 1, BufferUsage::Activations)
-            .unwrap();
-
-        let kernel_values = patterned_f32s(3 * 3 * 2 * 3, -0.3, 0.025);
-        let input_values = patterned_f32s(4 * 3 * 2, -0.2, 0.05);
-        ctx.write_tensor_data(kernel, &f32s_to_bytes(&kernel_values))
-            .unwrap();
-        ctx.write_tensor_data(input, &f32s_to_bytes(&input_values))
-            .unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, out).unwrap();
-
-        let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
-        let session = MetalGraphSession::from_runtime(
-            runtime,
-            &ctx,
-            &prepared,
-            BufferStorageMode::Shared,
-            BufferStorageMode::Shared,
-        )
-        .unwrap();
-
-        let execution = session.execute(&ctx, &[], &[out]).unwrap();
-        let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-        let expected = cpu_conv_2d_f32(
-            &kernel_values,
-            &input_values,
-            3,
-            3,
-            2,
-            3,
-            4,
-            3,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        );
-
-        assert_eq!(actual.len(), expected.len());
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            assert!(
-                (a - e).abs() < 1.0e-5,
-                "conv_2d output mismatch: actual={} expected={}",
-                a,
-                e
-            );
-        }
-    }
-
-    #[test]
-    fn executes_group_norm_graph_on_metal_when_available() {
-        let runtime = match MetalRuntime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => return,
-        };
-
-        let mut ctx = Context::new(InitParams {
-            mem_size: 1 << 20,
-            mem_buffer: None,
-            no_alloc: false,
-        });
-
-        let src = ctx
-            .new_tensor_4d(TensorType::F32, 3, 2, 4, 1, BufferUsage::Activations)
-            .unwrap();
-        let out = ctx
-            .group_norm(src, 2, 1.0e-6, BufferUsage::Activations)
-            .unwrap();
-
-        let values = patterned_f32s(3 * 2 * 4, -0.6, 0.11);
-        ctx.write_tensor_data(src, &f32s_to_bytes(&values)).unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, out).unwrap();
-
-        let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
-        let session = MetalGraphSession::from_runtime(
-            runtime,
-            &ctx,
-            &prepared,
-            BufferStorageMode::Shared,
-            BufferStorageMode::Shared,
-        )
-        .unwrap();
-
-        let execution = session.execute(&ctx, &[], &[out]).unwrap();
-        let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-        let expected = cpu_group_norm_f32(&values, 3, 2, 4, 1, 2, 1.0e-6);
-
-        assert_eq!(actual.len(), expected.len());
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            assert!(
-                (a - e).abs() < 1.0e-5,
-                "group_norm output mismatch: actual={} expected={}",
-                a,
-                e
-            );
-        }
-    }
-
-    #[test]
-    fn executes_upscale_nearest_graph_on_metal_when_available() {
-        let runtime = match MetalRuntime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => return,
-        };
-
-        let mut ctx = Context::new(InitParams {
-            mem_size: 1 << 20,
-            mem_buffer: None,
-            no_alloc: false,
-        });
-
-        let src = ctx
-            .new_tensor_4d(TensorType::F32, 3, 2, 2, 1, BufferUsage::Activations)
-            .unwrap();
-        let out = ctx
-            .upscale(
-                src,
-                2,
-                ScaleMode::Nearest,
-                false,
-                false,
-                BufferUsage::Activations,
-            )
-            .unwrap();
-
-        let values = patterned_f32s(3 * 2 * 2, -0.4, 0.09);
-        ctx.write_tensor_data(src, &f32s_to_bytes(&values)).unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, out).unwrap();
-
-        let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
-        let session = MetalGraphSession::from_runtime(
-            runtime,
-            &ctx,
-            &prepared,
-            BufferStorageMode::Shared,
-            BufferStorageMode::Shared,
-        )
-        .unwrap();
-
-        let execution = session.execute(&ctx, &[], &[out]).unwrap();
-        let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-        let expected = cpu_upscale_nearest_f32(&values, 3, 2, 2, 1, 2);
-
-        assert_eq!(actual.len(), expected.len());
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            assert!(
-                (a - e).abs() < 1.0e-6,
-                "upscale nearest output mismatch: actual={} expected={}",
-                a,
-                e
-            );
-        }
-    }
-
-    #[test]
-    fn executes_repeat_channel_vector_graph_on_metal_when_available() {
-        let runtime = match MetalRuntime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => return,
-        };
-
-        let mut ctx = Context::new(InitParams {
-            mem_size: 1 << 20,
-            mem_buffer: None,
-            no_alloc: false,
-        });
-
-        let shape_of = ctx
-            .new_tensor_4d(TensorType::F32, 8, 6, 4, 1, BufferUsage::Activations)
-            .unwrap();
-        let vector = ctx
-            .new_tensor_1d(TensorType::F32, 4, BufferUsage::Activations)
-            .unwrap();
-        let reshaped = ctx.reshape(vector, &[1, 1, 4, 1]).unwrap();
-        let out = ctx
-            .repeat(reshaped, shape_of, BufferUsage::Activations)
-            .unwrap();
-
-        let vector_values = vec![-0.35f32, 0.125, 0.7, -1.1];
-        ctx.write_tensor_data(vector, &f32s_to_bytes(&vector_values))
-            .unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, out).unwrap();
-
-        let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
-        let session = MetalGraphSession::from_runtime(
-            runtime,
-            &ctx,
-            &prepared,
-            BufferStorageMode::Shared,
-            BufferStorageMode::Shared,
-        )
-        .unwrap();
-
-        let execution = session.execute(&ctx, &[], &[out]).unwrap();
-        let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-        let expected = cpu_repeat_f32(&vector_values, 1, 1, 4, 1, 8, 6, 4, 1);
-
-        assert_eq!(actual.len(), expected.len());
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            assert!(
-                (a - e).abs() < 1.0e-6,
-                "repeat output mismatch: actual={} expected={}",
-                a,
-                e
-            );
-        }
-    }
-
-    #[test]
-    fn executes_channel_affine_graph_on_metal_when_available() {
-        let runtime = match MetalRuntime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => return,
-        };
-
-        let mut ctx = Context::new(InitParams {
-            mem_size: 1 << 20,
-            mem_buffer: None,
-            no_alloc: false,
-        });
-
-        let src = ctx
-            .new_tensor_4d(TensorType::F32, 8, 6, 4, 1, BufferUsage::Activations)
-            .unwrap();
-        let scale_vector = ctx
-            .new_tensor_1d(TensorType::F32, 4, BufferUsage::Activations)
-            .unwrap();
-        let bias_vector = ctx
-            .new_tensor_1d(TensorType::F32, 4, BufferUsage::Activations)
-            .unwrap();
-        let scale_reshaped = ctx.reshape(scale_vector, &[1, 1, 4, 1]).unwrap();
-        let bias_reshaped = ctx.reshape(bias_vector, &[1, 1, 4, 1]).unwrap();
-        let scale = ctx
-            .repeat(scale_reshaped, src, BufferUsage::Activations)
-            .unwrap();
-        let bias = ctx
-            .repeat(bias_reshaped, src, BufferUsage::Activations)
-            .unwrap();
-        let scaled = ctx
-            .binary_like_a(Op::Mul, src, scale, BufferUsage::Activations)
-            .unwrap();
-        let out = ctx
-            .binary_like_a(Op::Add, scaled, bias, BufferUsage::Activations)
-            .unwrap();
-
-        let src_values = patterned_f32s(8 * 6 * 4, -0.45, 0.017);
-        let scale_values = vec![0.8f32, -0.35, 1.25, 0.5];
-        let bias_values = vec![-0.2f32, 0.9, 0.15, -0.6];
-        ctx.write_tensor_data(src, &f32s_to_bytes(&src_values))
-            .unwrap();
-        ctx.write_tensor_data(scale_vector, &f32s_to_bytes(&scale_values))
-            .unwrap();
-        ctx.write_tensor_data(bias_vector, &f32s_to_bytes(&bias_values))
-            .unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, out).unwrap();
-
-        let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
-        let session = MetalGraphSession::from_runtime(
-            runtime,
-            &ctx,
-            &prepared,
-            BufferStorageMode::Shared,
-            BufferStorageMode::Shared,
-        )
-        .unwrap();
-
-        let execution = session.execute(&ctx, &[], &[out]).unwrap();
-        let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-        let repeated_scale = cpu_repeat_f32(&scale_values, 1, 1, 4, 1, 8, 6, 4, 1);
-        let repeated_bias = cpu_repeat_f32(&bias_values, 1, 1, 4, 1, 8, 6, 4, 1);
-        let expected = src_values
-            .iter()
-            .zip(repeated_scale.iter())
-            .zip(repeated_bias.iter())
-            .map(|((src, scale), bias)| src * scale + bias)
-            .collect::<Vec<_>>();
-
-        assert_eq!(actual.len(), expected.len());
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            assert!(
-                (a - e).abs() < 1.0e-6,
-                "channel affine output mismatch: actual={} expected={}",
-                a,
-                e
-            );
-        }
-    }
-
-    #[test]
-    fn executes_large_upscale_conv_bias_graph_on_metal_when_available() {
-        let runtime = match MetalRuntime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => return,
-        };
-
-        let mut ctx = Context::new(InitParams {
-            mem_size: 32 << 20,
-            mem_buffer: None,
-            no_alloc: false,
-        });
-
-        let src = ctx
-            .new_tensor_4d(TensorType::F32, 64, 48, 4, 1, BufferUsage::Activations)
-            .unwrap();
-        let weights = ctx
-            .new_tensor_4d(TensorType::F32, 3, 3, 4, 3, BufferUsage::Weights)
-            .unwrap();
-        let bias_vector = ctx
-            .new_tensor_1d(TensorType::F32, 3, BufferUsage::Weights)
-            .unwrap();
-        let upscaled = ctx
-            .upscale(
-                src,
-                2,
-                ScaleMode::Nearest,
-                false,
-                false,
-                BufferUsage::Activations,
-            )
-            .unwrap();
-        let conv = ctx
-            .conv_2d(
-                weights,
-                upscaled,
-                1,
-                1,
-                1,
-                1,
-                1,
-                1,
-                BufferUsage::Activations,
-            )
-            .unwrap();
-        let bias_reshaped = ctx.reshape(bias_vector, &[1, 1, 3, 1]).unwrap();
-        let bias = ctx
-            .repeat(bias_reshaped, conv, BufferUsage::Activations)
-            .unwrap();
-        let out = ctx
-            .binary_like_a(Op::Add, conv, bias, BufferUsage::Activations)
-            .unwrap();
-
-        let src_values = patterned_f32s(64 * 48 * 4, -0.3, 0.0007);
-        let weight_values = patterned_f32s(3 * 3 * 4 * 3, -0.12, 0.003);
-        let bias_values = vec![0.05f32, -0.15, 0.3];
-        ctx.write_tensor_data(src, &f32s_to_bytes(&src_values))
-            .unwrap();
-        ctx.write_tensor_data(weights, &f32s_to_bytes(&weight_values))
-            .unwrap();
-        ctx.write_tensor_data(bias_vector, &f32s_to_bytes(&bias_values))
-            .unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, out).unwrap();
-
-        let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
-        let session = MetalGraphSession::from_runtime(
-            runtime,
-            &ctx,
-            &prepared,
-            BufferStorageMode::Shared,
-            BufferStorageMode::Shared,
-        )
-        .unwrap();
-
-        let execution = session.execute(&ctx, &[], &[out]).unwrap();
-        let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-
-        let upscaled_expected = cpu_upscale_nearest_f32(&src_values, 64, 48, 4, 1, 2);
-        let conv_expected = cpu_conv_2d_f32(
-            &weight_values,
-            &upscaled_expected,
-            3,
-            3,
-            4,
-            3,
-            128,
-            96,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-        );
-        let repeated_bias = cpu_repeat_f32(&bias_values, 1, 1, 3, 1, 128, 96, 3, 1);
-        let expected = conv_expected
-            .iter()
-            .zip(repeated_bias.iter())
-            .map(|(conv, bias)| conv + bias)
-            .collect::<Vec<_>>();
-
-        assert_eq!(actual.len(), expected.len());
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            assert!(
-                (a - e).abs() < 2.0e-4,
-                "large upscale->conv->bias output mismatch: actual={} expected={}",
-                a,
-                e
-            );
-        }
-    }
-
-    #[test]
-    fn executes_large_group_norm_graph_on_metal_when_available() {
-        let runtime = match MetalRuntime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => return,
-        };
-
-        let mut ctx = Context::new(InitParams {
-            mem_size: 96 << 20,
-            mem_buffer: None,
-            no_alloc: false,
-        });
-
-        let width = 256usize;
-        let height = 256usize;
-        let channels = 128usize;
-        let batch = 1usize;
-        let groups = 32usize;
-        let src = ctx
-            .new_tensor_4d(
-                TensorType::F32,
-                width as i64,
-                height as i64,
-                channels as i64,
-                batch as i64,
-                BufferUsage::Activations,
-            )
-            .unwrap();
-        let out = ctx
-            .group_norm(src, groups as i32, 1.0e-6, BufferUsage::Activations)
-            .unwrap();
-
-        let values = hashed_f32s(
-            width * height * channels * batch,
-            0x1234_5678,
-            0.85,
-            -0.1,
-            0.7,
-        );
-        ctx.write_tensor_data(src, &f32s_to_bytes(&values)).unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, out).unwrap();
-
-        let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
-        let session = MetalGraphSession::from_runtime(
-            runtime,
-            &ctx,
-            &prepared,
-            BufferStorageMode::Shared,
-            BufferStorageMode::Shared,
-        )
-        .unwrap();
-
-        let execution = session.execute(&ctx, &[], &[out]).unwrap();
-        let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-        let expected = cpu_group_norm_f32(&values, width, height, channels, batch, groups, 1.0e-6);
-
-        assert_eq!(actual.len(), expected.len());
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            assert!(
-                (a - e).abs() < 2.0e-4,
-                "large group_norm output mismatch: actual={} expected={}",
-                a,
-                e
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "Metal unary backend still skips large tensor regions; FLUX routes activations via GLU instead"]
-    fn executes_large_silu_graph_on_metal_when_available() {
-        let runtime = match MetalRuntime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => return,
-        };
-
-        let mut ctx = Context::new(InitParams {
-            mem_size: 96 << 20,
-            mem_buffer: None,
-            no_alloc: false,
-        });
-
-        let width = 256usize;
-        let height = 256usize;
-        let channels = 128usize;
-        let batch = 1usize;
-        let src = ctx
-            .new_tensor_4d(
-                TensorType::F32,
-                width as i64,
-                height as i64,
-                channels as i64,
-                batch as i64,
-                BufferUsage::Activations,
-            )
-            .unwrap();
-        let out = ctx
-            .unary(src, UnaryOp::Silu, BufferUsage::Activations)
-            .unwrap();
-
-        let values = hashed_f32s(
-            width * height * channels * batch,
-            0x8765_4321,
-            1.1,
-            0.0,
-            1.3,
-        );
-        ctx.write_tensor_data(src, &f32s_to_bytes(&values)).unwrap();
-
-        let mut graph = Graph::new();
-        graph.build_forward_expand(&ctx, out).unwrap();
-
-        let prepared = prepare_graph(&ctx, &graph, runtime.features()).unwrap();
-        let session = MetalGraphSession::from_runtime(
-            runtime,
-            &ctx,
-            &prepared,
-            BufferStorageMode::Shared,
-            BufferStorageMode::Shared,
-        )
-        .unwrap();
-
-        let execution = session.execute(&ctx, &[], &[out]).unwrap();
-        let actual = bytes_to_f32s(execution.outputs.get(&out).unwrap());
-        let expected = cpu_silu_f32(&values);
-
-        assert_eq!(actual.len(), expected.len());
-        for (index, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
-            let x = index % width;
-            let y = (index / width) % height;
-            let c = (index / (width * height)) % channels;
-            assert!(
-                (a - e).abs() < 1.0e-6,
-                "large silu output mismatch at index={} x={} y={} c={}: actual={} expected={}",
-                index,
-                x,
-                y,
-                c,
-                a,
-                e
-            );
-        }
-    }
-
     fn cpu_rope_norm_f32(
         src: &[f32],
         positions: &[i32],
@@ -10164,189 +8591,6 @@ mod tests {
             }
         }
         dst
-    }
-
-    fn cpu_conv_2d_f32(
-        weights: &[f32],
-        input: &[f32],
-        kw: usize,
-        kh: usize,
-        ic: usize,
-        oc: usize,
-        iw: usize,
-        ih: usize,
-        batch: usize,
-        stride_x: usize,
-        stride_y: usize,
-        pad_x: usize,
-        pad_y: usize,
-        dil_x: usize,
-        dil_y: usize,
-    ) -> Vec<f32> {
-        let ow = (iw + 2 * pad_x - dil_x * (kw - 1) - 1) / stride_x + 1;
-        let oh = (ih + 2 * pad_y - dil_y * (kh - 1) - 1) / stride_y + 1;
-        let mut out = vec![0.0f32; ow * oh * oc * batch];
-
-        for n in 0..batch {
-            for out_channel in 0..oc {
-                for oy in 0..oh {
-                    for ox in 0..ow {
-                        let mut acc = 0.0f32;
-                        let base_x = ox * stride_x;
-                        let base_y = oy * stride_y;
-                        for in_channel in 0..ic {
-                            for ky in 0..kh {
-                                let iy = base_y + ky * dil_y;
-                                if iy < pad_y || iy >= ih + pad_y {
-                                    continue;
-                                }
-                                let iy = iy - pad_y;
-                                for kx in 0..kw {
-                                    let ix = base_x + kx * dil_x;
-                                    if ix < pad_x || ix >= iw + pad_x {
-                                        continue;
-                                    }
-                                    let ix = ix - pad_x;
-                                    let weight_idx =
-                                        (((out_channel * ic + in_channel) * kh + ky) * kw) + kx;
-                                    let input_idx = (((n * ic + in_channel) * ih + iy) * iw) + ix;
-                                    acc += weights[weight_idx] * input[input_idx];
-                                }
-                            }
-                        }
-                        let out_idx = (((n * oc + out_channel) * oh + oy) * ow) + ox;
-                        out[out_idx] = acc;
-                    }
-                }
-            }
-        }
-
-        out
-    }
-
-    fn cpu_group_norm_f32(
-        input: &[f32],
-        width: usize,
-        height: usize,
-        channels: usize,
-        batch: usize,
-        groups: usize,
-        epsilon: f32,
-    ) -> Vec<f32> {
-        let mut out = input.to_vec();
-        let channels_per_group = channels / groups;
-        let group_len = width * height * channels_per_group;
-
-        for b in 0..batch {
-            for g in 0..groups {
-                let channel_start = g * channels_per_group;
-                let mut mean = 0.0f32;
-                for c in 0..channels_per_group {
-                    for y in 0..height {
-                        for x in 0..width {
-                            let idx =
-                                (((b * channels + channel_start + c) * height + y) * width) + x;
-                            mean += input[idx];
-                        }
-                    }
-                }
-                mean /= group_len as f32;
-
-                let mut variance = 0.0f32;
-                for c in 0..channels_per_group {
-                    for y in 0..height {
-                        for x in 0..width {
-                            let idx =
-                                (((b * channels + channel_start + c) * height + y) * width) + x;
-                            let centered = input[idx] - mean;
-                            variance += centered * centered;
-                        }
-                    }
-                }
-                variance /= group_len as f32;
-                let scale = 1.0f32 / (variance + epsilon).sqrt();
-
-                for c in 0..channels_per_group {
-                    for y in 0..height {
-                        for x in 0..width {
-                            let idx =
-                                (((b * channels + channel_start + c) * height + y) * width) + x;
-                            out[idx] = (input[idx] - mean) * scale;
-                        }
-                    }
-                }
-            }
-        }
-
-        out
-    }
-
-    fn cpu_upscale_nearest_f32(
-        input: &[f32],
-        width: usize,
-        height: usize,
-        channels: usize,
-        batch: usize,
-        scale: usize,
-    ) -> Vec<f32> {
-        let out_width = width * scale;
-        let out_height = height * scale;
-        let mut out = vec![0.0f32; out_width * out_height * channels * batch];
-
-        for b in 0..batch {
-            for c in 0..channels {
-                for y in 0..out_height {
-                    for x in 0..out_width {
-                        let src_x = x / scale;
-                        let src_y = y / scale;
-                        let src_idx = (((b * channels + c) * height + src_y) * width) + src_x;
-                        let dst_idx = (((b * channels + c) * out_height + y) * out_width) + x;
-                        out[dst_idx] = input[src_idx];
-                    }
-                }
-            }
-        }
-
-        out
-    }
-
-    fn cpu_repeat_f32(
-        input: &[f32],
-        src_width: usize,
-        src_height: usize,
-        src_channels: usize,
-        src_batch: usize,
-        dst_width: usize,
-        dst_height: usize,
-        dst_channels: usize,
-        dst_batch: usize,
-    ) -> Vec<f32> {
-        let mut out = vec![0.0f32; dst_width * dst_height * dst_channels * dst_batch];
-        for b in 0..dst_batch {
-            let src_b = b % src_batch;
-            for c in 0..dst_channels {
-                let src_c = c % src_channels;
-                for y in 0..dst_height {
-                    let src_y = y % src_height;
-                    for x in 0..dst_width {
-                        let src_x = x % src_width;
-                        let src_idx = (((src_b * src_channels + src_c) * src_height + src_y)
-                            * src_width)
-                            + src_x;
-                        let dst_idx = (((b * dst_channels + c) * dst_height + y) * dst_width) + x;
-                        out[dst_idx] = input[src_idx];
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    fn cpu_silu_f32(input: &[f32]) -> Vec<f32> {
-        input
-            .iter()
-            .map(|value| *value / (1.0f32 + (-*value).exp()))
-            .collect()
     }
 
     fn f32s_to_bytes(values: &[f32]) -> Vec<u8> {
@@ -10502,7 +8746,8 @@ mod tests {
                     out[block_base + 16 + i] = ((row * 29 + block * 19 + i * 7) & 0xFF) as u8;
                 }
                 for i in 0..128 {
-                    out[block_base + 48 + i] = ((row * 37 + block * 23 + i * 5) & 0xFF) as u8;
+                    out[block_base + 48 + i] =
+                        ((row * 37 + block * 23 + i * 5) & 0xFF) as u8;
                 }
             }
         }
@@ -10864,8 +9109,7 @@ mod tests {
                     for idx in 0..row {
                         sum += a_batch[row * n + idx] * out_batch[col + idx * k];
                     }
-                    out_batch[col + row * k] =
-                        (b_batch[col + row * k] - sum) / a_batch[row * n + row];
+                    out_batch[col + row * k] = (b_batch[col + row * k] - sum) / a_batch[row * n + row];
                 }
             }
         }

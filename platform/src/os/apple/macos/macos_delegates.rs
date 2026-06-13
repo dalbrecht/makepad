@@ -11,7 +11,6 @@ use {
                 get_event_key_modifier, get_event_mouse_button, load_mouse_cursor,
                 nsstring_to_string, superclass,
             },
-            cx_native::EventFlow,
             macos::{
                 macos_app::{with_macos_app, MacosApp},
                 macos_event::MacosEvent,
@@ -50,36 +49,8 @@ pub fn define_macos_timer_delegate() -> *const Class {
 }
 
 pub fn define_app_delegate() -> *const Class {
-    extern "C" fn application_should_terminate(_: &Object, _: Sel, _: ObjcId) -> isize {
-        const NSTERMINATE_CANCEL: isize = 0;
-        const NSTERMINATE_NOW: isize = 1;
-
-        if with_macos_app(|app| app.event_flow == EventFlow::Exit) {
-            return NSTERMINATE_NOW;
-        }
-
-        with_macos_app(|app| app.terminating_from_app_delegate = true);
-        MacosApp::do_callback(MacosEvent::AppQuitRequested);
-        let should_terminate = with_macos_app(|app| {
-            app.terminating_from_app_delegate = false;
-            app.event_flow == EventFlow::Exit
-        });
-
-        if should_terminate {
-            NSTERMINATE_NOW
-        } else {
-            NSTERMINATE_CANCEL
-        }
-    }
-
     let superclass = class!(NSObject);
-    let mut decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
-    unsafe {
-        decl.add_method(
-            sel!(applicationShouldTerminate:),
-            application_should_terminate as extern "C" fn(&Object, Sel, ObjcId) -> isize,
-        );
-    }
+    let decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
 
     return decl.register();
 }

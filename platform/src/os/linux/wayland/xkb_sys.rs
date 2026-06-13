@@ -404,9 +404,6 @@ extern "C" {
     // Key repeat
     pub fn xkb_keymap_key_repeats(keymap: *mut xkb_keymap, key: xkb_keycode_t) -> c_int;
 
-    // Get keymap from state
-    pub fn xkb_state_get_keymap(state: *mut xkb_state) -> *mut xkb_keymap;
-
     // Keysym utilities
     pub fn xkb_keysym_get_name(keysym: xkb_keysym_t, buffer: *mut c_char, size: usize) -> c_int;
 
@@ -568,16 +565,16 @@ pub fn xkb_keysym_to_keycode(keysym: xkb_keysym_t) -> crate::event::keyboard::Ke
         XKB_KEY_Print => KeyCode::PrintScreen,
         XKB_KEY_Scroll_Lock => KeyCode::ScrollLock,
         XKB_KEY_Pause => KeyCode::Pause,
-        XKB_KEY_Home | XKB_KEY_KP_Home => KeyCode::Home,
-        XKB_KEY_Page_Up | XKB_KEY_KP_Page_Up => KeyCode::PageUp,
-        XKB_KEY_Delete | XKB_KEY_KP_Delete => KeyCode::Delete,
-        XKB_KEY_End | XKB_KEY_KP_End => KeyCode::End,
-        XKB_KEY_Page_Down | XKB_KEY_KP_Page_Down => KeyCode::PageDown,
-        XKB_KEY_Left | XKB_KEY_KP_Left => KeyCode::ArrowLeft,
-        XKB_KEY_Right | XKB_KEY_KP_Right => KeyCode::ArrowRight,
-        XKB_KEY_Down | XKB_KEY_KP_Down => KeyCode::ArrowDown,
-        XKB_KEY_Up | XKB_KEY_KP_Up => KeyCode::ArrowUp,
-        XKB_KEY_Insert | XKB_KEY_KP_Insert => KeyCode::Insert,
+        XKB_KEY_Home => KeyCode::Home,
+        XKB_KEY_Page_Up => KeyCode::PageUp,
+        XKB_KEY_Delete => KeyCode::Delete,
+        XKB_KEY_End => KeyCode::End,
+        XKB_KEY_Page_Down => KeyCode::PageDown,
+        XKB_KEY_Left => KeyCode::ArrowLeft,
+        XKB_KEY_Right => KeyCode::ArrowRight,
+        XKB_KEY_Down => KeyCode::ArrowDown,
+        XKB_KEY_Up => KeyCode::ArrowUp,
+        XKB_KEY_Insert => KeyCode::Insert,
         XKB_KEY_apostrophe => KeyCode::Quote,
 
         _ => KeyCode::Unknown,
@@ -703,14 +700,6 @@ impl XkbState {
             None
         } else {
             Some(XkbState { ptr })
-        }
-    }
-
-    /// Check if a key should repeat according to the keymap
-    pub fn key_repeats(&self, keycode: u32) -> bool {
-        unsafe {
-            let keymap = xkb_state_get_keymap(self.ptr);
-            xkb_keymap_key_repeats(keymap, keycode) != 0
         }
     }
 

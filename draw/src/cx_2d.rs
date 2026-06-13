@@ -3,7 +3,7 @@ use {
         cx_draw::CxDraw,
         draw_list_2d::DrawList2d,
         makepad_math::{Vec2Index, Vec2d},
-        makepad_platform::{DrawListId, DrawPassId, LiveId},
+        makepad_platform::{DrawListId, LiveId},
         turtle::{AlignEntry, FinishedWalk, Turtle, Walk},
     },
     std::{ops::Deref, ops::DerefMut},
@@ -12,8 +12,6 @@ use {
 pub struct Cx2d<'a, 'b> {
     pub cx: &'b mut CxDraw<'a>,
     pub(crate) overlay_id: Option<DrawListId>,
-    pub(crate) overlay_pass_id: Option<DrawPassId>,
-    pub(crate) overlay_draw_depth: usize,
 
     //pub (crate) overlay_sweep_lock: Option<Rc<RefCell<Area>>>,
     pub(crate) turtles: Vec<Turtle>,
@@ -44,8 +42,6 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         draw_call_parent_stack.push(1);
         Self {
             overlay_id: None,
-            overlay_pass_id: None,
-            overlay_draw_depth: 0,
             cx,
             turtle_clips: Vec::with_capacity(1024),
             finished_rows: Vec::with_capacity(1024),
@@ -55,10 +51,6 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             draw_call_parent_stack,
             draw_call_parent_next: 2,
         }
-    }
-
-    pub fn is_drawing_overlay(&self) -> bool {
-        self.overlay_draw_depth > 0
     }
 
     #[inline]

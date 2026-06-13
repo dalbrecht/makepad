@@ -1,8 +1,6 @@
 use crate::{error::GltfError, loader::LoadedGltf};
 use makepad_base64::base64_decode;
-use std::{fs, io::Read, path::Path};
-
-const MAX_GLTF_IMAGE_BYTES: usize = 1024 * 1024 * 1024;
+use std::{fs, path::Path};
 
 /// Resolve image payload bytes for a glTF image entry.
 /// Supports external files, `data:` URIs, and GLB bufferView-backed images.
@@ -42,23 +40,11 @@ pub fn load_image_bytes(loaded: &LoadedGltf, image_index: usize) -> Result<Vec<u
             })?;
 
         let start = buffer_view.byte_offset.unwrap_or(0);
-        let end = start
-            .checked_add(buffer_view.byte_length)
-            .ok_or_else(|| {
-                GltfError::Validation(format!(
-                    "image[{image_index}] bufferView {buffer_view_index} byte range overflows"
-                ))
-            })?;
+        let end = start + buffer_view.byte_length;
         if end > buffer.len() {
             return Err(GltfError::Validation(format!(
                 "image[{image_index}] bufferView {buffer_view_index} overruns buffer bounds ({end} > {})",
                 buffer.len()
-            )));
-        }
-        if buffer_view.byte_length > MAX_GLTF_IMAGE_BYTES {
-            return Err(GltfError::Validation(format!(
-                "image[{image_index}] bufferView {buffer_view_index} is too large ({} bytes)",
-                buffer_view.byte_length
             )));
         }
         return Ok(buffer[start..end].to_vec());
@@ -75,7 +61,7 @@ fn load_uri(uri: &str, base_dir: Option<&Path>) -> Result<Vec<u8>, GltfError> {
     }
 
     if let Some(file_uri) = uri.strip_prefix("file://") {
-        return read_limited_file(Path::new(file_uri));
+        return Ok(fs::read(Path::new(file_uri))?);
     }
 
     if uri.contains("://") {
@@ -84,7 +70,7 @@ fn load_uri(uri: &str, base_dir: Option<&Path>) -> Result<Vec<u8>, GltfError> {
 
     let base_dir = base_dir.ok_or_else(|| GltfError::UnsupportedUri(uri.to_string()))?;
     let path = base_dir.join(uri);
-    read_limited_file(&path)
+    Ok(fs::read(path)?)
 }
 
 fn decode_data_uri(uri: &str) -> Result<Vec<u8>, GltfError> {
@@ -101,47 +87,8 @@ fn decode_data_uri(uri: &str) -> Result<Vec<u8>, GltfError> {
         ));
     }
 
-    let max_base64_len = MAX_GLTF_IMAGE_BYTES.div_ceil(3) * 4;
-    if data.len() > max_base64_len {
-        return Err(GltfError::DataUri(format!(
-            "data uri image is too large ({} base64 bytes)",
-            data.len()
-        )));
-    }
-
-    let decoded = base64_decode(data.as_bytes())
-        .map_err(|_| GltfError::DataUri("base64 decode failed".to_string()))?;
-    if decoded.len() > MAX_GLTF_IMAGE_BYTES {
-        return Err(GltfError::DataUri(format!(
-            "data uri image is too large ({} bytes)",
-            decoded.len()
-        )));
-    }
-    Ok(decoded)
-}
-
-fn read_limited_file(path: &Path) -> Result<Vec<u8>, GltfError> {
-    if let Ok(metadata) = fs::metadata(path) {
-        if metadata.len() > MAX_GLTF_IMAGE_BYTES as u64 {
-            return Err(GltfError::Validation(format!(
-                "image file {} is too large ({} bytes)",
-                path.display(),
-                metadata.len()
-            )));
-        }
-    }
-    let file = fs::File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take((MAX_GLTF_IMAGE_BYTES as u64) + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_GLTF_IMAGE_BYTES {
-        return Err(GltfError::Validation(format!(
-            "image file {} is too large ({} bytes)",
-            path.display(),
-            bytes.len()
-        )));
-    }
-    Ok(bytes)
+    base64_decode(data.as_bytes())
+        .map_err(|_| GltfError::DataUri("base64 decode failed".to_string()))
 }
 
 #[cfg(test)]

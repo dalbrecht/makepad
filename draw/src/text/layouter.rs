@@ -101,7 +101,7 @@ impl Layouter {
         self.loader.define_font(id, definition);
     }
 
-    pub fn get_or_load_font_family(&mut self, id: FontFamilyId) -> Rc<FontFamily> {
+    pub fn get_or_load_font_family(&mut self, id: FontFamilyId) -> Option<Rc<FontFamily>> {
         self.loader.get_or_load_font_family_rc(id)
     }
 
@@ -125,10 +125,20 @@ impl Layouter {
     }
 
     fn layout(&mut self, params: OwnedLayoutParams) -> LaidoutText {
-        let font_family = self
+        let font_family = match self
             .loader
             .get_or_load_font_family(params.style.font_family_id)
-            .clone();
+        {
+            Some(family) => family.clone(),
+            None => {
+                return LaidoutText {
+                    text: params.text,
+                    size_in_lpxs: Size::ZERO,
+                    rows: Vec::new(),
+                    is_truncated: false,
+                };
+            }
+        };
         LayoutContext::new(font_family, params.text, params.style, params.options)
             .layout_multiline()
     }
@@ -552,12 +562,13 @@ impl LayoutContext {
     /// Finishes any pending glyphs into a row (without a newline).
     /// Always ensures at least one row exists.
     fn finish_current_row_if_pending(&mut self) {
-        let has_pending_content =
-            self.current_row_start != self.current_row_end || !self.glyphs.is_empty();
+        let has_pending_content = self.current_row_start != self.current_row_end
+            || !self.glyphs.is_empty();
         if has_pending_content || self.rows.is_empty() {
             self.finish_current_row(false);
         }
     }
+
 }
 
 #[derive(Debug)]
@@ -628,33 +639,30 @@ impl Fitter {
                 max_count = mid_count;
             }
         }
-        if let Some(mut best_count) = best_count {
-            while best_count > 0 {
-                let best_len = self.lens[..best_count].iter().sum();
-                let best_text = self.font_family.get_or_shape(self.text.substr(0..best_len));
-                if best_text.width_in_ems * self.font_size_in_lpxs <= wrap_width_in_lpxs {
-                    self.lens.drain(..best_count);
-                    self.widths_in_lpxs.drain(..best_count);
-                    self.text = self.text.substr(best_len..);
-                    return Some(best_text);
-                }
-                best_count -= 1;
-            }
+        if let Some(best_count) = best_count {
+            let best_len = self.lens[..best_count].iter().sum();
+            let best_text = self.font_family.get_or_shape(self.text.substr(0..best_len));
+            self.lens.drain(..best_count);
+            self.widths_in_lpxs.drain(..best_count);
+            self.text = self.text.substr(best_len..);
+            Some(best_text)
+        } else {
+            None
         }
-        None
     }
 
     fn can_fit(&self, count: usize, wrap_width_in_lpxs: f32) -> bool {
-        // Use the pre-computed per-segment widths to estimate whether `count`
-        // segments fit within the wrap width. This avoids calling get_or_shape()
-        // on progressively longer substrings during the binary search — those
-        // cumulative substrings are unique and always miss the shaper cache,
-        // making each call a full HarfBuzz shape operation.
-        //
-        // The final candidate is shaped and checked exactly in `fit()` before it
-        // is accepted, so this estimate can never allow an overflowing row.
+        let len = self.lens[..count].iter().sum();
         let estimated_width_in_lpxs: f32 = self.widths_in_lpxs[..count].iter().sum();
-        estimated_width_in_lpxs <= wrap_width_in_lpxs
+        if 0.5 * estimated_width_in_lpxs > wrap_width_in_lpxs {
+            return false;
+        }
+        let text = self.font_family.get_or_shape(self.text.substr(0..len));
+        let actual_width_in_lpxs = text.width_in_ems * self.font_size_in_lpxs;
+        if actual_width_in_lpxs > wrap_width_in_lpxs {
+            return false;
+        }
+        true
     }
 
     fn pop(&mut self) -> usize {
@@ -954,7 +962,8 @@ impl PartialEq for LayoutOptions {
         self.first_row_indent_in_lpxs.to_bits() == other.first_row_indent_in_lpxs.to_bits()
             && self.first_row_min_line_spacing_below_in_lpxs.to_bits()
                 == other.first_row_min_line_spacing_below_in_lpxs.to_bits()
-            && self.max_width_in_lpxs.map(f32::to_bits) == other.max_width_in_lpxs.map(f32::to_bits)
+            && self.max_width_in_lpxs.map(f32::to_bits)
+                == other.max_width_in_lpxs.map(f32::to_bits)
             && self.wrap == other.wrap
             && self.align.to_bits() == other.align.to_bits()
             && self.line_spacing_scale.to_bits() == other.line_spacing_scale.to_bits()
@@ -1232,8 +1241,8 @@ impl LaidoutGlyph {
 mod tests {
     use super::{
         merge_segments_for_line_breaking, parse_text_atlas_size_value, Layouter, Size,
-        LAYOUT_CACHE_MAX_TEXT_LEN, LAYOUT_CACHE_MULTILINE_LINE_COUNT,
-        LAYOUT_CACHE_MULTILINE_TEXT_LEN,
+        LAYOUT_CACHE_MAX_TEXT_LEN,
+        LAYOUT_CACHE_MULTILINE_LINE_COUNT, LAYOUT_CACHE_MULTILINE_TEXT_LEN,
     };
     use unicode_segmentation::UnicodeSegmentation;
 
@@ -1259,7 +1268,10 @@ mod tests {
     /// Helper: split text by word bounds and return segment lengths,
     /// then apply merging, then reconstruct the segment strings.
     fn merged_segments(text: &str) -> Vec<String> {
-        let mut lens: Vec<usize> = text.split_word_bounds().map(|s| s.len()).collect();
+        let mut lens: Vec<usize> = text
+            .split_word_bounds()
+            .map(|s| s.len())
+            .collect();
         merge_segments_for_line_breaking(text, &mut lens);
         let mut result = Vec::new();
         let mut offset = 0;
@@ -1313,7 +1325,10 @@ mod tests {
 
     #[test]
     fn no_merge_for_plain_words() {
-        assert_eq!(merged_segments("hello world"), vec!["hello", " ", "world"]);
+        assert_eq!(
+            merged_segments("hello world"),
+            vec!["hello", " ", "world"]
+        );
     }
 
     #[test]

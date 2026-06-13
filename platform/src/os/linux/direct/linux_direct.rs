@@ -73,7 +73,6 @@ impl Cx {
 
         cx.os_type = OsType::LinuxDirect;
         cx.gpu_info.performance = GpuPerformance::Tier1;
-        cx.set_physical_keyboard_state(true);
 
         cx.call_event_handler(&Event::Startup);
         cx.redraw_all();
@@ -115,7 +114,6 @@ impl Cx {
         event: DirectEvent,
     ) -> EventFlow {
         if let EventFlow::Exit = self.handle_platform_ops(direct_app) {
-            self.call_event_handler(&Event::Shutdown);
             return EventFlow::Exit;
         }
 
@@ -137,38 +135,24 @@ impl Cx {
                 //let p = profile_start();
                 self.handle_repaint(direct_app);
                 //profile_end("paint openGL", p);
-
-                // Run script-VM garbage collection at a safe point after paint, matching
-                // the macOS backend, so the script object heap doesn't grow without bound.
-                self.with_vm(|vm| {
-                    if vm.heap().needs_gc() {
-                        vm.gc();
-                    }
-                });
             }
-            DirectEvent::MouseDown(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
+            DirectEvent::MouseDown(e) => {
                 self.fingers.process_tap_count(e.abs, e.time);
                 self.fingers.mouse_down(e.button, CxWindowPool::id_zero());
                 self.call_event_handler(&Event::MouseDown(e.into()))
             }
-            DirectEvent::MouseMove(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
+            DirectEvent::MouseMove(e) => {
                 self.call_event_handler(&Event::MouseMove(e.into()));
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
                 self.fingers.switch_captures();
             }
-            DirectEvent::MouseUp(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
+            DirectEvent::MouseUp(e) => {
                 let button = e.button;
                 self.call_event_handler(&Event::MouseUp(e.into()));
                 self.fingers.mouse_up(button);
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
             }
-            DirectEvent::Scroll(mut e) => {
-                self.dpi_override_scale(&mut e.abs, e.window_id);
-                self.call_event_handler(&Event::Scroll(e.into()))
-            }
+            DirectEvent::Scroll(e) => self.call_event_handler(&Event::Scroll(e.into())),
             DirectEvent::KeyDown(e) => {
                 self.keyboard.process_key_down(e.clone());
                 self.call_event_handler(&Event::KeyDown(e))
@@ -181,7 +165,6 @@ impl Cx {
             DirectEvent::Timer(e) => {
                 if e.timer_id == 0 {
                     if SignalToUI::check_and_clear_ui_signal() {
-                        self.handle_termination_signal();
                         self.handle_media_signals();
                         self.handle_script_signals();
                         self.call_event_handler(&Event::Signal);
@@ -288,18 +271,12 @@ impl Cx {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     let window = &mut self.windows[window_id];
-                    window.os_dpi_factor = Some(direct_app.dpi_factor);
-                    // Honor a preset `dpi_override` (e.g. set in the DSL on
-                    // the Window block) by using it as the effective scale.
-                    // `Cx::set_window_dpi_override` at runtime hits the same
-                    // field and re-emits the geom directly.
-                    let dpi_factor = window.dpi_override.unwrap_or(direct_app.dpi_factor);
                     let size = dvec2(
-                        direct_app.drm.width as f64 / dpi_factor,
-                        direct_app.drm.height as f64 / dpi_factor,
+                        direct_app.drm.width as f64 / direct_app.dpi_factor,
+                        direct_app.drm.height as f64 / direct_app.dpi_factor,
                     );
                     window.window_geom = WindowGeom {
-                        dpi_factor,
+                        dpi_factor: direct_app.dpi_factor,
                         can_fullscreen: false,
                         xr_is_presenting: false,
                         is_fullscreen: true,
@@ -319,10 +296,8 @@ impl Cx {
                     grab_keyboard,
                 } => {
                     let window = &mut self.windows[window_id];
-                    window.os_dpi_factor = Some(direct_app.dpi_factor);
-                    let dpi_factor = window.dpi_override.unwrap_or(direct_app.dpi_factor);
                     window.window_geom = WindowGeom {
-                        dpi_factor,
+                        dpi_factor: direct_app.dpi_factor,
                         can_fullscreen: false,
                         xr_is_presenting: false,
                         is_fullscreen: false,
@@ -393,6 +368,7 @@ impl Cx {
                         },
                     ));
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
@@ -404,9 +380,11 @@ impl Cx {
 
 impl CxOsApi for Cx {
     fn init_cx_os(&mut self) {
-        if let Some(item) = std::option_env!("MAKEPAD_PACKAGE_DIR") {
-            self.package_root = Some(item.to_string());
+        self.live_expand();
+        if !Self::has_studio_web_socket() {
+            self.start_disk_live_file_watcher(100);
         }
+        self.live_scan_dependencies();
         self.native_load_dependencies();
     }
 

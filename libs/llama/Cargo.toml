@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 makepad-ggml = { path = "../ggml" }
 
+[workspace]
+
 [[bin]]
 name = "llama-load"
 path = "src/bin/llama_load.rs"

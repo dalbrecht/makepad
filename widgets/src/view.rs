@@ -589,10 +589,6 @@ impl WidgetNode for View {
         self.area
     }
 
-    fn set_scroll_pos(&mut self, cx: &mut Cx, v: Vec2d) {
-        self.set_scroll_pos(cx, v);
-    }
-
     fn redraw(&mut self, cx: &mut Cx) {
         self.area.redraw(cx);
         if let Some(draw_list) = &self.draw_list {

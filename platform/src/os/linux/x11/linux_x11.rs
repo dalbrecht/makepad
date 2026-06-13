@@ -65,7 +65,6 @@ impl X11Cx {
         cx.borrow_mut().gpu_info.performance = GpuPerformance::Tier1;
 
         let opengl_windows = Rc::new(RefCell::new(Vec::new()));
-        cx.borrow_mut().set_physical_keyboard_state(true);
         let is_stdin_loop = crate::app_main::should_run_stdin_loop_from_env();
         if is_stdin_loop {
             cx.borrow_mut().in_makepad_studio = true;
@@ -108,8 +107,6 @@ impl X11Cx {
         opengl_windows: &mut Vec<OpenglWindow>,
     ) -> EventFlow {
         if let EventFlow::Exit = self.handle_platform_ops(opengl_windows, xlib_app) {
-            let mut cx = self.cx.borrow_mut();
-            cx.call_event_handler(&Event::Shutdown);
             return EventFlow::Exit;
         }
 
@@ -135,10 +132,9 @@ impl X11Cx {
                     .iter_mut()
                     .find(|w| w.window_id == re.window_id)
                 {
-                    {
-                        let cx_window = &mut cx.windows[re.window_id];
-                        cx_window.os_dpi_factor = Some(re.new_geom.dpi_factor);
-                        re.new_geom = cx_window.native_window_geom_to_layout(re.new_geom);
+                    if let Some(dpi_override) = cx.windows[re.window_id].dpi_override {
+                        re.new_geom.inner_size *= re.new_geom.dpi_factor / dpi_override;
+                        re.new_geom.dpi_factor = dpi_override;
                     }
 
                     window.window_geom = re.new_geom.clone();
@@ -195,31 +191,15 @@ impl X11Cx {
                 // ok here we send out to all our childprocesses
 
                 self.handle_repaint(opengl_windows);
-
-                // Run script-VM garbage collection at a safe point after paint, matching
-                // the macOS backend. Without this the script object heap grows without
-                // bound on Linux: every `eval` / `script_apply_eval!` allocates script
-                // objects that are only reclaimed by `gc()`. `needs_gc()` gates this so
-                // it only runs once the heap has grown past its threshold (~2x).
-                {
-                    let mut cx = self.cx.borrow_mut();
-                    cx.with_vm(|vm| {
-                        if vm.heap().needs_gc() {
-                            vm.gc();
-                        }
-                    });
-                }
             }
-            XlibEvent::MouseDown(mut e) => {
+            XlibEvent::MouseDown(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.fingers.process_tap_count(e.abs, e.time);
                 cx.fingers.mouse_down(e.button, e.window_id);
                 cx.call_event_handler(&Event::MouseDown(e.into()))
             }
-            XlibEvent::MouseMove(mut e) => {
+            XlibEvent::MouseMove(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 let abs = e.abs;
                 let modifiers = e.modifiers;
                 cx.call_event_handler(&Event::MouseMove(e.into()));
@@ -236,9 +216,8 @@ impl X11Cx {
                 cx.fingers.cycle_hover_area(live_id!(mouse).into());
                 cx.fingers.switch_captures();
             }
-            XlibEvent::MouseUp(mut e) => {
+            XlibEvent::MouseUp(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 let button = e.button;
                 let abs = e.abs;
                 let modifiers = e.modifiers;
@@ -259,14 +238,12 @@ impl X11Cx {
                     }
                 }
             }
-            XlibEvent::Scroll(mut e) => {
+            XlibEvent::Scroll(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.call_event_handler(&Event::Scroll(e.into()))
             }
-            XlibEvent::WindowDragQuery(mut e) => {
+            XlibEvent::WindowDragQuery(e) => {
                 let mut cx = self.cx.borrow_mut();
-                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.call_event_handler(&Event::WindowDragQuery(e))
             }
             XlibEvent::WindowCloseRequested(e) => {
@@ -323,7 +300,6 @@ impl X11Cx {
                 let mut cx = self.cx.borrow_mut();
                 if e.timer_id == 0 {
                     if SignalToUI::check_and_clear_ui_signal() {
-                        cx.handle_termination_signal();
                         cx.handle_media_signals();
                         cx.handle_script_signals();
                         cx.call_event_handler(&Event::Signal);
@@ -425,15 +401,6 @@ impl X11Cx {
                 }
 
                 cx.run_live_edit_if_needed("linux-x11");
-                let has_platform_ops = !cx.platform_ops.is_empty();
-                drop(cx);
-                if has_platform_ops {
-                    if let EventFlow::Exit = self.handle_platform_ops(opengl_windows, xlib_app) {
-                        let mut cx = self.cx.borrow_mut();
-                        cx.call_event_handler(&Event::Shutdown);
-                        return EventFlow::Exit;
-                    }
-                }
                 return EventFlow::Wait;
             }
         }
@@ -452,16 +419,6 @@ impl X11Cx {
     }
 
     pub(crate) fn handle_repaint(&mut self, opengl_windows: &mut Vec<OpenglWindow>) {
-        {
-            // Paint is emitted on every idle poll/timer tick. If no pass is dirty there is
-            // nothing to draw, so skip the eglMakeCurrent + full pass-list scan below.
-            // demo_time_repaint forces a redraw of time-animated passes (see
-            // compute_pass_repaint_order), so it must keep us rendering.
-            let cx = self.cx.borrow();
-            if !cx.any_passes_dirty() && !cx.demo_time_repaint {
-                return;
-            }
-        }
         let mut passes_todo = Vec::new();
         {
             let mut cx = self.cx.borrow_mut();
@@ -668,6 +625,7 @@ impl X11Cx {
                         window.xlib_window.restore();
                     }
                 }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 CxOsOp::ResizeWindow(window_id, size) => {
                     if let Some(window) =
                         opengl_windows.iter_mut().find(|w| w.window_id == window_id)
@@ -741,8 +699,6 @@ impl X11Cx {
                 }
                 CxOsOp::ShowTextIME(area, pos, _config) => {
                     let pos = area.clipped_rect(&cx).pos + pos;
-                    let window_id = cx.get_window_id_of(&area).unwrap_or(CxWindowPool::id_zero());
-                    let pos = cx.windows[window_id].layout_vec2d_to_native_points(pos);
                     opengl_windows.iter_mut().for_each(|w| {
                         w.xlib_window.set_ime_spot(pos);
                         w.xlib_window.set_ime_active(true);

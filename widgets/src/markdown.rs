@@ -3,9 +3,7 @@ use crate::{
     widget::*, WidgetMatchEvent,
 };
 
-use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd,
-};
+use pulldown_cmark::{CodeBlockKind, Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -185,10 +183,50 @@ script_mod! {
             quote_fg_color: theme.color_label_inner
             code_color: theme.color_bg_highlight
             selection_color: theme.color_selection_focus
-            table_header_bg_color: theme.color_bg_highlight
-            table_border_color: theme.color_shadow
             space_1: uniform(theme.space_1)
             space_2: uniform(theme.space_2)
+
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                match self.block_type {
+                    FlowBlockType.Quote => {
+                        sdf.box(0. 0. self.rect_size.x self.rect_size.y 2.)
+                        sdf.fill(self.quote_bg_color)
+                        sdf.box(self.space_1 self.space_1 self.space_1 self.rect_size.y-self.space_2 1.5)
+                        sdf.fill(self.quote_fg_color)
+                        return sdf.result
+                    }
+                    FlowBlockType.Sep => {
+                        sdf.box(0. 1. self.rect_size.x-1. self.rect_size.y-2. 2.)
+                        sdf.fill(self.sep_color)
+                        return sdf.result
+                    }
+                    FlowBlockType.Code => {
+                        sdf.box(0. 0. self.rect_size.x self.rect_size.y 2.)
+                        sdf.fill(self.code_color)
+                        return sdf.result
+                    }
+                    FlowBlockType.InlineCode => {
+                        sdf.box(1. 1. self.rect_size.x-2. self.rect_size.y-2. 2.)
+                        sdf.fill(self.code_color)
+                        return sdf.result
+                    }
+                    FlowBlockType.Underline => {
+                        sdf.box(0. self.rect_size.y-2. self.rect_size.x 2.0 0.5)
+                        sdf.fill(self.line_color)
+                        return sdf.result
+                    }
+                    FlowBlockType.Strikethrough => {
+                        sdf.box(0. self.rect_size.y * 0.45 self.rect_size.x 2.0 0.5)
+                        sdf.fill(self.line_color)
+                        return sdf.result
+                    }
+                    FlowBlockType.Selection => {
+                        return vec4(self.selection_color.rgb * self.selection_color.a, self.selection_color.a)
+                    }
+                }
+                return #f00
+            }
         }
 
         link := mod.widgets.MarkdownLink{}
@@ -270,10 +308,6 @@ impl Markdown {
         // Track state for nested formatting
         let mut list_stack: Vec<ListState> = Vec::new();
         let mut is_first_block = true;
-        // Per-column alignments for the current table, and the current cell's
-        // column index within its row. Both are reset when a new table starts.
-        let mut table_alignments: Vec<Alignment> = Vec::new();
-        let mut table_cell_index: usize = 0;
 
         let parser = Parser::new_ext(
             self.body.as_ref(),
@@ -541,89 +575,33 @@ impl Markdown {
                 MdEvent::TaskListMarker(_) => {
                     // TODO: Implement task list markers
                 }
-                MdEvent::Start(Tag::Table(alignments)) => {
-                    if !is_first_block {
-                        tf.new_line_collapsed_with_spacing(cx, self.paragraph_spacing);
-                    }
-                    is_first_block = false;
-                    tf.begin_table(cx, alignments.len());
-                    table_alignments = alignments;
-                    table_cell_index = 0;
+                MdEvent::Start(Tag::Table(_)) => {
+                    // TODO: Implement table support
                 }
                 MdEvent::End(TagEnd::Table) => {
-                    tf.end_table(cx);
-                    tf.new_line_collapsed_with_spacing(cx, self.paragraph_spacing);
-                    table_alignments.clear();
-                    table_cell_index = 0;
+                    // TODO: Implement table support
                 }
                 MdEvent::Start(Tag::TableHead) => {
-                    tf.begin_table_header_row(cx);
-                    table_cell_index = 0;
+                    // TODO: Implement table header support
                 }
                 MdEvent::End(TagEnd::TableHead) => {
-                    tf.end_table_row(cx);
-                    tf.in_table_header = false;
+                    // TODO: Implement table header support
                 }
                 MdEvent::Start(Tag::TableRow) => {
-                    tf.begin_table_row(cx);
-                    table_cell_index = 0;
+                    // TODO: Implement table row support
                 }
                 MdEvent::End(TagEnd::TableRow) => {
-                    tf.end_table_row(cx);
+                    // TODO: Implement table row support
                 }
                 MdEvent::Start(Tag::TableCell) => {
-                    let align_x = table_alignments
-                        .get(table_cell_index)
-                        .map(alignment_to_x)
-                        .unwrap_or(0.0);
-                    tf.begin_table_cell(cx, align_x);
-                    if tf.in_table_header {
-                        tf.bold.push();
-                    }
+                    // TODO: Implement table cell support
                 }
                 MdEvent::End(TagEnd::TableCell) => {
-                    if tf.in_table_header {
-                        tf.bold.pop();
-                    }
-                    tf.end_table_cell(cx);
-                    table_cell_index += 1;
-                }
-                MdEvent::InlineHtml(text) => {
-                    // Support a handful of inline HTML tags that have no
-                    // CommonMark equivalent. Anything not matched is ignored,
-                    // matching the pre-existing behavior.
-                    match text.trim().to_ascii_lowercase().as_str() {
-                        "<sub>" => {
-                            tf.push_size_rel_scale(0.7);
-                            tf.y_shift_scales.push(0.55);
-                        }
-                        "</sub>" => {
-                            tf.font_sizes.pop();
-                            tf.y_shift_scales.pop();
-                        }
-                        "<sup>" => {
-                            tf.push_size_rel_scale(0.7);
-                            tf.y_shift_scales.push(-0.2);
-                        }
-                        "</sup>" => {
-                            tf.font_sizes.pop();
-                            tf.y_shift_scales.pop();
-                        }
-                        _ => {}
-                    }
+                    // TODO: Implement table cell support
                 }
                 _ => {} // Unimplemented or unnecessary events
             }
         }
-    }
-}
-
-/// Maps pulldown_cmark table-column alignment to `Layout::align.x`.
-fn alignment_to_x(alignment: &Alignment) -> f64 {
-    match alignment {
-        Alignment::None | Alignment::Left => 0.0,
-        Alignment::Center => 0.5,
-        Alignment::Right => 1.0,
     }
 }
 

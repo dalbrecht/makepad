@@ -257,9 +257,7 @@ impl Widget for Splitter {
         match event.hits_with_options(
             cx,
             self.draw_bg.area(),
-            HitOptions::new()
-                .with_margin(self.margin())
-                .with_touch_margin(self.touch_margin()),
+            HitOptions::new().with_margin(self.margin()),
         ) {
             Hit::FingerHoverIn(_) => {
                 match self.axis {
@@ -434,29 +432,18 @@ impl Splitter {
     }
 
     fn margin(&self) -> Inset {
-        self.axis_inset(3.0)
-    }
-
-    /// Wider hit margin used only when the event came from a touch device.
-    /// Fingers are blunter than mouse cursors, so the bar needs more slop to
-    /// be grabbable on touchscreens.
-    fn touch_margin(&self) -> Inset {
-        self.axis_inset(8.0)
-    }
-
-    fn axis_inset(&self, side: f64) -> Inset {
         match self.axis {
             SplitterAxis::Horizontal => Inset {
-                left: side,
+                left: 3.0,
                 top: 0.0,
-                right: side,
+                right: 3.0,
                 bottom: 0.0,
             },
             SplitterAxis::Vertical => Inset {
                 left: 0.0,
-                top: side,
+                top: 3.0,
                 right: 0.0,
-                bottom: side,
+                bottom: 3.0,
             },
         }
     }

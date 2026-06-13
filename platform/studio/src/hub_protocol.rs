@@ -95,7 +95,6 @@ pub enum ClientToHub {
 
     // === Build Control ===
     ListBuilds,
-    ListAppSockets,
     RunItem {
         mount: String,
         name: String,
@@ -188,36 +187,6 @@ pub enum ClientToHub {
         path: String,
     },
 
-    // === AI ===
-    AiGetState {
-        mount: String,
-    },
-    AiCreateAgent {
-        mount: String,
-        title: Option<String>,
-    },
-    AiDeleteAgent {
-        mount: String,
-        agent_id: AiAgentId,
-    },
-    AiSelectAgent {
-        mount: String,
-        agent_id: AiAgentId,
-    },
-    AiSetBackend {
-        mount: String,
-        backend_id: String,
-    },
-    AiSendPrompt {
-        mount: String,
-        agent_id: AiAgentId,
-        text: String,
-    },
-    AiCancelPrompt {
-        mount: String,
-        agent_id: AiAgentId,
-    },
-
     // === Search & Query ===
     SearchFiles {
         mount: Option<String>,
@@ -294,8 +263,6 @@ pub enum HubToClient {
         path: String,
         content: String,
         git_status: GitStatus,
-        line: Option<usize>,
-        column: Option<usize>,
     },
     TextFileRead {
         path: String,
@@ -328,9 +295,6 @@ pub enum HubToClient {
     // === Build ===
     Builds {
         builds: Vec<BuildInfo>,
-    },
-    AppSockets {
-        sockets: Vec<AppSocketInfo>,
     },
     RunItems {
         mount: String,
@@ -439,12 +403,6 @@ pub enum HubToClient {
     TerminalExited {
         path: String,
         code: i32,
-    },
-
-    // === AI ===
-    AiMountState {
-        mount: String,
-        state: AiMountState,
     },
 
     // === Search & Query ===
@@ -611,78 +569,9 @@ pub struct BuildInfo {
 }
 
 #[derive(Clone, Debug, SerBin, DeBin, SerJson, DeJson)]
-pub struct AppSocketInfo {
-    pub web_socket_id: u64,
-    pub build_id: Option<QueryId>,
-    pub crate_name: Option<String>,
-    pub mount: Option<String>,
-    pub package: Option<String>,
-    pub build_active: bool,
-}
-
-#[derive(Clone, Debug, SerBin, DeBin, SerJson, DeJson)]
 pub struct RunItem {
     pub name: String,
     pub in_studio: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, SerBin, DeBin, SerJson, DeJson)]
-pub struct AiAgentId(pub u64);
-
-#[derive(Clone, Debug, SerBin, DeBin, SerJson, DeJson)]
-pub enum AiMessageRole {
-    User,
-    Assistant,
-    Thinking,
-    System,
-    ToolCall,
-    ToolResult,
-    Error,
-}
-
-#[derive(Clone, Debug, SerBin, DeBin, SerJson, DeJson)]
-pub struct AiMessage {
-    pub role: AiMessageRole,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, SerBin, DeBin, SerJson, DeJson)]
-pub struct AiBackendInfo {
-    pub id: String,
-    pub label: String,
-    pub detail: String,
-    pub configured: bool,
-}
-
-#[derive(Clone, Debug, SerBin, DeBin, SerJson, DeJson)]
-pub struct AiAgentSummary {
-    pub agent_id: AiAgentId,
-    pub title: String,
-    pub backend_id: String,
-    pub status: String,
-    pub pending: bool,
-    pub updated_at: f64,
-    pub message_count: usize,
-}
-
-#[derive(Clone, Debug, SerBin, DeBin, SerJson, DeJson)]
-pub struct AiAgentState {
-    pub agent_id: AiAgentId,
-    pub title: String,
-    pub backend_id: String,
-    pub status: String,
-    pub pending: bool,
-    pub messages: Vec<AiMessage>,
-}
-
-#[derive(Clone, Debug, Default, SerBin, DeBin, SerJson, DeJson)]
-pub struct AiMountState {
-    pub backends: Vec<AiBackendInfo>,
-    pub active_backend_id: Option<String>,
-    pub active_agent_id: Option<AiAgentId>,
-    pub agents: Vec<AiAgentSummary>,
-    pub active_agent: Option<AiAgentState>,
-    pub live_markdown: String,
 }
 
 #[derive(Clone, Debug, SerBin, DeBin, SerJson, DeJson)]

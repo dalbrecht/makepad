@@ -9,23 +9,8 @@ use std::{
 
 use crate::{android::*, makepad_shell::*};
 
-#[derive(Clone, Copy)]
 pub struct AndroidSDKUrls {
-    /// API level the NDK clang toolchain targets (`<arch>-linux-android<N>-clang`)
-    /// and the value emitted as `android:minSdkVersion`. This is the floor for
-    /// device compatibility — the lowest API level the resulting native binary
-    /// will load on.
-    ///
-    /// Note: this is *not* the compile SDK. The Java side is compiled against
-    /// `android.jar` from `platform` / `build_tools_version` (typically a higher
-    /// API), which lets Java call API > sdk_version classes guarded by runtime
-    /// `Build.VERSION.SDK_INT` checks.
     pub sdk_version: usize,
-    /// API level declared as `android:targetSdkVersion` in the manifest. Independent
-    /// from `sdk_version`: it sets runtime behavior compatibility, not what the binary
-    /// links against. Play Store requires this to be ≥34 (≥35 for Aug 2025 updates),
-    /// while `sdk_version` can stay lower for broader device coverage.
-    pub target_sdk_version: usize,
     pub sdk_extension: &'static str,
     pub platform: &'static str,
     pub build_tools_version: &'static str,
@@ -47,25 +32,7 @@ pub const BUILD_TOOLS_DIR: &str = "build-tools";
 pub const PLATFORMS_DIR: &str = "platforms";
 
 pub const ANDROID_SDK_URLS_33: AndroidSDKUrls = AndroidSDKUrls {
-    // NDK clang triple targets API 26 (Android 8.0 Oreo). The compiled .so will
-    // load on API 26+ devices, ~96-97% of the active Android population. The
-    // NDK r28 toolchain still supports compiling for API 21+ on arm64; we pick
-    // 26 because that's the lowest API where every NDK Camera2/AAudio/etc.
-    // entry point Makepad uses is stably available without weak-linkage hacks.
-    //
-    // Java code is gated with `if (Build.VERSION.SDK_INT >= N)` everywhere it
-    // calls API > 26 methods. Native code that touches API 29+ entry points
-    // (Choreographer postFrameCallback64 / postVsyncCallback) is dispatched via
-    // dlsym + version-checked function pointers in `android_jni.rs`.
-    sdk_version: 26,
-    // Manifest declares `targetSdkVersion=35` (Android 15), the current Play
-    // Store floor for new submissions. Independent of `sdk_version`: target
-    // controls runtime-behavior compat, not what the binary links against.
-    target_sdk_version: 35,
-    // Build-tools and platform stay at API 33 — that's our *compile* SDK, used
-    // for `android.jar` (Java compile classpath) and aapt2. Java code can call
-    // API 33 classes at compile time; runtime version checks keep older devices
-    // from actually executing those paths.
+    sdk_version: 33,
     build_tools_version: "33.0.1",
     sdk_extension: "ext4",
     platform: "android-33-ext4",
@@ -91,32 +58,27 @@ const URL_OPENJDK_17_0_2_MACOS_AARCH64: &str = "https://download.java.net/java/G
 const URL_OPENJDK_17_0_2_MACOS_X64: &str = "https://download.java.net/java/GA/jdk17.0.2/dfd4a8d0985749f896bed50d7138ee7f/8/GPL/openjdk-17.0.2_macos-x64_bin.tar.gz";
 const URL_OPENJDK_17_0_2_LINUX_X64: &str = "https://download.java.net/java/GA/jdk17.0.2/dfd4a8d0985749f896bed50d7138ee7f/8/GPL/openjdk-17.0.2_linux-x64_bin.tar.gz";
 
-/// Bundletool is needed to package a base module zip into an AAB. Single jar.
-pub const URL_BUNDLETOOL: &str =
-    "https://github.com/google/bundletool/releases/download/1.18.1/bundletool-all-1.18.1.jar";
-/// Local relative path under the SDK root where bundletool.jar is installed.
-pub const BUNDLETOOL_JAR_REL: &str = "bundletool/bundletool.jar";
-
 fn url_file_name(url: &str) -> &str {
     url.rsplit_once('/').unwrap().1
 }
 
 pub fn rustup_toolchain_install(targets: &[AndroidTarget]) -> Result<(), String> {
     println!("Installing Rust toolchains for android");
-    // Android targets are all tier-2 (prebuilt std, no `-Z build-std`), so they
-    // build on stable. Only install stable if it's missing — don't force-update.
-    crate::utils::ensure_rust_toolchain_installed("stable")?;
+    println!("Installing nightly");
+    shell_env(
+        &[],
+        &std::env::current_dir().unwrap(),
+        "rustup",
+        &["install", "nightly"],
+    )?;
     for target in targets {
         let toolchain = target.toolchain();
-        println!("Adding rust stable target {}", toolchain);
-        // `rustup target add` is idempotent and only fetches the target's std
-        // component; it does not update the compiler, so it's safe to run every
-        // time without the missing-only check.
+        println!("Installing rust nightly for {}", toolchain);
         shell_env(
             &[],
             &std::env::current_dir().unwrap(),
             "rustup",
-            &["target", "add", toolchain, "--toolchain", "stable"],
+            &["target", "add", toolchain, "--toolchain", "nightly"],
         )?;
     }
     Ok(())
@@ -132,59 +94,49 @@ pub fn download_sdk(
     let src_dir = &sdk_dir.join("sources");
     mkdir(src_dir)?;
 
-    fn curl(step: usize, total: usize, src_dir: &Path, url: &str) -> Result<(), String> {
+    fn curl(step: usize, src_dir: &Path, url: &str) -> Result<(), String> {
         //let https = HttpsConnection::connect("https://makepad.dev","https");
-        println!("{step}/{total}: Downloading: {}", url);
-        // -L follows redirects (bundletool's GitHub release URL 302s to a CDN).
+        println!("{step}/5: Downloading: {}", url);
         shell(
             src_dir,
             "curl",
             &[
                 url,
                 "-#",
-                "-L",
                 "--output",
                 src_dir.join(url_file_name(url)).to_str().unwrap(),
             ],
         )?;
         Ok(())
     }
-    let total = 6;
-    curl(1, total, src_dir, urls.platform_dl)?;
+    curl(1, src_dir, urls.platform_dl)?;
     match host_os {
         HostOs::WindowsX64 => {
-            curl(2, total, src_dir, urls.build_tools_windows)?;
-            curl(3, total, src_dir, urls.platform_tools_windows)?;
-            curl(4, total, src_dir, urls.ndk_windows)?;
-            curl(5, total, src_dir, URL_OPENJDK_17_0_2_WINDOWS_X64)?;
+            curl(2, src_dir, urls.build_tools_windows)?;
+            curl(3, src_dir, urls.platform_tools_windows)?;
+            curl(4, src_dir, urls.ndk_windows)?;
+            curl(5, src_dir, URL_OPENJDK_17_0_2_WINDOWS_X64)?;
         }
         HostOs::MacosX64 | HostOs::MacosAarch64 => {
-            curl(2, total, src_dir, urls.build_tools_macos)?;
-            curl(3, total, src_dir, urls.platform_tools_macos)?;
-            curl(4, total, src_dir, urls.ndk_macos)?;
+            curl(2, src_dir, urls.build_tools_macos)?;
+            curl(3, src_dir, urls.platform_tools_macos)?;
+            curl(4, src_dir, urls.ndk_macos)?;
             if host_os == HostOs::MacosX64 {
-                curl(5, total, src_dir, URL_OPENJDK_17_0_2_MACOS_X64)?;
+                curl(5, src_dir, URL_OPENJDK_17_0_2_MACOS_X64)?;
             } else {
-                curl(5, total, src_dir, URL_OPENJDK_17_0_2_MACOS_AARCH64)?;
+                curl(5, src_dir, URL_OPENJDK_17_0_2_MACOS_AARCH64)?;
             }
         }
         HostOs::LinuxX64 => {
-            curl(2, total, src_dir, urls.build_tools_linux)?;
-            curl(3, total, src_dir, urls.platform_tools_linux)?;
-            curl(4, total, src_dir, urls.ndk_linux)?;
-            curl(5, total, src_dir, URL_OPENJDK_17_0_2_LINUX_X64)?;
+            curl(2, src_dir, urls.build_tools_linux)?;
+            curl(3, src_dir, urls.platform_tools_linux)?;
+            curl(4, src_dir, urls.ndk_linux)?;
+            curl(5, src_dir, URL_OPENJDK_17_0_2_LINUX_X64)?;
         }
         HostOs::Unsupported => panic!(),
     }
-    curl(6, total, src_dir, URL_BUNDLETOOL)?;
+    // alright lets parse the sdk_path option
     Ok(())
-}
-
-/// Copy the downloaded bundletool jar into the SDK directory at a stable path.
-fn install_bundletool(sdk_dir: &Path) -> Result<(), String> {
-    let src = sdk_dir.join("sources").join(url_file_name(URL_BUNDLETOOL));
-    let dst = sdk_dir.join(BUNDLETOOL_JAR_REL);
-    cp(&src, &dst, false)
 }
 
 pub fn remove_sdk_sources(
@@ -203,7 +155,7 @@ pub fn expand_sdk(
     _targets: &[AndroidTarget],
     urls: &AndroidSDKUrls,
 ) -> Result<(), String> {
-    let full_ndk = args.contains(&String::from("--full-ndk"));
+    let full_ndk = !args.contains(&String::from("--strip-ndk"));
     let src_dir = &sdk_dir.join("sources");
 
     fn unzip(
@@ -494,14 +446,6 @@ pub fn expand_sdk(
                         &copy_map(
                             "android-13",
                             &format!("{BUILD_TOOLS_DIR}/{ANDROID_BUILD_TOOLS_VERSION}"),
-                            "aapt2.exe",
-                        ),
-                        false,
-                    ),
-                    (
-                        &copy_map(
-                            "android-13",
-                            &format!("{BUILD_TOOLS_DIR}/{ANDROID_BUILD_TOOLS_VERSION}"),
                             "zipalign.exe",
                         ),
                         false,
@@ -535,130 +479,66 @@ pub fn expand_sdk(
                     ("platform-tools/AdbWinUsbApi.dll", false),
                 ],
             )?;
-            const NDK_ZIP_ROOT: &str = "android-ndk-r28b";
-            let NDK_OUT_BASE = format!("ndk/{NDK_VERSION_FULL}");
+            const NDK_IN: &str = "android-ndk-r28b/toolchains/llvm/prebuilt/windows-x86_64";
+            let NDK_OUT =
+                &format!("ndk/{NDK_VERSION_FULL}/toolchains/llvm/prebuilt/windows-x86_64");
 
+            // We only need to extract the contents of the `NDK_IN` directory within the `URL_NDK_33_LINUX` zip file,
+            // and then copy that directory it into the proper `NDK_OUT` directory location.
             let cwd = std::env::current_dir().unwrap();
             let url_file_name = url_file_name(urls.ndk_windows);
-            println!(
-                "4/5: Unzipping: {} ({})",
-                url_file_name,
-                if full_ndk { "full NDK" } else { "stripped NDK" }
+            println!("4/5: Unzipping: {} (full NDK)", url_file_name);
+            let ndk_out_path = sdk_dir.join(NDK_OUT);
+            mkdir(&ndk_out_path)?;
+
+            // Some shell environments on Windows are Linux-like (Git Bash, cygwin, mingw, etc),
+            // and therefore support `unzip` and `cp`.
+            let unzip_result = shell(
+                &cwd,
+                "unzip",
+                &[
+                    "-q", // quiet
+                    "-o", // overwrite existing files
+                    src_dir.join(url_file_name).to_str().unwrap(),
+                    &format!("{NDK_IN}/**/*"),
+                    "-d",
+                    src_dir.to_str().unwrap(),
+                ],
             );
-
-            if full_ndk {
-                // Extract the entire NDK zip into src_dir, then move it.
-                let ndk_out = sdk_dir.join(&NDK_OUT_BASE);
-                mkdir(&ndk_out)?;
-
-                let unzip_result = shell(
+            if unzip_result.is_ok() {
+                shell(
                     &cwd,
-                    "unzip",
+                    "cp",
                     &[
-                        "-q",
-                        "-o",
-                        src_dir.join(url_file_name).to_str().unwrap(),
-                        "-d",
-                        src_dir.to_str().unwrap(),
+                        "--force",
+                        "--recursive",
+                        "--preserve",
+                        src_dir.join(NDK_IN).to_str().unwrap(),
+                        ndk_out_path.parent().unwrap().to_str().unwrap(),
                     ],
-                );
-                if unzip_result.is_ok() {
-                    shell(
-                        &cwd,
-                        "cp",
-                        &[
-                            "--force",
-                            "--recursive",
-                            "--preserve",
-                            src_dir.join(NDK_ZIP_ROOT).to_str().unwrap(),
-                            ndk_out.parent().unwrap().to_str().unwrap(),
-                        ],
-                    )
-                    .unwrap();
-                    // Rename extracted dir to versioned name.
-                    let extracted = sdk_dir.join("ndk").join(NDK_ZIP_ROOT);
-                    if extracted.exists() && extracted != ndk_out {
-                        // Remove the destination first (it may exist from a
-                        // previous install or from mkdir above).
-                        if ndk_out.exists() {
-                            std::fs::remove_dir_all(&ndk_out)
-                                .map_err(|e| format!("Failed to remove {ndk_out:?}: {e}"))?;
-                        }
-                        std::fs::rename(&extracted, &ndk_out).map_err(|e| {
-                            format!("Failed to rename {extracted:?} to {ndk_out:?}: {e}")
-                        })?;
-                    }
-                } else {
-                    // Windows native shell: use tar.
-                    let num_path_components = Path::new(NDK_ZIP_ROOT).iter().count();
-                    shell(
-                        &cwd,
-                        "tar",
-                        &[
-                            "-x",
-                            "-z",
-                            "-f",
-                            src_dir.join(url_file_name).to_str().unwrap(),
-                            "--strip-components",
-                            &num_path_components.to_string(),
-                            "-C",
-                            ndk_out.to_str().unwrap(),
-                            NDK_ZIP_ROOT,
-                        ],
-                    )
-                    .unwrap();
-                }
+                )
+                .unwrap();
             } else {
-                // Stripped: only extract toolchains/llvm/prebuilt/<host>.
-                let NDK_IN = format!("{NDK_ZIP_ROOT}/toolchains/llvm/prebuilt/windows-x86_64");
-                let NDK_OUT = format!("{NDK_OUT_BASE}/toolchains/llvm/prebuilt/windows-x86_64");
-                let ndk_out_path = sdk_dir.join(&NDK_OUT);
-                mkdir(&ndk_out_path)?;
-
-                let unzip_result = shell(
+                // If `unzip` failed, we're running on a true Windows shell (cmd, powershell),
+                // so we instead use `tar` (which is the BSD version of tar) to extract the zip file.
+                // Bonus: the BSD tar utility supports extracting files directly into NDK_OUT.
+                let num_path_components = Path::new(NDK_IN).iter().count();
+                shell(
                     &cwd,
-                    "unzip",
+                    "tar",
                     &[
-                        "-q",
-                        "-o",
+                        "-x",
+                        "-z",
+                        "-f",
                         src_dir.join(url_file_name).to_str().unwrap(),
-                        &format!("{NDK_IN}/**/*"),
-                        "-d",
-                        src_dir.to_str().unwrap(),
+                        "--strip-components",
+                        &num_path_components.to_string(),
+                        "-C",
+                        ndk_out_path.to_str().unwrap(),
+                        NDK_IN,
                     ],
-                );
-                if unzip_result.is_ok() {
-                    shell(
-                        &cwd,
-                        "cp",
-                        &[
-                            "--force",
-                            "--recursive",
-                            "--preserve",
-                            src_dir.join(&NDK_IN).to_str().unwrap(),
-                            ndk_out_path.parent().unwrap().to_str().unwrap(),
-                        ],
-                    )
-                    .unwrap();
-                } else {
-                    let num_path_components = Path::new(&NDK_IN).iter().count();
-                    shell(
-                        &cwd,
-                        "tar",
-                        &[
-                            "-x",
-                            "-z",
-                            "-f",
-                            src_dir.join(url_file_name).to_str().unwrap(),
-                            "--strip-components",
-                            &num_path_components.to_string(),
-                            "-C",
-                            ndk_out_path.to_str().unwrap(),
-                            &NDK_IN,
-                        ],
-                    )
-                    .unwrap();
-                }
+                )
+                .unwrap();
             }
             /*
             else {
@@ -741,8 +621,6 @@ pub fn expand_sdk(
                     (&copy_map(JDK_IN, JDK_OUT, "bin/java.exe"), false),
                     (&copy_map(JDK_IN, JDK_OUT, "bin/jar.exe"), false),
                     (&copy_map(JDK_IN, JDK_OUT, "bin/javac.exe"), false),
-                    (&copy_map(JDK_IN, JDK_OUT, "bin/jarsigner.exe"), false),
-                    (&copy_map(JDK_IN, JDK_OUT, "bin/keytool.exe"), false),
                     (&copy_map(JDK_IN, JDK_OUT, "lib/jvm.cfg"), false),
                     (&copy_map(JDK_IN, JDK_OUT, "bin/jli.dll"), false),
                     (&copy_map(JDK_IN, JDK_OUT, "bin/java.dll"), false),
@@ -839,14 +717,6 @@ pub fn expand_sdk(
                         &copy_map(
                             "android-13",
                             &format!("{BUILD_TOOLS_DIR}/{ANDROID_BUILD_TOOLS_VERSION}"),
-                            "aapt2",
-                        ),
-                        true,
-                    ),
-                    (
-                        &copy_map(
-                            "android-13",
-                            &format!("{BUILD_TOOLS_DIR}/{ANDROID_BUILD_TOOLS_VERSION}"),
                             "zipalign",
                         ),
                         true,
@@ -876,31 +746,18 @@ pub fn expand_sdk(
                 urls.platform_tools_macos,
                 &[("platform-tools/adb", true)],
             )?;
-            let NDK_BASE_IN = "AndroidNDK13676358.app/Contents/NDK";
-            let NDK_BASE_OUT = &format!("ndk/{NDK_VERSION_FULL}");
+            let NDK_IN = "AndroidNDK13676358.app/Contents/NDK/toolchains/llvm/prebuilt";
+            let NDK_OUT = &format!("ndk/{NDK_VERSION_FULL}/toolchains/llvm/prebuilt");
 
-            if full_ndk {
-                // Extract the entire NDK, which includes cmake toolchain files,
-                // source.properties, and everything else needed by crates that
-                // use cmake for cross-compilation (e.g., aws-lc-sys).
-                let ndk_all = copy_map(NDK_BASE_IN, NDK_BASE_OUT, "");
-                let files = [(ndk_all.as_str(), false)];
-                dmg_extract(4, src_dir, sdk_dir, urls.ndk_macos, &files, full_ndk)?;
-            } else {
-                // Stripped NDK: only extract the toolchain binaries.
-                let NDK_IN = &format!("{NDK_BASE_IN}/toolchains/llvm/prebuilt");
-                let NDK_OUT = &format!("{NDK_BASE_OUT}/toolchains/llvm/prebuilt");
-                let toolchain_dir = copy_map(NDK_IN, NDK_OUT, "");
-                let files = [(toolchain_dir.as_str(), false)];
-                dmg_extract(4, src_dir, sdk_dir, urls.ndk_macos, &files, full_ndk)?;
-            }
+            let toolchain_dir = copy_map(NDK_IN, NDK_OUT, "");
+            let files = [(toolchain_dir.as_str(), false)];
+            dmg_extract(4, src_dir, sdk_dir, urls.ndk_macos, &files, full_ndk)?;
             // We copied over the entire contents of `toolchains/llvm/prebuilt/*`,
             // but we still need to make each host prebuilt's `bin/*` executable.
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let prebuilt_root =
-                    sdk_dir.join(format!("{NDK_BASE_OUT}/toolchains/llvm/prebuilt"));
+                let prebuilt_root = sdk_dir.join(NDK_OUT);
                 std::fs::read_dir(&prebuilt_root)
                     .expect("failed to read NDK `prebuilt/` dir: {prebuilt_root:?}")
                     .filter_map(|r| {
@@ -945,8 +802,6 @@ pub fn expand_sdk(
                     (&copy_map(JDK_IN, JDK_OUT, "bin/java"), true),
                     (&copy_map(JDK_IN, JDK_OUT, "bin/jar"), true),
                     (&copy_map(JDK_IN, JDK_OUT, "bin/javac"), true),
-                    (&copy_map(JDK_IN, JDK_OUT, "bin/jarsigner"), true),
-                    (&copy_map(JDK_IN, JDK_OUT, "bin/keytool"), true),
                     (&copy_map(JDK_IN, JDK_OUT, "lib/libjli.dylib"), false),
                     (&copy_map(JDK_IN, JDK_OUT, "lib/jvm.cfg"), false),
                     (
@@ -1046,14 +901,6 @@ pub fn expand_sdk(
                         &copy_map(
                             "android-13",
                             &format!("{BUILD_TOOLS_DIR}/{ANDROID_BUILD_TOOLS_VERSION}"),
-                            "aapt2",
-                        ),
-                        true,
-                    ),
-                    (
-                        &copy_map(
-                            "android-13",
-                            &format!("{BUILD_TOOLS_DIR}/{ANDROID_BUILD_TOOLS_VERSION}"),
                             "lib64/libc++.so",
                         ),
                         true,
@@ -1091,17 +938,19 @@ pub fn expand_sdk(
                 urls.platform_tools_linux,
                 &[("platform-tools/adb", true)],
             )?;
-            const NDK_ZIP_ROOT: &str = "android-ndk-r28b";
-            let NDK_OUT_BASE = format!("ndk/{NDK_VERSION_FULL}");
+            const NDK_IN: &str = "android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64";
+            let NDK_OUT = &format!("ndk/{NDK_VERSION_FULL}/toolchains/llvm/prebuilt/linux-x86_64");
 
-            // Extract the entire NDK zip, then copy the needed subtree(s).
+            // Extract the entire NDK zip without file-pattern filters, then
+            // copy just the needed subtree.  Wildcard behavior in InfoZIP
+            // `unzip` varies across platforms (`*` matching `/` or not, `**`
+            // support), so the only portable invocation is a full extraction.
+            // The extra files are cleaned up by `remove_sdk_sources`.
             let cwd = std::env::current_dir().unwrap();
             let url_file_name = url_file_name(urls.ndk_linux);
-            println!(
-                "4/5: Unzipping: {} ({})",
-                url_file_name,
-                if full_ndk { "full NDK" } else { "stripped NDK" }
-            );
+            println!("4/5: Unzipping: {} (full NDK)", url_file_name);
+            let ndk_out_path = sdk_dir.join(NDK_OUT);
+            mkdir(&ndk_out_path)?;
             shell(
                 &cwd,
                 "unzip",
@@ -1113,51 +962,17 @@ pub fn expand_sdk(
                     src_dir.to_str().unwrap(),
                 ],
             )?;
-
-            if full_ndk {
-                // Copy the entire NDK directory tree.
-                let ndk_out = sdk_dir.join(&NDK_OUT_BASE);
-                mkdir(&ndk_out)?;
-                shell(
-                    &cwd,
-                    "cp",
-                    &[
-                        "--force",
-                        "--recursive",
-                        "--preserve",
-                        src_dir.join(NDK_ZIP_ROOT).to_str().unwrap(),
-                        ndk_out.parent().unwrap().to_str().unwrap(),
-                    ],
-                )?;
-                // Rename the extracted directory to the versioned name.
-                let extracted = sdk_dir.join("ndk").join(NDK_ZIP_ROOT);
-                if extracted.exists() && extracted != ndk_out {
-                    if ndk_out.exists() {
-                        std::fs::remove_dir_all(&ndk_out)
-                            .map_err(|e| format!("Failed to remove {ndk_out:?}: {e}"))?;
-                    }
-                    std::fs::rename(&extracted, &ndk_out).map_err(|e| {
-                        format!("Failed to rename {extracted:?} to {ndk_out:?}: {e}")
-                    })?;
-                }
-            } else {
-                // Stripped: only copy toolchains/llvm/prebuilt/<host>.
-                let NDK_IN = format!("{NDK_ZIP_ROOT}/toolchains/llvm/prebuilt/linux-x86_64");
-                let NDK_OUT = format!("{NDK_OUT_BASE}/toolchains/llvm/prebuilt/linux-x86_64");
-                let ndk_out_path = sdk_dir.join(&NDK_OUT);
-                mkdir(&ndk_out_path)?;
-                shell(
-                    &cwd,
-                    "cp",
-                    &[
-                        "--force",
-                        "--recursive",
-                        "--preserve",
-                        src_dir.join(&NDK_IN).to_str().unwrap(),
-                        ndk_out_path.parent().unwrap().to_str().unwrap(),
-                    ],
-                )?;
-            }
+            shell(
+                &cwd,
+                "cp",
+                &[
+                    "--force",
+                    "--recursive",
+                    "--preserve",
+                    src_dir.join(NDK_IN).to_str().unwrap(),
+                    ndk_out_path.parent().unwrap().to_str().unwrap(),
+                ],
+            )?;
 
             const JDK_IN: &str = "jdk-17.0.2";
             const JDK_OUT: &str = "openjdk";
@@ -1170,8 +985,6 @@ pub fn expand_sdk(
                     (&copy_map(JDK_IN, JDK_OUT, "bin/java"), true),
                     (&copy_map(JDK_IN, JDK_OUT, "bin/jar"), true),
                     (&copy_map(JDK_IN, JDK_OUT, "bin/javac"), true),
-                    (&copy_map(JDK_IN, JDK_OUT, "bin/jarsigner"), true),
-                    (&copy_map(JDK_IN, JDK_OUT, "bin/keytool"), true),
                     (&copy_map(JDK_IN, JDK_OUT, "lib/libjli.so"), false),
                     (&copy_map(JDK_IN, JDK_OUT, "lib/jvm.cfg"), false),
                     (&copy_map(JDK_IN, JDK_OUT, "lib/server/libjsig.so"), false),
@@ -1236,22 +1049,6 @@ pub fn expand_sdk(
             )?;
         }
         HostOs::Unsupported => panic!(),
-    }
-
-    // Install bundletool at <sdk>/bundletool/bundletool.jar so the AAB build
-    // pipeline can find it. Tolerate a missing source jar so users with older
-    // `download-sdk` runs can re-run `download-sdk` without re-running the
-    // whole `expand-sdk` step.
-    if sdk_dir
-        .join("sources")
-        .join(url_file_name(URL_BUNDLETOOL))
-        .is_file()
-    {
-        install_bundletool(sdk_dir)?;
-    } else {
-        eprintln!(
-            "warning: bundletool jar not found in sources; re-run `cargo makepad android download-sdk` to enable AAB builds"
-        );
     }
     Ok(())
 }

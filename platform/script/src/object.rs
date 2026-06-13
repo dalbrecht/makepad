@@ -8,11 +8,9 @@ use crate::value::*;
 use crate::value_map::*;
 use crate::*;
 use ::std::cell::RefCell;
-use ::std::collections::hash_map::Entry;
 use ::std::collections::HashMap;
 use ::std::fmt;
 use ::std::rc::Rc;
-//use std::collections::btree_map::BTreeMap;
 
 #[derive(Default)]
 pub struct ScriptObjectTag(u64);
@@ -44,11 +42,11 @@ impl Clone for ScriptObjectRef {
         if let Some(roots) = &self.roots {
             let mut roots = roots.borrow_mut();
             match roots.entry(self.obj) {
-                Entry::Occupied(mut occ) => {
+                std::collections::hash_map::Entry::Occupied(mut occ) => {
                     let value = occ.get_mut();
                     *value += 1;
                 }
-                Entry::Vacant(_vac) => {
+                std::collections::hash_map::Entry::Vacant(_vac) => {
                     eprintln!("ScriptObjectRef root is vacant!");
                 }
             }
@@ -90,7 +88,7 @@ impl Drop for ScriptObjectRef {
         if let Some(roots) = &self.roots {
             let mut roots = roots.borrow_mut();
             match roots.entry(self.obj) {
-                Entry::Occupied(mut occ) => {
+                std::collections::hash_map::Entry::Occupied(mut occ) => {
                     let value = occ.get_mut();
                     if *value >= 1 {
                         *value -= 1;
@@ -101,7 +99,7 @@ impl Drop for ScriptObjectRef {
                         occ.remove();
                     }
                 }
-                Entry::Vacant(_vac) => {
+                std::collections::hash_map::Entry::Vacant(_vac) => {
                     eprintln!("ScriptObjectRef root is vacant!");
                 }
             }
@@ -924,7 +922,7 @@ impl ScriptObjectData {
         if self.tag.is_tracked() {
             let order = self.map.len() as u32;
             match self.map.entry(key) {
-                Entry::Occupied(mut occ) => {
+                VecMapEntry::Occupied(mut occ) => {
                     let old = occ.get_mut();
                     if old.value != value {
                         old.tag.set_dirty();
@@ -933,7 +931,7 @@ impl ScriptObjectData {
                     }
                     return;
                 }
-                Entry::Vacant(vac) => {
+                VecMapEntry::Vacant(vac) => {
                     vac.insert(ScriptMapValue {
                         value,
                         tag: ScriptMapTag::dirty_with_order(order),
@@ -956,7 +954,7 @@ impl ScriptObjectData {
     pub fn map_set_if_exist(&mut self, key: ScriptValue, value: ScriptValue) -> bool {
         if self.tag.is_tracked() {
             match self.map.entry(key) {
-                Entry::Occupied(mut occ) => {
+                VecMapEntry::Occupied(mut occ) => {
                     let old = occ.get_mut();
                     if old.value != value {
                         old.tag.set_dirty();
@@ -965,7 +963,7 @@ impl ScriptObjectData {
                     }
                     return true;
                 }
-                Entry::Vacant(_) => {}
+                VecMapEntry::Vacant(_) => {}
             }
         }
         if let Some(val) = self.map.get_mut(&key) {
@@ -986,14 +984,14 @@ impl ScriptObjectData {
     pub fn map_get_if_dirty(&mut self, key: &ScriptValue) -> Option<ScriptValue> {
         if self.tag.is_tracked() {
             match self.map.entry(*key) {
-                Entry::Occupied(mut occ) => {
+                VecMapEntry::Occupied(mut occ) => {
                     let val = occ.get_mut();
                     if val.tag.get_and_clear_dirty() {
                         return Some(val.value);
                     }
                     return None;
                 }
-                Entry::Vacant(_) => return None,
+                VecMapEntry::Vacant(_) => return None,
             };
         }
         self.map_get(key)
