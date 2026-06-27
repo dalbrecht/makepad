@@ -696,7 +696,10 @@ mod tests {
                 variations: Vec::new(),
             },
         );
-        loader.get_or_load_font(font_id).clone()
+        loader
+            .get_or_load_font(font_id)
+            .expect("test font should load")
+            .clone()
     }
 
     #[test]
