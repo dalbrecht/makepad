@@ -135,6 +135,7 @@ impl Layouter {
                     text: params.text,
                     size_in_lpxs: Size::ZERO,
                     rows: Vec::new(),
+                    is_truncated: false,
                 };
             }
         };
