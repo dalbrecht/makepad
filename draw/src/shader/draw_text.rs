@@ -3414,6 +3414,7 @@ mod tests {
     #[test]
     fn draw_text_color_is_visible_through_instance_slice() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
         cx.with_vm(|vm| {
             crate::script_mod(vm);
             let mut draw_text = DrawText::script_new_with_default(vm);
@@ -3430,6 +3431,7 @@ mod tests {
     #[test]
     fn slug_helper_color_is_visible_through_instance_slice() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
         cx.with_vm(|vm| {
             crate::script_mod(vm);
             register_draw_text_slug(vm);
