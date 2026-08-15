@@ -159,7 +159,7 @@ impl<'a, K, V> Iterator for ValueMapIter<'a, K, V> {
 
 impl<K, V> ValueMap<K, V>
 where
-    K: std::cmp::Eq + Copy,
+    K: std::cmp::Eq + std::hash::Hash + Copy,
 {
     #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
@@ -194,10 +194,7 @@ where
         self.get(key).is_some()
     }
 
-    pub fn insert(&mut self, key: K, value: V) -> Option<V>
-    where
-        K: std::hash::Hash,
-    {
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(spill) = &mut self.spill {
             return spill.insert(key, value);
@@ -290,7 +287,7 @@ where
 
 impl<'a, K, V> IntoIterator for &'a ValueMap<K, V>
 where
-    K: std::cmp::Eq + Copy,
+    K: std::cmp::Eq + std::hash::Hash + Copy,
 {
     type Item = (&'a K, &'a V);
     type IntoIter = ValueMapIter<'a, K, V>;
@@ -301,7 +298,7 @@ where
 
 impl<K, V> Index<K> for ValueMap<K, V>
 where
-    K: std::cmp::Eq + Copy + From<LiveId>,
+    K: std::cmp::Eq + std::hash::Hash + Copy + From<LiveId>,
 {
     type Output = V;
     fn index(&self, index: K) -> &Self::Output {
@@ -311,7 +308,7 @@ where
 
 impl<K, V> IndexMut<K> for ValueMap<K, V>
 where
-    K: std::cmp::Eq + Copy + From<LiveId>,
+    K: std::cmp::Eq + std::hash::Hash + Copy + From<LiveId>,
 {
     fn index_mut(&mut self, index: K) -> &mut Self::Output {
         self.get_mut(&index).unwrap()
