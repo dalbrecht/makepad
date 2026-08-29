@@ -765,7 +765,6 @@ impl WaylandCx {
                         window.toplevel.unset_fullscreen();
                     }
                 }
-                CxOsOp::SetWindowTitle(_, _) => {}
                 CxOsOp::ResizeWindow(window_id, size) => {}
                 // A Wayland client is not told where its windows are and cannot move them;
                 // the compositor owns placement, so a window here is never left off-screen
