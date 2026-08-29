@@ -1702,13 +1702,6 @@ impl Cx {
                         metal_window.cocoa_window.restore();
                     }
                 }
-                CxOsOp::SetWindowTitle(window_id, title) => {
-                    if let Some(metal_window) =
-                        metal_windows.iter_mut().find(|w| w.window_id == window_id)
-                    {
-                        metal_window.cocoa_window.set_title(&title);
-                    }
-                }
                 CxOsOp::HideWindow(window_id) => {
                     if let Some(metal_window) =
                         metal_windows.iter_mut().find(|w| w.window_id == window_id)
