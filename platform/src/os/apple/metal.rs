@@ -3,7 +3,9 @@ use {
         cx::Cx,
         draw_list::{CxDrawKind, DrawListId},
         draw_pass::{DrawPassClearColor, DrawPassClearDepth, DrawPassId},
-        draw_shader::{CxDrawShader, CxDrawShaderCode, CxDrawShaderMapping, DrawShaderId},
+        draw_shader::{
+            CxDrawShader, CxDrawShaderCode, CxDrawShaderMapping, DrawShaderId, ScopeUniformSlot,
+        },
         draw_vars::DrawVars,
         geometry::Geometry,
         makepad_objc_sys::objc_block,
@@ -2476,8 +2478,10 @@ impl DrawVars {
                 &output,
                 geometry_id,
             );
-            for &(source_obj, _) in &mapping.scope_uniform_sources {
-                vm.bx.heap.set_static(source_obj.into());
+            for source in &mapping.scope_uniform_sources {
+                if let ScopeUniformSlot::Scope(source_obj, _) = source {
+                    vm.bx.heap.set_static((*source_obj).into());
+                }
             }
 
             // Fill the scope uniform buffer from current script values

@@ -2,7 +2,7 @@ use super::CxOsDrawShader;
 use crate::{
     draw_shader::{
         CxDrawShader, CxDrawShaderCode, CxDrawShaderMapping, DrawShaderAttrFormat, DrawShaderId,
-        DrawShaderInputPacking, DrawShaderInputs,
+        DrawShaderInputPacking, DrawShaderInputs, ScopeUniformSlot,
     },
     draw_vars::DrawVars,
     geometry::Geometry,
@@ -156,8 +156,10 @@ impl DrawVars {
                 &output,
                 geometry_id,
             );
-            for &(source_obj, _) in &mapping.scope_uniform_sources {
-                vm.bx.heap.set_static(source_obj.into());
+            for source in &mapping.scope_uniform_sources {
+                if let ScopeUniformSlot::Scope(source_obj, _) = source {
+                    vm.bx.heap.set_static((*source_obj).into());
+                }
             }
             mapping.fill_scope_uniforms_buffer(&vm.bx.heap, &vm.thread().trap.pass());
             mapping.varying_total_slots = varying_total_slots;
