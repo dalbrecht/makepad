@@ -1963,13 +1963,6 @@ impl Cx {
                             metal_window.cocoa_window.get_window_geom();
                     }
                 }
-                CxOsOp::SetWindowTitle(window_id, title) => {
-                    if let Some(metal_window) =
-                        metal_windows.iter_mut().find(|w| w.window_id == window_id)
-                    {
-                        metal_window.cocoa_window.set_title(&title);
-                    }
-                }
                 CxOsOp::SetWindowDpiOverride(window_id, dpi_override) => {
                     let geom_change = metal_windows
                         .iter_mut()
