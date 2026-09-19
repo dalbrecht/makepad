@@ -406,24 +406,30 @@ impl LabelCache {
         }
         self.start(cx);
         draw.text_style.ensure_fonts_loaded(cx);
-        let family = if self.families.insert(key.family) {
-            let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
-            let family = fonts.borrow_mut().get_or_load_font_family(key.family);
-            Some(FamilySnapshot {
-                id: key.family,
-                font_ids: family.fonts().iter().map(|f| f.id()).collect(),
-                fonts: family
-                    .fonts()
-                    .iter()
-                    // Requests and their family definitions share one FIFO.
-                    // Repeated fallback faces need no second full byte copy.
-                    .filter(|f| self.sent_fonts.insert(f.id()))
-                    .map(|f| f.worker_definition())
-                    .collect(),
-                diagnostics: family.diagnostics().clone(),
-            })
-        } else {
+        let family = if self.families.contains(&key.family) {
             None
+        } else {
+            let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
+            let loaded = fonts.borrow_mut().get_or_load_font_family(key.family);
+            match loaded {
+                Some(family) => {
+                    self.families.insert(key.family);
+                    Some(FamilySnapshot {
+                        id: key.family,
+                        font_ids: family.fonts().iter().map(|f| f.id()).collect(),
+                        fonts: family
+                            .fonts()
+                            .iter()
+                            // Requests and their family definitions share one FIFO.
+                            // Repeated fallback faces need no second full byte copy.
+                            .filter(|f| self.sent_fonts.insert(f.id()))
+                            .map(|f| f.worker_definition())
+                            .collect(),
+                        diagnostics: family.diagnostics().clone(),
+                    })
+                }
+                None => None,
+            }
         };
         self.waiting.insert(key.clone());
         self.unsent.push_back(Request { key, family });
