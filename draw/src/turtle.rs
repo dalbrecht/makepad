@@ -1178,6 +1178,7 @@ mod tests {
     #[test]
     fn script_strings_accept_inline_and_heap_values_and_round_trip_compounds() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
         cx.with_vm(|vm| {
             crate::script_mod(vm);
             let mut size = Size::fill();
