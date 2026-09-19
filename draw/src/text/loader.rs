@@ -258,7 +258,9 @@ mod tests {
             },
         );
 
-        let family = loader.get_or_load_font_family_rc(family_id);
+        let family = loader
+            .get_or_load_font_family_rc(family_id)
+            .expect("test font family should load");
         let before = (
             loader.font_definitions.len(),
             loader.font_cache.len(),
@@ -325,6 +327,7 @@ mod tests {
 
         let shaped = loader
             .get_or_load_font_family_rc(family_id)
+            .expect("test font family should load")
             .get_or_shape("⌘".into());
         assert!(shaped.glyphs.iter().all(|glyph| glyph.id != 0));
         assert!(shaped

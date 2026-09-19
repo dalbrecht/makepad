@@ -253,8 +253,8 @@ impl ScriptHook for AnimatorState {
         // AnimatorState stores a raw ScriptObject (not ScriptObjectRef) in `apply`,
         // which lives outside the GC's reach. Without this, GC can free the object
         // and subsequent render frames trigger use-after-free panics.
-        if let Some(obj) = self.apply {
-            vm.bx.heap.set_static(obj.into());
+        if let Some(obj) = &self.apply {
+            vm.bx.heap.set_static(obj.clone().into());
         }
     }
 }
