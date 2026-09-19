@@ -3941,6 +3941,7 @@ mod tests {
     #[test]
     fn ellipsis_fit_bound_keeps_the_below_ellipsis_relocation_path() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
         let mut draw_text = cx.with_vm(|vm| {
             crate::script_mod(vm);
             DrawText::script_new_with_default(vm)
