@@ -483,7 +483,7 @@ mod system_font_tests {
                 variations: Vec::new(),
             },
         );
-        Some(loader.get_or_load_font(font_id).clone())
+        loader.get_or_load_font(font_id).cloned()
     }
 
     fn outline_works(path: &str, ch: char) -> Option<bool> {
