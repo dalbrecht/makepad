@@ -240,6 +240,8 @@ where
     pub fn retained_bytes(&self) -> usize {
         let entry = std::mem::size_of::<(K, V)>();
         let vec_bytes = self.vec.capacity().saturating_mul(entry);
+        // wasm32 compiles the HashMap spill out, so retained size is the vec only.
+        #[cfg(not(target_arch = "wasm32"))]
         let spill_bytes = self.spill.as_ref().map_or(0, |spill| {
             spill.capacity().saturating_mul(
                 entry
@@ -247,6 +249,8 @@ where
                     .saturating_add(1),
             )
         });
+        #[cfg(target_arch = "wasm32")]
+        let spill_bytes = 0;
         vec_bytes.saturating_add(spill_bytes)
     }
 
