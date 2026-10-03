@@ -10,6 +10,7 @@ use {
         egl_sys::{self, LibEgl, EGL_NONE},
         event::{Event, KeyCode, KeyEvent, TouchUpdateEvent, VirtualKeyboardEvent, WindowGeom},
         gpu_info::GpuPerformance,
+        makepad_live_id::LiveId,
         makepad_math::*,
         os::cx_native::EventFlow,
         shared_framebuf::{PollTimer, PollTimers},
@@ -84,6 +85,7 @@ impl Cx {
                 }
             }
         }
+        self.call_event_handler(&Event::Shutdown);
     }
 
     fn handle_all_pending_messages(&mut self, from_ohos_rx: &mpsc::Receiver<FromOhosMessage>) {
@@ -102,9 +104,13 @@ impl Cx {
         }
 
         // Signals
-        if SignalToUI::check_and_clear_ui_signal() {
+        let internal_signal = SignalToUI::check_and_clear_internal_signal();
+        let ui_signal = SignalToUI::check_and_clear_ui_signal();
+        if internal_signal || ui_signal {
             self.handle_media_signals();
             self.handle_script_signals();
+        }
+        if ui_signal {
             self.call_event_handler(&Event::Signal);
         }
         if SignalToUI::check_and_clear_action_signal() {
@@ -172,6 +178,12 @@ impl Cx {
                 self.os.display_size = dvec2(width as f64, height as f64);
                 let window_id = CxWindowPool::id_zero();
                 let window = &mut self.windows[window_id];
+                // Stash the OS-reported scale factor so a later
+                // `set_window_dpi_override(None)` can recover the native scale.
+                // OpenHarmony converts touch coords at the source so the
+                // helper-based remap is unnecessary, but this field is also
+                // consulted by `Cx::set_window_dpi_override`.
+                window.os_dpi_factor = Some(self.os.dpi_factor);
                 let old_geom = window.window_geom.clone();
 
                 let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
@@ -199,6 +211,24 @@ impl Cx {
                 self.redraw_all();
                 self.os.first_after_resize = true;
                 self.call_event_handler(&Event::ClearAtlasses);
+            }
+            FromOhosMessage::TouchCancel(mut touches) => {
+                let window_id = CxWindowPool::id_zero();
+                let dpi_factor = self.windows[window_id].dpi_override.unwrap_or(self.os.dpi_factor);
+                for touch in &mut touches {
+                    touch.abs /= dpi_factor;
+                    let digit_id = crate::makepad_live_id::live_id_num!(touch, touch.uid).into();
+                    self.fingers.cancel_digit(digit_id);
+                    self.call_event_handler(&Event::FingerCancel(crate::event::FingerCancelEvent {
+                        window_id,
+                        digit_id,
+                        device: crate::event::DigitDevice::Touch { uid: touch.uid },
+                        abs: touch.abs,
+                        time: touch.time,
+                        modifiers: Default::default(),
+                    }));
+                }
+                self.fingers.process_touch_update_end(&touches);
             }
             FromOhosMessage::Touch(mut touches) => {
                 let time = touches[0].time;
@@ -438,7 +468,7 @@ impl Cx {
     pub fn draw_pass_to_fullscreen(&mut self, draw_pass_id: DrawPassId) {
         let draw_list_id = self.passes[draw_pass_id].main_draw_list_id.unwrap();
 
-        self.setup_render_pass(draw_pass_id);
+        self.setup_render_pass(draw_pass_id, false);
 
         // keep repainting in a loop
         //self.passes[draw_pass_id].paint_dirty = false;
@@ -493,7 +523,9 @@ impl Cx {
         self.compute_pass_repaint_order(&mut passes_todo);
         self.repaint_id += 1;
         for draw_pass_id in &passes_todo {
-            self.passes[*draw_pass_id].set_time(self.os.timers.time_now() as f32);
+            let uniforms_gen = self.next_uniform_gen();
+            self.passes[*draw_pass_id]
+                .set_time(self.os.timers.time_now() as f32, uniforms_gen);
             match self.passes[*draw_pass_id].parent.clone() {
                 CxDrawPassParent::Xr => {}
                 CxDrawPassParent::Window(_window_id) => {
@@ -510,11 +542,12 @@ impl Cx {
     }
 
     fn handle_platform_ops(&mut self) -> EventFlow {
-        while let Some(op) = self.platform_ops.pop() {
+        while let Some(op) = self.platform_ops.pop_front() {
             //crate::log!("============ handle_platform_ops");
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     let window = &mut self.windows[window_id];
+                    window.os_dpi_factor = Some(self.os.dpi_factor);
                     let size = dvec2(
                         self.os.display_size.x / self.os.dpi_factor,
                         self.os.display_size.y / self.os.dpi_factor,
@@ -583,6 +616,12 @@ impl Cx {
                     //self.os.keyboard_visible = false;
                     //unsafe {android_jni::to_java_show_keyboard(false);}
                 }
+                CxOsOp::StartExternalDragging { .. } => {
+                    crate::error!("external file dragging is not implemented on OpenHarmony");
+                    self.call_event_handler(&Event::DragEnd);
+                }
+                // Track selection is currently implemented on Linux GStreamer only.
+                CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
                 CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
@@ -595,19 +634,12 @@ impl Cx {
 
 impl CxOsApi for Cx {
     fn init_cx_os(&mut self) {
-        self.live_registry.borrow_mut().package_root = Some("makepad".to_string());
-        self.live_expand();
-        self.live_scan_dependencies();
-    }
-
-    fn spawn_thread<F>(&mut self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        std::thread::spawn(f);
+        self.package_root = Some("makepad".to_string());
+        self.native_load_dependencies();
     }
 
     fn open_url(&mut self, _url: &str, _in_place: OpenUrlInPlace) {
+        if self.script_data.std.host_io_only() { return; }
         crate::error!("open_url not implemented on this platform");
     }
 

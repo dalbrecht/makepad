@@ -18,6 +18,7 @@ use {
         super::egl_sys::{self, LibEgl},
         super::libc_sys,
         android_camera_player::AndroidCameraPlayer,
+        android_file_dialog,
         android_jni::{self, *},
         android_keycodes::android_to_makepad_key_code,
         android_media::CxAndroidMedia,
@@ -25,11 +26,12 @@ use {
         ndk_sys,
     },
     crate::{
-        cx::{Cx, OsType},
+        cx::{AndroidParams, Cx, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace, XrFrameCpuBreakdown},
         draw_pass::CxDrawPassParent,
         draw_pass::{DrawPassClearColor, DrawPassClearDepth, DrawPassId},
         event::{
+            drag_drop::{DragEvent, DragItem, DragResponse, DropEvent},
             keyboard::{CharOffset, FullTextState, ImeAction, ImeActionEvent},
             video_playback::CameraPreviewMode,
             Event,
@@ -41,7 +43,6 @@ use {
             TextClipboardEvent,
             //TimerEvent,
             TextInputEvent,
-            drag_drop::{DragEvent, DragItem, DragResponse, DropEvent},
             //TouchPoint,
             TouchUpdateEvent,
             VideoDecodingErrorEvent,
@@ -58,6 +59,7 @@ use {
             WindowGeomChangeEvent,
         },
         gpu_info::GpuPerformance,
+        ime::TextInputConfig,
         makepad_live_id::*,
         makepad_math::*,
         media_api::CxMediaApi,
@@ -103,6 +105,25 @@ fn android_debug_log(prio: i32, msg: &str) {
     }
     let msg = format!("{msg}\0");
     unsafe { __android_log_write(prio as c_int, "Makepad\0".as_ptr(), msg.as_ptr()) };
+}
+
+/// An Android system property's value, empty when unset. Bionic's
+/// `__system_property_get` is in libc on every API level this runs on.
+fn android_system_property(name: &str) -> String {
+    use std::ffi::{c_char, c_int, CString};
+    extern "C" {
+        fn __system_property_get(name: *const c_char, value: *mut c_char) -> c_int;
+    }
+    const PROP_VALUE_MAX: usize = 92;
+    let Ok(name) = CString::new(name) else {
+        return String::new();
+    };
+    let mut value = [0u8; PROP_VALUE_MAX];
+    let len = unsafe { __system_property_get(name.as_ptr(), value.as_mut_ptr() as *mut c_char) };
+    if len <= 0 {
+        return String::new();
+    }
+    String::from_utf8_lossy(&value[..(len as usize).min(PROP_VALUE_MAX)]).into_owned()
 }
 
 fn android_panic_summary(info: &std::panic::PanicHookInfo<'_>) -> String {
@@ -153,7 +174,8 @@ pub fn set_current_thread_priority(priority: crate::CxThreadPriority) {
     }
 
     let nice = match priority {
-        crate::CxThreadPriority::Normal => 0,
+        crate::CxThreadPriority::Normal | crate::CxThreadPriority::UserInteractive => 0,
+        crate::CxThreadPriority::UserInitiated => 1,
         crate::CxThreadPriority::Utility => 5,
         crate::CxThreadPriority::Background => 10,
         crate::CxThreadPriority::Idle => 15,
@@ -260,10 +282,12 @@ impl Cx {
             }
         }
 
+        let spawner = self.thread_spawner();
         let mut vulkan = self.os.vulkan.take();
         let result = self.os.openxr.create_session(
             self.os.display.as_ref().unwrap(),
             vulkan.as_mut(),
+            &spawner,
             self.current_android_xr_options(),
             &self.os_type,
         );
@@ -283,9 +307,19 @@ impl Cx {
     /// It handles all incoming messages, processes other events, and manages drawing operations.
     pub fn main_loop(&mut self, from_java_rx: mpsc::Receiver<FromJavaMessage>) {
         self.gpu_info.performance = GpuPerformance::Tier1;
-        // Populate display_context and script heap with safe area insets
-        // BEFORE Startup, so app script_mod! definitions can use them.
-        let insets = self.os.safe_area_insets;
+        // Populate display_context and script heap with the initial display
+        // metrics BEFORE Startup, so app script_mod! definitions can use them.
+        // No window DPI override exists before Startup creates the first
+        // window, so native Android points are layout points for this initial
+        // script heap population. Window creation will publish converted
+        // values through WindowGeomChange once an override can be known.
+        let insets = self.os.native_safe_area_insets;
+        let dpi_factor = if self.os.dpi_factor > 0.0 {
+            self.os.dpi_factor
+        } else {
+            1.0
+        };
+        self.display_context.screen_size = self.os.display_size / dpi_factor;
         self.display_context.safe_area_insets = insets;
         self.update_safe_inset_script_values(insets);
         self.call_event_handler(&Event::Startup);
@@ -304,8 +338,34 @@ impl Cx {
             // This ensures we're in sync with the Android Choreographer when we receive a RenderLoop message.
             match from_java_rx.recv() {
                 Ok(FromJavaMessage::RenderLoop) => {
+                    let render_loop_started = std::time::Instant::now();
+                    // Drain all pending messages, coalescing consecutive touch-move
+                    // events to avoid redundant event dispatch before painting.
+                    // Start/Stop events are never dropped — only pure-Move events
+                    // are replaced by the next one.
+                    let mut pending_touch_move: Option<FromJavaMessage> = None;
                     while let Ok(msg) = from_java_rx.try_recv() {
+                        if let FromJavaMessage::Touch(ref touches) = msg {
+                            if touches
+                                .iter()
+                                .all(|t| t.state == crate::event::finger::TouchState::Move)
+                            {
+                                // This is a pure move event — defer it; a newer one
+                                // may arrive and supersede it.
+                                pending_touch_move = Some(msg);
+                                continue;
+                            }
+                        }
+                        // A non-touch or non-pure-move message arrived.
+                        // Flush the deferred move first (if any) so ordering is preserved.
+                        if let Some(deferred) = pending_touch_move.take() {
+                            self.handle_message(deferred);
+                        }
                         self.handle_message(msg);
+                    }
+                    // Flush the last deferred move (if any).
+                    if let Some(deferred) = pending_touch_move.take() {
+                        self.handle_message(deferred);
                     }
                     self.handle_other_events();
                     if self.os.in_xr_mode && self.os.openxr.session.is_none() {
@@ -315,14 +375,57 @@ impl Cx {
                         continue;
                     }
                     self.os.openxr.logged_waiting_for_session = false;
-                    // If a script re-apply was requested (e.g., safe area insets
-                    // changed on rotation), fire LiveEdit now.
-                    if self.pending_script_reapply {
-                        self.pending_script_reapply = false;
-                        self.call_event_handler(&Event::LiveEdit);
-                        self.redraw_all();
+                    // After every event, drain any pending re-apply. The
+                    // cheap gate (both flags false) keeps the hot path
+                    // zero-cost; everything else — picking the right
+                    // `Event` variant for each flag, skipping shader-cache
+                    // reset for manual triggers, deferring a same-tick
+                    // `ScriptReapply` follow-up to keep rotation light —
+                    // is documented in `run_live_edit_if_needed`.
+                    if self.pending_script_reapply || self.pending_live_edit_request {
+                        self.run_live_edit_if_needed("android");
                     }
-                    self.handle_drawing();
+                    // Drop the frame entirely if the window surface has been
+                    // torn down (typically during background/foreground or a
+                    // rotation). Issuing GL calls without a current EGL context
+                    // — which is what `destroy_surface` leaves us in — is
+                    // undefined behavior and crashes Mali/Adreno drivers with
+                    // a SIGSEGV inside `render_view`.
+                    if self.os.has_drawable_surface() {
+                        // If we previously skipped frames because the surface
+                        // wasn't ready, the redraw request may have been consumed
+                        // by an earlier draw cycle that couldn't actually paint.
+                        // Force a full redraw on the first frame after the surface
+                        // becomes (or becomes again) drawable.
+                        if self.os.needs_first_draw {
+                            self.os.needs_first_draw = false;
+                            self.redraw_all();
+                        }
+                        // The event side of a frame: the drained Java messages
+                        // (touches coalesced), the timers/signals and the live
+                        // edit gate, before any drawing. Only for a vsync that
+                        // draws (the same test `handle_drawing` makes): at rest
+                        // the loop wakes 120 times a second and paints nothing.
+                        if self.any_passes_dirty()
+                            || self.need_redrawing()
+                            || !self.new_next_frames.is_empty()
+                            || self.demo_time_repaint
+                        {
+                            crate::trace!(
+                                "frame.cpu",
+                                "events_ms={:.3}",
+                                render_loop_started.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        self.handle_drawing();
+                    } else {
+                        // Surface not ready — remember that we need a full
+                        // redraw once it becomes available, since any pending
+                        // draw event may be consumed by handle_drawing() on
+                        // a future iteration when the surface is briefly valid
+                        // but immediately torn down again (rotation race).
+                        self.os.needs_first_draw = true;
+                    }
                 }
                 Ok(message) => {
                     self.handle_message(message);
@@ -354,6 +457,81 @@ impl Cx {
                 .ok();
         }
         from_java_messages_clear()
+    }
+
+    fn sync_android_surface_alive_from_backend(&mut self) {
+        #[cfg(not(use_vulkan))]
+        {
+            self.os.surface_alive = self
+                .os
+                .display
+                .as_ref()
+                .map(|d| d.is_surface_alive())
+                .unwrap_or(false);
+        }
+
+        #[cfg(use_vulkan)]
+        {
+            self.os.surface_alive = if self.os.in_xr_mode && self.os.openxr.session.is_some() {
+                self.os.vulkan.is_some()
+            } else {
+                self.os
+                    .vulkan
+                    .as_ref()
+                    .map(|vulkan| vulkan.has_drawable_surface())
+                    .unwrap_or(false)
+            };
+        }
+    }
+
+    fn request_android_surface_redraw(&mut self) {
+        // A newly created/recreated surface starts with undefined contents.
+        // Always re-arm the first full redraw instead of relying on a later
+        // size-change callback to do it for us.
+        self.os.needs_first_draw = true;
+        self.redraw_all();
+    }
+
+    fn hide_android_surface_cover_after_first_present_if_needed(&mut self) {
+        if !self.os.hide_surface_cover_after_first_present || self.os.in_xr_mode {
+            return;
+        }
+        self.os.hide_surface_cover_after_first_present = false;
+        unsafe {
+            android_jni::to_java_set_surface_cover_visible(false);
+        }
+    }
+
+    fn request_android_surface_snapshot_refresh_after_present_if_needed(&mut self) {
+        if !self.os.refresh_surface_snapshot_after_first_present || self.os.in_xr_mode {
+            return;
+        }
+        self.os.refresh_surface_snapshot_after_first_present = false;
+        unsafe {
+            android_jni::to_java_request_surface_snapshot_refresh();
+        }
+    }
+
+    // Dispatches a copy or cut to the focused widget and writes the widget's
+    // response to the system clipboard. Shared by the keyboard and menu paths.
+    fn copy_or_cut_to_clipboard(&mut self, cut: bool) {
+        let response = Rc::new(RefCell::new(None));
+        let e = if cut {
+            Event::TextCut(TextClipboardEvent {
+                response: response.clone(),
+            })
+        } else {
+            Event::TextCopy(TextClipboardEvent {
+                response: response.clone(),
+            })
+        };
+        self.call_event_handler(&e);
+        let text = response.borrow().clone();
+        if let Some(text) = text {
+            unsafe {
+                to_java_copy_to_clipboard(text);
+            }
+        }
     }
 
     pub(crate) fn handle_message(&mut self, msg: FromJavaMessage) {
@@ -406,8 +584,31 @@ impl Cx {
                         }
                     }
                 }
+
+                if !self.os.in_xr_mode {
+                    self.sync_android_surface_alive_from_backend();
+                    if self.os.surface_alive {
+                        self.request_android_surface_redraw();
+                    }
+                }
             }
-            FromJavaMessage::SurfaceDestroyed => {
+            FromJavaMessage::SurfaceDestroyed { ack } => {
+                // CRITICAL: clear `surface_alive` BEFORE tearing down the
+                // surface itself. The render thread is the only one allowed to
+                // touch GL state, and we are on the render thread right now —
+                // but the helper functions we call below (`destroy_surface`,
+                // `suspend_surface`) issue EGL/Vulkan calls that can themselves
+                // trip the renderer if it observes a half-torn-down state.
+                self.os.surface_alive = false;
+                // Ensure the next time the surface becomes drawable, we force
+                // a full redraw to avoid a black screen.
+                self.os.needs_first_draw = true;
+                // The Java host shows its placeholder cover before sending
+                // SurfaceDestroyed, so only arm the hide-on-present path for
+                // genuine surface teardown/rebuild cycles, not cold start.
+                self.os.hide_surface_cover_after_first_present = true;
+                self.os.refresh_surface_snapshot_after_first_present = true;
+
                 #[cfg(not(use_vulkan))]
                 unsafe {
                     self.os.display.as_mut().unwrap().destroy_surface();
@@ -449,6 +650,11 @@ impl Cx {
                         );
                     }
                 }
+
+                // Tell the JNI thread (which is blocked inside
+                // `surfaceOnSurfaceDestroyed`) that it's now safe to return to
+                // Android — we've fully released our hold on the surface.
+                signal_surface_ack(&ack);
             }
             FromJavaMessage::SurfaceChanged {
                 window,
@@ -516,8 +722,12 @@ impl Cx {
                             }
                         } else {
                             match CxVulkan::new(window, width_u32, height_u32) {
-                                Ok(vulkan) => self.os.vulkan = Some(vulkan),
+                                Ok(vulkan) => {
+                                    self.os.vulkan = Some(vulkan);
+                                    self.os.gl_fallback = false;
+                                }
                                 Err(err) => {
+                                    self.os.gl_fallback = true;
                                     crate::error!(
                                         "Android Vulkan backend init failed, falling back to OpenGL: {err}"
                                     );
@@ -527,13 +737,27 @@ impl Cx {
                     }
                 }
 
+                if !self.os.in_xr_mode {
+                    self.sync_android_surface_alive_from_backend();
+                    if self.os.surface_alive {
+                        self.request_android_surface_redraw();
+                    }
+                }
+
                 self.os.display_size = dvec2(width as f64, height as f64);
                 let window_id = CxWindowPool::id_zero();
                 let window = &mut self.windows[window_id];
+                // Stash the OS-reported scale factor so a later
+                // `set_window_dpi_override(None)` can recover the native scale,
+                // and so `remap_dpi_override` (used by `dpi_override_scale`
+                // on platforms whose touch coords aren't already in
+                // override-points) has a baseline. Android itself converts
+                // touch coords at the source, so the helper is a no-op here.
+                window.os_dpi_factor = Some(self.os.dpi_factor);
                 let old_geom = window.window_geom.clone();
 
-                let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
-                let size = self.os.display_size / dpi_factor;
+                let dpi_factor = window.effective_dpi_factor();
+                let size = window.physical_vec2d_to_layout(self.os.display_size);
                 window.window_geom = WindowGeom {
                     dpi_factor,
                     can_fullscreen: false,
@@ -543,7 +767,8 @@ impl Cx {
                     position: dvec2(0.0, 0.0),
                     inner_size: size,
                     outer_size: size,
-                    safe_area_insets: self.os.safe_area_insets,
+                    safe_area_insets: window
+                        .native_safe_area_insets_to_layout(self.os.native_safe_area_insets),
                     ..Default::default()
                 };
                 let new_geom = window.window_geom.clone();
@@ -564,23 +789,50 @@ impl Cx {
                 pointer_id,
                 time,
             } => {
-                let window = &mut self.windows[CxWindowPool::id_zero()];
-                let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
+                let window = &self.windows[CxWindowPool::id_zero()];
                 let e = Event::LongPress(LongPressEvent {
-                    abs: abs / dpi_factor,
+                    abs: window.physical_vec2d_to_layout(abs),
                     uid: pointer_id,
                     window_id: CxWindowPool::id_zero(),
                     time,
                 });
                 self.call_event_handler(&e);
             }
+            FromJavaMessage::TouchCancel(mut touches) => {
+                // ACTION_CANCEL: every pointer was taken away, not lifted. Each
+                // is cancelled for every capture, dispatched as
+                // `Event::FingerCancel` (raw consumers see a cancel, never a
+                // release; an internal drag ends with no drop) and retired.
+                let Some(time) = touches.first().map(|t| t.time) else { return };
+                let window = &self.windows[CxWindowPool::id_zero()];
+                for touch in &mut touches {
+                    touch.abs = window.physical_vec2d_to_layout(touch.abs);
+                    touch.radius = window.physical_vec2d_to_layout(touch.radius);
+                }
+                for touch in &touches {
+                    let digit_id: crate::event::DigitId = crate::makepad_live_id::live_id_num!(touch, touch.uid).into();
+                    self.fingers.cancel_digit(digit_id);
+                    self.call_event_handler(&Event::FingerCancel(crate::event::FingerCancelEvent {
+                        window_id: CxWindowPool::id_zero(),
+                        digit_id,
+                        device: crate::event::DigitDevice::Touch { uid: touch.uid },
+                        abs: touch.abs,
+                        time,
+                        modifiers: Default::default(),
+                    }));
+                }
+                if self.os.internal_drag_items.take().is_some() {
+                    self.call_event_handler(&Event::DragEnd);
+                    self.drag_drop.cycle_drag();
+                }
+                self.fingers.process_touch_update_end(&touches);
+            }
             FromJavaMessage::Touch(mut touches) => {
                 let time = touches[0].time;
-                let window = &mut self.windows[CxWindowPool::id_zero()];
-                let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
+                let window = &self.windows[CxWindowPool::id_zero()];
                 for touch in &mut touches {
-                    touch.abs /= dpi_factor;
-                    touch.radius /= dpi_factor;
+                    touch.abs = window.physical_vec2d_to_layout(touch.abs);
+                    touch.radius = window.physical_vec2d_to_layout(touch.radius);
                 }
 
                 // Check for outside-click popup dismiss on touch start
@@ -612,9 +864,11 @@ impl Cx {
 
                 // Synthesize internal drag-and-drop events from touch gestures.
                 if self.os.internal_drag_items.is_some() {
-                    if let Some(touch) = e.touches.iter().find(|t| {
-                        t.state == crate::event::finger::TouchState::Stop
-                    }) {
+                    if let Some(touch) = e
+                        .touches
+                        .iter()
+                        .find(|t| t.state == crate::event::finger::TouchState::Stop)
+                    {
                         // Touch lifted: fire Drop + DragEnd
                         if let Some(items) = self.os.internal_drag_items.take() {
                             self.call_event_handler(&Event::Drop(DropEvent {
@@ -627,9 +881,11 @@ impl Cx {
                             self.call_event_handler(&Event::DragEnd);
                             self.drag_drop.cycle_drag();
                         }
-                    } else if let Some(touch) = e.touches.iter().find(|t| {
-                        t.state == crate::event::finger::TouchState::Move
-                    }) {
+                    } else if let Some(touch) = e
+                        .touches
+                        .iter()
+                        .find(|t| t.state == crate::event::finger::TouchState::Move)
+                    {
                         // Finger moving: fire Drag event
                         if let Some(items) = self.os.internal_drag_items.as_ref() {
                             self.call_event_handler(&Event::Drag(DragEvent {
@@ -660,62 +916,51 @@ impl Cx {
             FromJavaMessage::KeyDown {
                 keycode,
                 meta_state,
+                is_repeat,
             } => {
-                let e: Event;
                 let makepad_keycode = android_to_makepad_key_code(keycode);
                 if !makepad_keycode.is_unknown() {
                     let control = meta_state & ANDROID_META_CTRL_MASK != 0;
                     let alt = meta_state & ANDROID_META_ALT_MASK != 0;
                     let shift = meta_state & ANDROID_META_SHIFT_MASK != 0;
+                    let key_event = KeyEvent {
+                        key_code: makepad_keycode,
+                        is_repeat,
+                        modifiers: KeyModifiers {
+                            shift,
+                            control,
+                            alt,
+                            ..Default::default()
+                        },
+                        time: self.os.timers.time_now(),
+                    };
+                    self.keyboard.process_key_down(key_event.clone());
                     let is_shortcut = control || alt;
-                    if is_shortcut {
-                        if makepad_keycode == KeyCode::KeyC {
-                            let response = Rc::new(RefCell::new(None));
-                            e = Event::TextCopy(TextClipboardEvent {
-                                response: response.clone(),
-                            });
-                            self.call_event_handler(&e);
-                            // let response = response.borrow();
-                            // if let Some(response) = response.as_ref(){
-                            //     to_java.copy_to_clipboard(response);
-                            // }
-                        } else if makepad_keycode == KeyCode::KeyX {
-                            let response = Rc::new(RefCell::new(None));
-                            let e = Event::TextCut(TextClipboardEvent {
-                                response: response.clone(),
-                            });
-                            self.call_event_handler(&e);
-                        } else if makepad_keycode == KeyCode::KeyV {
-                            let content = unsafe { android_jni::to_java_paste_from_clipboard() };
-                            if !content.is_empty() {
-                                e = Event::TextInput(TextInputEvent {
-                                    input: content,
-                                    replace_last: false,
-                                    was_paste: true,
-                                    ..Default::default()
-                                });
-                                self.call_event_handler(&e);
-                            }
+                    // Clipboard shortcuts are consumed here and never reach the
+                    // widget as a key event.
+                    if is_shortcut && makepad_keycode == KeyCode::KeyC {
+                        self.copy_or_cut_to_clipboard(false);
+                    } else if is_shortcut && makepad_keycode == KeyCode::KeyX {
+                        self.copy_or_cut_to_clipboard(true);
+                    } else if is_shortcut && makepad_keycode == KeyCode::KeyV {
+                        let content = unsafe { android_jni::to_java_paste_from_clipboard() };
+                        if !content.is_empty() {
+                            self.call_event_handler(&Event::TextInput(TextInputEvent {
+                                input: content,
+                                replace_last: false,
+                                was_paste: true,
+                                ..Default::default()
+                            }));
                         }
                     } else {
-                        if makepad_keycode == KeyCode::Back {
+                        // Everything else reaches the widget as a KeyDown, including
+                        // other Ctrl/Alt shortcuts like Ctrl+Enter or Ctrl+A.
+                        if makepad_keycode == KeyCode::Back && !is_repeat {
                             self.call_event_handler(&Event::BackPressed {
                                 handled: Cell::new(false),
                             });
                         }
-
-                        e = Event::KeyDown(KeyEvent {
-                            key_code: makepad_keycode,
-                            is_repeat: false,
-                            modifiers: KeyModifiers {
-                                shift,
-                                control,
-                                alt,
-                                ..Default::default()
-                            },
-                            time: self.os.timers.time_now(),
-                        });
-                        self.call_event_handler(&e);
+                        self.call_event_handler(&Event::KeyDown(key_event));
                     }
                 }
             }
@@ -728,7 +973,7 @@ impl Cx {
                 let alt = meta_state & ANDROID_META_ALT_MASK != 0;
                 let shift = meta_state & ANDROID_META_SHIFT_MASK != 0;
 
-                let e = Event::KeyUp(KeyEvent {
+                let key_event = KeyEvent {
                     key_code: makepad_keycode,
                     is_repeat: false,
                     modifiers: KeyModifiers {
@@ -738,32 +983,65 @@ impl Cx {
                         ..Default::default()
                     },
                     time: self.os.timers.time_now(),
-                });
-                self.call_event_handler(&e);
+                };
+                if !makepad_keycode.is_unknown() {
+                    self.keyboard.process_key_up(key_event.clone());
+                }
+                self.call_event_handler(&Event::KeyUp(key_event));
             }
             FromJavaMessage::ResizeTextIME {
                 keyboard_height,
                 is_open,
             } => {
-                let keyboard_height = (keyboard_height as f64) / self.os.dpi_factor;
-                if !is_open {
-                    self.os.keyboard_closed = keyboard_height;
-                }
+                // Java reports the bottom IME occlusion in physical pixels.
+                // Convert to Makepad layout points and dedup repeated inset/layout
+                // callbacks. A visible IME may still have zero bottom
+                // occlusion (floating keyboard, transient animation frame);
+                // keep it as a visible zero-height keyboard so KeyboardView can
+                // clear any previous bottom shift without treating focus as
+                // dismissed.
+                let height_logical = self.windows[CxWindowPool::id_zero()]
+                    .physical_pixels_to_layout(keyboard_height as f64);
+                let time = self.os.timers.time_now();
                 if is_open {
+                    if self.os.last_ime_visible
+                        && (height_logical - self.os.last_ime_height).abs() < 0.5
+                    {
+                        return;
+                    }
+                    self.os.last_ime_visible = true;
+                    self.os.last_ime_height = height_logical;
                     self.call_event_handler(&Event::VirtualKeyboard(
                         VirtualKeyboardEvent::DidShow {
-                            height: keyboard_height - self.os.keyboard_closed,
-                            time: self.os.timers.time_now(),
+                            height: height_logical,
+                            time,
                         },
                     ))
-                } else {
-                    self.text_ime_was_dismissed();
+                } else if !is_open {
+                    // Java says the keyboard is down; forget the last shown
+                    // config so the next `ShowTextIME` re-issues the request.
+                    self.os.last_ime_config = None;
+                    if !self.os.last_ime_visible {
+                        return;
+                    }
+                    self.os.last_ime_visible = false;
+                    self.os.last_ime_height = 0.0;
+                    // With a physical keyboard attached, Android auto-hides the
+                    // soft keyboard while the focused TextInput stays active.
+                    // Marking the IME dismissed (and re-issuing HideTextIME) would
+                    // stop the IME from composing hardware-key input and freeze the
+                    // IME position. Mirror the iOS guard (see ios.rs handling of
+                    // VirtualKeyboardEvent::DidHide).
+                    if !self.keyboard.has_physical_keyboard() {
+                        self.text_ime_was_dismissed();
+                    }
                     self.call_event_handler(&Event::VirtualKeyboard(
-                        VirtualKeyboardEvent::DidHide {
-                            time: self.os.timers.time_now(),
-                        },
+                        VirtualKeyboardEvent::DidHide { time },
                     ))
                 }
+            }
+            FromJavaMessage::PhysicalKeyboard { connected } => {
+                self.update_physical_keyboard_state(connected);
             }
             FromJavaMessage::HttpResponse {
                 request_id,
@@ -867,14 +1145,63 @@ impl Cx {
                         }
                     };
 
-                    self.call_event_handler(&Event::PermissionResult(
-                        crate::permission::PermissionResult {
-                            permission: perm,
-                            request_id,
-                            status: permission_status,
-                        },
-                    ));
+                    // Deferred start: StartLocationUpdates fired this dialog.
+                    if perm == crate::permission::Permission::Location
+                        && self.os.location_updates_wanted
+                    {
+                        match permission_status {
+                            crate::permission::PermissionStatus::Granted => unsafe {
+                                android_jni::to_java_start_location_updates(
+                                    LOCATION_MIN_INTERVAL_MS,
+                                    LOCATION_MIN_DISTANCE_M,
+                                );
+                            },
+                            _ => {
+                                self.call_event_handler(&Event::LocationError(
+                                    crate::event::LocationErrorEvent::PermissionDenied,
+                                ));
+                            }
+                        }
+                    }
+                    if request_id != LOCATION_INTERNAL_PERMISSION_REQUEST_ID {
+                        self.call_event_handler(&Event::PermissionResult(
+                            crate::permission::PermissionResult {
+                                permission: perm,
+                                request_id,
+                                status: permission_status,
+                            },
+                        ));
+                    }
                 }
+            }
+            FromJavaMessage::LocationUpdate {
+                lon,
+                lat,
+                accuracy_m,
+                altitude_m,
+                speed_mps,
+                heading_deg,
+                time_ms,
+            } => {
+                self.call_event_handler(&Event::LocationUpdate(
+                    crate::event::LocationUpdateEvent {
+                        lon,
+                        lat,
+                        accuracy_m: accuracy_m as f64,
+                        altitude_m,
+                        speed_mps: speed_mps.map(|v| v as f64),
+                        heading_deg: heading_deg.map(|v| v as f64),
+                        time: time_ms as f64 / 1000.0,
+                    },
+                ));
+            }
+            FromJavaMessage::LocationError { code, message } => {
+                let error = if code == 1 {
+                    crate::event::LocationErrorEvent::PermissionDenied
+                } else {
+                    crate::event::LocationErrorEvent::Unavailable(message)
+                };
+                self.call_event_handler(&Event::LocationError(error));
             }
             FromJavaMessage::VideoPlaybackPrepared {
                 video_id,
@@ -918,6 +1245,16 @@ impl Cx {
                 }
                 if let Some(mut asp) = self.os.software_video_players.remove(&live_id) {
                     asp.player.cleanup();
+                    unsafe {
+                        let env = attach_jni_env();
+                        if let Some(surface) = asp.oes_surface.take() {
+                            crate::gpu_texture::clear_media_oes_surface(asp.oes_tex_id);
+                            (**env).DeleteGlobalRef.unwrap()(env, surface);
+                        }
+                        if let Some(bridge) = asp.oes_bridge.take() {
+                            android_jni::to_java_release_oes_decode_surface(env, bridge);
+                        }
+                    }
                 }
                 self.os.video_configs.remove(&live_id);
 
@@ -932,27 +1269,41 @@ impl Cx {
                 let force_native = force_native_video();
                 if !force_native && !self.os.software_video_players.contains_key(&live_id) {
                     if let Some(config) = self.os.video_configs.get(&live_id).cloned() {
-                        crate::log!(
+                        if config.source.is_android_content_uri() {
+                            crate::log!(
+                                "VIDEO: Android native decode failed for content URI {}: {}",
+                                live_id.0,
+                                error
+                            );
+                        } else {
+                            crate::log!(
                             "VIDEO: Android native decode failed for {}, falling back to software video: {}",
                             live_id.0,
                             error
                         );
-                        let asp = AndroidSoftwarePlayer {
-                            player: PlaybackSessionHandle::new(
-                                live_id,
-                                config.texture_id,
-                                config.source,
-                                config.autoplay,
-                                config.should_loop,
-                            ),
-                            tex_y_id: config.tex_y_id,
-                            tex_u_id: config.tex_u_id,
-                            tex_v_id: config.tex_v_id,
-                            yuv_matrix: 0.0,
-                        };
-                        self.os.software_video_players.insert(live_id, asp);
-                        self.redraw_all();
-                        return;
+                            let (oes_bridge, oes_surface, oes_tex_id) =
+                                self.setup_mediacodec_oes_bridge(config.texture_id);
+                            let asp = AndroidSoftwarePlayer {
+                                player: PlaybackSessionHandle::new(
+                                    live_id,
+                                    config.texture_id,
+                                    config.source,
+                                    config.autoplay,
+                                    config.should_loop,
+                                ),
+                                tex_y_id: config.tex_y_id,
+                                tex_u_id: config.tex_u_id,
+                                tex_v_id: config.tex_v_id,
+                                texture_id: config.texture_id,
+                                yuv_matrix: 0.0,
+                                oes_bridge,
+                                oes_surface,
+                                oes_tex_id,
+                            };
+                            self.os.software_video_players.insert(live_id, asp);
+                            self.redraw_all();
+                            return;
+                        }
                     }
                 }
 
@@ -1004,6 +1355,12 @@ impl Cx {
                         android_jni::to_java_set_full_screen(env, true);
                     }
                 }
+                // Java may keep a cached snapshot overlay visible across any
+                // pause/resume transition, even when Android never tears down
+                // the underlying SurfaceView. Always hide that overlay on the
+                // first successful present after resume.
+                self.os.hide_surface_cover_after_first_present = true;
+                self.os.refresh_surface_snapshot_after_first_present = true;
                 self.redraw_all();
                 self.reinitialise_media();
                 self.call_event_handler(&Event::Resume);
@@ -1033,31 +1390,9 @@ impl Cx {
             }
             FromJavaMessage::ClipboardAction { action } => {
                 if action == "copy" {
-                    let response = Rc::new(RefCell::new(None));
-                    let e = Event::TextCopy(TextClipboardEvent {
-                        response: response.clone(),
-                    });
-                    self.call_event_handler(&e);
-                    // Get the copied text from the widget's response
-                    if let Some(text) = response.borrow().as_ref() {
-                        // Copy to clipboard
-                        unsafe {
-                            to_java_copy_to_clipboard(text.clone());
-                        }
-                    };
+                    self.copy_or_cut_to_clipboard(false);
                 } else if action == "cut" {
-                    let response = Rc::new(RefCell::new(None));
-                    let e = Event::TextCut(TextClipboardEvent {
-                        response: response.clone(),
-                    });
-                    self.call_event_handler(&e);
-                    // Get the cut text from the widget's response
-                    if let Some(text) = response.borrow().as_ref() {
-                        // Copy to clipboard
-                        unsafe {
-                            to_java_copy_to_clipboard(text.clone());
-                        }
-                    };
+                    self.copy_or_cut_to_clipboard(true);
                 } else if action == "select_all" {
                     // Simulate Ctrl+A keypress to trigger select_all in widgets
                     let e = Event::KeyDown(KeyEvent {
@@ -1090,11 +1425,10 @@ impl Cx {
                 time,
             } => {
                 let window = &self.windows[CxWindowPool::id_zero()];
-                let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
                 let e = Event::SelectionHandleDrag(SelectionHandleDragEvent {
                     handle,
                     phase,
-                    abs: abs / dpi_factor,
+                    abs: window.physical_vec2d_to_layout(abs),
                     time,
                 });
                 self.call_event_handler(&e);
@@ -1145,13 +1479,14 @@ impl Cx {
                     bottom,
                     left,
                 };
-                if self.os.safe_area_insets != new_insets {
-                    self.os.safe_area_insets = new_insets;
+                if self.os.native_safe_area_insets != new_insets {
+                    self.os.native_safe_area_insets = new_insets;
                     // Update the WindowGeom with the new safe area insets
                     let window_id = CxWindowPool::id_zero();
                     let window = &mut self.windows[window_id];
                     let old_geom = window.window_geom.clone();
-                    window.window_geom.safe_area_insets = new_insets;
+                    let safe_area_insets = window.native_safe_area_insets_to_layout(new_insets);
+                    window.window_geom.safe_area_insets = safe_area_insets;
                     let new_geom = window.window_geom.clone();
                     if old_geom != new_geom {
                         self.call_event_handler(&Event::WindowGeomChange(WindowGeomChangeEvent {
@@ -1174,13 +1509,16 @@ impl Cx {
             || self.demo_time_repaint
         {
             let time_now = self.os.timers.time_now();
+            let phase_started = std::time::Instant::now();
             if !self.new_next_frames.is_empty() {
                 self.call_next_frame_event(time_now);
             }
+            let next_frame_done = std::time::Instant::now();
             if self.need_redrawing() {
                 self.call_draw_event(time_now);
                 self.compile_shaders_for_active_backend();
             }
+            let draw_done = std::time::Instant::now();
 
             if self.os.first_after_resize {
                 self.os.first_after_resize = false;
@@ -1188,6 +1526,30 @@ impl Cx {
             }
 
             self.handle_repaint();
+            // Where a frame's CPU goes on the main thread, per phase: the
+            // NextFrame step, the widget draw (`call_draw_event`) and the
+            // repaint of every dirty pass (`handle_repaint`, record + submit).
+            // `adb shell setprop debug.makepad.trace frame.cpu`.
+            crate::trace!(
+                "frame.cpu",
+                "next_frame_ms={:.3} draw_ms={:.3} repaint_ms={:.3}",
+                next_frame_done.duration_since(phase_started).as_secs_f64() * 1000.0,
+                draw_done.duration_since(next_frame_done).as_secs_f64() * 1000.0,
+                draw_done.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            // Run script-VM garbage collection at a safe point after paint, matching
+            // the macOS backend, so the script object heap doesn't grow without bound:
+            // every `eval` / `script_apply_eval!` allocates script objects that are
+            // only reclaimed by `gc()`. `needs_gc()` gates the actual sweep.
+            self.with_vm(|vm| {
+                if vm.heap().needs_gc() {
+                    vm.gc();
+                }
+            });
+        } else {
+            #[cfg(not(use_vulkan))]
+            self.maintain_instance_retirements();
         }
     }
 
@@ -1206,14 +1568,29 @@ impl Cx {
     }
 
     fn draw_pass_to_window_for_active_backend(&mut self, draw_pass_id: DrawPassId) {
+        // No surface → no point dispatching to either backend. Both backends
+        // will SIGSEGV inside the GPU driver if their swapchain/window has
+        // been torn down out from under them.
+        if !self.os.has_drawable_surface() {
+            return;
+        }
+
         #[cfg(use_vulkan)]
         {
             if self.os.vulkan.is_some() {
                 let mut vulkan = self.os.vulkan.take().unwrap();
                 let result = vulkan.draw_pass_and_present(self, draw_pass_id);
                 self.os.vulkan = Some(vulkan);
-                if let Err(err) = result {
-                    crate::error!("Android Vulkan draw/present failed: {err}");
+                match result {
+                    Ok(presented) => {
+                        if presented {
+                            self.hide_android_surface_cover_after_first_present_if_needed();
+                            self.request_android_surface_snapshot_refresh_after_present_if_needed();
+                        }
+                    }
+                    Err(err) => {
+                        crate::error!("Android Vulkan draw/present failed: {err}");
+                    }
                 }
             } else {
                 self.draw_pass_to_fullscreen(draw_pass_id);
@@ -1228,6 +1605,13 @@ impl Cx {
     }
 
     pub(crate) fn draw_pass_to_texture_for_active_backend(&mut self, draw_pass_id: DrawPassId) {
+        // Off-screen passes still issue GL/Vulkan commands against the active
+        // context, so they must respect surface validity for the same reason
+        // as window passes.
+        if !self.os.has_drawable_surface() {
+            return;
+        }
+
         #[cfg(use_vulkan)]
         {
             if let Some(mut vulkan) = self.os.vulkan.take() {
@@ -1251,10 +1635,21 @@ impl Cx {
             if self.os.vulkan.is_none() {
                 unsafe {
                     if let Some(display) = &mut self.os.display {
-                        (display.libegl.eglSwapBuffers.unwrap())(
-                            display.egl_display,
-                            display.surface,
-                        );
+                        // Skip the swap if the window surface has been torn
+                        // down — most drivers return EGL_BAD_SURFACE here, but
+                        // some (Mali/Adreno) crash inside the swap buffer
+                        // implementation when the underlying buffer queue is
+                        // already gone.
+                        if display.is_surface_alive() {
+                            let swapped = (display.libegl.eglSwapBuffers.unwrap())(
+                                display.egl_display,
+                                display.surface,
+                            );
+                            if swapped != 0 {
+                                self.hide_android_surface_cover_after_first_present_if_needed();
+                                self.request_android_surface_snapshot_refresh_after_present_if_needed();
+                            }
+                        }
                     }
                 }
             }
@@ -1264,7 +1659,16 @@ impl Cx {
         #[cfg(not(use_vulkan))]
         unsafe {
             if let Some(display) = &mut self.os.display {
-                (display.libegl.eglSwapBuffers.unwrap())(display.egl_display, display.surface);
+                if display.is_surface_alive() {
+                    let swapped = (display.libegl.eglSwapBuffers.unwrap())(
+                        display.egl_display,
+                        display.surface,
+                    );
+                    if swapped != 0 {
+                        self.hide_android_surface_cover_after_first_present_if_needed();
+                        self.request_android_surface_snapshot_refresh_after_present_if_needed();
+                    }
+                }
             }
         }
     }
@@ -1280,9 +1684,13 @@ impl Cx {
         }
 
         // Signals
-        if SignalToUI::check_and_clear_ui_signal() {
+        let internal_signal = SignalToUI::check_and_clear_internal_signal();
+        let ui_signal = SignalToUI::check_and_clear_ui_signal();
+        if internal_signal || ui_signal {
             self.handle_media_signals();
             self.handle_script_signals();
+        }
+        if ui_signal {
             self.call_event_handler(&Event::Signal);
         }
         if SignalToUI::check_and_clear_action_signal() {
@@ -1306,8 +1714,12 @@ impl Cx {
                     enabled: false,
                     matrix: 0.0,
                     biplanar: false,
+                    full_range: false,
                     rotation_steps: 0.0,
+                    external: false,
+                    array: false,
                 },
+                rgba_gl_2d: false,
             });
             self.call_event_handler(&e);
         }
@@ -1321,11 +1733,17 @@ impl Cx {
         // Live edits
         self.run_live_edit_if_needed("android");
 
+        // `setprop debug.makepad.grab <n>`: the app's own frame grab.
+        self.android_poll_debug_grab();
+
         // Platform operations
         self.handle_platform_ops();
     }
 
     fn get_video_updates(&mut self) -> Vec<LiveId> {
+        if self.os.video_surfaces.is_empty() {
+            return Vec::new();
+        }
         let mut videos_to_update = Vec::new();
         for (live_id, surface_texture) in self.os.video_surfaces.iter_mut() {
             unsafe {
@@ -1408,6 +1826,7 @@ impl Cx {
                                 video_id: player.video_id,
                                 current_position_ms: 0,
                                 yuv,
+                                rgba_gl_2d: false,
                             }));
                         }
                         Err(error) => {
@@ -1450,8 +1869,12 @@ impl Cx {
                         enabled: true,
                         matrix: 1.0,
                         biplanar: false,
+                        full_range: false,
                         rotation_steps: player.yuv_rotation_steps(),
+                        external: false,
+                        array: false,
                     },
+                    rgba_gl_2d: false,
                 }));
             }
         }
@@ -1481,6 +1904,17 @@ impl Cx {
                     video_tracks,
                     audio_tracks,
                 })) => {
+                    if let Some(bridge) = asp.oes_bridge {
+                        unsafe {
+                            let env = attach_jni_env();
+                            android_jni::to_java_oes_decode_surface_set_default_buffer_size(
+                                env,
+                                bridge,
+                                width as i32,
+                                height as i32,
+                            );
+                        }
+                    }
                     events.push(Event::VideoPlaybackPrepared(VideoPlaybackPreparedEvent {
                         video_id: asp.player.video_id,
                         video_width: width,
@@ -1500,8 +1934,51 @@ impl Cx {
                 None => {}
             }
 
+            // OES present: SurfaceTexture.frameAvailable is async. Drain on the GL
+            // thread every poll; only emit VideoTextureUpdated when updateTexImage
+            // actually applied a frame (never present stale OES content).
+            let mut presented_oes = false;
+            if let Some(bridge) = asp.oes_bridge {
+                let (drained, st_matrix) = unsafe {
+                    let env = attach_jni_env();
+                    android_jni::to_java_oes_decode_surface_drain(env, bridge)
+                };
+                if drained > 0 {
+                    let tex_id = if asp.oes_tex_id != 0 {
+                        asp.oes_tex_id
+                    } else {
+                        self.textures[asp.texture_id].os.gl_texture.unwrap_or(0)
+                    };
+                    if tex_id != 0 {
+                        let tex = &mut self.textures[asp.texture_id];
+                        tex.os.gl_texture = Some(tex_id);
+                        tex.os.gl_texture_owned = false;
+                        tex.os.oes_st_matrix = st_matrix;
+                        tex.format = TextureFormat::VideoExternal;
+                        events.push(Event::VideoTextureUpdated(VideoTextureUpdatedEvent {
+                            video_id: asp.player.video_id,
+                            current_position_ms: asp.player.current_position_ms(),
+                            yuv: crate::event::video_playback::VideoYuvMetadata {
+                                enabled: false,
+                                matrix: 0.0,
+                                biplanar: false,
+                                full_range: false,
+                                rotation_steps: 0.0,
+                                external: false,
+                                array: false,
+                            },
+                            rgba_gl_2d: false,
+                        }));
+                        presented_oes = true;
+                    }
+                }
+            }
+
             if asp.player.poll_frame() {
-                if let Some(planes) = asp.player.take_yuv_frame() {
+                if presented_oes {
+                    // Ack decoder-side OesFrame markers for the drained frames.
+                    while asp.player.take_oes_frame().is_some() {}
+                } else if let Some(planes) = asp.player.take_yuv_frame() {
                     asp.yuv_matrix = planes.matrix.as_f32();
                     upload_yuv_to_gl(
                         unsafe { &*gl },
@@ -1518,10 +1995,18 @@ impl Cx {
                             enabled: true,
                             matrix: asp.yuv_matrix,
                             biplanar: false,
+                            full_range: false,
                             rotation_steps: 0.0,
+                            external: false,
+                            array: false,
                         },
+                        rgba_gl_2d: false,
                     }));
                 }
+                // Pending take_oes_frame without a successful drain: leave markers
+                // in the queue until SurfaceTexture catches up on a later poll.
+            } else if presented_oes {
+                while asp.player.take_oes_frame().is_some() {}
             }
 
             if asp.player.check_eos() {
@@ -1571,28 +2056,83 @@ impl Cx {
             let mut cx = startup();
             let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
 
+            // A phone has no `MAKEPAD_TRACE` environment: the trace topics
+            // come from a system property instead
+            // (`adb shell setprop debug.makepad.trace gpu.present`).
+            let trace_topics = android_system_property("debug.makepad.trace");
+            if !trace_topics.is_empty() {
+                crate::makepad_error_log::set_trace_topics(&trace_topics);
+            }
+
             cx.os.activity_thread_id = Some(activity_thread_id);
             cx.os.render_thread_id =
                 Some(unsafe { libc_sys::syscall(libc_sys::SYS_GETTID) as u64 });
 
-            let window = loop {
+            let mut initial_params: Option<AndroidParams> = None;
+            let mut initial_surface: Option<(*mut ndk_sys::ANativeWindow, i32, i32)> = None;
+            let mut initial_physical_keyboard: Option<bool> = None;
+
+            let (window, width, height, android_params) = loop {
                 // Here use blocking method `recv` to reduce CPU usage during cold start.
                 match from_java_rx.recv() {
                     Ok(FromJavaMessage::Init(params)) => {
-                        cx.os.dpi_factor = params.density;
-                        cx.os_type = OsType::Android(params);
+                        initial_params = Some(params);
+                    }
+                    Ok(FromJavaMessage::SurfaceCreated { window }) => {
+                        // Bootstrap off the first SurfaceChanged so we have a
+                        // real size. SurfaceCreated still hands us an acquired
+                        // ANativeWindow ref, so release it immediately here to
+                        // avoid leaking the unused bootstrap callback.
+                        unsafe {
+                            if !window.is_null() {
+                                ndk_sys::ANativeWindow_release(window);
+                            }
+                        }
                     }
                     Ok(FromJavaMessage::SurfaceChanged {
                         window,
                         width,
                         height,
                     }) => {
-                        cx.os.display_size = dvec2(width as f64, height as f64);
-                        break window;
+                        if let Some((old_window, _, _)) =
+                            initial_surface.replace((window, width, height))
+                        {
+                            unsafe {
+                                if !old_window.is_null() {
+                                    ndk_sys::ANativeWindow_release(old_window);
+                                }
+                            }
+                        }
+                    }
+                    Ok(FromJavaMessage::PhysicalKeyboard { connected }) => {
+                        initial_physical_keyboard = Some(connected);
+                    }
+                    Ok(FromJavaMessage::SurfaceDestroyed { ack }) => {
+                        if let Some((old_window, _, _)) = initial_surface.take() {
+                            unsafe {
+                                if !old_window.is_null() {
+                                    ndk_sys::ANativeWindow_release(old_window);
+                                }
+                            }
+                        }
+                        signal_surface_ack(&ack);
                     }
                     _ => (),
                 }
+
+                if initial_params.is_some() && initial_surface.is_some() {
+                    let android_params = initial_params.take().unwrap();
+                    let (window, width, height) = initial_surface.take().unwrap();
+                    break (window, width, height, android_params);
+                }
             };
+
+            cx.os.dpi_factor = android_params.density;
+            cx.os_type = OsType::Android(android_params);
+            if let Some(connected) = initial_physical_keyboard {
+                cx.set_physical_keyboard_state(connected);
+            }
+            cx.os.display_size = dvec2(width as f64, height as f64);
 
             // SAFETY:
             // The LibEgl instance (libegl) has been properly loaded and initialized earlier.
@@ -1688,12 +2228,18 @@ impl Cx {
                         cx.os.vulkan = Some(vulkan);
                     }
                     Err(err) => {
+                        cx.os.gl_fallback = true;
                         crate::error!(
                             "Android Vulkan backend init failed on startup, continuing with OpenGL: {err}"
                         );
                     }
                 }
             }
+
+            // The initial SurfaceChanged was consumed during bootstrap so the
+            // regular lifecycle handler will not get a second chance to seed
+            // drawable-surface state for the first frame. Do it explicitly here.
+            cx.sync_android_surface_alive_from_backend();
 
             cx.main_loop(from_java_rx);
             cx.stop_studio_websocket();
@@ -1801,9 +2347,37 @@ impl Cx {
     }
 
     pub fn draw_pass_to_fullscreen(&mut self, draw_pass_id: DrawPassId) {
+        // Defense in depth: even though `main_loop` already gates `handle_drawing`
+        // on `has_drawable_surface`, this method is also reachable via the popup
+        // overlay path in `handle_repaint`, and we want a hard, local guarantee
+        // that we never issue GL commands without a current EGL context.
+        //
+        // 1. Bail immediately if the surface is gone.
+        // 2. Re-bind our context to its surface every frame. On Android the
+        //    EGL context can become "uncurrent" if foreign code (or our own
+        //    teardown path) called `eglMakeCurrent(NULL, ...)`. Re-binding is
+        //    cheap when already current and is the only way to recover from
+        //    a context that quietly drifted out of sync.
+        if !self.os.has_drawable_surface() {
+            return;
+        }
+        let make_current_ok = self
+            .os
+            .display
+            .as_ref()
+            .map(|d| d.try_make_current())
+            .unwrap_or(false);
+        if !make_current_ok {
+            // The display struct exists but the EGL surface is no longer
+            // bindable; mark it dead so we don't burn CPU re-checking until
+            // the next SurfaceCreated.
+            self.os.surface_alive = false;
+            return;
+        }
+
         let draw_list_id = self.passes[draw_pass_id].main_draw_list_id.unwrap();
 
-        self.setup_render_pass(draw_pass_id);
+        self.setup_render_pass(draw_pass_id, false);
 
         // keep repainting in a loop
         self.passes[draw_pass_id].paint_dirty = false;
@@ -1859,7 +2433,8 @@ impl Cx {
         self.compute_pass_repaint_order(&mut passes_todo);
         self.repaint_id += 1;
         for draw_pass_id in &passes_todo {
-            self.passes[*draw_pass_id].set_time(self.os.timers.time_now() as f32);
+            let uniforms_gen = self.next_uniform_gen();
+            self.passes[*draw_pass_id].set_time(self.os.timers.time_now() as f32, uniforms_gen);
             match self.passes[*draw_pass_id].parent.clone() {
                 CxDrawPassParent::Xr => {
                     // cant happen
@@ -1875,7 +2450,7 @@ impl Cx {
                     self.draw_pass_to_window_for_active_backend(*draw_pass_id);
 
                     // Draw popup window passes as overlays on the same surface
-                    for popup_pass_id in &passes_todo.clone() {
+                    for popup_pass_id in &passes_todo {
                         if let CxDrawPassParent::Window(pw_id) = self.passes[*popup_pass_id].parent
                         {
                             let pw = &self.windows[pw_id];
@@ -1911,6 +2486,20 @@ impl Cx {
                 }
             }
         }
+        // A repaint that ended without a window pass (captures only, or the
+        // window pass skipped its turn) still has to reach the GPU.
+        #[cfg(use_vulkan)]
+        if let Some(mut vulkan) = self.os.vulkan.take() {
+            if let Err(err) = vulkan.end_repaint() {
+                crate::error!("Android Vulkan repaint submit failed: {err}");
+            }
+            self.os.vulkan = Some(vulkan);
+        }
+        // If no render ran the retirement step under this beat's repaint_id, run it here.
+        #[cfg(not(use_vulkan))]
+        if self.draw_lists.1.retirement_frame != Some(self.repaint_id) {
+            self.maintain_instance_retirements();
+        }
 
         let timestamp_ns = (self.os.timers.time_now().max(0.0) * 1_000_000_000.0) as u64;
         for index in 0..MAX_VIDEO_DEVICE_INDEX {
@@ -1929,12 +2518,13 @@ impl Cx {
     }
 
     fn handle_platform_ops(&mut self) -> EventFlow {
-        while let Some(op) = self.platform_ops.pop() {
+        while let Some(op) = self.platform_ops.pop_front() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     let window = &mut self.windows[window_id];
-                    let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
-                    let size = self.os.display_size / dpi_factor;
+                    window.os_dpi_factor = Some(self.os.dpi_factor);
+                    let dpi_factor = window.effective_dpi_factor();
+                    let size = window.physical_vec2d_to_layout(self.os.display_size);
                     window.window_geom = WindowGeom {
                         dpi_factor,
                         can_fullscreen: false,
@@ -1944,12 +2534,18 @@ impl Cx {
                         position: dvec2(0.0, 0.0),
                         inner_size: size,
                         outer_size: size,
-                        safe_area_insets: self.os.safe_area_insets,
+                        safe_area_insets: window
+                            .native_safe_area_insets_to_layout(self.os.native_safe_area_insets),
                         ..Default::default()
                     };
                     window.is_created = true;
-                    //let ret = unsafe{ndk_sys::ANativeWindow_setFrameRate(self.os.display.as_ref().unwrap().window, 120.0, 0)};
-                    //crate::log!("{}",ret);
+                    // To request a specific surface frame rate here, use
+                    // `ANativeWindow_setFrameRate` — but note it is API 30+.
+                    // It must be `dlsym`-resolved from libandroid.so and gated
+                    // on `sdk_version >= 30` (the same pattern as the
+                    // Choreographer callbacks in `ndk_sys.rs` / `android_jni.rs`),
+                    // never declared as a plain `extern "C"`, or it breaks
+                    // `dlopen` of libmakepad.so on API 26-29 devices.
                     let new_geom = window.window_geom.clone();
                     let old_geom = window.window_geom.clone();
                     self.call_event_handler(&Event::WindowGeomChange(WindowGeomChangeEvent {
@@ -1965,10 +2561,9 @@ impl Cx {
                     size,
                     grab_keyboard,
                 } => {
-                    let dpi_factor = self.windows[parent_window_id]
-                        .dpi_override
-                        .unwrap_or(self.os.dpi_factor);
+                    let dpi_factor = self.windows[parent_window_id].effective_dpi_factor();
                     let window = &mut self.windows[window_id];
+                    window.os_dpi_factor = Some(self.os.dpi_factor);
                     window.window_geom = WindowGeom {
                         dpi_factor,
                         can_fullscreen: false,
@@ -2011,24 +2606,52 @@ impl Cx {
                     self.os.timers.timers.remove(&timer_id);
                 }
                 CxOsOp::ShowTextIME(_area, _pos, config) => unsafe {
-                    android_jni::to_java_configure_keyboard(&config);
-                    android_jni::to_java_show_keyboard(true);
+                    // A focused `TextInput` re-issues `ShowTextIME` on every
+                    // draw. Calling into Java each time thrashes the IME:
+                    // `configure_keyboard` can restart the input connection,
+                    // and under the edge-to-edge insets of targetSdk 35 the
+                    // resulting inset change triggers a `redraw_all()`, which
+                    // re-draws the `TextInput`, which re-issues `ShowTextIME`
+                    // — a loop that flickers the soft keyboard open then shut.
+                    // Only touch Java when the requested config actually
+                    // changes; `last_ime_config` is cleared whenever the
+                    // keyboard goes down (here or via `ResizeTextIME`).
+                    if self.os.last_ime_config != Some(config) {
+                        android_jni::to_java_configure_keyboard(&config);
+                        android_jni::to_java_show_keyboard(true);
+                        self.os.last_ime_config = Some(config);
+                    }
                 },
                 CxOsOp::HideTextIME => unsafe {
+                    // Unconditional on purpose: unlike `ShowTextIME` this is not
+                    // issued per-frame, so there is no thrash to dedup — and a
+                    // skipped hide would leave the soft keyboard stuck open.
                     android_jni::to_java_show_keyboard(false);
+                    self.os.last_ime_config = None;
                 },
                 CxOsOp::SyncImeState {
                     text,
                     selection,
-                    composition: _,
+                    composition,
                 } => {
                     let sel_start_utf16 = selection.start.to_utf16_index(&text) as i32;
                     let sel_end_utf16 = selection.end.to_utf16_index(&text) as i32;
+                    let (comp_start_utf16, comp_end_utf16) = if let Some(composition) = composition
+                    {
+                        (
+                            composition.start.to_utf16_index(&text) as i32,
+                            composition.end.to_utf16_index(&text) as i32,
+                        )
+                    } else {
+                        (-1, -1)
+                    };
                     unsafe {
                         android_jni::to_java_update_ime_text_state(
                             &text,
                             sel_start_utf16,
                             sel_end_utf16,
+                            comp_start_utf16,
+                            comp_end_utf16,
                         );
                     }
                 }
@@ -2037,22 +2660,18 @@ impl Cx {
                 },
                 CxOsOp::SetPrimarySelection(_) => {}
                 CxOsOp::ShowSelectionHandles { start, end } => unsafe {
-                    // Rust positions are in logical points; Android overlay APIs expect physical pixels.
-                    let dpi_factor = self.windows[CxWindowPool::id_zero()]
-                        .dpi_override
-                        .unwrap_or(self.os.dpi_factor);
+                    // Rust positions are in Makepad layout points; Android overlay APIs expect physical pixels.
+                    let window = &self.windows[CxWindowPool::id_zero()];
                     android_jni::to_java_show_selection_handles(
-                        start * dpi_factor,
-                        end * dpi_factor,
+                        window.layout_vec2d_to_physical_pixels(start),
+                        window.layout_vec2d_to_physical_pixels(end),
                     );
                 },
                 CxOsOp::UpdateSelectionHandles { start, end } => unsafe {
-                    let dpi_factor = self.windows[CxWindowPool::id_zero()]
-                        .dpi_override
-                        .unwrap_or(self.os.dpi_factor);
+                    let window = &self.windows[CxWindowPool::id_zero()];
                     android_jni::to_java_update_selection_handles(
-                        start * dpi_factor,
-                        end * dpi_factor,
+                        window.layout_vec2d_to_physical_pixels(start),
+                        window.layout_vec2d_to_physical_pixels(end),
                     );
                 },
                 CxOsOp::HideSelectionHandles => unsafe {
@@ -2064,11 +2683,12 @@ impl Cx {
                     rect,
                     keyboard_shift,
                 } => unsafe {
+                    let dpi_factor = self.windows[CxWindowPool::id_zero()].effective_dpi_factor();
                     android_jni::to_java_show_clipboard_actions(
                         has_selection,
                         rect,
                         keyboard_shift,
-                        self.os.dpi_factor,
+                        dpi_factor,
                     );
                 },
                 CxOsOp::HideClipboardActions => unsafe {
@@ -2076,10 +2696,12 @@ impl Cx {
                 },
                 CxOsOp::AttachCameraNativePreview { video_id, area } => {
                     let rect = area.clipped_rect(self);
-                    let left = (rect.pos.x * self.os.dpi_factor) as i32;
-                    let top = (rect.pos.y * self.os.dpi_factor) as i32;
-                    let right = ((rect.pos.x + rect.size.x) * self.os.dpi_factor) as i32;
-                    let bottom = ((rect.pos.y + rect.size.y) * self.os.dpi_factor) as i32;
+                    let rect =
+                        self.windows[CxWindowPool::id_zero()].layout_rect_to_physical_pixels(rect);
+                    let left = rect.pos.x as i32;
+                    let top = rect.pos.y as i32;
+                    let right = (rect.pos.x + rect.size.x) as i32;
+                    let bottom = (rect.pos.y + rect.size.y) as i32;
                     unsafe {
                         android_jni::to_java_attach_camera_preview(
                             video_id, left, top, right, bottom,
@@ -2092,10 +2714,12 @@ impl Cx {
                     visible,
                 } => {
                     let rect = area.clipped_rect(self);
-                    let left = (rect.pos.x * self.os.dpi_factor) as i32;
-                    let top = (rect.pos.y * self.os.dpi_factor) as i32;
-                    let right = ((rect.pos.x + rect.size.x) * self.os.dpi_factor) as i32;
-                    let bottom = ((rect.pos.y + rect.size.y) * self.os.dpi_factor) as i32;
+                    let rect =
+                        self.windows[CxWindowPool::id_zero()].layout_rect_to_physical_pixels(rect);
+                    let left = rect.pos.x as i32;
+                    let top = rect.pos.y as i32;
+                    let right = (rect.pos.x + rect.size.x) as i32;
+                    let bottom = (rect.pos.y + rect.size.y) as i32;
                     unsafe {
                         android_jni::to_java_update_camera_preview(
                             video_id, left, top, right, bottom, visible,
@@ -2126,6 +2750,34 @@ impl Cx {
                     request_id,
                 } => {
                     self.handle_permission_request(permission, request_id);
+                }
+                CxOsOp::StartLocationUpdates => {
+                    self.os.location_updates_wanted = true;
+                    match self
+                        .check_android_permission_status(crate::permission::Permission::Location)
+                    {
+                        crate::permission::PermissionStatus::Granted => unsafe {
+                            android_jni::to_java_start_location_updates(
+                                LOCATION_MIN_INTERVAL_MS,
+                                LOCATION_MIN_DISTANCE_M,
+                            );
+                        },
+                        // NotDetermined also covers "permanently denied" on
+                        // Android (indistinguishable at check time) — request
+                        // and let the result decide.
+                        _ => unsafe {
+                            android_jni::to_java_request_permission(
+                                to_android_permission(crate::permission::Permission::Location),
+                                LOCATION_INTERNAL_PERMISSION_REQUEST_ID,
+                            );
+                        },
+                    }
+                }
+                CxOsOp::StopLocationUpdates => {
+                    self.os.location_updates_wanted = false;
+                    unsafe {
+                        android_jni::to_java_stop_location_updates();
+                    }
                 }
                 CxOsOp::HttpRequest {
                     request_id,
@@ -2230,12 +2882,7 @@ impl Cx {
                         );
                         self.os.camera_players.insert(video_id, player);
                         self.call_event_handler(&Event::VideoYuvTexturesReady(
-                            VideoYuvTexturesReady {
-                                video_id,
-                                tex_y,
-                                tex_u,
-                                tex_v,
-                            },
+                            VideoYuvTexturesReady::planes(video_id, tex_y, tex_u, tex_v),
                         ));
                         continue;
                     }
@@ -2271,6 +2918,12 @@ impl Cx {
                         } else if source.is_session() {
                             crate::log!("VIDEO: session source uses software video decoder");
                         }
+
+                        // Ensure the VideoExternal OES texture exists, then wrap it in a
+                        // SurfaceTexture+Surface for MediaCodec zero-copy present.
+                        let (oes_bridge, oes_surface, oes_tex_id) =
+                            self.setup_mediacodec_oes_bridge(texture_id);
+
                         self.os.software_video_players.insert(
                             video_id,
                             AndroidSoftwarePlayer {
@@ -2284,28 +2937,24 @@ impl Cx {
                                 tex_y_id,
                                 tex_u_id,
                                 tex_v_id,
+                                texture_id,
                                 yuv_matrix: 0.0,
+                                oes_bridge,
+                                oes_surface,
+                                oes_tex_id,
                             },
                         );
                         // Notify widget so it can bind textures to shader slots
                         self.call_event_handler(&Event::VideoYuvTexturesReady(
-                            VideoYuvTexturesReady {
-                                video_id,
-                                tex_y,
-                                tex_u,
-                                tex_v,
-                            },
+                            VideoYuvTexturesReady::planes(video_id, tex_y, tex_u, tex_v),
                         ));
                         continue;
                     }
                     // Notify widget so it can bind textures to shader slots
                     // (needed if native decode fails and we fall back to software)
-                    self.call_event_handler(&Event::VideoYuvTexturesReady(VideoYuvTexturesReady {
-                        video_id,
-                        tex_y,
-                        tex_u,
-                        tex_v,
-                    }));
+                    self.call_event_handler(&Event::VideoYuvTexturesReady(
+                        VideoYuvTexturesReady::planes(video_id, tex_y, tex_u, tex_v),
+                    ));
 
                     unsafe {
                         let env = attach_jni_env();
@@ -2404,6 +3053,16 @@ impl Cx {
                     }
                     if let Some(mut asp) = self.os.software_video_players.remove(&video_id) {
                         asp.player.cleanup();
+                        unsafe {
+                            let env = attach_jni_env();
+                            if let Some(surface) = asp.oes_surface.take() {
+                                crate::gpu_texture::clear_media_oes_surface(asp.oes_tex_id);
+                                (**env).DeleteGlobalRef.unwrap()(env, surface);
+                            }
+                            if let Some(bridge) = asp.oes_bridge.take() {
+                                android_jni::to_java_release_oes_decode_surface(env, bridge);
+                            }
+                        }
                         self.call_event_handler(&Event::VideoPlaybackResourcesReleased(
                             VideoPlaybackResourcesReleasedEvent { video_id },
                         ));
@@ -2449,6 +3108,11 @@ impl Cx {
                     }
                     if let Some(asp) = self.os.software_video_players.get(&video_id) {
                         asp.player.set_playback_rate(rate);
+                    } else {
+                        unsafe {
+                            let env = attach_jni_env();
+                            android_jni::to_java_set_video_playback_rate(env, video_id, rate);
+                        }
                     }
                 }
                 CxOsOp::PrepareAudioPlayback(video_id, source, autoplay, should_loop) => {
@@ -2456,6 +3120,8 @@ impl Cx {
                     let _ = (video_id, source, autoplay, should_loop);
                     // TODO: implement via MediaPlayer when needed
                 }
+                // Track selection is currently implemented on Linux GStreamer only.
+                CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
                 CxOsOp::XrStartPresenting => {
                     self.os.xr_buffer_scale_requested = self
                         .os
@@ -2533,12 +3199,33 @@ impl Cx {
                         android_jni::to_java_set_full_screen(env, false);
                     }
                 }
+                CxOsOp::SetSystemBarDarkIcons(dark_icons) => unsafe {
+                    let env = attach_jni_env();
+                    android_jni::to_java_set_system_bar_appearance(env, dark_icons);
+                },
                 CxOsOp::SetCursor(_) => {
                     // no need
                 }
                 CxOsOp::StartDragging(items) => {
                     self.os.internal_drag_items = Some(Arc::new(items));
                 }
+                CxOsOp::StartExternalDragging { .. } => {
+                    crate::error!("external file dragging is not implemented on Android");
+                    self.call_event_handler(&Event::DragEnd);
+                }
+                CxOsOp::SelectFileDialog(settings) => {
+                    android_file_dialog::open_select_file_dialog(settings);
+                }
+                CxOsOp::SaveFileDialog(settings) => {
+                    android_file_dialog::open_save_file_dialog(settings);
+                }
+                CxOsOp::SelectFolderDialog(settings) => {
+                    android_file_dialog::open_select_folder_dialog(settings);
+                }
+                CxOsOp::SaveFolderDialog(settings) => {
+                    android_file_dialog::open_save_folder_dialog(settings);
+                }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
@@ -2554,21 +3241,23 @@ impl CxOsApi for Cx {
         self.package_root = Some("makepad".to_string());
     }
 
-    fn spawn_thread<F>(&mut self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        std::thread::spawn(f);
-    }
-
     fn seconds_since_app_start(&self) -> f64 {
         Instant::now()
             .duration_since(self.os.start_time)
             .as_secs_f64()
     }
 
-    fn open_url(&mut self, _url: &str, _in_place: OpenUrlInPlace) {
-        crate::error!("open_url not implemented on this platform");
+    fn open_url(&mut self, url: &str, _in_place: OpenUrlInPlace) {
+        // A Splash isolate held to the host service bridge opens nothing itself.
+        if self.script_data.std.host_io_only() { return; }
+        // A hosted child has no JVM to start an Intent with: its WM does.
+        if super::android_hosted::is_hosted() {
+            Cx::send_studio_message(crate::studio::AppToStudio::Relay(
+                crate::studio::ChildRelay::OpenUrl { url: url.to_string() },
+            ));
+            return;
+        }
+        unsafe { android_jni::to_java_open_url(url) };
     }
 
     fn in_xr_mode(&self) -> bool {
@@ -2638,8 +3327,16 @@ fn to_android_permission(permission: crate::permission::Permission) -> &'static 
         crate::permission::Permission::Camera => "android.permission.CAMERA",
         crate::permission::Permission::HeadsetCamera => "horizonos.permission.HEADSET_CAMERA",
         crate::permission::Permission::SceneAccess => "com.oculus.permission.USE_SCENE",
+        crate::permission::Permission::Location => "android.permission.ACCESS_FINE_LOCATION",
     }
 }
+
+/// Internal request id for the permission dialog fired by
+/// `CxOsOp::StartLocationUpdates` (distinct from app-issued ids, which
+/// count up from 1).
+const LOCATION_INTERNAL_PERMISSION_REQUEST_ID: i32 = i32::MAX;
+const LOCATION_MIN_INTERVAL_MS: i64 = 1000;
+const LOCATION_MIN_DISTANCE_M: f32 = 3.0;
 
 impl Cx {
     fn find_popup_to_dismiss_on_touch(
@@ -2779,6 +3476,7 @@ fn string_to_permission(permission_str: &str) -> Option<crate::permission::Permi
         "android.permission.CAMERA" => Some(crate::permission::Permission::Camera),
         "horizonos.permission.HEADSET_CAMERA" => Some(crate::permission::Permission::HeadsetCamera),
         "com.oculus.permission.USE_SCENE" => Some(crate::permission::Permission::SceneAccess),
+        "android.permission.ACCESS_FINE_LOCATION" => Some(crate::permission::Permission::Location),
         _ => None,
     }
 }
@@ -2786,17 +3484,26 @@ fn string_to_permission(permission_str: &str) -> Option<crate::permission::Permi
 impl Default for CxOs {
     fn default() -> Self {
         Self {
+            location_updates_wanted: false,
             start_time: Instant::now(),
             first_after_resize: true,
+            needs_first_draw: true,
+            hide_surface_cover_after_first_present: false,
+            refresh_surface_snapshot_after_first_present: true,
             frame_time: 0,
             display_size: dvec2(100., 100.),
             dpi_factor: 1.5,
-            safe_area_insets: Default::default(),
-            keyboard_closed: 0.0,
+            native_safe_area_insets: Default::default(),
+            last_ime_height: 0.0,
+            last_ime_visible: false,
+            last_ime_config: None,
             media: CxAndroidMedia::default(),
             display: None,
+            surface_alive: false,
             #[cfg(use_vulkan)]
             vulkan: None,
+            #[cfg(use_vulkan)]
+            gl_fallback: false,
             quit: false,
             fullscreen: false,
             timers: Default::default(),
@@ -2848,23 +3555,116 @@ pub(crate) struct AndroidSoftwarePlayer {
     pub tex_y_id: TextureId,
     pub tex_u_id: TextureId,
     pub tex_v_id: TextureId,
+    pub texture_id: TextureId,
     pub yuv_matrix: f32,
+    /// JNI global ref to `OesDecodeSurface` when MediaCodec ZC is active.
+    pub oes_bridge: Option<jni_sys::jobject>,
+    /// JNI global ref to `android.view.Surface` published for the decoder.
+    pub oes_surface: Option<jni_sys::jobject>,
+    pub oes_tex_id: u32,
+}
+
+impl Cx {
+    /// Create VideoExternal OES tex + Java SurfaceTexture/Surface for MediaCodec ZC.
+    fn setup_mediacodec_oes_bridge(
+        &mut self,
+        texture_id: TextureId,
+    ) -> (Option<jni_sys::jobject>, Option<jni_sys::jobject>, u32) {
+        let gl = self.os.gl();
+        let cxtex = &mut self.textures[texture_id];
+        let _ = cxtex.setup_video_texture(gl);
+        let Some(tex) = cxtex.os.gl_texture else {
+            return (None, None, 0);
+        };
+        unsafe {
+            let env = attach_jni_env();
+            let Some(bridge) = android_jni::to_java_create_oes_decode_surface(env, tex) else {
+                return (None, None, tex);
+            };
+            let Some(surface_local) =
+                android_jni::to_java_oes_decode_surface_get_surface(env, bridge)
+            else {
+                android_jni::to_java_release_oes_decode_surface(env, bridge);
+                return (None, None, tex);
+            };
+            let surface_global = (**env).NewGlobalRef.unwrap()(env, surface_local);
+            (**env).DeleteLocalRef.unwrap()(env, surface_local);
+            if surface_global.is_null() {
+                android_jni::to_java_release_oes_decode_surface(env, bridge);
+                return (None, None, tex);
+            }
+            crate::gpu_texture::publish_media_oes_surface(
+                surface_global as *mut std::ffi::c_void,
+                tex,
+            );
+            crate::log!("VIDEO: MediaCodec OES surface ready tex={}", tex);
+            (Some(bridge), Some(surface_global), tex)
+        }
+    }
 }
 
 pub struct CxOs {
+    /// The app called `start_location_updates`; used to start streaming after
+    /// the runtime permission dialog resolves (and to re-arm on resume).
+    pub location_updates_wanted: bool,
     pub first_after_resize: bool,
+    /// Set to `true` when a `RenderLoop` callback arrives but the surface is not
+    /// yet drawable. When the surface later becomes ready, this flag triggers a
+    /// `redraw_all()` to ensure the first frame is painted. Without this, the app
+    /// can start up showing a black screen if the initial redraw request was
+    /// consumed before the surface was available.
+    pub needs_first_draw: bool,
+    /// Tracks whether the Java-side surface cover overlay should remain visible
+    /// until the next successful present reaches the rebuilt Android surface.
+    pub hide_surface_cover_after_first_present: bool,
+    /// Tracks whether Java should refresh its cached `SurfaceView` snapshot
+    /// after the next successful present. This keeps the task snapshot path
+    /// from falling back to black when Android backgrounds/resumes the app
+    /// without destroying the surface.
+    pub refresh_surface_snapshot_after_first_present: bool,
     pub display_size: Vec2d,
     pub dpi_factor: f64,
-    pub safe_area_insets: crate::event::SafeAreaInsets,
-    pub keyboard_closed: f64,
+    /// Safe area insets in native Android logical points (`px / density`).
+    /// Convert through `CxWindow` before exposing them to widgets.
+    pub native_safe_area_insets: crate::event::SafeAreaInsets,
+    /// Last reported soft-keyboard height in Makepad layout points. Used to dedup
+    /// repeated inset notifications from `onApplyWindowInsets` /
+    /// `onGlobalLayout` so we don't re-fire `VirtualKeyboardEvent`s on
+    /// unrelated layout passes.
+    pub last_ime_height: f64,
+    /// Whether the soft keyboard was visible the last time we dispatched a
+    /// `VirtualKeyboardEvent`. Pairs with `last_ime_height` for dedup.
+    pub last_ime_visible: bool,
+    /// The `TextInputConfig` last sent to the Android IME via `ShowTextIME`,
+    /// or `None` while the keyboard is requested-hidden. A focused `TextInput`
+    /// re-issues `ShowTextIME` every draw; this dedups those so the JNI IME
+    /// calls (and the inset-driven redraw loop they trigger) fire only on a
+    /// real change. Reset to `None` on `HideTextIME` and when Java reports the
+    /// keyboard closed.
+    pub last_ime_config: Option<TextInputConfig>,
     pub frame_time: i64,
     pub quit: bool,
     pub fullscreen: bool,
     pub(crate) start_time: Instant,
     pub(crate) timers: PollTimers,
     pub display: Option<CxAndroidDisplay>,
+    /// Tracks whether the active rendering surface (EGL window surface in OpenGL
+    /// mode, or `ANativeWindow`-backed Vulkan surface in Vulkan mode) is currently
+    /// valid for drawing.
+    ///
+    /// Set to `true` after a successful `SurfaceCreated`/`SurfaceChanged` and to
+    /// `false` synchronously inside the `SurfaceDestroyed` handler. The render
+    /// thread MUST consult this before issuing any GL/Vulkan draw or present
+    /// calls — Android can pull the underlying buffer queue out from under us
+    /// at any moment, and the GPU drivers (Mali/Adreno) will SIGSEGV if you
+    /// touch GL state without a current/valid surface.
+    pub(crate) surface_alive: bool,
     #[cfg(use_vulkan)]
     pub(crate) vulkan: Option<CxVulkan>,
+    /// Vulkan found no usable device and OpenGL ES draws instead; what
+    /// `Cx::gpu_backend` reports in a Vulkan build.
+    #[cfg(use_vulkan)]
+    pub(crate) gl_fallback: bool,
     pub(crate) media: CxAndroidMedia,
     pub(crate) video_surfaces: HashMap<LiveId, jobject>,
     pub(crate) video_configs: HashMap<LiveId, AndroidVideoConfig>,
@@ -2900,13 +3700,93 @@ impl CxOs {
     pub(crate) fn gl(&self) -> &LibGl {
         &self.display.as_ref().unwrap().libgl
     }
+
+    /// True while the Vulkan renderer exists. A Vulkan build whose
+    /// `CxVulkan::new` failed renders with OpenGL ES and answers false.
+    #[cfg(use_vulkan)]
+    pub(crate) fn vulkan_active(&self) -> bool {
+        self.vulkan.is_some()
+    }
+
+    /// Returns `true` only when it is currently safe to issue draw / swap-buffer
+    /// calls against the active backend's window surface.
+    ///
+    /// This consults the `surface_alive` flag (set by the `SurfaceCreated`/
+    /// `SurfaceChanged`/`SurfaceDestroyed` message handlers) AND verifies that
+    /// the underlying handles still look healthy.
+    ///
+    /// On Android the only thread allowed to drive the renderer is the
+    /// dedicated render thread that owns the EGL/Vulkan context, so calling
+    /// this from anywhere else is meaningless.
+    ///
+    /// **XR mode escape hatch (Vulkan only):** when an OpenXR session is
+    /// active, rendering goes through OpenXR's own swapchains and a Vulkan
+    /// instance whose validity is **independent** of the Android window
+    /// surface lifecycle. The `SurfaceDestroyed` handler deliberately keeps
+    /// the Vulkan backend alive in that case (`keep_xr_backend_alive`) and
+    /// only nulls out `display.window`. Without this escape hatch the
+    /// off-screen texture passes invoked from `openxr_handle_repaint` (UI
+    /// surfaces composited into the XR scene) would be silently skipped any
+    /// time `display.window` is null — which would visibly break Quest 3
+    /// rendering whenever the host Activity surface is recycled.
+    pub(crate) fn has_drawable_surface(&self) -> bool {
+        #[cfg(use_vulkan)]
+        {
+            // Vulkan + active XR session: rendering is driven by OpenXR's own
+            // swapchains, not the Android window surface. Always allow passes
+            // to proceed; the actual draw uses Vulkan resources that we know
+            // are still alive (we never `suspend_surface()` while a session
+            // is running).
+            if self.in_xr_mode && self.openxr.session.is_some() {
+                return self.vulkan.is_some();
+            }
+        }
+
+        if !self.surface_alive {
+            return false;
+        }
+
+        #[cfg(not(use_vulkan))]
+        {
+            self.display
+                .as_ref()
+                .map(|d| d.is_surface_alive())
+                .unwrap_or(false)
+        }
+        #[cfg(use_vulkan)]
+        {
+            // Non-XR Vulkan: the EGL surface is a 1x1 pbuffer kept alive only
+            // for GL interop, so the relevant question is whether the Vulkan
+            // backend still has a live Android window surface + swapchain.
+            self.vulkan
+                .as_ref()
+                .map(|vulkan| vulkan.has_drawable_surface())
+                .unwrap_or(false)
+        }
+    }
 }
 
 impl CxAndroidDisplay {
+    /// Returns `true` if the EGL window surface is non-null. This is the
+    /// low-level test the GL backend uses; higher-level code should prefer
+    /// [`CxOs::has_drawable_surface`].
+    #[inline]
+    pub(crate) fn is_surface_alive(&self) -> bool {
+        !self.surface.is_null()
+    }
+
     /// Make Makepad's EGL context current (with its surface).
     /// Required before creating shared GL contexts.
+    ///
+    /// Panics if no surface is bound or if `eglMakeCurrent` fails. Call sites
+    /// that may run while the surface is being torn down should use
+    /// [`Self::try_make_current`] instead.
     pub fn make_current(&self) {
         unsafe {
+            assert!(
+                !self.surface.is_null(),
+                "CxAndroidDisplay::make_current called with no EGL surface bound"
+            );
             let res = (self.libegl.eglMakeCurrent.unwrap())(
                 self.egl_display,
                 self.surface,
@@ -2920,15 +3800,39 @@ impl CxAndroidDisplay {
         }
     }
 
+    /// Fallible version of [`Self::make_current`]. Returns `false` if no
+    /// surface is bound or if `eglMakeCurrent` fails for any reason. The render
+    /// loop calls this on every frame as defense-in-depth: if the GL context
+    /// somehow got detached (driver-initiated, foreign code, etc.) we re-bind
+    /// it; if the surface is gone we silently skip the frame.
+    pub(crate) fn try_make_current(&self) -> bool {
+        if self.surface.is_null() {
+            return false;
+        }
+        unsafe {
+            (self.libegl.eglMakeCurrent.unwrap())(
+                self.egl_display,
+                self.surface,
+                self.surface,
+                self.egl_context,
+            ) != 0
+        }
+    }
+
     #[cfg(not(use_vulkan))]
     unsafe fn destroy_surface(&mut self) {
+        // Releasing the context from the current thread BEFORE destroying the
+        // surface is required by the EGL spec — otherwise the driver may
+        // dereference torn-down state on the next GL call.
         (self.libegl.eglMakeCurrent.unwrap())(
             self.egl_display,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         );
-        (self.libegl.eglDestroySurface.unwrap())(self.egl_display, self.surface);
+        if !self.surface.is_null() {
+            (self.libegl.eglDestroySurface.unwrap())(self.egl_display, self.surface);
+        }
         self.surface = std::ptr::null_mut();
     }
 

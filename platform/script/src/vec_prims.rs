@@ -9,6 +9,7 @@ use crate::*;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::Arc;
 
 impl<T> ScriptHook for Vec<T> where T: ScriptApply + ScriptNew + 'static + ScriptDeriveMarker {}
 impl<T> ScriptNew for Vec<T>
@@ -99,29 +100,9 @@ where
     }
     fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
         let arr = vm.bx.heap.new_array();
-        let trap = vm.bx.threads.cur().trap.pass();
-        let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-        // we swap the vec off of the heap to be able to script_to_value the rest
-        let mut vec_store = ScriptArrayStorage::ScriptValue(Default::default());
-        std::mem::swap(&mut vec_store, astore);
-        if let ScriptArrayStorage::ScriptValue(vec) = &mut vec_store {
-            vec.clear();
-            for v in self {
-                vec.push_back(v.script_to_value(vm));
-            }
-            let trap = vm.bx.threads.cur().trap.pass();
-            let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-            std::mem::swap(&mut vec_store, astore);
-        } else {
-            let mut vec_store = ScriptArrayStorage::ScriptValue(Default::default());
-            if let ScriptArrayStorage::ScriptValue(vec) = &mut vec_store {
-                for v in self {
-                    vec.push_back(v.script_to_value(vm));
-                }
-                let trap = vm.bx.threads.cur().trap.pass();
-                let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-                std::mem::swap(&mut vec_store, astore);
-            }
+        for value in self {
+            let value = value.script_to_value(vm);
+            vm.bx.heap.array_push_unchecked(arr, value);
         }
         arr.into()
     }
@@ -236,16 +217,47 @@ impl ScriptApply for Vec<u8> {
         }
     }
     fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
-        let arr = vm.bx.heap.new_array();
-        let trap = vm.bx.threads.cur().trap.pass();
-        let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-        if let ScriptArrayStorage::U8(v) = astore {
-            v.clear();
-            v.extend(self)
-        } else {
-            *astore = ScriptArrayStorage::U8(self.clone());
-        }
-        arr.into()
+        vm.bx.heap.new_array_from_slice_u8(self).into()
+    }
+}
+
+impl ScriptDeriveMarker for Arc<[u8]> {}
+impl ScriptHook for Arc<[u8]> {}
+impl ScriptNew for Arc<[u8]> {
+    fn script_type_id_static() -> ScriptTypeId {
+        ScriptTypeId::of::<Self>()
+    }
+    fn script_type_check(heap: &ScriptHeap, value: ScriptValue) -> bool {
+        <Vec<u8> as ScriptNew>::script_type_check(heap, value)
+    }
+    fn script_default(vm: &mut ScriptVm) -> ScriptValue {
+        <Vec<u8> as ScriptNew>::script_default(vm)
+    }
+    fn script_new(_vm: &mut ScriptVm) -> Self {
+        Arc::from([])
+    }
+    fn script_proto_build(vm: &mut ScriptVm, props: &mut ScriptTypeProps) -> ScriptValue {
+        <Vec<u8> as ScriptNew>::script_proto_build(vm, props)
+    }
+}
+
+impl ScriptApply for Arc<[u8]> {
+    fn script_type_id(&self) -> ScriptTypeId {
+        ScriptTypeId::of::<Self>()
+    }
+    fn script_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        apply: &Apply,
+        scope: &mut Scope,
+        value: ScriptValue,
+    ) {
+        let mut bytes = self.to_vec();
+        bytes.script_apply(vm, apply, scope, value);
+        *self = Arc::from(bytes);
+    }
+    fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
+        vm.bx.heap.new_array_from_slice_u8(self).into()
     }
 }
 
@@ -326,13 +338,8 @@ impl ScriptApply for Vec<ScriptValue> {
     }
     fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
         let arr = vm.bx.heap.new_array();
-        let trap = vm.bx.threads.cur().trap.pass();
-        let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-        if let ScriptArrayStorage::ScriptValue(v) = astore {
-            v.clear();
-            v.extend(self)
-        } else {
-            *astore = ScriptArrayStorage::ScriptValue(self.iter().cloned().collect());
+        for value in self {
+            vm.bx.heap.array_push_unchecked(arr, *value);
         }
         arr.into()
     }
@@ -422,6 +429,13 @@ where
                     has_string_keys = true;
                 }
                 let value = value.script_to_value(vm);
+                if !vm.bx.heap.charge_object_map_entry(
+                    obj,
+                    key,
+                    "converting a Rust map to a script object",
+                ) {
+                    continue;
+                }
                 obj_map.insert(
                     key,
                     ScriptMapValue {
@@ -522,6 +536,13 @@ where
                     has_string_keys = true;
                 }
                 let value = value.script_to_value(vm);
+                if !vm.bx.heap.charge_object_map_entry(
+                    obj,
+                    key,
+                    "converting a Rust map to a script object",
+                ) {
+                    continue;
+                }
                 obj_map.insert(
                     key,
                     ScriptMapValue {

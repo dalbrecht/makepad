@@ -3,25 +3,30 @@ use {
         area::Area,
         event::{
             finger::MouseButton, DragItem, KeyModifiers, MouseDownEvent, MouseMoveEvent,
-            MouseUpEvent, ScrollEvent, TextInputEvent, WindowCloseRequestedEvent,
-            WindowClosedEvent, WindowDragQueryEvent, WindowDragQueryResponse, WindowGeom,
-            WindowGeomChangeEvent,
+            MouseUpEvent, PinchEvent, PinchPhase, ScrollEvent, ScrollPhase, TextInputEvent,
+            WindowCloseRequestedEvent,
+            WindowDragQueryEvent, WindowDragQueryResponse, WindowGeom, WindowGeomChangeEvent,
         },
-        makepad_math::{Rect, Vec2d},
+        makepad_math::{dvec2, Rect, Vec2d},
         os::{
             apple::apple_sys::*,
+            apple_classes::get_apple_class_global,
             apple::apple_util::str_to_nsstring,
             macos::{
-                macos_app::{get_macos_class_global, with_macos_app, MacosApp},
+                macos_app::{
+                    activate_cocoa_window_on_pointer_down, focus_allowed, get_macos_class_global,
+                    with_macos_app, MacosApp,
+                },
                 macos_event::MacosEvent,
             },
         },
+        screen::{clamp_point_to_screens, fit_window_rect_to_screens, ScreenGeom},
         window::{
             MacosWindowChrome, MacosWindowConfig, MacosWindowKind, MacosWindowLevel,
             WindowBackdrop, WindowId, WindowVisuals,
         },
     },
-    std::{cell::Cell, os::raw::c_void, rc::Rc},
+    std::{cell::Cell, os::raw::c_void, path::Path, rc::Rc},
 };
 
 #[derive(Clone)]
@@ -29,7 +34,10 @@ pub struct MacosWindow {
     pub(crate) window_id: WindowId,
     pub(crate) view: ObjcId,
     pub(crate) window: ObjcId,
-    pub(crate) ime_spot: Vec2d,
+    // Caret/composition line rect in window content-view points (y-down from the
+    // view top). first_rect_for_character_range turns this into the screen rect
+    // the IME anchors its candidate window above/below.
+    pub(crate) ime_rect: Rect,
     // When ime_active is false, key events are not forward to NSTextInputContext so IME dose not active.
     pub(crate) ime_active: bool,
     pub(crate) is_fullscreen: bool,
@@ -37,9 +45,28 @@ pub struct MacosWindow {
     pub(crate) macos_config: MacosWindowConfig,
     pub(crate) visual_effect_view: ObjcId,
     pub(crate) last_mouse_pos: Vec2d,
+    /// The buttons this window delivered a down for and no up yet: a
+    /// buttonless `mouseMoved:` while one is held means the up was taken
+    /// by AppKit (see `release_lost_buttons`).
+    buttons_down: MouseButton,
     window_delegate: ObjcId,
     live_resize_timer: ObjcId,
     last_window_geom: Option<WindowGeom>,
+    /// Wall-clock time of the most recent OS momentum scroll event. While the momentum
+    /// stream is live, macOS suppresses tap-to-click, so taps in that window have to be
+    /// synthesized from the raw trackpad touches.
+    last_momentum_time: f64,
+    /// Wall-clock time of the current raw trackpad touch sequence's start
+    /// (0.0 = no single-finger touch in progress).
+    touch_began_time: f64,
+    /// Whether a scroll gesture or a real mouse press arrived during the current raw
+    /// touch sequence, which disqualifies it from being a tap.
+    touch_disqualified: bool,
+    /// The Cocoa view/delegate can receive queued callbacks after close. A
+    /// retired window stays allocated until its retained native peers go away,
+    /// but no longer forwards those callbacks into `Cx`.
+    retired: bool,
+    close_event_deferred: bool,
 }
 
 impl MacosWindow {
@@ -52,7 +79,10 @@ impl MacosWindow {
             let view: ObjcId = msg_send![get_macos_class_global().view, alloc];
 
             let () = msg_send![pool, drain];
-            with_macos_app(|app| app.cocoa_windows.push((window, view)));
+            with_macos_app(|app| {
+                app.cocoa_windows.push((window, view));
+                app.cocoa_window_ids.push((window_id, window));
+            });
             MacosWindow {
                 is_fullscreen: false,
                 is_popup: false,
@@ -64,8 +94,14 @@ impl MacosWindow {
                 window_id: window_id,
                 view: view,
                 last_window_geom: None,
-                ime_spot: Vec2d::default(),
+                last_momentum_time: 0.0,
+                touch_began_time: 0.0,
+                touch_disqualified: false,
+                retired: false,
+                close_event_deferred: false,
+                ime_rect: Rect::default(),
                 last_mouse_pos: Vec2d::default(),
+                buttons_down: MouseButton::empty(),
                 ime_active: false,
             }
         }
@@ -132,6 +168,50 @@ impl MacosWindow {
         }
     }
 
+    /// Swap the AppKit titlebar container's class for the makepad subclass
+    /// whose hitTest keeps only NSButtons (the traffic lights): with a
+    /// transparent titlebar the container otherwise eats every DRAG in the
+    /// top strip — moving the window while the app's own control (a slider
+    /// in a custom top bar) never sees the mouse. Defensive on every step:
+    /// if AppKit's private view tree ever changes shape, the window keeps
+    /// stock behavior instead of breaking.
+    unsafe fn defang_titlebar_container(&mut self) {
+        let subclass = get_macos_class_global().titlebar_container;
+        if subclass.is_null() {
+            crate::log!("defang: NSTitlebarContainerView class missing — native titlebar drags stay live");
+            return;
+        }
+        // 0 = NSWindowCloseButton; its superview chain is
+        // NSTitlebarView -> NSTitlebarContainerView.
+        let close: ObjcId = msg_send![self.window, standardWindowButton: 0u64];
+        if close == nil {
+            crate::log!("defang: no close button — native titlebar drags stay live");
+            return;
+        }
+        let titlebar: ObjcId = msg_send![close, superview];
+        if titlebar == nil {
+            return;
+        }
+        let container: ObjcId = msg_send![titlebar, superview];
+        if container == nil {
+            return;
+        }
+        let is_container: bool =
+            msg_send![container, isKindOfClass: Class::get("NSTitlebarContainerView").unwrap()];
+        if !is_container {
+            let cls: ObjcId = msg_send![container, class];
+            let name: *const std::os::raw::c_char = {
+                let s: ObjcId = msg_send![cls, description];
+                msg_send![s, UTF8String]
+            };
+            let name = std::ffi::CStr::from_ptr(name).to_string_lossy().to_string();
+            crate::log!("defang: container is {name}, not NSTitlebarContainerView — native drags stay live");
+            return;
+        }
+        object_setClass(container, subclass as ObjcId);
+        // crate::log!("defang: titlebar container swapped — WindowDragQuery decides drags");
+    }
+
     pub fn set_window_level(&mut self, level: MacosWindowLevel) {
         unsafe {
             let () = msg_send![self.window, setLevel: Self::level_to_native(level)];
@@ -146,6 +226,13 @@ impl MacosWindow {
         };
         self.set_window_level(level);
         self.send_change_event();
+    }
+
+    pub fn set_title(&mut self, title: &str) {
+        unsafe {
+            let title = str_to_nsstring(title);
+            let () = msg_send![self.window, setTitle: title];
+        }
     }
 
     fn is_topmost(&self) -> bool {
@@ -174,15 +261,23 @@ impl MacosWindow {
         self.macos_config = macos_config.normalized();
         unsafe {
             let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];
+            crate::startup_trace("NSWindow init begin");
 
             // set the backpointeers
             (*self.window_delegate).set_ivar("macos_window_ptr", self as *mut _ as *mut c_void);
             let () = msg_send![self.view, initWithPtr: self as *mut _ as *mut c_void];
+            // Receive raw trackpad touches (NSTouchTypeMaskIndirect), which widgets use
+            // to stop kinetic scrolling the instant a finger contacts the pad.
+            let () = msg_send![self.view, setAllowedTouchTypes: 2u64];
 
             let left_top = if let Some(position) = position {
+                // A restored position can name a display that is gone. Pinning it before the
+                // window is built keeps it from being ordered on screen somewhere unreachable;
+                // `fit_to_screens` below corrects the finished frame.
+                let pinned = clamp_point_to_screens(&macos_screens(), position);
                 NSPoint {
-                    x: position.x as f64,
-                    y: position.y as f64,
+                    x: pinned.x,
+                    y: pinned.y,
                 }
             } else {
                 NSPoint { x: 0., y: 0. }
@@ -212,6 +307,11 @@ impl MacosWindow {
             let () = msg_send![self.window, setTitle: title];
             let () = msg_send![self.window, setTitleVisibility: NSWindowTitleVisibility::NSWindowTitleHidden];
             let () = msg_send![self.window, setTitlebarAppearsTransparent: YES];
+            // The transparent titlebar still EATS DRAGS in the top ~28pt (a
+            // slider drawn there moves the window instead); swap the
+            // container's class so only AppKit's own buttons stay hittable
+            // and the app's WindowDragQuery alone decides window drags.
+            self.defang_titlebar_container();
             let () = msg_send![
                 self.window,
                 setCollectionBehavior: Self::collection_behavior_for_config(self.macos_config)
@@ -237,11 +337,28 @@ impl MacosWindow {
 
             let () = msg_send![self.window, setContentView: self.view];
             let () = msg_send![self.window, makeFirstResponder: self.view];
-            if self.is_nonactivating_panel() {
-                let () = msg_send![self.window, orderFront: nil];
-            } else {
-                let () = msg_send![self.window, makeKeyAndOrderFront: nil];
+            // MAKEPAD_HIDE_WINDOWS=1: never order the window onto the
+            // screen — GPU eval/test runs render their offscreen passes on
+            // real Metal without flashing a window (the occlusion gate only
+            // skips the WINDOW pass's present; child passes still render).
+            if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_none() {
+                // A no-focus process (`--remote`, MAKEPAD_NO_FOCUS) shows the
+                // window without making it key or activating the app —
+                // see `macos_app::focus_allowed`.
+                if self.is_nonactivating_panel() || !focus_allowed() {
+                    let () = msg_send![self.window, orderFront: nil];
+                } else {
+                    let () = msg_send![self.window, makeKeyAndOrderFront: nil];
+                    // `--focus`: bring the app to the front as its window
+                    // opens. A binary launched from a terminal or by an agent
+                    // otherwise stays behind the launcher.
+                    if std::env::args().any(|arg| arg == "--focus") {
+                        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+                        let () = msg_send![ns_app, activateIgnoringOtherApps: YES];
+                    }
+                }
             }
+            crate::startup_trace("NSWindow ordered front");
 
             let rect = NSRect {
                 origin: NSPoint { x: 0., y: 0. },
@@ -263,6 +380,11 @@ impl MacosWindow {
 
             if position.is_none() {
                 let () = msg_send![self.window, center];
+            }
+            if !is_fullscreen {
+                // A restored size and position are only as good as the display arrangement
+                // they were saved on; a fullscreen window is AppKit's to place.
+                self.fit_to_screens();
             }
 
             let input_context: ObjcId = msg_send![self.view, inputContext];
@@ -288,6 +410,9 @@ impl MacosWindow {
             // set the backpointers
             (*self.window_delegate).set_ivar("macos_window_ptr", self as *mut _ as *mut c_void);
             let () = msg_send![self.view, initWithPtr: self as *mut _ as *mut c_void];
+            // Receive raw trackpad touches (NSTouchTypeMaskIndirect), which widgets use
+            // to stop kinetic scrolling the instant a finger contacts the pad.
+            let () = msg_send![self.view, setAllowedTouchTypes: 2u64];
 
             // Convert position from parent-client coordinates to screen coordinates.
             // The position is relative to the parent window's content view origin (top-left).
@@ -412,8 +537,20 @@ impl MacosWindow {
         let () = msg_send![ns_app, setApplicationIconImage: ns_image];
     }
 
-    pub fn set_ime_spot(&mut self, spot: Vec2d) {
-        self.ime_spot = spot;
+    pub fn set_ime_rect(&mut self, rect: Rect) {
+        if self.ime_rect == rect {
+            return;
+        }
+        self.ime_rect = rect;
+        // The caret line moved, so the IME's cached character coordinates are
+        // stale. Invalidate them so it re-queries first_rect_for_character_range
+        // and repositions the candidate window relative to the new line.
+        unsafe {
+            let input_context: ObjcId = msg_send![self.view, inputContext];
+            if input_context != nil {
+                let () = msg_send![input_context, invalidateCharacterCoordinates];
+            }
+        }
     }
 
     pub fn start_live_resize(&mut self) {
@@ -458,8 +595,12 @@ impl MacosWindow {
     }
 
     pub fn restore(&mut self) {
-        unsafe {
-            let () = msg_send![self.window, toggleFullScreen: nil];
+        // `toggleFullScreen:` is a toggle, so without the guard `RestoreWindow` on a
+        // window that was never fullscreen puts it *into* fullscreen.
+        if self.is_fullscreen {
+            unsafe {
+                let () = msg_send![self.window, toggleFullScreen: nil];
+            }
         }
     }
     pub fn hide(&mut self) {
@@ -475,13 +616,6 @@ impl MacosWindow {
     pub fn maximize(&mut self) {
         unsafe {
             let () = msg_send![self.window, toggleFullScreen: nil];
-        }
-    }
-
-    pub fn set_title(&self, title: &str) {
-        unsafe {
-            let ns_title = str_to_nsstring(title);
-            let () = msg_send![self.window, setTitle: ns_title];
         }
     }
 
@@ -606,9 +740,9 @@ impl MacosWindow {
             let (t1, l1, r1, b1) = ns_to_rect(miniaturize);
             let (t2, l2, r2, b2) = ns_to_rect(zoom);
 
-            let top  = t0.min(t1).min(t2);
+            let top = t0.min(t1).min(t2);
             let left = l0.min(l1).min(l2);
-            let right  = r0.max(r1).max(r2);
+            let right = r0.max(r1).max(r2);
             let bottom = b0.max(b1).max(b2);
 
             // During a fullscreen transition the content view resizes before
@@ -622,7 +756,10 @@ impl MacosWindow {
 
             let rect = Rect {
                 pos: Vec2d { x: left, y: top },
-                size: Vec2d { x: right - left, y: bottom - top },
+                size: Vec2d {
+                    x: right - left,
+                    y: bottom - top,
+                },
             };
 
             Some(rect)
@@ -645,17 +782,53 @@ impl MacosWindow {
     }
 
     pub fn do_callback(&mut self, event: MacosEvent) {
-        MacosApp::do_callback(event);
+        if !self.retired {
+            MacosApp::do_callback(event);
+        }
+    }
+
+    pub(crate) fn retire(&mut self) {
+        self.retired = true;
+        unsafe {
+            if self.live_resize_timer != nil {
+                let () = msg_send![self.live_resize_timer, invalidate];
+                self.live_resize_timer = nil;
+            }
+            let () = msg_send![self.window, setAcceptsMouseMovedEvents: NO];
+            let () = msg_send![self.window, setDelegate: nil];
+        }
     }
 
     pub fn set_position(&mut self, pos: Vec2d) {
         let mut window_frame: NSRect = unsafe { msg_send![self.window, frame] };
         window_frame.origin.x = pos.x as f64;
         window_frame.origin.y = pos.y as f64;
-        //not very nice: CGDisplay::main().pixels_high() as f64
+        // A caller placing the window cannot know the display arrangement it is placing
+        // into, so the request is fitted to the displays that are actually attached.
+        let fitted = fit_window_rect_to_screens(&macos_screens(), rect_of(window_frame));
         unsafe {
-            let () = msg_send![self.window, setFrame: window_frame display: YES];
+            let () = msg_send![self.window, setFrame: ns_rect_of(fitted) display: YES];
         };
+    }
+
+    /// Moves and resizes the window so it sits entirely within one display's visible frame.
+    ///
+    /// See `crate::screen::fit_window_rect_to_screens` for what counts as a fit and why it
+    /// is unconditional. A window that already fits is left untouched.
+    pub fn fit_to_screens(&mut self) {
+        let screens = macos_screens();
+        if screens.is_empty() {
+            return;
+        }
+        let frame: NSRect = unsafe { msg_send![self.window, frame] };
+        let current = rect_of(frame);
+        let fitted = fit_window_rect_to_screens(&screens, current);
+        if fitted == current {
+            return;
+        }
+        unsafe {
+            let () = msg_send![self.window, setFrame: ns_rect_of(fitted) display: YES];
+        }
     }
 
     pub fn get_position(&self) -> Vec2d {
@@ -715,6 +888,9 @@ impl MacosWindow {
     }
 
     pub fn send_change_event(&mut self) {
+        if self.retired {
+            return;
+        }
         //return;
         let new_geom = self.get_window_geom();
         let old_geom = if let Some(old_geom) = &self.last_window_geom {
@@ -733,10 +909,16 @@ impl MacosWindow {
     }
 
     pub fn send_got_focus_event(&mut self) {
+        if self.retired {
+            return;
+        }
         self.do_callback(MacosEvent::WindowGotFocus(self.window_id));
     }
 
     pub fn send_lost_focus_event(&mut self) {
+        if self.retired {
+            return;
+        }
         if self.is_popup {
             self.do_callback(MacosEvent::PopupDismissed(
                 crate::event::window::PopupDismissedEvent {
@@ -750,6 +932,9 @@ impl MacosWindow {
     }
 
     pub fn mouse_down_can_drag_window(&mut self) -> bool {
+        if self.retired {
+            return false;
+        }
         let response = Rc::new(Cell::new(WindowDragQueryResponse::NoAnswer));
         self.do_callback(MacosEvent::WindowDragQuery(WindowDragQueryEvent {
             window_id: self.window_id,
@@ -763,7 +948,14 @@ impl MacosWindow {
     }
 
     pub fn send_mouse_down(&mut self, button: MouseButton, modifiers: KeyModifiers) {
+        if self.retired {
+            return;
+        }
+        // A real press arrived, so the current touch needs no synthesized tap.
+        self.touch_disqualified = true;
+        activate_cocoa_window_on_pointer_down(self.window);
         let () = unsafe { msg_send![self.window, makeFirstResponder: self.view] };
+        self.buttons_down.insert(button);
         self.do_callback(MacosEvent::MouseDown(MouseDownEvent {
             button,
             modifiers,
@@ -775,6 +967,21 @@ impl MacosWindow {
     }
 
     pub fn send_mouse_up(&mut self, button: MouseButton, modifiers: KeyModifiers) {
+        if self.retired {
+            return;
+        }
+        // The physical button-up ends a scrub pin UNCONDITIONALLY at the
+        // platform layer: cursor restored at the press point even if event
+        // dispatch drops the up. (Cx's call_event_handler hook clears its
+        // own flag; the owner's later release call no-ops.)
+        if button.is_primary() {
+            with_macos_app(|app| {
+                if app.pointer_pin_mode {
+                    app.set_pointer_pin(false);
+                }
+            });
+        }
+        self.buttons_down.remove(button);
         self.do_callback(MacosEvent::MouseUp(MouseUpEvent {
             button,
             modifiers,
@@ -784,7 +991,71 @@ impl MacosWindow {
         }));
     }
 
-    pub fn send_mouse_move(&mut self, _event: ObjcId, pos: Vec2d, modifiers: KeyModifiers) {
+    /// A buttonless `mouseMoved:` (AppKit sends `mouseDragged:` while a
+    /// button is held) while this window still counts a button down: the up
+    /// never reached the view — a full-screen transition, a Space switch or
+    /// a window drag took it — and the app kept its capture, panning on
+    /// every pointer motion (the phantom pan after a maximise). The lost up
+    /// is delivered before the move.
+    pub fn release_lost_buttons(&mut self, modifiers: KeyModifiers) {
+        if self.retired || self.buttons_down.is_empty() {
+            return;
+        }
+        for bit in 0..32 {
+            let button = MouseButton::from_bits_retain(1 << bit);
+            if self.buttons_down.contains(button) {
+                self.send_mouse_up(button, modifiers);
+            }
+        }
+        self.buttons_down = MouseButton::empty();
+    }
+
+    /// A raw trackpad touch began. `single` is whether exactly one finger is touching.
+    pub fn on_raw_touches_began(&mut self, single: bool) {
+        if single {
+            self.touch_began_time = self.time_now();
+            // Only a touch that starts while the OS momentum stream is live can have
+            // its tap suppressed by macOS; anywhere else the OS delivers the click
+            // itself and synthesizing one would double it.
+            self.touch_disqualified =
+                self.touch_began_time - self.last_momentum_time > 0.25;
+        } else {
+            self.touch_began_time = 0.0;
+            self.touch_disqualified = true;
+        }
+    }
+
+    /// A raw trackpad touch sequence ended. If it was a short, single-finger,
+    /// gesture-free touch during the OS momentum stream, macOS has suppressed its
+    /// tap-to-click, so deliver the tap ourselves.
+    pub fn on_raw_touches_ended(&mut self, modifiers: KeyModifiers) {
+        let began = self.touch_began_time;
+        self.touch_began_time = 0.0;
+        if began > 0.0 && !self.touch_disqualified && self.time_now() - began < 0.3 {
+            self.send_mouse_down(MouseButton::PRIMARY, modifiers);
+            self.send_mouse_up(MouseButton::PRIMARY, modifiers);
+        }
+    }
+
+    pub fn send_mouse_move(&mut self, event: ObjcId, pos: Vec2d, modifiers: KeyModifiers) {
+        if self.retired {
+            return;
+        }
+        // Pointer lock: the hardware cursor is frozen (its abs never moves),
+        // but NSEvent still reports per-event deltas — integrate them into a
+        // virtual position so every downstream MouseMove consumer works
+        // unchanged, captured-FPS style.
+        // Browser pointer-lock model: while locked, `abs` stays PINNED at
+        // the lock point (the position of the click that locked — inside
+        // the game view, so widget routing never wanders into other panels)
+        // and the true motion travels as `lock_delta`. An unbounded virtual
+        // position routed clicks into whatever UI it drifted over.
+        let (pos, lock_delta) = with_macos_app(|app| {
+            let (dx, dy): (f64, f64) = unsafe {
+                (msg_send![event, deltaX], msg_send![event, deltaY])
+            };
+            app.locked_mouse_transform(pos, Vec2d { x: dx, y: dy }, self.last_mouse_pos)
+        });
         self.last_mouse_pos = pos;
 
         if !self.is_nonactivating_panel() {
@@ -794,6 +1065,7 @@ impl MacosWindow {
         self.do_callback(MacosEvent::MouseMove(MouseMoveEvent {
             window_id: self.window_id,
             abs: pos,
+            lock_delta,
             modifiers: modifiers,
             time: self.time_now(),
             handled: Cell::new(Area::Empty),
@@ -802,7 +1074,28 @@ impl MacosWindow {
         //get_macos_app_global().ns_event = ptr::null_mut();
     }
 
-    pub fn send_scroll(&mut self, scroll: Vec2d, modifiers: KeyModifiers, is_mouse: bool) {
+    pub fn send_scroll(
+        &mut self,
+        scroll: Vec2d,
+        modifiers: KeyModifiers,
+        is_mouse: bool,
+        phase: ScrollPhase,
+    ) {
+        if self.retired {
+            return;
+        }
+        match phase {
+            // Only live momentum arms the tap synthesizer: after the stream ends,
+            // macOS delivers taps itself and synthesizing one would double it.
+            ScrollPhase::Momentum => {
+                self.last_momentum_time = self.time_now();
+            }
+            ScrollPhase::Began | ScrollPhase::Changed | ScrollPhase::Ended => {
+                // A scroll gesture means the current touch isn't a tap.
+                self.touch_disqualified = true;
+            }
+            _ => {}
+        }
         self.do_callback(MacosEvent::Scroll(ScrollEvent {
             window_id: self.window_id,
             scroll,
@@ -812,6 +1105,24 @@ impl MacosWindow {
             is_mouse,
             handled_x: Cell::new(false),
             handled_y: Cell::new(false),
+            phase,
+        }));
+    }
+
+    /// A magnify step from the trackpad, at the pointer like a scroll.
+    pub fn send_pinch(&mut self, scale: f64, phase: PinchPhase, modifiers: KeyModifiers) {
+        if self.retired {
+            return;
+        }
+        // A pinch means the current touch isn't a tap.
+        self.touch_disqualified = true;
+        self.do_callback(MacosEvent::Pinch(PinchEvent {
+            window_id: self.window_id,
+            abs: self.last_mouse_pos,
+            scale,
+            phase,
+            modifiers,
+            time: self.time_now(),
         }));
     }
 
@@ -830,9 +1141,11 @@ impl MacosWindow {
     }
 
     pub fn send_window_closed_event(&mut self) {
-        self.do_callback(MacosEvent::WindowClosed(WindowClosedEvent {
-            window_id: self.window_id,
-        }))
+        if self.close_event_deferred {
+            return;
+        }
+        self.close_event_deferred = true;
+        MacosApp::defer_window_closed(self.window_id);
     }
 
     pub fn send_text_input(&mut self, input: String, replace_last: bool) {
@@ -846,84 +1159,203 @@ impl MacosWindow {
 
     pub fn set_ime_active(&mut self, active: bool) {
         self.ime_active = active;
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn start_dragging(&mut self, items: Vec<DragItem>) {
-        let ns_event: ObjcId = unsafe {
-            let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
-            msg_send![ns_app, currentEvent]
-        };
-        let mut dragged_files = Vec::new();
-        for item in items {
-            match item {
-                DragItem::FilePath { path, internal_id } => {
-                    let pasteboard_item: ObjcId =
-                        unsafe { msg_send![class!(NSPasteboardItem), new] };
-                    let _: () = unsafe {
-                        msg_send![
-                            pasteboard_item,
-                            setString: str_to_nsstring(
-                                &if let Some(id) = internal_id{
-                                    format!("file://{}#makepad_internal_id={}", if path.len()==0{"makepad_internal_empty"}else {&path}, id.0)
-                                }
-                                else{
-                                    format!("file://{}",if path.len()==0{"makepad_internal_empty"}else {&path})
-                                }
-                            )
-                            forType: NSPasteboardTypeFileURL
-                        ]
-                    };
-                    let dragging_item: ObjcId = unsafe { msg_send![class!(NSDraggingItem), alloc] };
-                    let _: () = unsafe {
-                        msg_send![dragging_item, initWithPasteboardWriter: pasteboard_item]
-                    };
-                    let bounds: NSRect = unsafe { msg_send![self.view, bounds] };
-                    let _: () = unsafe {
-                        msg_send![dragging_item, setDraggingFrame: bounds contents: self.view]
-                    };
-                    dragged_files.push(dragging_item)
-                }
-                _ => {
-                    crate::error!("Dragging string not implemented on macos yet");
+        if !active {
+            unsafe {
+                let has_marked_text: BOOL = msg_send![self.view, hasMarkedText];
+                if has_marked_text != NO {
+                    // The widget keeps its preview as text on blur. Clear only
+                    // AppKit's state so the next focused widget is not edited.
+                    clear_marked_text_ivar(&*self.view);
                 }
             }
         }
+    }
 
-        let dragging_items: ObjcId = unsafe {
-            msg_send![
-                class!(NSArray),
-                arrayWithObjects: dragged_files.as_ptr()
-                count: dragged_files.len()
-            ]
+    /// Starts a Finder-compatible file drag from this exact native window.
+    /// Internal Makepad drags deliberately do not use this path: they need
+    /// immediate framework events rather than AppKit's nested drag session.
+    #[cfg(target_os = "macos")]
+    pub fn start_external_dragging(&mut self, items: Vec<DragItem>) -> bool {
+        if self.retired || items.is_empty() {
+            return false;
+        }
+
+        let paths = items
+            .into_iter()
+            .map(|item| match item {
+                DragItem::FilePath {
+                    path,
+                    internal_id: None,
+                } => Some(path),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(paths) = paths else {
+            crate::error!("external drag accepts only public file paths");
+            return false;
         };
+        if paths.iter().any(|path| {
+            let path = Path::new(path);
+            !path.is_absolute() || !path.is_file()
+        }) {
+            crate::error!("external drag requires absolute paths to existing files");
+            return false;
+        }
 
         unsafe {
-            let _: ObjcId = msg_send![
+            let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+            let ns_event: ObjcId = msg_send![ns_app, currentEvent];
+            if ns_event == nil {
+                return false;
+            }
+            let event_window: ObjcId = msg_send![ns_event, window];
+            if event_window == nil || event_window != self.window {
+                return false;
+            }
+            let event_type: NSEventType = msg_send![ns_event, type];
+            if !matches!(
+                event_type,
+                NSEventType::NSLeftMouseDown
+                    | NSEventType::NSLeftMouseDragged
+                    | NSEventType::NSRightMouseDown
+                    | NSEventType::NSRightMouseDragged
+                    | NSEventType::NSOtherMouseDown
+                    | NSEventType::NSOtherMouseDragged
+            ) {
+                return false;
+            }
+
+            let window_point: NSPoint = msg_send![ns_event, locationInWindow];
+            let view_point: NSPoint =
+                msg_send![self.view, convertPoint: window_point fromView: nil];
+            let workspace: ObjcId = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let mut dragging_items = Vec::with_capacity(paths.len());
+
+            for (index, path) in paths.iter().enumerate() {
+                let ns_path = str_to_nsstring(path);
+                let file_url: ObjcId =
+                    msg_send![class!(NSURL), fileURLWithPath: ns_path isDirectory: NO];
+                if file_url == nil {
+                    continue;
+                }
+                let item: ObjcId = msg_send![class!(NSDraggingItem), alloc];
+                let item: ObjcId = msg_send![item, initWithPasteboardWriter: file_url];
+                if item == nil {
+                    continue;
+                }
+
+                let icon: ObjcId = msg_send![workspace, iconForFile: ns_path];
+                let icon: ObjcId = if icon == nil {
+                    nil
+                } else {
+                    msg_send![icon, copy]
+                };
+                let offset = index as f64 * 3.0;
+                let frame = NSRect {
+                    origin: NSPoint {
+                        x: view_point.x - 24.0 + offset,
+                        y: view_point.y - 24.0 - offset,
+                    },
+                    size: NSSize {
+                        width: 48.0,
+                        height: 48.0,
+                    },
+                };
+                let _: () = msg_send![item, setDraggingFrame: frame contents: icon];
+                if icon != nil {
+                    let _: () = msg_send![icon, release];
+                }
+                dragging_items.push(item);
+            }
+
+            if dragging_items.is_empty() {
+                return false;
+            }
+            let array: ObjcId = msg_send![
+                class!(NSArray),
+                arrayWithObjects: dragging_items.as_ptr()
+                count: dragging_items.len()
+            ];
+            let session: ObjcId = msg_send![
                 self.view,
-                beginDraggingSessionWithItems: dragging_items
+                beginDraggingSessionWithItems: array
                 event: ns_event
                 source: self.view
             ];
+            if session != nil {
+                let _: () =
+                    msg_send![session, setAnimatesToStartingPositionsOnCancelOrFail: NO];
+            }
+            for item in dragging_items {
+                let _: () = msg_send![item, release];
+            }
+            session != nil
         }
-
-        /*
-         self.delegate?.cellClick(self ,index:self.index)
-        //
-        let pasteboardItem = NSPasteboardItem()
-        pasteboardItem.setString(zText!.stringValue, forType:.string)
-        let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
-        draggingItem.setDraggingFrame(self.bounds, contents:self)
-        beginDraggingSession(with: [draggingItem], event: event, source: self.zIcon.image)
-        */
-
-        // TODO
     }
+}
+
+// Do not send TextInput here: callers have already committed the composition or
+// moved focus. Clear our state first so a reentrant unmarkText is a no-op.
+pub(crate) unsafe fn clear_marked_text_ivar(this: &Object) {
+    let marked_text: ObjcId = *this.get_ivar("markedText");
+    let mutable_string = marked_text.mutable_string();
+    let _: () = msg_send![mutable_string, setString: get_apple_class_global().const_empty_string.as_id()];
+    let input_context: ObjcId = msg_send![this, inputContext];
+    let _: () = msg_send![input_context, discardMarkedText];
 }
 
 pub fn get_cocoa_window(this: &Object) -> &mut MacosWindow {
     unsafe {
         let ptr: *mut c_void = *this.get_ivar("macos_window_ptr");
         &mut *(ptr as *mut MacosWindow)
+    }
+}
+
+/// Converts an `NSRect` to makepad's rectangle, leaving Cocoa's bottom-left origin as it is.
+fn rect_of(r: NSRect) -> Rect {
+    Rect {
+        pos: dvec2(r.origin.x, r.origin.y),
+        size: dvec2(r.size.width, r.size.height),
+    }
+}
+
+/// Converts makepad's rectangle back to an `NSRect`.
+fn ns_rect_of(r: Rect) -> NSRect {
+    NSRect {
+        origin: NSPoint {
+            x: r.pos.x,
+            y: r.pos.y,
+        },
+        size: NSSize {
+            width: r.size.x,
+            height: r.size.y,
+        },
+    }
+}
+
+/// The displays currently attached, in Cocoa's global point space (bottom-left origin) —
+/// the space an `NSWindow` frame is expressed in.
+pub fn macos_screens() -> Vec<ScreenGeom> {
+    unsafe {
+        let screens: ObjcId = msg_send![class!(NSScreen), screens];
+        let count: usize = msg_send![screens, count];
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            let screen: ObjcId = msg_send![screens, objectAtIndex: index];
+            if screen == nil {
+                continue;
+            }
+            let frame: NSRect = msg_send![screen, frame];
+            let visible: NSRect = msg_send![screen, visibleFrame];
+            out.push(ScreenGeom {
+                bounds: rect_of(frame),
+                work_area: rect_of(visible),
+                // Element zero of `NSScreen.screens` is the display holding the menu bar,
+                // which is the one Cocoa places windows against; `mainScreen` follows the
+                // key window instead and would move under the app.
+                is_primary: index == 0,
+            });
+        }
+        out
     }
 }

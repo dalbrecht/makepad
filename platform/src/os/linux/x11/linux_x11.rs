@@ -1,9 +1,11 @@
 use {
     self::super::super::{
         egl_sys,
-        gstreamer_sys::LibGStreamer,
-        linux_video_playback::GStreamerVideoPlayer,
-        linux_video_player::{LinuxVideoPlayer, YuvTextureSet},
+        linux_video_playback::{poll_pending_gstreamer_teardowns, GStreamerVideoPlayer},
+        linux_video_player::{
+            collect_linux_video_player_events, prepare_desktop_linux_video, LinuxPrepareResult,
+            LinuxVideoPlayer,
+        },
         opengl_cx::OpenglCx,
         v4l2_camera_player::V4l2CameraPlayer,
         x11::x11_sys,
@@ -17,15 +19,13 @@ use {
         draw_pass::CxDrawPassParent,
         event::{
             video_playback::{
-                VideoBufferedRangesEvent, VideoDecodingErrorEvent, VideoPlaybackPreparedEvent,
-                VideoPlaybackResourcesReleasedEvent, VideoSeekableRangesEvent,
-                VideoTextureUpdatedEvent, VideoYuvTexturesReady,
+                VideoDecodingErrorEvent, VideoPlaybackResourcesReleasedEvent, VideoYuvTexturesReady,
             },
             *,
         },
         gpu_info::GpuPerformance,
         makepad_live_id::*,
-        makepad_math::dvec2,
+        makepad_math::{dvec2, Rect},
         os::cx_native::EventFlow,
         texture::TextureFormat,
         thread::SignalToUI,
@@ -33,7 +33,6 @@ use {
     },
     std::cell::RefCell,
     std::rc::Rc,
-    std::sync::{Arc, Mutex},
 };
 
 fn log_linux_backdrop_unsupported_once() {
@@ -49,14 +48,12 @@ pub fn x11_event_loop(cx: Rc<RefCell<Cx>>) {
 
 pub struct X11Cx {
     pub cx: Rc<RefCell<Cx>>,
-    internal_drag_items: Option<Arc<Vec<DragItem>>>,
 }
 
 impl X11Cx {
     pub fn event_loop_impl(cx: Rc<RefCell<Cx>>) {
         let mut x11_cx = X11Cx {
             cx: cx.clone(),
-            internal_drag_items: None,
         };
         cx.borrow_mut().self_ref = Some(cx.clone());
         cx.borrow_mut().os_type = OsType::LinuxWindow(LinuxWindowParams {
@@ -65,6 +62,7 @@ impl X11Cx {
         cx.borrow_mut().gpu_info.performance = GpuPerformance::Tier1;
 
         let opengl_windows = Rc::new(RefCell::new(Vec::new()));
+        cx.borrow_mut().set_physical_keyboard_state(true);
         let is_stdin_loop = crate::app_main::should_run_stdin_loop_from_env();
         if is_stdin_loop {
             cx.borrow_mut().in_makepad_studio = true;
@@ -106,7 +104,10 @@ impl X11Cx {
         event: XlibEvent,
         opengl_windows: &mut Vec<OpenglWindow>,
     ) -> EventFlow {
+        let _phase = crate::thread::ui_phase(crate::thread::UiPhase::NativeEvent);
         if let EventFlow::Exit = self.handle_platform_ops(opengl_windows, xlib_app) {
+            let mut cx = self.cx.borrow_mut();
+            cx.call_event_handler(&Event::Shutdown);
             return EventFlow::Exit;
         }
 
@@ -132,9 +133,10 @@ impl X11Cx {
                     .iter_mut()
                     .find(|w| w.window_id == re.window_id)
                 {
-                    if let Some(dpi_override) = cx.windows[re.window_id].dpi_override {
-                        re.new_geom.inner_size *= re.new_geom.dpi_factor / dpi_override;
-                        re.new_geom.dpi_factor = dpi_override;
+                    {
+                        let cx_window = &mut cx.windows[re.window_id];
+                        cx_window.os_dpi_factor = Some(re.new_geom.dpi_factor);
+                        re.new_geom = cx_window.native_window_geom_to_layout(re.new_geom);
                     }
 
                     window.window_geom = re.new_geom.clone();
@@ -191,59 +193,78 @@ impl X11Cx {
                 // ok here we send out to all our childprocesses
 
                 self.handle_repaint(opengl_windows);
+
+                {
+                    let cx = self.cx.borrow();
+                    let has_platform_ops = !cx.platform_ops.is_empty();
+                    drop(cx);
+                    if has_platform_ops {
+                        if let EventFlow::Exit =
+                            self.handle_platform_ops(opengl_windows, xlib_app)
+                        {
+                            let mut cx = self.cx.borrow_mut();
+                            cx.call_event_handler(&Event::Shutdown);
+                            return EventFlow::Exit;
+                        }
+                    }
+                }
+
+                // Run script-VM garbage collection at a safe point after paint, matching
+                // the macOS backend. Without this the script object heap grows without
+                // bound on Linux: every `eval` / `script_apply_eval!` allocates script
+                // objects that are only reclaimed by `gc()`. `needs_gc()` gates this so
+                // it only runs once the heap has grown past its threshold (~2x).
+                {
+                    let mut cx = self.cx.borrow_mut();
+                    cx.with_vm(|vm| {
+                        if vm.heap().needs_gc() {
+                            vm.gc();
+                        }
+                    });
+                }
             }
-            XlibEvent::MouseDown(e) => {
+            XlibEvent::MouseDown(mut e) => {
                 let mut cx = self.cx.borrow_mut();
+                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.fingers.process_tap_count(e.abs, e.time);
                 cx.fingers.mouse_down(e.button, e.window_id);
                 cx.call_event_handler(&Event::MouseDown(e.into()))
             }
-            XlibEvent::MouseMove(e) => {
+            XlibEvent::MouseMove(mut e) => {
                 let mut cx = self.cx.borrow_mut();
-                let abs = e.abs;
-                let modifiers = e.modifiers;
+                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.call_event_handler(&Event::MouseMove(e.into()));
-                if let Some(items) = self.internal_drag_items.as_ref() {
-                    cx.call_event_handler(&Event::Drag(DragEvent {
-                        modifiers,
-                        handled: Arc::new(Mutex::new(false)),
-                        abs,
-                        items: items.clone(),
-                        response: Arc::new(Mutex::new(DragResponse::None)),
-                    }));
-                    cx.drag_drop.cycle_drag();
-                }
                 cx.fingers.cycle_hover_area(live_id!(mouse).into());
                 cx.fingers.switch_captures();
             }
-            XlibEvent::MouseUp(e) => {
+            XlibEvent::MouseUp(mut e) => {
                 let mut cx = self.cx.borrow_mut();
+                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 let button = e.button;
-                let abs = e.abs;
-                let modifiers = e.modifiers;
                 cx.call_event_handler(&Event::MouseUp(e.into()));
                 cx.fingers.mouse_up(button);
                 cx.fingers.cycle_hover_area(live_id!(mouse).into());
-                if button == MouseButton::PRIMARY {
-                    if let Some(items) = self.internal_drag_items.take() {
-                        cx.call_event_handler(&Event::Drop(DropEvent {
-                            modifiers,
-                            handled: Arc::new(Mutex::new(false)),
-                            abs,
-                            items,
-                        }));
-                        cx.drag_drop.cycle_drag();
-                        cx.call_event_handler(&Event::DragEnd);
-                        cx.drag_drop.cycle_drag();
-                    }
-                }
             }
-            XlibEvent::Scroll(e) => {
+            XlibEvent::MouseLeave(mut e) => {
                 let mut cx = self.cx.borrow_mut();
+                cx.dpi_override_scale(&mut e.abs, e.window_id);
+                cx.call_event_handler(&Event::MouseLeave(e));
+                cx.fingers.cycle_hover_area(live_id!(mouse).into());
+                cx.fingers.switch_captures();
+            }
+            XlibEvent::Scroll(mut e) => {
+                let mut cx = self.cx.borrow_mut();
+                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.call_event_handler(&Event::Scroll(e.into()))
             }
-            XlibEvent::WindowDragQuery(e) => {
+            XlibEvent::Pinch(mut e) => {
                 let mut cx = self.cx.borrow_mut();
+                cx.dpi_override_scale(&mut e.abs, e.window_id);
+                cx.call_event_handler(&Event::Pinch(e))
+            }
+            XlibEvent::WindowDragQuery(mut e) => {
+                let mut cx = self.cx.borrow_mut();
+                cx.dpi_override_scale(&mut e.abs, e.window_id);
                 cx.call_event_handler(&Event::WindowDragQuery(e))
             }
             XlibEvent::WindowCloseRequested(e) => {
@@ -254,13 +275,15 @@ impl X11Cx {
                 let mut cx = self.cx.borrow_mut();
                 cx.call_event_handler(&Event::TextInput(e))
             }
-            XlibEvent::Drag(e) => {
+            XlibEvent::Drag(window_id, mut e) => {
                 let mut cx = self.cx.borrow_mut();
+                cx.dpi_override_scale(&mut e.abs, window_id);
                 cx.call_event_handler(&Event::Drag(e));
                 cx.drag_drop.cycle_drag();
             }
-            XlibEvent::Drop(e) => {
+            XlibEvent::Drop(window_id, mut e) => {
                 let mut cx = self.cx.borrow_mut();
+                cx.dpi_override_scale(&mut e.abs, window_id);
                 cx.call_event_handler(&Event::Drop(e));
                 cx.drag_drop.cycle_drag();
             }
@@ -299,9 +322,14 @@ impl X11Cx {
             XlibEvent::Timer(e) => {
                 let mut cx = self.cx.borrow_mut();
                 if e.timer_id == 0 {
-                    if SignalToUI::check_and_clear_ui_signal() {
+                    let internal_signal = SignalToUI::check_and_clear_internal_signal();
+                    let ui_signal = SignalToUI::check_and_clear_ui_signal();
+                    if internal_signal || ui_signal {
+                        cx.handle_termination_signal();
                         cx.handle_media_signals();
                         cx.handle_script_signals();
+                    }
+                    if ui_signal {
                         cx.call_event_handler(&Event::Signal);
                     }
                     if SignalToUI::check_and_clear_action_signal() {
@@ -312,83 +340,29 @@ impl X11Cx {
                     cx.handle_networking_events();
 
                     // Poll video players on the timer tick (every ~8ms).
-                    if !cx.os.video_players.is_empty() {
+                    // Always sweep pending GStreamer teardowns so the last closed
+                    // player still finishes NULL without waiting for a new prepare.
+                    if cx.os.video_players.is_empty() {
+                        poll_pending_gstreamer_teardowns();
+                    } else {
                         cx.os.opengl_cx.as_ref().unwrap().make_current();
                         let gl: *const super::super::super::gl_sys::LibGl =
                             &cx.os.opengl_cx.as_ref().unwrap().libgl;
+                        let egl = cx
+                            .os
+                            .opengl_cx
+                            .as_ref()
+                            .map(|cx| cx as *const super::super::opengl_cx::OpenglCx);
                         let mut players = std::mem::take(&mut cx.os.video_players);
                         let mut video_events = Vec::new();
                         for (_video_id, player) in players.iter_mut() {
-                            match player.check_prepared() {
-                                Some(Ok(crate::media_plugin::PlaybackPrepared {
-                                    width,
-                                    height,
-                                    duration_ms: duration,
-                                    is_seekable,
-                                    video_tracks,
-                                    audio_tracks,
-                                })) => {
-                                    video_events.push(Event::VideoPlaybackPrepared(
-                                        VideoPlaybackPreparedEvent {
-                                            video_id: player.video_id(),
-                                            video_width: width,
-                                            video_height: height,
-                                            duration,
-                                            is_seekable,
-                                            video_tracks,
-                                            audio_tracks,
-                                        },
-                                    ));
-                                    let seekable = player.seekable_ranges();
-                                    if !seekable.is_empty() {
-                                        video_events.push(Event::VideoSeekableRanges(
-                                            VideoSeekableRangesEvent {
-                                                video_id: player.video_id(),
-                                                ranges: seekable,
-                                            },
-                                        ));
-                                    }
-                                    let buffered = player.buffered_ranges();
-                                    if !buffered.is_empty() {
-                                        video_events.push(Event::VideoBufferedRanges(
-                                            VideoBufferedRangesEvent {
-                                                video_id: player.video_id(),
-                                                ranges: buffered,
-                                            },
-                                        ));
-                                    }
-                                }
-                                Some(Err(err)) => {
-                                    video_events.push(Event::VideoDecodingError(
-                                        VideoDecodingErrorEvent {
-                                            video_id: player.video_id(),
-                                            error: err,
-                                        },
-                                    ));
-                                }
-                                None => {}
-                            }
-                            if player.poll_frame(unsafe { &*gl }, &mut cx.textures) {
-                                video_events.push(Event::VideoTextureUpdated(
-                                    VideoTextureUpdatedEvent {
-                                        video_id: player.video_id(),
-                                        current_position_ms: player.current_position_ms(),
-                                        yuv: crate::event::video_playback::VideoYuvMetadata {
-                                            enabled: player.is_yuv_mode(),
-                                            matrix: player.yuv_matrix(),
-                                            biplanar: false,
-                                            rotation_steps: 0.0,
-                                        },
-                                    },
-                                ));
-                            }
-                            if player.check_eos() {
-                                video_events.push(Event::VideoPlaybackCompleted(
-                                    crate::event::video_playback::VideoPlaybackCompletedEvent {
-                                        video_id: player.video_id(),
-                                    },
-                                ));
-                            }
+                            let opengl_cx = egl.map(|ptr| unsafe { &*ptr });
+                            video_events.extend(collect_linux_video_player_events(
+                                player,
+                                unsafe { &*gl },
+                                &mut cx.textures,
+                                opengl_cx,
+                            ));
                         }
                         cx.os.video_players = players;
                         for event in video_events {
@@ -401,7 +375,32 @@ impl X11Cx {
                 }
 
                 cx.run_live_edit_if_needed("linux-x11");
+                let has_platform_ops = !cx.platform_ops.is_empty();
+                drop(cx);
+                if has_platform_ops {
+                    if let EventFlow::Exit = self.handle_platform_ops(opengl_windows, xlib_app) {
+                        let mut cx = self.cx.borrow_mut();
+                        cx.call_event_handler(&Event::Shutdown);
+                        return EventFlow::Exit;
+                    }
+                }
                 return EventFlow::Wait;
+            }
+        }
+
+        // Drain ops queued during this event (e.g. pause/resume from MouseDown).
+        // Without this, input handlers would wait until the next event's opening
+        // drain — tens of ms of audible lag for video controls.
+        {
+            let cx = self.cx.borrow();
+            let has_platform_ops = !cx.platform_ops.is_empty();
+            drop(cx);
+            if has_platform_ops {
+                if let EventFlow::Exit = self.handle_platform_ops(opengl_windows, xlib_app) {
+                    let mut cx = self.cx.borrow_mut();
+                    cx.call_event_handler(&Event::Shutdown);
+                    return EventFlow::Exit;
+                }
             }
         }
 
@@ -419,6 +418,18 @@ impl X11Cx {
     }
 
     pub(crate) fn handle_repaint(&mut self, opengl_windows: &mut Vec<OpenglWindow>) {
+        {
+            // Paint is emitted on every idle poll/timer tick. If no pass is dirty there is
+            // nothing to draw, so skip the eglMakeCurrent + full pass-list scan below.
+            // demo_time_repaint forces a redraw of time-animated passes (see
+            // compute_pass_repaint_order), so it must keep us rendering.
+            let mut cx = self.cx.borrow_mut();
+            if !cx.any_passes_dirty() && !cx.demo_time_repaint {
+                // This still binds our context while retirement work is pending.
+                cx.maintain_instance_retirements();
+                return;
+            }
+        }
         let mut passes_todo = Vec::new();
         {
             let mut cx = self.cx.borrow_mut();
@@ -429,7 +440,9 @@ impl X11Cx {
         for draw_pass_id in &passes_todo {
             let parent = {
                 let mut cx = self.cx.borrow_mut();
-                cx.passes[*draw_pass_id].set_time(get_xlib_app_global().time_now() as f32);
+                let uniforms_gen = cx.next_uniform_gen();
+                cx.passes[*draw_pass_id]
+                    .set_time(get_xlib_app_global().time_now() as f32, uniforms_gen);
                 cx.passes[*draw_pass_id].parent.clone()
             };
             match parent {
@@ -461,6 +474,11 @@ impl X11Cx {
                     cx.draw_pass_to_texture(*draw_pass_id, None);
                 }
             }
+        }
+        // If no render ran the retirement step under this beat's repaint_id, run it here.
+        let mut cx = self.cx.borrow_mut();
+        if cx.draw_lists.1.retirement_frame != Some(cx.repaint_id) {
+            cx.maintain_instance_retirements();
         }
     }
 
@@ -523,17 +541,19 @@ impl X11Cx {
     ) -> EventFlow {
         let mut ret = EventFlow::Poll;
         let mut cx = self.cx.borrow_mut();
-        while let Some(op) = cx.platform_ops.pop() {
+        while let Some(op) = cx.platform_ops.pop_front() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     let gl_cx = cx.os.opengl_cx.as_ref().unwrap();
                     let window = &cx.windows[window_id];
+                    let (create_position, create_inner_size) = window.create_geom();
                     let opengl_window = OpenglWindow::new(
                         window_id,
                         gl_cx,
-                        window.create_inner_size.unwrap_or(dvec2(800., 600.)),
-                        window.create_position,
+                        create_inner_size,
+                        create_position,
                         &window.create_title,
+                        &window.create_app_id,
                         window.is_fullscreen,
                     );
                     let window = &mut cx.windows[window_id];
@@ -622,10 +642,27 @@ impl X11Cx {
                     if let Some(window) =
                         opengl_windows.iter_mut().find(|w| w.window_id == window_id)
                     {
+                        // Drop both, same as the Wayland arm: `is_fullscreen()` is the
+                        // union, so a caller restoring off it means "make it small again".
+                        window.xlib_window.normal();
                         window.xlib_window.restore();
                     }
                 }
-                CxOsOp::SetWindowTitle(_, _) => {}
+                CxOsOp::FullscreenWindow(window_id) => {
+                    if let Some(window) =
+                        opengl_windows.iter_mut().find(|w| w.window_id == window_id)
+                    {
+                        window.xlib_window.fullscreen();
+                    }
+                }
+                CxOsOp::NormalizeWindow(window_id) => {
+                    if let Some(window) =
+                        opengl_windows.iter_mut().find(|w| w.window_id == window_id)
+                    {
+                        window.xlib_window.normal();
+                        window.xlib_window.restore();
+                    }
+                }
                 CxOsOp::ResizeWindow(window_id, size) => {
                     if let Some(window) =
                         opengl_windows.iter_mut().find(|w| w.window_id == window_id)
@@ -638,6 +675,13 @@ impl X11Cx {
                         opengl_windows.iter_mut().find(|w| w.window_id == window_id)
                     {
                         window.xlib_window.set_position(size);
+                    }
+                }
+                CxOsOp::SetWindowTitle(window_id, title) => {
+                    if let Some(window) =
+                        opengl_windows.iter_mut().find(|w| w.window_id == window_id)
+                    {
+                        window.xlib_window.set_title(&title);
                     }
                 }
                 CxOsOp::SetWindowVisuals(_window_id, visuals) => {
@@ -673,10 +717,28 @@ impl X11Cx {
                 CxOsOp::HideSelectionHandles => {}
                 CxOsOp::AccessibilityUpdate(_) => {}
                 CxOsOp::StartDragging(items) => {
-                    self.internal_drag_items = Some(Arc::new(items));
+                    cx.drag_drop.start_internal_drag(items);
+                }
+                CxOsOp::StartExternalDragging { .. } => {
+                    crate::error!("external file dragging is not implemented on X11");
+                    cx.call_event_handler(&Event::DragEnd);
                 }
                 CxOsOp::SetCursor(cursor) => {
                     xlib_app.set_mouse_cursor(cursor);
+                }
+                // The desktop's own dialog helper, on its own thread; the
+                // answer arrives as a FileDialogAction like every OS.
+                CxOsOp::SelectFileDialog(settings) => {
+                    crate::os::linux::file_dialog::open_select_file_dialog(settings);
+                }
+                CxOsOp::SaveFileDialog(settings) => {
+                    crate::os::linux::file_dialog::open_save_file_dialog(settings);
+                }
+                CxOsOp::SelectFolderDialog(settings) => {
+                    crate::os::linux::file_dialog::open_select_folder_dialog(settings);
+                }
+                CxOsOp::SaveFolderDialog(settings) => {
+                    crate::os::linux::file_dialog::open_save_folder_dialog(settings);
                 }
                 CxOsOp::StartTimer {
                     timer_id,
@@ -697,17 +759,35 @@ impl X11Cx {
                 CxOsOp::CancelHttpRequest { request_id } => {
                     let _ = cx.net.http_cancel(request_id);
                 }
-                CxOsOp::ShowTextIME(area, pos, _config) => {
-                    let pos = area.clipped_rect(&cx).pos + pos;
+                CxOsOp::ShowTextIME(area, cursor_rect, _config) => {
+                    let area_rect = area.clipped_rect(&cx);
+                    let area_pos = area_rect.pos;
+                    let window_id = cx.get_window_id_of(&area).unwrap_or(CxWindowPool::id_zero());
+                    let top_left = cx.windows[window_id]
+                        .layout_vec2d_to_native_points(area_pos + cursor_rect.pos);
+                    let bottom_right = cx.windows[window_id]
+                        .layout_vec2d_to_native_points(area_pos + cursor_rect.pos + cursor_rect.size);
+                    let area_top_left = cx.windows[window_id]
+                        .layout_vec2d_to_native_points(area_rect.pos);
+                    let area_bottom_right = cx.windows[window_id]
+                        .layout_vec2d_to_native_points(area_rect.pos + area_rect.size);
+                    let ime_rect = Rect {
+                        pos: top_left,
+                        size: bottom_right - top_left,
+                    };
+                    let ime_area_rect = Rect {
+                        pos: area_top_left,
+                        size: area_bottom_right - area_top_left,
+                    };
                     opengl_windows.iter_mut().for_each(|w| {
-                        w.xlib_window.set_ime_spot(pos);
+                        w.xlib_window.set_ime_rect(ime_rect, ime_area_rect);
                         w.xlib_window.set_ime_active(true);
                     });
                 }
                 CxOsOp::HideTextIME => {
                     opengl_windows.iter_mut().for_each(|w| {
                         w.xlib_window.set_ime_active(false);
-                        w.xlib_window.set_ime_spot(dvec2(0.0, 0.0));
+                        w.xlib_window.set_ime_rect(Rect::default(), Rect::default());
                     });
                 }
                 CxOsOp::CheckPermission {
@@ -750,14 +830,13 @@ impl X11Cx {
                     autoplay,
                     should_loop,
                 ) => {
-                    // Skip if an active player already exists for this video_id
-                    if cx
-                        .os
-                        .video_players
-                        .get(&video_id)
-                        .map_or(false, |p| p.is_active())
-                    {
-                        continue;
+                    // Replacing an existing player for the same id: tear down first so
+                    // prepare is never a silent no-op (source changes, replay, etc.).
+                    if let Some(mut player) = cx.os.video_players.remove(&video_id) {
+                        player.cleanup();
+                        cx.call_event_handler(&Event::VideoPlaybackResourcesReleased(
+                            VideoPlaybackResourcesReleasedEvent { video_id },
+                        ));
                     }
                     // Camera source: use V4L2 capture player with YUV plane textures
                     if let VideoSource::Camera(input_id, format_id) = source {
@@ -781,112 +860,39 @@ impl X11Cx {
                             .video_players
                             .insert(video_id, LinuxVideoPlayer::Camera(player));
                         cx.call_event_handler(&Event::VideoYuvTexturesReady(
-                            VideoYuvTexturesReady {
-                                video_id,
-                                tex_y,
-                                tex_u,
-                                tex_v,
-                            },
+                            VideoYuvTexturesReady::planes(video_id, tex_y, tex_u, tex_v),
                         ));
                         continue;
                     }
-                    // Try GStreamer first, fall back to software rav1d
-                    let force_software_env =
-                        std::env::var_os("MAKEPAD_FORCE_SOFTWARE_VIDEO").is_some();
-                    let mut use_software = force_software_env || source.is_session();
-                    if force_software_env {
-                        crate::log!(
-                            "VIDEO: MAKEPAD_FORCE_SOFTWARE_VIDEO set, using software video decoder"
-                        );
-                    } else if source.is_session() {
-                        crate::log!("VIDEO: session source uses software video decoder");
-                    }
-                    if cx.os.gstreamer.is_none() {
-                        match LibGStreamer::try_load() {
-                            Some(gst) => {
-                                gst.init();
-                                cx.os.gstreamer = Some(gst);
-                            }
-                            None => {
-                                crate::log!(
-                                    "VIDEO: GStreamer not available, using software video decoder"
-                                );
-                                use_software = true;
-                            }
-                        }
-                    }
-                    if !use_software {
-                        if cx.os.gstreamer.is_some() {
-                            let yuv = YuvTextureSet::new(
-                                cx.textures.alloc(TextureFormat::VideoYuvPlane),
-                                cx.textures.alloc(TextureFormat::VideoYuvPlane),
-                                cx.textures.alloc(TextureFormat::VideoYuvPlane),
-                            );
-                            let gst = cx.os.gstreamer.as_ref().unwrap();
-
-                            let player = GStreamerVideoPlayer::new(
-                                gst,
-                                video_id,
-                                texture_id,
-                                Some(yuv.ids),
-                                source.clone(),
-                                autoplay,
-                                should_loop,
-                            );
-                            if player.is_active() {
-                                cx.os.video_players.insert(
-                                    video_id,
-                                    LinuxVideoPlayer::GStreamer {
-                                        player,
-                                        yuv: Some(yuv.clone()),
-                                    },
-                                );
-                                cx.call_event_handler(&Event::VideoYuvTexturesReady(
-                                    VideoYuvTexturesReady {
-                                        video_id,
-                                        tex_y: yuv.tex_y,
-                                        tex_u: yuv.tex_u,
-                                        tex_v: yuv.tex_v,
-                                    },
-                                ));
-                                continue;
-                            }
-                            crate::log!("VIDEO: GStreamer pipeline failed, falling back to software video decoder");
-                            use_software = true;
-                        }
-                    }
-                    if use_software {
-                        // Allocate YUV textures internally for software decode
-                        let yuv = YuvTextureSet::new(
-                            cx.textures.alloc(TextureFormat::VideoYuvPlane),
-                            cx.textures.alloc(TextureFormat::VideoYuvPlane),
-                            cx.textures.alloc(TextureFormat::VideoYuvPlane),
-                        );
-                        let player =
-                            crate::video_decode::software_video::PlaybackSessionHandle::new(
-                                video_id,
-                                texture_id,
-                                source,
-                                autoplay,
-                                should_loop,
-                            );
-                        cx.os.video_players.insert(
+                    // Shared prepare for file/network/session sources.
+                    let prep = {
+                        let cx_ref = &mut *cx;
+                        prepare_desktop_linux_video(
+                            &mut cx_ref.os.gstreamer,
+                            &mut cx_ref.textures,
                             video_id,
-                            LinuxVideoPlayer::Software {
-                                player,
-                                yuv: yuv.clone(),
-                                yuv_matrix: 0.0,
-                            },
-                        );
-                        // Notify widget so it can bind textures to shader slots
-                        cx.call_event_handler(&Event::VideoYuvTexturesReady(
-                            VideoYuvTexturesReady {
-                                video_id,
-                                tex_y: yuv.tex_y,
-                                tex_u: yuv.tex_u,
-                                tex_v: yuv.tex_v,
-                            },
-                        ));
+                            source,
+                            texture_id,
+                            autoplay,
+                            should_loop,
+                            cx_ref.os.opengl_cx.as_ref(),
+                        )
+                    };
+                    match prep {
+                        LinuxPrepareResult::Ready { player, yuv } => {
+                            cx.os.video_players.insert(video_id, player);
+                            if let Some(yuv) = yuv {
+                                cx.call_event_handler(&Event::VideoYuvTexturesReady(
+                                    VideoYuvTexturesReady::planes(video_id, yuv.tex_y, yuv.tex_u, yuv.tex_v)
+                                        .with_external_opt(yuv.tex_y_oes, yuv.tex_u_oes),
+                                ));
+                            }
+                        }
+                        LinuxPrepareResult::Failed(error) => {
+                            cx.call_event_handler(&Event::VideoDecodingError(
+                                VideoDecodingErrorEvent { video_id, error },
+                            ));
+                        }
                     }
                 }
                 CxOsOp::BeginVideoPlayback(video_id) => {
@@ -905,12 +911,12 @@ impl X11Cx {
                     }
                 }
                 CxOsOp::MuteVideoPlayback(video_id) => {
-                    if let Some(player) = cx.os.video_players.get(&video_id) {
+                    if let Some(player) = cx.os.video_players.get_mut(&video_id) {
                         player.mute();
                     }
                 }
                 CxOsOp::UnmuteVideoPlayback(video_id) => {
-                    if let Some(player) = cx.os.video_players.get(&video_id) {
+                    if let Some(player) = cx.os.video_players.get_mut(&video_id) {
                         player.unmute();
                     }
                 }
@@ -928,7 +934,7 @@ impl X11Cx {
                     }
                 }
                 CxOsOp::SetVideoVolume(video_id, volume) => {
-                    if let Some(player) = cx.os.video_players.get(&video_id) {
+                    if let Some(player) = cx.os.video_players.get_mut(&video_id) {
                         player.set_volume(volume);
                     }
                 }
@@ -937,19 +943,27 @@ impl X11Cx {
                         player.set_playback_rate(rate);
                     }
                 }
+                CxOsOp::SelectVideoTrack(video_id, index) => {
+                    if let Some(player) = cx.os.video_players.get_mut(&video_id) {
+                        let _ = player.select_video_track(index);
+                    }
+                }
+                CxOsOp::SelectAudioTrack(video_id, index) => {
+                    if let Some(player) = cx.os.video_players.get_mut(&video_id) {
+                        let _ = player.select_audio_track(index);
+                    }
+                }
                 CxOsOp::AttachCameraNativePreview { .. }
                 | CxOsOp::UpdateCameraNativePreview { .. }
                 | CxOsOp::DetachCameraNativePreview { .. } => {
                     // Native camera preview is emulated via composited texture path on Linux.
                 }
                 CxOsOp::PrepareAudioPlayback(video_id, source, autoplay, should_loop) => {
-                    if cx
-                        .os
-                        .video_players
-                        .get(&video_id)
-                        .map_or(false, |p| p.is_active())
-                    {
-                        continue;
+                    if let Some(mut player) = cx.os.video_players.remove(&video_id) {
+                        player.cleanup();
+                        cx.call_event_handler(&Event::VideoPlaybackResourcesReleased(
+                            VideoPlaybackResourcesReleasedEvent { video_id },
+                        ));
                     }
                     if cx.os.gstreamer.is_none() {
                         match super::super::gstreamer_sys::LibGStreamer::try_load() {

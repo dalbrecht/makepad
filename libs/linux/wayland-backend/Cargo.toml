@@ -59,14 +59,14 @@ name = "rs_sys_impls"
 path = "tests/rs_sys_impls.rs"
 
 [dependencies.downcast-rs]
+path = "../downcast-rs"
 version = "1.2"
 
 [dependencies.log]
-version = "0.4"
+package = "makepad-error-log"
+path = "../../error_log"
+version = "1.0.0"
 optional = true
-
-[dependencies.libc]
-version = "0.2"
 
 [dependencies.raw-window-handle]
 version = "0.5.0"
@@ -78,6 +78,7 @@ optional = true
 package = "raw-window-handle"
 
 [dependencies.scoped-tls]
+path = "../scoped-tls"
 version = "1.0"
 optional = true
 
@@ -100,4 +101,5 @@ version = "1.1"
 version = "0.10"
 
 [dev-dependencies.scoped-tls]
+path = "../scoped-tls"
 version = "1.0"

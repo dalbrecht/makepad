@@ -28,6 +28,7 @@ pub struct AAsset {
     _unused: [u8; 0],
 }
 
+pub const AASSET_MODE_STREAMING: ::std::os::raw::c_uint = 2;
 pub const AASSET_MODE_BUFFER: ::std::os::raw::c_uint = 3;
 
 #[link(name = "android")]
@@ -54,15 +55,55 @@ extern "C" {
         assetManager: jni_sys::jobject,
     ) -> *mut AAssetManager;
 
-    pub fn ANativeWindow_setFrameRate(
-        window: *mut ANativeWindow,
-        frameRate: f32,
-        compatibility: i8,
-    ) -> i32;
+    // NOTE: `ANativeWindow_setFrameRate` is deliberately NOT declared here.
+    // It is API 30+; a plain `extern "C"` strong reference to it would break
+    // `dlopen` of libmakepad.so on API 26-29 devices. If surface frame-rate
+    // control is wanted, resolve it via `dlsym(libandroid.so, ...)` gated on
+    // `sdk_version >= 30`, the same way the Choreographer post-callbacks are
+    // handled below.
 
+    // AHardwareBuffer_acquire / _release are API 26 — safe at the minSdk floor.
     pub fn AHardwareBuffer_acquire(buffer: *mut AHardwareBuffer);
     pub fn AHardwareBuffer_release(buffer: *mut AHardwareBuffer);
 }
+
+// The shared-frame transport between a host and its hosted children
+// (`android_hosted`); all API 26, in libnativewindow.
+#[link(name = "nativewindow")]
+extern "C" {
+    pub fn AHardwareBuffer_allocate(
+        desc: *const AHardwareBuffer_Desc,
+        out_buffer: *mut *mut AHardwareBuffer,
+    ) -> ::std::os::raw::c_int;
+    pub fn AHardwareBuffer_describe(
+        buffer: *const AHardwareBuffer,
+        out_desc: *mut AHardwareBuffer_Desc,
+    );
+    pub fn AHardwareBuffer_sendHandleToUnixSocket(
+        buffer: *const AHardwareBuffer,
+        socket_fd: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+    pub fn AHardwareBuffer_recvHandleFromUnixSocket(
+        socket_fd: ::std::os::raw::c_int,
+        out_buffer: *mut *mut AHardwareBuffer,
+    ) -> ::std::os::raw::c_int;
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Default)]
+pub struct AHardwareBuffer_Desc {
+    pub width: u32,
+    pub height: u32,
+    pub layers: u32,
+    pub format: u32,
+    pub usage: u64,
+    pub stride: u32,
+    pub rfu0: u32,
+    pub rfu1: u64,
+}
+
+pub const AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM: u32 = 1;
+pub const AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT: u64 = 1 << 9;
 
 pub const AHARDWAREBUFFER_USAGE_CPU_READ_RARELY: u64 = 2;
 pub const AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN: u64 = 3;
@@ -83,21 +124,22 @@ pub type AChoreographerPostCallbackFn = unsafe extern "C" fn(
 
 #[cfg(not(no_android_choreographer))]
 extern "C" {
+    // AChoreographer_getInstance was introduced in API 24, so it's safe to
+    // link directly at our minSdk floor (26).
     pub fn AChoreographer_getInstance() -> *mut AChoreographer;
-    // Android SDK >= 33
-    pub fn AChoreographer_postVsyncCallback(
-        choreographer: *mut AChoreographer,
-        callback: Option<AChoreographer_vsyncCallback>,
-        data: *mut c_void,
-    ) -> i32;
-
-    // Android SDK < 33 && >= 29
-    pub fn AChoreographer_postFrameCallback64(
-        choreographer: *mut AChoreographer,
-        callback: Option<AChoreographer_vsyncCallback>,
-        data: *mut c_void,
-    ) -> i32;
 }
+
+// AChoreographer_postVsyncCallback (API 33) and AChoreographer_postFrameCallback64
+// (API 29) are deliberately NOT declared in an `extern "C"` block.
+//
+// A strong undefined reference to a symbol that doesn't exist on API 26-28
+// devices makes the entire `libmakepad.so` fail to `dlopen` at process start
+// (`UnsatisfiedLinkError: cannot locate symbol ...`), even if the call site is
+// runtime-gated behind an `sdk_version >= 29` check — the relocation is still
+// emitted. Rust's `extern "C"` can't express weak linkage on stable, so these
+// are instead resolved at runtime with `dlsym(libandroid.so, ...)` in
+// android_jni.rs, typed via `AChoreographerPostCallbackFn`, only on devices
+// where they actually exist.
 
 #[repr(C)]
 pub struct ANativeActivity {

@@ -1,11 +1,23 @@
 pub use makepad_code_editor;
 pub use makepad_widgets;
 
-use makepad_ai::*;
+use makepad_ai_hub::{
+    chat_wire::{
+        ChatMessage as HubChatMessage, ChatRole as HubChatRole, ProviderAvailability,
+        ProviderKind,
+    },
+    providers::{
+        claude_api::ClaudeApiChatProvider,
+        provider::{ChatProvider, ProviderEvent, TurnInput},
+    },
+};
 use makepad_widgets::makepad_platform::makepad_micro_serde::*;
+use makepad_widgets::makepad_platform::thread::SignalToUI;
 use makepad_widgets::*;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
 
-app_main!(App);
+app_main!(App, font_assets: [MATH_VIEW_FONT_ASSET]);
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -23,17 +35,29 @@ script_mod! {
             auto_tail: true
             smooth_tail: true
             selectable: true
+            // Drop (don't pool) items that leave the list so a removed glass message's overlay
+            // draw list is freed — the overlay flush then clears its stuck lensing widgets.
+            reuse_items: false
 
-            User := RoundedView {
+            User := glass.Card {
                 width: Fill
                 height: Fit
-                margin: Inset{top: 4 bottom: 4 left: 50 right: 8}
-                padding: Inset{left: 12 top: 8 right: 12 bottom: 8}
+                // Extra vertical margin gives the (now smaller) shadow room so it isn't clipped by
+                // the list-item bounds - the glass shader expands the quad by shadow_radius.
+                margin: Inset{top: 8 bottom: 10 left: 50 right: 8}
+                padding: Inset{left: 14 top: 10 right: 14 bottom: 10}
                 flow: Overlay
-                show_bg: true
+                // Frosted blue glass message bubble: refracts the vector backdrop and tints it
+                // blue, instead of a flat solid fill.
                 draw_bg +: {
-                    color: #3a5a8a
-                    radius: 8.0
+                    corner_radius: 10.0
+                    tint_color: #x6fa6ff
+                    tint_alpha: 0.16
+                    lensing_effect: 0.5
+                    border_alpha: 0.5
+                    // Smaller, tighter shadow so it doesn't read as fat or get cut off.
+                    shadow_radius: 9.0
+                    shadow_offset: vec2(0.0, 3.0)
                 }
 
                 selectable := Markdown {
@@ -59,6 +83,7 @@ script_mod! {
                         width: Fill
                         height: Fit
                         splash_view := Splash {
+                            allow_net: true
                             width: Fill
                             height: Fit
                         }
@@ -96,8 +121,10 @@ script_mod! {
                 padding: Inset{left: 12 top: 8 right: 12 bottom: 8}
                 flow: Overlay
                 show_bg: true
+                // Transparent assistant bubble so glass UIs rendered inside refract the window
+                // backdrop (an opaque bubble would be all the glass could "see").
                 draw_bg +: {
-                    color: #2a2a3a
+                    color: #2a2a3a00
                     radius: 8.0
                 }
 
@@ -140,6 +167,7 @@ script_mod! {
                             width: Fill
                             height: Fit
                             splash_view := Splash {
+                                allow_net: true
                                 flow: Overlay
                                 width: Fill
                                 height: Fit
@@ -180,9 +208,42 @@ script_mod! {
                 window.inner_size: vec2(900, 700)
                 window.title: "AI Chat"
                 body +: {
-                    flow: Down
-                    padding: Inset{left: 16 top: 16 right: 16 bottom: 16}
-                    spacing: 12
+                    flow: Overlay
+                    show_bg: true
+                    draw_bg.color: #x05070e
+
+                    // Styled backdrop: a crisp VECTOR scene (resolution-independent) so the glass
+                    // UIs in the chat have real high-frequency detail to refract/blur. A pre-blurred
+                    // shader gradient blurs to nothing; hard vector edges (shapes, rings, ribbons,
+                    // dots) are exactly what makes the gauss lensing read as glass.
+                    Svg{
+                        width: Fill
+                        height: Fill
+                        // Drive the SVG's animateTransform clock (slowly drifting swirl drapes).
+                        animating: true
+                        draw_svg +: {
+                            // Stretch the art to fill the window (default preserve_aspect letterboxes
+                            // a fixed-ratio viewBox, leaving dead flat areas the glass can't lens).
+                            preserve_aspect: false
+                            svg: crate_resource("self:resources/background.svg")
+                        }
+                    }
+                    // Barely-there veil: just enough to seat the header text, but light enough
+                    // that the glass still refracts the FULL-brightness backdrop (a heavier veil
+                    // darkened the gauss and made the glass look black).
+                    View{
+                        width: Fill
+                        height: Fill
+                        show_bg: true
+                        draw_bg.color: #x05070e18
+                    }
+
+                    content_layer := View {
+                        width: Fill
+                        height: Fill
+                        flow: Down
+                        padding: Inset{left: 16 top: 16 right: 16 bottom: 16}
+                        spacing: 12
 
                     View {
                         width: Fill
@@ -204,8 +265,9 @@ script_mod! {
                         }
 
                         backend_dropdown := DropDown {
-                            width: 170
-                            labels: ["Claude Splash" "Claude (ACP)" "Claude (API)" "Gemini" "Gemini Splash" "OpenAI"]
+                            width: 150
+                            labels: ["Claude Splash" "Local OpenAI"]
+                            draw_text.text_style.font_size: 12
                         }
                     }
 
@@ -218,26 +280,29 @@ script_mod! {
                         spacing: 8
                         align: Align{y: 1.0}
 
-                        input := TextInput {
+                        input := glass.TextInput {
                             width: Fill
-                            height: Fit
+                            height: 42
                             empty_text: "Type a message... (Enter to send)"
                         }
 
-                        send_button := Button {
+                        send_button := glass.GlassButtonProminent {
                             text: "Send"
-                            width: 80
+                            width: 84
+                            height: 42
                         }
 
-                        cancel_button := Button {
+                        cancel_button := glass.GlassButton {
                             text: "Cancel"
-                            width: 80
+                            width: 84
+                            height: 42
                             visible: false
                         }
 
-                        clear_button := Button {
+                        clear_button := glass.GlassButton {
                             text: "Clear"
-                            width: 80
+                            width: 84
+                            height: 42
                         }
                     }
 
@@ -252,6 +317,7 @@ script_mod! {
                             draw_text.text_style.font_size: 10
                             draw_text.color: #888
                         }
+                    }
                     }
                 }
             }
@@ -316,8 +382,11 @@ impl ChatData {
     }
 
     pub fn load_from_disk() -> Vec<ChatMessage> {
+        // Use the saved log if there is one; on a fresh install (no save file yet) seed the chat
+        // with the bundled default history so the showcase opens with example apps instead of blank.
         std::fs::read_to_string(CHAT_SAVE_PATH)
             .ok()
+            .or_else(|| Some(include_str!("../resources/default_history.json").to_string()))
             .and_then(|s| SavedHistory::deserialize_json(&s).ok())
             .map(|saved| {
                 saved
@@ -408,67 +477,155 @@ impl Widget for ChatList {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BackendType {
-    ClaudeSplash,
-    ClaudeAcp,
-    ClaudeApi,
-    Gemini,
-    GeminiSplash,
-    OpenAi,
-}
-
-const ALL_BACKENDS: [BackendType; 6] = [
-    BackendType::ClaudeSplash,
-    BackendType::ClaudeAcp,
-    BackendType::ClaudeApi,
-    BackendType::Gemini,
-    BackendType::GeminiSplash,
-    BackendType::OpenAi,
-];
-
-impl BackendType {
-    fn to_index(self) -> usize {
-        ALL_BACKENDS.iter().position(|&b| b == self).unwrap()
-    }
-
-    fn from_index(index: usize) -> Option<Self> {
-        ALL_BACKENDS.get(index).copied()
-    }
-
-    fn status_label(self) -> &'static str {
-        match self {
-            Self::ClaudeSplash => "Active: Claude Splash (UI Agent via ACP)",
-            Self::ClaudeAcp => "Active: Claude (ACP via Zed)",
-            Self::ClaudeApi => "Active: Claude (API)",
-            Self::Gemini => "Active: Gemini",
-            Self::GeminiSplash => "Active: Gemini Splash (UI Agent)",
-            Self::OpenAi => "Active: OpenAI",
-        }
-    }
-
-    fn system_prompt(self) -> String {
-        match self {
-            Self::ClaudeSplash | Self::GeminiSplash => {
-                let splash_md_path =
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../splash.md");
-                let splash_md = std::fs::read_to_string(&splash_md_path)
-                    .unwrap_or_else(|_| include_str!("../../../splash.md").to_string());
-                format!(
-                    r#"You are an AI agent that can create on-demand UI using Makepad's Splash scripting language.
+fn claude_splash_system_prompt() -> String {
+    let splash_md_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../splash.md");
+    let splash_md = std::fs::read_to_string(&splash_md_path)
+        .unwrap_or_else(|_| include_str!("../../../splash.md").to_string());
+    format!(
+        r#"You are an AI agent that can create on-demand UI using Makepad's Splash scripting language.
 
 You can answer questions normally using markdown. But when it makes sense to show something visually — a layout, a UI mockup, a styled card, a button arrangement, an animation, or anything graphical — you should embed a ```runsplash code block in your markdown response. The content inside a ```runsplash block is live Splash script that will be rendered as real interactive UI inline in the chat.
 
-IMPORTANT: `use mod.prelude.widgets.*` is automatically prepended to every runsplash block — do NOT include it yourself. All widget names (View, Label, Button, etc.) are already in scope.
+IMPORTANT: `use mod.prelude.widgets.*` is automatically prepended to every runsplash block — do NOT include it yourself. All widget names (View, Label, Button, Image, etc.) are already in scope. AI Chat also enables the network sandbox and prepends `use mod.net`, so networked mini apps may use `net.http_request`, `http_resource(...)`, `parse_json()`, and `url_encode()` directly.
+
+For requests to create an app, tool, form, todo app, calculator, editor, or anything with buttons/inputs/lists, produce working Splash business logic inside the ```runsplash block. Splash supports local `let` state, `fn` functions, widget callbacks such as `on_click`, `on_return`, `on_change`, and `CheckBox{{on_click: |checked| ...}}`, plus `ui.<id>.render()`, `ui.<id>.text()`, and `ui.<id>.set_text(...)`.
+
+Do NOT say that event handlers, mutable state, or render hooks are unavailable in Splash. Do NOT fall back to Rust, `MatchEvent`, `PortalList`, host-app instructions, CLAUDE.md guidance, or project-file edits when the user asks for chat-rendered Splash. For UI/app generation requests, return the `runsplash` block only, with no explanatory prose before or after it.
 
 The block content is Splash script. It gets evaluated and rendered as a live widget tree. Do NOT wrap it in Root{{}} or Window{{}} — the content is placed directly inside a container.
 
 Here is the complete Splash scripting manual. Follow it exactly:
 
 {splash_md}"#
-                )
+    )
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum BackendType {
+    #[default]
+    ClaudeSplash,
+    LocalOpenAi,
+}
+
+const BACKENDS: [BackendType; 2] = [BackendType::ClaudeSplash, BackendType::LocalOpenAi];
+
+impl BackendType {
+    fn to_index(self) -> usize {
+        BACKENDS
+            .iter()
+            .position(|&backend| backend == self)
+            .unwrap()
+    }
+
+    fn from_index(index: usize) -> Option<Self> {
+        BACKENDS.get(index).copied()
+    }
+
+    fn status_label(self) -> &'static str {
+        match self {
+            Self::ClaudeSplash => "Active: Claude Splash (Claude Code)",
+            Self::LocalOpenAi => "Active: Local OpenAI stream at 10.0.0.168:8080",
+        }
+    }
+}
+
+enum AiWorkerCommand {
+    Send(TurnInput),
+    Cancel,
+}
+
+enum AiWorkerEvent {
+    Availability(ProviderAvailability),
+    Delta(String),
+    Done(String),
+    Error(String),
+}
+
+struct AiWorker {
+    command_tx: Sender<AiWorkerCommand>,
+    event_rx: Receiver<AiWorkerEvent>,
+}
+
+impl AiWorker {
+    fn new(cx: &mut Cx) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        if let Ok(task) = cx.spawn_worker(move || ai_worker_loop(command_rx, event_tx)) {
+            task.detach();
+        }
+        Self {
+            command_tx,
+            event_rx,
+        }
+    }
+
+    fn send(&self, input: TurnInput) -> Result<(), String> {
+        self.command_tx
+            .send(AiWorkerCommand::Send(input))
+            .map_err(|_| "AI provider worker ended".to_string())
+    }
+
+    fn cancel(&self) {
+        let _ = self.command_tx.send(AiWorkerCommand::Cancel);
+    }
+
+    fn poll(&self) -> Vec<AiWorkerEvent> {
+        self.event_rx.try_iter().collect()
+    }
+}
+
+fn emit_ai_worker_event(event_tx: &Sender<AiWorkerEvent>, event: AiWorkerEvent) -> bool {
+    if event_tx.send(event).is_err() {
+        return false;
+    }
+    SignalToUI::set_ui_signal();
+    true
+}
+
+fn ai_worker_loop(command_rx: Receiver<AiWorkerCommand>, event_tx: Sender<AiWorkerEvent>) {
+    let mut provider =
+        ClaudeApiChatProvider::from_env(ProviderKind::ClaudeCli, None);
+    if !emit_ai_worker_event(
+        &event_tx,
+        AiWorkerEvent::Availability(provider.availability()),
+    ) {
+        return;
+    }
+
+    loop {
+        match command_rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(AiWorkerCommand::Send(input)) => {
+                if let Err(error) = provider.begin_turn(&input) {
+                    if !emit_ai_worker_event(&event_tx, AiWorkerEvent::Error(error)) {
+                        return;
+                    }
+                }
             }
-            _ => "You are a helpful assistant. Be concise but thorough.".to_string(),
+            Ok(AiWorkerCommand::Cancel) => provider.cancel(),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                provider.cancel();
+                return;
+            }
+        }
+
+        for event in provider.poll() {
+            let event = match event {
+                ProviderEvent::Delta(text) => Some(AiWorkerEvent::Delta(text)),
+                ProviderEvent::Done { text } => Some(AiWorkerEvent::Done(text)),
+                ProviderEvent::Error(error) => Some(AiWorkerEvent::Error(error)),
+                ProviderEvent::FunctionCall { .. } => Some(AiWorkerEvent::Error(
+                    "AI provider requested an unsupported function".to_string(),
+                )),
+                ProviderEvent::Status { .. } | ProviderEvent::Serving(_) => None,
+            };
+            if let Some(event) = event {
+                if !emit_ai_worker_event(&event_tx, event) {
+                    provider.cancel();
+                    return;
+                }
+            }
         }
     }
 }
@@ -478,102 +635,29 @@ pub struct App {
     #[live]
     ui: WidgetRef,
     #[rust]
-    agent: Option<Box<dyn Agent>>,
+    ai_worker: Option<AiWorker>,
+    #[rust(false)]
+    current_prompt: bool,
     #[rust]
-    session_id: Option<SessionId>,
+    active_backend: BackendType,
     #[rust]
-    current_prompt: Option<PromptId>,
+    backend_available: bool,
     #[rust]
-    available_backends: Vec<BackendType>,
-    #[rust]
-    active_backend: Option<BackendType>,
-    #[rust]
-    history_injected: bool,
+    backend_unavailable_reason: String,
 }
 
 impl App {
-    fn detect_available_backends() -> Vec<BackendType> {
-        let mut available_backends = vec![];
-        if ClaudeAcpAgent::is_available() {
-            available_backends.push(BackendType::ClaudeSplash);
-            available_backends.push(BackendType::ClaudeAcp);
+    fn create_backend_session(&mut self, cx: &mut Cx, backend: BackendType) {
+        if let Some(worker) = &self.ai_worker {
+            worker.cancel();
         }
-        if Self::read_key_file("ANTHROPIC_API_KEY").is_some() {
-            available_backends.push(BackendType::ClaudeApi);
-        }
-        if Self::read_key_file("GOOGLE_API_KEY").is_some() {
-            available_backends.push(BackendType::Gemini);
-            available_backends.push(BackendType::GeminiSplash);
-        }
-        if Self::read_key_file("OPENAI_API_KEY").is_some() {
-            available_backends.push(BackendType::OpenAi);
-        }
-        available_backends
-    }
-
-    fn read_key_file(path: &str) -> Option<String> {
-        std::fs::read_to_string(path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    fn create_agent(&self, backend: BackendType) -> Option<Box<dyn Agent>> {
-        match backend {
-            BackendType::ClaudeSplash | BackendType::ClaudeAcp => ClaudeAcpAgent::is_available()
-                .then(|| Box::new(ClaudeAcpAgent::new()) as Box<dyn Agent>),
-            BackendType::ClaudeApi => Self::read_key_file("ANTHROPIC_API_KEY").map(|key| {
-                Box::new(StatelessBackendAdapter::new(Box::new(ClaudeBackend::new(
-                    BackendConfig::Claude {
-                        api_key: Some(key),
-                        oauth_token: None,
-                        model: "claude-sonnet-4-5-20250929".to_string(),
-                    },
-                )))) as Box<dyn Agent>
-            }),
-            BackendType::Gemini | BackendType::GeminiSplash => {
-                Self::read_key_file("GOOGLE_API_KEY").map(|key| {
-                    Box::new(StatelessBackendAdapter::new(Box::new(GeminiBackend::new(
-                        BackendConfig::Gemini {
-                            api_key: key,
-                            model: "gemini-3-pro-preview".to_string(),
-                        },
-                    )))) as Box<dyn Agent>
-                })
-            }
-            BackendType::OpenAi => Self::read_key_file("OPENAI_API_KEY").map(|key| {
-                Box::new(StatelessBackendAdapter::new(Box::new(OpenAiBackend::new(
-                    BackendConfig::OpenAI {
-                        api_key: key,
-                        model: "gpt-4o".to_string(),
-                        base_url: None,
-                        reasoning_effort: None,
-                    },
-                )))) as Box<dyn Agent>
-            }),
-        }
-    }
-
-    fn switch_backend(&mut self, cx: &mut Cx, backend: BackendType) {
-        if self.active_backend == Some(backend) {
-            return;
-        }
-        if let Some(agent) = self.create_agent(backend) {
-            self.agent = Some(agent);
-            self.active_backend = Some(backend);
-            self.session_id = None;
-            self.current_prompt = None;
-            self.history_injected = false;
-
-            let config = SessionConfig {
-                system_prompt: Some(backend.system_prompt()),
-                ..Default::default()
-            };
-            if let Some(agent) = &mut self.agent {
-                self.session_id = Some(agent.create_session(cx, config));
-            }
-            self.update_status(cx);
-        }
+        self.ai_worker = None;
+        self.current_prompt = false;
+        self.active_backend = backend;
+        self.backend_available = false;
+        self.backend_unavailable_reason.clear();
+        self.ai_worker = Some(AiWorker::new(cx));
+        self.update_status(cx);
     }
 
     fn clear_chat(&mut self, cx: &mut Cx) {
@@ -584,17 +668,11 @@ impl App {
             data.is_streaming = false;
             data.save_to_disk();
         }
-        self.history_injected = false;
-
-        if let Some(agent) = &mut self.agent {
-            let backend = self.active_backend.unwrap_or(BackendType::Gemini);
-            let config = SessionConfig {
-                system_prompt: Some(backend.system_prompt()),
-                ..Default::default()
-            };
-            self.session_id = Some(agent.create_session(cx, config));
-        }
-        self.ui.redraw(cx);
+        self.create_backend_session(cx, self.active_backend);
+        // Full repaint (not just ui.redraw) so the window overlay pass is rebuilt — the glass
+        // widgets draw into self-managed overlay draw lists, and a partial redraw can leave
+        // those stale lists composited (the "stuck glass after Clear" bug).
+        cx.redraw_all();
     }
 
     fn send_message(&mut self, cx: &mut Cx) {
@@ -604,12 +682,15 @@ impl App {
             return;
         }
 
-        let (agent, session_id) = match (&mut self.agent, self.session_id) {
-            (Some(agent), Some(session_id)) => (agent, session_id),
-            _ => return,
+        let Some(worker) = &self.ai_worker else {
+            return;
         };
+        if !self.backend_available {
+            self.update_status(cx);
+            return;
+        }
 
-        let items_len = {
+        let (items_len, messages) = {
             let mut data = CHAT_DATA.write().unwrap();
             data.messages.push(ChatMessage {
                 role: ChatRole::User,
@@ -617,37 +698,33 @@ impl App {
             });
             data.streaming_text.clear();
             data.is_streaming = true;
-            data.messages.len() + 1
+            let messages = data
+                .messages
+                .iter()
+                .map(|message| {
+                    HubChatMessage::new(
+                        match message.role {
+                            ChatRole::User => HubChatRole::User,
+                            ChatRole::Assistant => HubChatRole::Assistant,
+                        },
+                        message.text.clone(),
+                    )
+                })
+                .collect();
+            (data.messages.len() + 1, messages)
         };
         input.set_text(cx, "");
 
-        // Inject history on first prompt for stateless backends
-        if !self.history_injected && agent.is_stateless() {
-            let data = CHAT_DATA.read().unwrap();
-            let history: Vec<Message> = data.messages[..data.messages.len() - 1]
-                .iter()
-                .map(|m| match m.role {
-                    ChatRole::User => Message::user(&m.text),
-                    ChatRole::Assistant => Message::assistant(&m.text),
-                })
-                .collect();
-            drop(data);
-            if !history.is_empty() {
-                agent.inject_history(session_id, history);
-            }
-            self.history_injected = true;
+        let turn = TurnInput::new(claude_splash_system_prompt(), messages);
+        if let Err(error) = worker.send(turn) {
+            CHAT_DATA.write().unwrap().is_streaming = false;
+            self.ui
+                .label(cx, ids!(status_label))
+                .set_text(cx, &format!("Error: {}", error));
+            return;
         }
-
-        // ACP doesn't support system prompts via the protocol, so for ClaudeSplash
-        // we prepend the splash system prompt context to each user message.
-        let prompt_text = if self.active_backend == Some(BackendType::ClaudeSplash) {
-            let system = BackendType::ClaudeSplash.system_prompt();
-            format!("<system>\n{system}\n</system>\n\n{text}")
-        } else {
-            text
-        };
-        self.current_prompt = Some(agent.send_prompt(cx, session_id, &prompt_text));
-        self.ui.view(cx, ids!(cancel_button)).set_visible(cx, true);
+        self.current_prompt = true;
+        self.ui.widget(cx, ids!(cancel_button)).set_visible(cx, true);
 
         let chat_list = self.ui.widget(cx, ids!(chat_list));
         let list = chat_list.portal_list(cx, ids!(list));
@@ -657,8 +734,11 @@ impl App {
     }
 
     fn cancel_request(&mut self, cx: &mut Cx) {
-        if let (Some(agent), Some(prompt_id)) = (&mut self.agent, self.current_prompt.take()) {
-            agent.cancel_prompt(cx, prompt_id);
+        if self.current_prompt {
+            if let Some(worker) = &self.ai_worker {
+                worker.cancel();
+            }
+            self.current_prompt = false;
 
             let mut data = CHAT_DATA.write().unwrap();
             let text = std::mem::take(&mut data.streaming_text);
@@ -671,29 +751,34 @@ impl App {
             data.is_streaming = false;
             drop(data);
 
-            self.ui.view(cx, ids!(cancel_button)).set_visible(cx, false);
+            self.ui.widget(cx, ids!(cancel_button)).set_visible(cx, false);
             self.ui.redraw(cx);
         }
     }
 
     fn update_status(&self, cx: &mut Cx) {
-        let status = match self.active_backend {
-            Some(b) => b.status_label(),
-            None => "No backend selected",
+        let status = if self.backend_available {
+            self.active_backend.status_label().to_string()
+        } else if self.backend_unavailable_reason.is_empty() {
+            "Checking AI provider availability...".to_string()
+        } else {
+            format!("Unavailable: {}", self.backend_unavailable_reason)
         };
-        self.ui.label(cx, ids!(status_label)).set_text(cx, status);
+        self.ui
+            .label(cx, ids!(status_label))
+            .set_text(cx, &status);
     }
 }
 
 impl MatchEvent for App {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self.ui.button(cx, ids!(send_button)).clicked(actions) {
+        if self.ui.glass_button(cx, ids!(send_button)).clicked(actions) {
             self.send_message(cx);
         }
-        if self.ui.button(cx, ids!(cancel_button)).clicked(actions) {
+        if self.ui.glass_button(cx, ids!(cancel_button)).clicked(actions) {
             self.cancel_request(cx);
         }
-        if self.ui.button(cx, ids!(clear_button)).clicked(actions) {
+        if self.ui.glass_button(cx, ids!(clear_button)).clicked(actions) {
             self.clear_chat(cx);
         }
         if self
@@ -713,7 +798,10 @@ impl MatchEvent for App {
             .selected(actions)
         {
             if let Some(backend) = BackendType::from_index(index) {
-                self.switch_backend(cx, backend);
+                if backend != self.active_backend {
+                    self.cancel_request(cx);
+                    self.create_backend_session(cx, backend);
+                }
             }
         }
 
@@ -728,26 +816,17 @@ impl MatchEvent for App {
                     data.save_to_disk();
                 }
                 drop(data);
-                self.ui.redraw(cx);
+                // Full repaint so removing a glass message doesn't leave its overlay stuck.
+                cx.redraw_all();
             }
         }
     }
 
     fn handle_startup(&mut self, cx: &mut Cx) {
-        let default_backend = if self.available_backends.contains(&BackendType::ClaudeSplash) {
-            Some(BackendType::ClaudeSplash)
-        } else if self.available_backends.contains(&BackendType::GeminiSplash) {
-            Some(BackendType::GeminiSplash)
-        } else {
-            self.available_backends.first().copied()
-        };
-        if let Some(backend) = default_backend {
-            self.switch_backend(cx, backend);
-            self.ui
-                .drop_down(cx, ids!(backend_dropdown))
-                .set_selected_item(cx, backend.to_index());
-        }
-        self.update_status(cx);
+        self.create_backend_session(cx, self.active_backend);
+        self.ui
+            .drop_down(cx, ids!(backend_dropdown))
+            .set_selected_item(cx, self.active_backend.to_index());
     }
 }
 
@@ -760,25 +839,28 @@ impl AppMain for App {
 
     fn after_new_from_script(_vm: &mut ScriptVm, app: &mut Self) {
         CHAT_DATA.write().unwrap().messages = ChatData::load_from_disk();
-        app.available_backends = Self::detect_available_backends();
+        app.active_backend = BackendType::ClaudeSplash;
+        app.backend_available = false;
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
 
-        if let Some(agent) = &mut self.agent {
-            for event in agent.handle_event(cx, event) {
+        if let Some(worker) = &self.ai_worker {
+            for event in worker.poll() {
                 match event {
-                    AgentEvent::SessionReady { .. } => {
+                    AiWorkerEvent::Availability(ProviderAvailability::Available { .. }) => {
+                        self.backend_available = true;
+                        self.backend_unavailable_reason.clear();
                         self.update_status(cx);
                     }
-                    AgentEvent::SessionError { error, .. } => {
-                        self.ui
-                            .label(cx, ids!(status_label))
-                            .set_text(cx, &format!("Error: {}", error));
+                    AiWorkerEvent::Availability(ProviderAvailability::Unavailable { reason }) => {
+                        self.backend_available = false;
+                        self.backend_unavailable_reason = reason;
+                        self.update_status(cx);
                     }
-                    AgentEvent::TextDelta { text, .. } => {
+                    AiWorkerEvent::Delta(text) => {
                         let item_id = {
                             let mut data = CHAT_DATA.write().unwrap();
                             data.streaming_text.push_str(&text);
@@ -791,8 +873,11 @@ impl AppMain for App {
                         }
                         cx.redraw_all();
                     }
-                    AgentEvent::TurnComplete { .. } => {
+                    AiWorkerEvent::Done(full_text) => {
                         let mut data = CHAT_DATA.write().unwrap();
+                        if data.streaming_text.is_empty() {
+                            data.streaming_text = full_text;
+                        }
                         let text = std::mem::take(&mut data.streaming_text);
                         if !text.is_empty() {
                             data.messages.push(ChatMessage {
@@ -804,20 +889,19 @@ impl AppMain for App {
                         data.save_to_disk();
                         drop(data);
 
-                        self.current_prompt = None;
-                        self.ui.view(cx, ids!(cancel_button)).set_visible(cx, false);
+                        self.current_prompt = false;
+                        self.ui.widget(cx, ids!(cancel_button)).set_visible(cx, false);
                         cx.redraw_all();
                     }
-                    AgentEvent::PromptError { error, .. } => {
+                    AiWorkerEvent::Error(error) => {
                         CHAT_DATA.write().unwrap().is_streaming = false;
-                        self.current_prompt = None;
-                        self.ui.view(cx, ids!(cancel_button)).set_visible(cx, false);
+                        self.current_prompt = false;
+                        self.ui.widget(cx, ids!(cancel_button)).set_visible(cx, false);
                         self.ui
                             .label(cx, ids!(status_label))
                             .set_text(cx, &format!("Error: {}", error));
                         cx.redraw_all();
                     }
-                    AgentEvent::ToolRequest { .. } => {}
                 }
             }
         }

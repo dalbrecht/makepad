@@ -1,11 +1,15 @@
-use super::sdk::{AndroidSDKUrls, BUILD_TOOLS_DIR, PLATFORMS_DIR};
-use crate::android::{AndroidConfig, AndroidTarget, AndroidVariant, HostOs};
+use super::sdk::{AndroidSDKUrls, BUILD_TOOLS_DIR, BUNDLETOOL_JAR_REL, PLATFORMS_DIR};
+use crate::android::{AndroidConfig, AndroidTarget, AndroidVariant, HostOs, ManifestArgs};
+use crate::font_assets::{is_font_path, remove_existing_fonts, FontAssetManifest, FontPackage};
 use crate::makepad_shell::*;
 use crate::utils::*;
+use makepad_zip_file::*;
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashSet},
     fs,
+    fs::File,
     hash::{Hash, Hasher},
+    io::Write,
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -16,6 +20,222 @@ fn aapt_path(sdk_dir: &Path, urls: &AndroidSDKUrls) -> PathBuf {
         .join(BUILD_TOOLS_DIR)
         .join(urls.build_tools_version)
         .join("aapt")
+}
+
+fn aapt2_path(sdk_dir: &Path, urls: &AndroidSDKUrls) -> PathBuf {
+    sdk_dir
+        .join(BUILD_TOOLS_DIR)
+        .join(urls.build_tools_version)
+        .join("aapt2")
+}
+
+fn bundletool_jar_path(sdk_dir: &Path) -> PathBuf {
+    sdk_dir.join(BUNDLETOOL_JAR_REL)
+}
+
+fn keytool_path(sdk_dir: &Path) -> PathBuf {
+    let bundled = sdk_dir.join("openjdk/bin/keytool");
+    if bundled.is_file() {
+        return bundled;
+    }
+    let bundled_exe = sdk_dir.join("openjdk/bin/keytool.exe");
+    if bundled_exe.is_file() {
+        return bundled_exe;
+    }
+    // Fall back to bundled path even if missing — caller will surface the error
+    // when keytool is invoked. We don't search PATH here because creating a
+    // keystore is a one-time setup; a clear error pointing at install-toolchain
+    // is better than silently using whatever the user has.
+    bundled
+}
+
+/// Path to the `<keystore>.makepad` metadata file written next to a keystore by
+/// `keystore-create`. Plain `key = value` text, intentionally password-free.
+pub fn keystore_sidecar_path(keystore: &Path) -> PathBuf {
+    let mut name = keystore
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".makepad");
+    keystore.with_file_name(name)
+}
+
+#[derive(Debug, Default)]
+pub struct KeystoreSidecar {
+    pub alias: Option<String>,
+    pub store_type: Option<String>,
+}
+
+pub fn read_keystore_sidecar(keystore: &Path) -> Option<KeystoreSidecar> {
+    let path = keystore_sidecar_path(keystore);
+    let text = fs::read_to_string(&path).ok()?;
+    let mut sc = KeystoreSidecar::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim().trim_matches('"').to_string();
+        match key {
+            "alias" => sc.alias = Some(val),
+            "store_type" => sc.store_type = Some(val),
+            _ => {}
+        }
+    }
+    Some(sc)
+}
+
+fn write_keystore_sidecar(keystore: &Path, sc: &KeystoreSidecar) -> Result<(), String> {
+    let path = keystore_sidecar_path(keystore);
+    let mut body = String::from(
+        "# Keystore metadata written by `cargo makepad android keystore-create`.\n\
+         # Safe to commit: contains no passwords. `cargo makepad android build-aab` reads this\n\
+         # next to the keystore so you only need to pass --keystore + password on each build.\n",
+    );
+    if let Some(alias) = &sc.alias {
+        body.push_str(&format!("alias = {alias}\n"));
+    }
+    if let Some(store_type) = &sc.store_type {
+        body.push_str(&format!("store_type = {store_type}\n"));
+    }
+    fs::write(&path, body).map_err(|e| format!("Cant write {:?}: {e}", path))
+}
+
+pub struct KeystoreCreateOpts {
+    pub keystore_path: PathBuf,
+    pub alias: String,
+    pub validity_days: u32,
+    pub key_size: u32,
+    pub key_alg: String,
+    pub store_type: String,
+    pub dname: Option<String>,
+}
+
+pub fn keystore_create(sdk_dir: &Path, opts: &KeystoreCreateOpts) -> Result<(), String> {
+    if opts.keystore_path.exists() {
+        return Err(format!(
+            "Refusing to overwrite existing file {:?}. Pick a new path or delete the existing keystore first.",
+            opts.keystore_path
+        ));
+    }
+    let keytool = keytool_path(sdk_dir);
+    if !keytool.is_file() {
+        return Err(format!(
+            "keytool not found at {:?}. Run `cargo makepad android install-toolchain` to download it.",
+            keytool
+        ));
+    }
+    if let Some(parent) = opts.keystore_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            mkdir(parent)?;
+        }
+    }
+
+    println!("================================================================================");
+    println!("CREATING ANDROID UPLOAD KEYSTORE");
+    println!("================================================================================");
+    println!();
+    println!("  This keystore is your *upload key* for the Google Play Store.");
+    println!();
+    println!("  CRITICAL — you MUST keep this file and its password forever:");
+    println!("    * If you lose either, you cannot push updates to your Play Store listing");
+    println!("      without going through Google's manual key-recovery process.");
+    println!("    * Back up the keystore file AND the password somewhere safe");
+    println!("      (password manager, offline copy, secret manager).");
+    println!("    * Do not commit the keystore to a public git repository.");
+    println!();
+    println!("  keytool will now prompt you for:");
+    println!("    1. A keystore password (you'll need this on every build).");
+    println!("    2. Your name / org / city / country (goes into the certificate; permanent).");
+    println!("    3. A key password — press Enter to reuse the keystore password (recommended).");
+    println!();
+    println!("================================================================================");
+    println!();
+
+    let java_home = sdk_dir.join("openjdk");
+    let cwd = std::env::current_dir().unwrap();
+
+    let validity = opts.validity_days.to_string();
+    let keysize = opts.key_size.to_string();
+    let keystore_str = opts.keystore_path.to_str().unwrap().to_string();
+
+    let mut args: Vec<String> = vec![
+        "-genkeypair".to_string(),
+        "-v".to_string(),
+        "-keystore".to_string(),
+        keystore_str,
+        "-alias".to_string(),
+        opts.alias.clone(),
+        "-keyalg".to_string(),
+        opts.key_alg.clone(),
+        "-keysize".to_string(),
+        keysize,
+        "-validity".to_string(),
+        validity,
+        "-storetype".to_string(),
+        opts.store_type.clone(),
+    ];
+    if let Some(dname) = &opts.dname {
+        args.push("-dname".to_string());
+        args.push(dname.clone());
+    }
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    // Use shell_env (interactive, not _cap) so keytool's prompts go straight
+    // to the terminal and the user can type passwords without echo.
+    shell_env(
+        &[("JAVA_HOME", java_home.to_str().unwrap())],
+        &cwd,
+        keytool.to_str().unwrap(),
+        &arg_refs,
+    )?;
+
+    write_keystore_sidecar(
+        &opts.keystore_path,
+        &KeystoreSidecar {
+            alias: Some(opts.alias.clone()),
+            store_type: Some(opts.store_type.clone()),
+        },
+    )?;
+
+    println!();
+    println!("================================================================================");
+    println!("KEYSTORE CREATED SUCCESSFULLY");
+    println!("================================================================================");
+    println!();
+    println!("  Keystore: {}", opts.keystore_path.display());
+    println!(
+        "  Metadata: {}  (alias auto-discovered by build-aab; safe to commit)",
+        keystore_sidecar_path(&opts.keystore_path).display()
+    );
+    println!();
+    println!("  BACK UP THE KEYSTORE FILE AND ITS PASSWORD NOW. Suggested locations:");
+    println!("    * 1Password / Bitwarden / your team's password manager");
+    println!("    * An offline encrypted backup (USB drive in a safe)");
+    println!("    * Your CI's secret store (GitHub Actions secrets, etc.) for automation");
+    println!();
+    println!("  Build a signed AAB with:");
+    println!(
+        "    cargo makepad android --keystore={} \\",
+        opts.keystore_path.display()
+    );
+    println!("        --keystore-pass=<password> \\");
+    println!("        build-aab -p <your-app> --release");
+    println!();
+    println!("  Or set MAKEPAD_KEYSTORE_PASS in your environment to skip the password flag:");
+    println!("    export MAKEPAD_KEYSTORE_PASS=<password>");
+    println!(
+        "    cargo makepad android --keystore={} build-aab -p <your-app> --release",
+        opts.keystore_path.display()
+    );
+    println!();
+    println!("================================================================================");
+
+    Ok(())
 }
 
 fn d8_jar_path(sdk_dir: &Path, urls: &AndroidSDKUrls) -> PathBuf {
@@ -64,13 +284,50 @@ pub struct BuildResult {
     java_url: String,
 }
 
-const SMALL_FONT_REPLACEMENTS: [(&str, &str); 5] = [
-    ("GoNotoKurrent-Bold.ttf", "IBMPlexSans-SemiBold.ttf"),
-    ("GoNotoKurrent-Regular.ttf", "IBMPlexSans-Text.ttf"),
-    ("LXGWWenKaiBold.ttf", "IBMPlexSans-Text.ttf"),
-    ("LXGWWenKaiRegular.ttf", "IBMPlexSans-Text.ttf"),
-    ("NotoColorEmoji.ttf", "IBMPlexSans-Text.ttf"),
-];
+impl BuildResult {
+    /// The signed, zipaligned APK the build produced.
+    pub fn apk(&self) -> &Path {
+        &self.dst_apk
+    }
+}
+
+/// The NDK clang cargo links `android_target` with: the value of the
+/// target's `CARGO_TARGET_<TRIPLE>_LINKER`. cargo hashes this string into
+/// every fingerprint, so a tree that must stay Fresh elsewhere (the
+/// super-app's on-device target/) records exactly this path.
+pub fn android_linker_path(
+    sdk_dir: &Path,
+    host_os: HostOs,
+    urls: &AndroidSDKUrls,
+    android_target: &AndroidTarget,
+) -> Result<PathBuf, String> {
+    let (_ndk_version, ndk_prebuilt_root) =
+        resolve_ndk_prebuilt_root(sdk_dir, host_os, urls.ndk_version_full)?;
+    let clang_filename = format!("{}{}-clang", android_target.clang(), urls.sdk_version);
+    Ok(ndk_prebuilt_root
+        .join("bin")
+        .join(host_bin_name(host_os, &clang_filename, "cmd")))
+}
+
+fn host_bin_name(host_os: HostOs, bin_filename: &str, windows_extension: &str) -> String {
+    match host_os {
+        HostOs::WindowsX64 => format!("{bin_filename}.{windows_extension}"),
+        HostOs::MacosX64 | HostOs::MacosAarch64 | HostOs::LinuxX64 => bin_filename.to_string(),
+        HostOs::Unsupported => panic!("unsupported host os"),
+    }
+}
+
+/// The `RUSTFLAGS` an Android `cargo rustc` for `android_target` runs with:
+/// the caller's flags, `-C prefer-dynamic` when asked, and the
+/// `--cfg android_target="<arch>"` the platform crate reads.
+pub fn android_rustflags(
+    existing: Option<&str>,
+    android_target: &AndroidTarget,
+    prefer_dynamic: bool,
+) -> String {
+    let cfg_flag = format!("--cfg android_target=\"{}\"", android_target.to_str());
+    compose_android_rustflags(existing, &cfg_flag, prefer_dynamic)
+}
 
 fn main_java(url: &str) -> String {
     format!(
@@ -107,8 +364,24 @@ fn has_explicit_lib_target(cargo_toml: &str, crate_dir: &Path) -> bool {
             .any(|line| line.trim_start().starts_with("[lib]"))
 }
 
+/// Turn a filesystem path into a Cargo.toml-friendly string.
+///
+/// On Windows, `Path::canonicalize()` often returns extended/verbatim paths
+/// (`\\?\C:\...`, `\\?\D:\...`, or `\\?\UNC\server\share\...`). Those prefixes
+/// are for Win32 APIs (bypass MAX_PATH); Cargo/TOML `path = "..."` does not
+/// accept them. Strip the prefix (any drive letter is left intact), keep UNC as
+/// `\\server\...`, then use forward slashes.
 fn normalize_toml_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let lossy = path.to_string_lossy();
+    let path = if let Some(rest) = lossy.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = lossy.strip_prefix(r"\\?\") {
+        // e.g. \\?\D:\foo -> D:\foo (C/D/E/... all use this branch)
+        rest.to_string()
+    } else {
+        lossy.into_owned()
+    };
+    path.replace('\\', "/")
 }
 
 fn absolutize_manifest_path(crate_dir: &Path, value: &str) -> String {
@@ -161,7 +434,7 @@ fn rewrite_relative_toml_value(line: &mut String, key: &str, crate_dir: &Path) {
     }
 }
 
-fn rewrite_wrapper_manifest_paths(cargo_toml: &str, crate_dir: &Path) -> String {
+pub(crate) fn rewrite_wrapper_manifest_paths(cargo_toml: &str, crate_dir: &Path) -> String {
     let mut out = String::with_capacity(cargo_toml.len() + 256);
     for raw_line in cargo_toml.lines() {
         let mut line = raw_line.to_string();
@@ -174,7 +447,7 @@ fn rewrite_wrapper_manifest_paths(cargo_toml: &str, crate_dir: &Path) -> String 
     out
 }
 
-fn extract_workspace_patch_sections(workspace_manifest: &str) -> String {
+pub(crate) fn extract_workspace_patch_sections(workspace_manifest: &str) -> String {
     let mut out = String::new();
     let mut current_section: Option<String> = None;
     let mut current_body = Vec::new();
@@ -344,7 +617,8 @@ fn rust_build(
     android_targets: &[AndroidTarget],
     variant: &AndroidVariant,
     urls: &AndroidSDKUrls,
-) -> Result<(), String> {
+    prefer_dynamic: bool,
+) -> Result<FontAssetManifest, String> {
     let cwd = std::env::current_dir().unwrap();
     let target_root = cargo_target_root(&cwd);
     let target_dir = cargo_target_dir(&cwd);
@@ -367,17 +641,29 @@ fn rust_build(
     };
     let (_ndk_version, ndk_prebuilt_root) =
         resolve_ndk_prebuilt_root(sdk_dir, host_os, urls.ndk_version_full)?;
+    // Derive ndk_root from ndk_prebuilt_root by going up through
+    // `toolchains/llvm/prebuilt/<host>/` (4 levels).
+    let ndk_root = ndk_prebuilt_root
+        .parent()
+        .unwrap() // prebuilt/
+        .parent()
+        .unwrap() // llvm/
+        .parent()
+        .unwrap() // toolchains/
+        .parent()
+        .unwrap() // ndk root
+        .to_path_buf();
+    let mut font_manifest = None;
     for android_target in android_targets {
-        let clang_filename = format!("{}{}-clang", android_target.clang(), urls.sdk_version);
+        let clangpp_filename = format!("{}{}-clang++", android_target.clang(), urls.sdk_version);
 
-        let bin_name = |bin_filename: &str, windows_extension: &str| match host_os {
-            HostOs::WindowsX64 => format!("{bin_filename}.{windows_extension}"),
-            HostOs::MacosX64 | HostOs::MacosAarch64 | HostOs::LinuxX64 => bin_filename.to_string(),
-            _ => panic!(),
+        let bin_name = |bin_filename: &str, windows_extension: &str| {
+            host_bin_name(host_os, bin_filename, windows_extension)
         };
-        let full_clang_path = ndk_prebuilt_root
+        let full_clang_path = android_linker_path(sdk_dir, host_os, urls, android_target)?;
+        let full_clangpp_path = ndk_prebuilt_root
             .join("bin")
-            .join(bin_name(&clang_filename, "cmd"));
+            .join(bin_name(&clangpp_filename, "cmd"));
         let full_llvm_ar_path = ndk_prebuilt_root
             .join("bin")
             .join(bin_name("llvm-ar", "exe"));
@@ -389,9 +675,13 @@ fn rust_build(
         let target_opt = format!("--target={toolchain}");
         let target_dir_arg = format!("--target-dir={target_dir_str}");
 
+        // Android builds on stable: all android targets are tier-2 and the
+        // build uses no nightly-only cargo/rustc features. `rustup run stable`
+        // pins the channel explicitly so it doesn't matter what the build
+        // crate's rust-toolchain.toml (if any) selects.
         let base_args = &[
             "run",
-            "nightly",
+            "stable",
             "cargo",
             "rustc",
             "--lib",
@@ -405,8 +695,11 @@ fn rust_build(
             args_out.push(arg);
         }
 
-        let target_arch_str = android_target.to_str();
-        let cfg_flag = format!("--cfg android_target=\"{}\"", target_arch_str);
+        let rustflags = android_rustflags(
+            std::env::var("RUSTFLAGS").ok().as_deref(),
+            android_target,
+            prefer_dynamic,
+        );
 
         let makepad_env = if let AndroidVariant::Quest = variant {
             Some(match std::env::var("MAKEPAD") {
@@ -450,8 +743,16 @@ fn rust_build(
             ),
             ("JAVA_HOME".to_string(), java_home),
             (
+                "ANDROID_NDK_ROOT".to_string(),
+                ndk_root.to_string_lossy().to_string(),
+            ),
+            (
                 format!("CC_{toolchain}"),
                 full_clang_path.to_string_lossy().to_string(),
+            ),
+            (
+                format!("CXX_{toolchain}"),
+                full_clangpp_path.to_string_lossy().to_string(),
             ),
             (
                 format!("AR_{toolchain}"),
@@ -461,7 +762,12 @@ fn rust_build(
                 format!("RANLIB_{toolchain}"),
                 full_llvm_ranlib_path.to_string_lossy().to_string(),
             ),
-            ("RUSTFLAGS".to_string(), cfg_flag.clone()),
+            // The aws-lc-sys crate requires the cmake builder (not the cc builder)
+            // for Android cross-compilation targets. With ANDROID_NDK_ROOT set
+            // and the full NDK installed (via --full-ndk), cmake's built-in
+            // Android module handles the cross-compilation setup automatically.
+            ("AWS_LC_SYS_CMAKE_BUILDER".to_string(), "1".to_string()),
+            ("RUSTFLAGS".to_string(), rustflags),
         ];
         if let Some(makepad_env) = makepad_env {
             env.push(("MAKEPAD".to_string(), makepad_env));
@@ -472,9 +778,63 @@ fn rust_build(
             .collect::<Vec<_>>();
 
         shell_env(&env_refs, &cargo_cwd, "rustup", &args_out)?;
+
+        // Consume the native metadata immediately after each Cargo link, before any packaging
+        // step can transform or discard the artifact.
+        let profile = get_profile_from_args(args);
+        let artifact = target_dir.join(format!(
+            "{toolchain}/{profile}/lib{}.so",
+            build_crate.replace('-', "_")
+        ));
+        let current = FontAssetManifest::from_native_file(&artifact)?;
+        if let Some(previous) = &font_manifest {
+            if previous != &current {
+                return Err(format!(
+                    "font manifests differ between Android targets; {toolchain} does not match the first target"
+                ));
+            }
+        } else {
+            font_manifest = Some(current);
+        }
     }
 
-    Ok(())
+    font_manifest.ok_or_else(|| "cannot package Android resources without a target font manifest".to_string())
+}
+
+/// Builds the `RUSTFLAGS` value for an Android `cargo rustc` invocation.
+///
+/// `prefer_dynamic`: debug builds pass `true` (dynamically linked `std` keeps
+/// incremental relinks fast). Release and AAB builds pass `false` — `prefer-dynamic`
+/// makes Rust ship `std` as a separate `libstd-<hash>.so`, and the toolchain's
+/// prebuilt copy of that library is only 4 KB-page aligned, which fails Google
+/// Play's 16 KB page-size requirement for apps targeting Android 15+. Static
+/// `std` keeps the app a single self-contained, NDK-linked (16 KB-aligned) `.so`.
+fn compose_android_rustflags(existing: Option<&str>, cfg_flag: &str, prefer_dynamic: bool) -> String {
+    let mut rustflags = existing.unwrap_or_default().trim().to_string();
+    if prefer_dynamic {
+        let has_prefer_dynamic = rustflags
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == ["-C", "prefer-dynamic"])
+            || rustflags
+                .split_whitespace()
+                .any(|token| token == "-Cprefer-dynamic");
+
+        if !has_prefer_dynamic {
+            if !rustflags.is_empty() {
+                rustflags.push(' ');
+            }
+            rustflags.push_str("-C prefer-dynamic");
+        }
+    }
+    if !cfg_flag.trim().is_empty() {
+        if !rustflags.is_empty() {
+            rustflags.push(' ');
+        }
+        rustflags.push_str(cfg_flag.trim());
+    }
+    rustflags
 }
 
 /// Resolve the cargo target directory for android builds.
@@ -492,7 +852,7 @@ fn cargo_target_root(cwd: &Path) -> PathBuf {
     }
 }
 
-fn cargo_target_dir(cwd: &Path) -> PathBuf {
+pub fn cargo_target_dir(cwd: &Path) -> PathBuf {
     if std::env::var_os("CARGO_TARGET_DIR").is_some() {
         cargo_target_root(cwd)
     } else {
@@ -500,16 +860,180 @@ fn cargo_target_dir(cwd: &Path) -> PathBuf {
     }
 }
 
-fn prepare_build(
+/// Final, resolved values for the manifest + APK/AAB packaging inputs.
+/// Produced by `resolve_packaging_inputs` from CLI flags + Cargo.toml metadata
+/// + sensible defaults, then consumed by both `build` and `build_aab`.
+struct ResolvedPackagingInputs {
+    /// Android package id (`com.foo.bar`). Becomes both the manifest `package=`
+    /// attribute and the Java module path.
+    java_url: String,
+    /// Launcher label (`<application android:label="...">`).
+    app_label: String,
+    /// `android:versionCode` — monotonic integer, required by Play Store.
+    version_code: u32,
+    /// `android:versionName` — human-readable, e.g. "1.0.0".
+    version_name: String,
+    /// Effective NDK target / `android:minSdkVersion` for this build. None
+    /// means use the cargo-makepad default from `urls.sdk_version`. Validated
+    /// to be ≥ 21 (NDK floor) and ≤ `urls.target_sdk_version` (Android rule).
+    min_sdk_version_override: Option<usize>,
+}
+
+/// Resolve packaging inputs with priority: CLI flag > Cargo.toml metadata > built-in default.
+///
+/// Cargo.toml fields read:
+///   `[package].version`                                  -> default `version_name`
+///   `[package.metadata.packager].identifier`             -> default `package_name`
+///   `[package.metadata.packager].product_name`           -> default `app_label`
+///   `[package.metadata.makepad.android].version_code`    -> default `version_code`
+///   `[package.metadata.makepad.android].version_name`    -> overrides `[package].version`
+fn resolve_packaging_inputs(
     build_crate: &str,
-    java_url: &str,
-    app_label: &str,
-    variant: &AndroidVariant,
+    binary_name: &str,
+    package_name_flag: Option<String>,
+    app_label_flag: Option<String>,
+    version_code_flag: Option<VersionCodeStrategy>,
+    version_name_flag: Option<String>,
+    min_sdk_version_flag: Option<usize>,
     urls: &AndroidSDKUrls,
-) -> Result<BuildPaths, String> {
+) -> Result<ResolvedPackagingInputs, String> {
+    let underscore_binary = binary_name.replace('-', "_");
+    let metadata = read_android_package_metadata(build_crate);
+
+    let java_url = package_name_flag
+        .or(metadata.identifier.clone())
+        .unwrap_or_else(|| format!("dev.makepad.{underscore_binary}"));
+
+    let app_label = app_label_flag
+        .or(metadata.product_name.clone())
+        .unwrap_or_else(|| {
+            let mut chars = underscore_binary.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        });
+
+    let version_code_strategy = version_code_flag
+        .or(metadata.version_code)
+        .unwrap_or(VersionCodeStrategy::Explicit(1));
+    let version_code = version_code_strategy.resolve();
+
+    let version_name = version_name_flag
+        .or(metadata.version_name_override.clone())
+        .or(metadata.package_version.clone())
+        .unwrap_or_else(|| "1.0".to_string());
+
+    // Resolve and validate the per-app min SDK override. Default = unset,
+    // meaning the build uses `urls.sdk_version` as before. When set, must be:
+    //   - >= 21 (the NDK r28 floor for arm64; lower targets fail to build)
+    //   - <= `urls.target_sdk_version` (Android rule: minSdk <= targetSdk)
+    //   - >= `urls.sdk_version` (going *below* the cargo-makepad floor would
+    //     require knowing for sure that all NDK extern fns Makepad uses still
+    //     link cleanly at that lower API; we don't audit that automatically)
+    let min_sdk_version_override =
+        resolve_min_sdk_override(min_sdk_version_flag, metadata.min_sdk_version, urls)?;
+
+    Ok(ResolvedPackagingInputs {
+        java_url,
+        app_label,
+        version_code,
+        version_name,
+        min_sdk_version_override,
+    })
+}
+
+/// The validated per-app min SDK override: the flag, else the package
+/// metadata, else none. When set it must be ≥ 21 (the NDK r28 floor for
+/// arm64), ≤ `urls.target_sdk_version` (Android rule: minSdk <= targetSdk)
+/// and ≥ `urls.sdk_version` (going below the audited floor would require
+/// knowing every NDK extern fn still links at that API).
+pub fn resolve_min_sdk_override(
+    min_sdk_version_flag: Option<usize>,
+    metadata_min_sdk_version: Option<usize>,
+    urls: &AndroidSDKUrls,
+) -> Result<Option<usize>, String> {
+    let min_sdk_version_override = min_sdk_version_flag.or(metadata_min_sdk_version);
+    if let Some(min) = min_sdk_version_override {
+        if min < 21 {
+            return Err(format!(
+                "min_sdk_version = {min} is below the NDK r28 arm64 floor of 21"
+            ));
+        }
+        if min > urls.target_sdk_version {
+            return Err(format!(
+                "min_sdk_version = {min} cannot exceed targetSdkVersion = {} (Android rule: minSdk <= targetSdk)",
+                urls.target_sdk_version
+            ));
+        }
+        if min < urls.sdk_version {
+            return Err(format!(
+                "min_sdk_version = {min} is below cargo-makepad's audited floor of {}. Lowering further requires verifying all NDK extern fns still link at API {min}; if you've done that audit, raise cargo-makepad's `urls.sdk_version` instead.",
+                urls.sdk_version
+            ));
+        }
+    }
+    Ok(min_sdk_version_override)
+}
+
+/// The SDK URLs `build` compiles `build_crate` with: `urls` with the
+/// package's effective min SDK (flag, else `[package.metadata.makepad.android]
+/// .min_sdk_version`) as `sdk_version`. What the NDK clang triple, the
+/// linker string and `android:minSdkVersion` come from.
+pub fn effective_sdk_urls(
+    build_crate: &str,
+    min_sdk_version_flag: Option<usize>,
+    urls: &AndroidSDKUrls,
+) -> Result<AndroidSDKUrls, String> {
+    let metadata = read_android_package_metadata(build_crate);
+    let mut effective = *urls;
+    if let Some(min) = resolve_min_sdk_override(min_sdk_version_flag, metadata.min_sdk_version, urls)? {
+        effective.sdk_version = min;
+    }
+    Ok(effective)
+}
+
+/// Inputs to `prepare_build`. Covers everything that influences the staged
+/// `tmp_dir/AndroidManifest.xml` so the file can vary per build mode (release
+/// APK vs debug APK vs Play Store AAB).
+pub struct PrepareBuildOpts<'a> {
+    pub build_crate: &'a str,
+    pub java_url: &'a str,
+    pub app_label: &'a str,
+    pub variant: &'a AndroidVariant,
+    pub urls: &'a AndroidSDKUrls,
+    pub version_code: u32,
+    pub version_name: &'a str,
+    pub debuggable: bool,
+}
+
+/// Replace `{key}` placeholders in a custom AndroidManifest template with the
+/// values cargo-makepad always knows. Used when the app crate ships its own
+/// `resources/android/AndroidManifest.xml.template`.
+fn substitute_manifest_template(template: &str, args: &ManifestArgs<'_>) -> String {
+    template
+        .replace("{label}", args.label)
+        .replace("{class_name}", args.class_name)
+        .replace("{package_id}", args.url)
+        .replace("{url}", args.url)
+        .replace("{min_sdk_version}", &args.sdk_version.to_string())
+        // `{sdk_version}` historically meant "the one SDK number" — alias to min
+        // so older templates keep compiling. New templates should prefer
+        // `{min_sdk_version}` / `{target_sdk_version}`.
+        .replace("{sdk_version}", &args.sdk_version.to_string())
+        .replace("{target_sdk_version}", &args.target_sdk_version.to_string())
+        .replace("{version_code}", &args.version_code.to_string())
+        .replace("{version_name}", args.version_name)
+        .replace(
+            "{debuggable}",
+            if args.debuggable { "true" } else { "false" },
+        )
+}
+
+fn prepare_build(opts: &PrepareBuildOpts<'_>) -> Result<BuildPaths, String> {
     let cwd = std::env::current_dir().unwrap();
     let target_dir = cargo_target_dir(&cwd);
-    let underscore_build_crate = build_crate.replace('-', "_");
+    let underscore_build_crate = opts.build_crate.replace('-', "_");
 
     let tmp_dir = target_dir
         .join("makepad-android-apk")
@@ -534,7 +1058,7 @@ fn prepare_build(
     let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     cp_all(&cargo_manifest_dir.join("src/android/res"), &res_dir, false)?;
 
-    let build_crate_dir = get_crate_dir(build_crate)?;
+    let build_crate_dir = get_crate_dir(opts.build_crate)?;
     let app_android_res = build_crate_dir.join("resources/android/res");
     if app_android_res.is_dir() {
         cp_all(&app_android_res, &res_dir, false)?;
@@ -557,26 +1081,47 @@ fn prepare_build(
         );
     }
 
-    let manifest_xml = variant.manifest_xml(
-        app_label,
-        "MakepadApp",
-        java_url,
-        urls.sdk_version,
-        has_android_icon,
-    );
+    let manifest_args = ManifestArgs {
+        label: opts.app_label,
+        class_name: "MakepadApp",
+        url: opts.java_url,
+        sdk_version: opts.urls.sdk_version,
+        target_sdk_version: opts.urls.target_sdk_version,
+        has_icon: has_android_icon,
+        version_code: opts.version_code,
+        version_name: opts.version_name,
+        debuggable: opts.debuggable,
+    };
+
+    // Custom manifest override: if `<crate>/resources/android/AndroidManifest.xml.template`
+    // exists, use it after substituting `{key}` placeholders. Useful for declaring a
+    // permissions/features set tailored to the app (Play Store rejects most of the
+    // default kitchen-sink permission list without justification).
+    let custom_template = build_crate_dir.join("resources/android/AndroidManifest.xml.template");
+    let manifest_xml = if custom_template.is_file() {
+        let template = fs::read_to_string(&custom_template)
+            .map_err(|e| format!("Cant read custom manifest {:?}: {e}", custom_template))?;
+        println!(
+            "Using custom AndroidManifest template: {}",
+            custom_template.display()
+        );
+        substitute_manifest_template(&template, &manifest_args)
+    } else {
+        opts.variant.manifest_xml(&manifest_args)
+    };
     let manifest_file = tmp_dir.join("AndroidManifest.xml");
     write_text(&manifest_file, &manifest_xml)?;
 
-    let main_java = main_java(java_url);
-    let java_path = java_url.replace('.', "/");
+    let main_java = main_java(opts.java_url);
+    let java_path = opts.java_url.replace('.', "/");
     let java_file = tmp_dir.join(&java_path).join("MakepadApp.java");
     write_text(&java_file, &main_java)?;
 
-    let xr_java = xr_java(java_url);
+    let xr_java = xr_java(opts.java_url);
     let xr_file = tmp_dir.join(&java_path).join("MakepadAppXr.java");
     write_text(&xr_file, &xr_java)?;
 
-    let apk_filename = to_snakecase(app_label);
+    let apk_filename = to_snakecase(opts.app_label);
     let dst_unaligned_apk = out_dir.join(format!("{apk_filename}.unaligned.apk"));
     let dst_apk = out_dir.join(format!("{apk_filename}.apk"));
 
@@ -653,12 +1198,14 @@ fn compile_java(
         makepad_java_classes_dir.join("MakepadActivity.java"),
         makepad_java_classes_dir.join("MakepadInputConnection.java"),
         makepad_java_classes_dir.join("MakepadNetwork.java"),
+        makepad_java_classes_dir.join("MakepadSpeech.java"),
         makepad_java_classes_dir.join("MakepadSocketStream.java"),
         makepad_java_classes_dir.join("MakepadWebSocket.java"),
         makepad_java_classes_dir.join("MakepadWebSocketReader.java"),
         makepad_java_classes_dir.join("ByteArrayMediaDataSource.java"),
         makepad_java_classes_dir.join("VideoPlayer.java"),
         makepad_java_classes_dir.join("VideoPlayerRunnable.java"),
+        makepad_java_classes_dir.join("OesDecodeSurface.java"),
         makepad_java_classes_dir.join("H264Encoder.java"),
         build_paths.java_file.clone(),
         build_paths.xr_file.clone(),
@@ -709,7 +1256,11 @@ fn compile_java(
     let android_jar = android_jar_path(sdk_dir, urls);
     let _ = rmdir(&build_paths.java_out_dir);
     mkdir(&build_paths.java_out_dir)?;
+    // Force UTF-8: Chinese Windows defaults javac to GBK, and UTF-8 comments
+    // (e.g. em dashes) then fail with "unmappable character".
     let mut javac_args = vec![
+        "-encoding",
+        "UTF-8",
         "-source",
         "1.8",
         "-target",
@@ -838,7 +1389,7 @@ fn ndk_version_sort_key(version: &str) -> Vec<u64> {
         .collect()
 }
 
-fn resolve_ndk_prebuilt_root(
+pub fn resolve_ndk_prebuilt_root(
     sdk_dir: &Path,
     host_os: HostOs,
     preferred_version: &str,
@@ -892,6 +1443,18 @@ fn resolve_ndk_prebuilt_root(
     Ok(versions.remove(0))
 }
 
+/// NDK host-prebuilt `llvm-readelf` path (`.exe` on Windows).
+pub fn llvm_readelf_path(ndk_prebuilt_root: &Path) -> Option<PathBuf> {
+    let bin = ndk_prebuilt_root.join("bin");
+    for name in ["llvm-readelf", "llvm-readelf.exe"] {
+        let candidate = bin.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Scan an ELF shared library for NEEDED entries using the NDK's llvm-readelf,
 /// then bundle any non-system shared libraries found in the NDK sysroot.
 ///
@@ -911,13 +1474,11 @@ fn bundle_ndk_shared_deps(
     let (_ndk_version, ndk_prebuilt_root) =
         resolve_ndk_prebuilt_root(sdk_dir, host_os, urls.ndk_version_full)?;
 
-    // Path to llvm-readelf shipped with the NDK.
-    let readelf_path = ndk_prebuilt_root.join("bin/llvm-readelf");
-    if !readelf_path.exists() {
+    let Some(readelf_path) = llvm_readelf_path(&ndk_prebuilt_root) else {
         // Gracefully skip when the NDK toolchain doesn't include llvm-readelf
         // (e.g. a stripped SDK install).
         return Ok(());
-    }
+    };
 
     // Run `llvm-readelf -d <so>` to list dynamic section entries.
     let cwd = std::env::current_dir().unwrap();
@@ -987,6 +1548,138 @@ fn bundle_ndk_shared_deps(
     Ok(())
 }
 
+pub fn read_needed_shared_libs(
+    sdk_dir: &Path,
+    host_os: HostOs,
+    urls: &AndroidSDKUrls,
+    so_path: &Path,
+) -> Result<Vec<String>, String> {
+    let (_ndk_version, ndk_prebuilt_root) =
+        resolve_ndk_prebuilt_root(sdk_dir, host_os, urls.ndk_version_full)?;
+
+    let Some(readelf_path) = llvm_readelf_path(&ndk_prebuilt_root) else {
+        return Ok(Vec::new());
+    };
+
+    let cwd = std::env::current_dir().unwrap();
+    let output = shell_env_cap(
+        &[],
+        &cwd,
+        readelf_path.to_str().unwrap(),
+        &["-d", so_path.to_str().unwrap()],
+    )?;
+
+    let mut libs = Vec::new();
+    for line in output.lines() {
+        if !line.contains("(NEEDED)") {
+            continue;
+        }
+        let Some(lib_name) = line.find('[').and_then(|start| {
+            line[start + 1..]
+                .find(']')
+                .map(|end| &line[start + 1..start + 1 + end])
+        }) else {
+            continue;
+        };
+        libs.push(lib_name.to_string());
+    }
+    Ok(libs)
+}
+
+fn bundle_local_shared_deps(
+    sdk_dir: &Path,
+    host_os: HostOs,
+    urls: &AndroidSDKUrls,
+    android_target: &AndroidTarget,
+    so_path: &Path,
+    abi: &str,
+    build_paths: &BuildPaths,
+    build_dir: &Path,
+) -> Result<(), String> {
+    let mut pending = vec![so_path.to_path_buf()];
+    let mut visited = HashSet::<String>::new();
+    let search_dirs = [build_dir.to_path_buf(), build_dir.join("deps")];
+
+    while let Some(current_so) = pending.pop() {
+        for lib_name in read_needed_shared_libs(sdk_dir, host_os, urls, &current_so)? {
+            if !visited.insert(lib_name.clone()) {
+                continue;
+            }
+
+            let binary_path = format!("lib/{abi}/{lib_name}");
+            let dst_lib = build_paths.out_dir.join(&binary_path);
+            if dst_lib.exists() {
+                continue;
+            }
+
+            let candidate = search_dirs
+                .iter()
+                .map(|dir| dir.join(&lib_name))
+                .find(|path| path.is_file())
+                .or_else(|| find_rustup_shared_lib(android_target, &lib_name));
+            let Some(candidate) = candidate else {
+                continue;
+            };
+
+            cp(&candidate, &dst_lib, false)?;
+            shell_env_cap(
+                &[],
+                &build_paths.out_dir,
+                aapt_path(sdk_dir, urls).to_str().unwrap(),
+                &[
+                    "add",
+                    build_paths.dst_unaligned_apk.to_str().unwrap(),
+                    &binary_path,
+                ],
+            )?;
+
+            // A local Rust dylib can still depend on NDK-provided shared libs.
+            bundle_ndk_shared_deps(
+                sdk_dir,
+                host_os,
+                urls,
+                android_target,
+                &dst_lib,
+                abi,
+                build_paths,
+            )?;
+
+            println!("  Bundled local shared dep: {lib_name} (for {abi})");
+            pending.push(candidate);
+        }
+    }
+
+    Ok(())
+}
+
+fn find_rustup_shared_lib(android_target: &AndroidTarget, lib_name: &str) -> Option<PathBuf> {
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            // Windows installs default to `%USERPROFILE%\.rustup`; Unix uses `$HOME`.
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|home| PathBuf::from(home).join(".rustup"))
+        })?;
+    let toolchains_dir = rustup_home.join("toolchains");
+    let tail = Path::new("lib")
+        .join("rustlib")
+        .join(android_target.toolchain())
+        .join("lib")
+        .join(lib_name);
+
+    for entry in fs::read_dir(toolchains_dir).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let candidate = entry.path().join(&tail);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn add_rust_library(
     sdk_dir: &Path,
     host_os: HostOs,
@@ -1013,7 +1706,8 @@ fn add_rust_library(
         let src_lib = target_dir.join(format!(
             "{android_target_dir}/{profile}/lib{underscore_target}.so"
         ));
-        build_dir = Some(target_dir.join(format!("{android_target_dir}/{profile}")));
+        let current_build_dir = target_dir.join(format!("{android_target_dir}/{profile}"));
+        build_dir = Some(current_build_dir.clone());
         let dst_lib = build_paths.out_dir.join(binary_path.clone());
         cp(&src_lib, &dst_lib, false)?;
 
@@ -1038,6 +1732,16 @@ fn add_rust_library(
             &dst_lib,
             abi,
             build_paths,
+        )?;
+        bundle_local_shared_deps(
+            sdk_dir,
+            host_os,
+            urls,
+            android_target,
+            &src_lib,
+            abi,
+            build_paths,
+            &current_build_dir,
         )?;
     }
     // for the quest variant add the precompiled openXR loader
@@ -1080,10 +1784,13 @@ fn add_resources(
     build_dir: &Path,
     android_targets: &[AndroidTarget],
     variant: &AndroidVariant,
-    config: &AndroidConfig,
+    font_manifest: &FontAssetManifest,
     urls: &AndroidSDKUrls,
 ) -> Result<(), String> {
     let mut assets_to_add: Vec<String> = Vec::new();
+    let package_root = build_paths.out_dir.join("assets/makepad");
+    remove_existing_fonts(&package_root)?;
+    let mut font_package = FontPackage::new(font_manifest);
 
     let build_crate_dir = get_crate_dir(build_crate)?;
     add_assets_dir_to_apk(
@@ -1092,7 +1799,7 @@ fn add_resources(
         build_crate,
         &build_crate_dir.join("resources"),
         "resources",
-        config,
+        &mut font_package,
     )?;
     add_font_assets_dir_to_apk(
         &build_paths.out_dir,
@@ -1100,7 +1807,7 @@ fn add_resources(
         build_crate,
         &build_crate_dir.join("fonts"),
         &build_crate_dir.join("resources"),
-        config,
+        &mut font_package,
     )?;
 
     let deps = get_crate_dep_dirs(build_crate, &build_dir, &android_targets[0].toolchain());
@@ -1111,7 +1818,7 @@ fn add_resources(
             name,
             &dep_dir.join("resources"),
             "resources",
-            config,
+            &mut font_package,
         )?;
         add_font_assets_dir_to_apk(
             &build_paths.out_dir,
@@ -1119,29 +1826,11 @@ fn add_resources(
             name,
             &dep_dir.join("fonts"),
             &dep_dir.join("resources"),
-            config,
+            &mut font_package,
         )?;
     }
-    // FIX THIS PROPER
-    // On quest remove most of the widget resourcse
-    if let AndroidVariant::Quest = variant {
-        let dst_dir = build_paths
-            .out_dir
-            .join(format!("assets/makepad/makepad_widgets/resources"));
-        let remove = [
-            "fa-solid-900.ttf",
-            //"LXGWWenKaiBold.ttf",
-            "LiberationMono-Regular.ttf",
-            //"GoNotoKurrent-Bold.ttf",
-            // "NotoColorEmoji.ttf",
-            //"IBMPlexSans-SemiBold.ttf",
-            "NotoSans-Regular.ttf",
-        ];
-        for remove in remove {
-            assets_to_add.retain(|v| !v.contains(remove));
-            rm(&dst_dir.join(remove))?;
-        }
-    }
+    let _ = variant;
+    font_package.finish()?.print();
 
     let mut aapt_args = vec!["add", build_paths.dst_unaligned_apk.to_str().unwrap()];
     for asset in &assets_to_add {
@@ -1158,13 +1847,55 @@ fn add_resources(
     Ok(())
 }
 
+// resources/ios is iOS-only; resources/android ships as runtime assets minus
+// the packaging inputs (manifest template, res/) already compiled into the package
+fn is_supported_font_asset(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "ttf" | "otf" | "ttc" | "woff" | "woff2"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn cp_android_runtime_assets(
+    source_dir: &Path,
+    dst_dir: &Path,
+    logical_prefix: &str,
+    font_package: &mut FontPackage<'_>,
+) -> Result<(), String> {
+    font_package.copy_tree_filtered(
+        source_dir,
+        dst_dir,
+        logical_prefix,
+        |relative| relative.starts_with("android") || relative.starts_with("ios"),
+        |_| Ok(()),
+    )?;
+    let android_src = source_dir.join("android");
+    if android_src.is_dir() {
+        font_package.copy_tree_filtered(
+            &android_src,
+            &dst_dir.join("android"),
+            &format!("{logical_prefix}/android"),
+            |relative| {
+                relative.starts_with("AndroidManifest.xml.template") || relative.starts_with("res")
+            },
+            |_| Ok(()),
+        )?;
+    }
+    Ok(())
+}
+
 fn add_assets_dir_to_apk(
     out_dir: &Path,
     assets_to_add: &mut Vec<String>,
     crate_name: &str,
     source_dir: &Path,
     asset_subdir: &str,
-    config: &AndroidConfig,
+    font_package: &mut FontPackage<'_>,
 ) -> Result<(), String> {
     if !source_dir.is_dir() {
         return Ok(());
@@ -1172,17 +1903,12 @@ fn add_assets_dir_to_apk(
 
     let crate_name = crate_name.replace('-', "_");
     let dst_dir = out_dir.join(format!("assets/makepad/{crate_name}/{asset_subdir}"));
-    mkdir(&dst_dir)?;
-    cp_all(source_dir, &dst_dir, false)?;
-    if config.small_fonts && asset_subdir == "resources" {
-        for (target_name, replacement_name) in SMALL_FONT_REPLACEMENTS {
-            let replacement = source_dir.join(replacement_name);
-            let target = dst_dir.join(target_name);
-            if replacement.is_file() && target.is_file() {
-                cp(&replacement, &target, false)?;
-            }
-        }
-    }
+    cp_android_runtime_assets(
+        source_dir,
+        &dst_dir,
+        &format!("{crate_name}/{asset_subdir}"),
+        font_package,
+    )?;
 
     let assets = ls(&dst_dir)?;
     for path in &assets {
@@ -1198,7 +1924,7 @@ fn add_font_assets_dir_to_apk(
     crate_name: &str,
     source_dir: &Path,
     resource_dir: &Path,
-    config: &AndroidConfig,
+    font_package: &mut FontPackage<'_>,
 ) -> Result<(), String> {
     if !source_dir.is_dir() {
         return Ok(());
@@ -1206,41 +1932,19 @@ fn add_font_assets_dir_to_apk(
 
     let crate_name = crate_name.replace('-', "_");
     let dst_dir = out_dir.join(format!("assets/makepad/{crate_name}/fonts"));
-    let assets = ls(source_dir)?;
-    for path in &assets {
-        let ext = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase());
-        if !matches!(
-            ext.as_deref(),
-            Some("ttf" | "otf" | "ttc" | "woff" | "woff2")
-        ) {
-            continue;
-        }
-        cp(&source_dir.join(path), &dst_dir.join(path), false)?;
+    font_package.copy_tree_filtered(
+        source_dir,
+        &dst_dir,
+        &format!("{crate_name}/fonts"),
+        |relative| {
+            !is_supported_font_asset(relative)
+                || (!is_font_path(relative) && resource_dir.join(relative).is_file())
+        },
+        |_| Ok(()),
+    )?;
+    for path in ls(&dst_dir)? {
         let path = path.display().to_string().replace("\\", "/");
         assets_to_add.push(format!("assets/makepad/{crate_name}/fonts/{path}"));
-    }
-    if config.small_fonts {
-        for (target_name, replacement_name) in SMALL_FONT_REPLACEMENTS {
-            let replacement = source_dir
-                .join(replacement_name)
-                .is_file()
-                .then(|| source_dir.join(replacement_name))
-                .or_else(|| {
-                    resource_dir
-                        .join(replacement_name)
-                        .is_file()
-                        .then(|| resource_dir.join(replacement_name))
-                });
-            let target = dst_dir.join(target_name);
-            if let Some(replacement) = replacement {
-                if target.is_file() {
-                    cp(&replacement, &target, false)?;
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -1250,16 +1954,30 @@ fn build_zipaligned_apk(
     build_paths: &BuildPaths,
     urls: &AndroidSDKUrls,
 ) -> Result<(), String> {
+    zipalign_apk(sdk_dir, urls, &build_paths.dst_unaligned_apk, &build_paths.dst_apk)
+}
+
+/// `zipalign -f 4 <unaligned> <aligned>` with the SDK's build tools.
+pub fn zipalign_apk(
+    sdk_dir: &Path,
+    urls: &AndroidSDKUrls,
+    unaligned: &Path,
+    aligned: &Path,
+) -> Result<(), String> {
+    let cwd = unaligned
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap());
     shell_env_cap(
         &[],
-        &build_paths.out_dir,
+        &cwd,
         zipalign_path(sdk_dir, urls).to_str().unwrap(),
         &[
             "-v",
             "-f",
             "4",
-            (build_paths.dst_unaligned_apk.to_str().unwrap()),
-            (build_paths.dst_apk.to_str().unwrap()),
+            (unaligned.to_str().unwrap()),
+            (aligned.to_str().unwrap()),
         ],
     )?;
 
@@ -1267,6 +1985,11 @@ fn build_zipaligned_apk(
 }
 
 fn sign_apk(sdk_dir: &Path, build_paths: &BuildPaths, urls: &AndroidSDKUrls) -> Result<(), String> {
+    sign_apk_debug(sdk_dir, urls, &build_paths.dst_apk)
+}
+
+/// Sign `apk` in place with the bundled debug keystore (apksigner).
+pub fn sign_apk_debug(sdk_dir: &Path, urls: &AndroidSDKUrls, apk: &Path) -> Result<(), String> {
     let cwd = std::env::current_dir().unwrap();
     let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let java_home = sdk_dir.join("openjdk");
@@ -1286,32 +2009,612 @@ fn sign_apk(sdk_dir: &Path, build_paths: &BuildPaths, urls: &AndroidSDKUrls) -> 
             "androiddebugkey",
             "--ks-pass",
             "pass:android",
-            (build_paths.dst_apk.to_str().unwrap()),
+            (apk.to_str().unwrap()),
         ],
     )?;
 
     Ok(())
 }
 
-pub fn build(
+// ============================================================================
+// AAB (Android App Bundle) build pipeline.
+//
+// Unlike the legacy APK pipeline which uses aapt v1 + apksigner, AABs require:
+//   1. aapt2 compile + aapt2 link --proto-format  -> proto-format base APK
+//   2. Repackage into the bundletool "module zip" layout
+//      (manifest/, dex/, res/, lib/, assets/, resources.pb)
+//   3. bundletool build-bundle -> .aab
+//   4. jarsigner               -> signed .aab
+//
+// The Play Store rejects debug-signed AABs, so the keystore is configurable.
+// ============================================================================
+
+/// Where to place the AAB-specific intermediate and output files.
+struct AabPaths {
+    staged_assets_dir: PathBuf,
+    staged_libs_dir: PathBuf,
+    compiled_res_zip: PathBuf,
+    proto_apk: PathBuf,
+    base_module_dir: PathBuf,
+    base_module_zip: PathBuf,
+    dst_aab: PathBuf,
+}
+
+fn prepare_aab_paths(build_crate: &str, app_label: &str) -> Result<AabPaths, String> {
+    let cwd = std::env::current_dir().unwrap();
+    let target_dir = cargo_target_dir(&cwd);
+    let underscore_build_crate = build_crate.replace('-', "_");
+    let aab_dir = target_dir
+        .join("makepad-android-aab")
+        .join(&underscore_build_crate);
+    let _ = rmdir(&aab_dir);
+    mkdir(&aab_dir)?;
+
+    let staged_assets_dir = aab_dir.join("assets");
+    let staged_libs_dir = aab_dir.join("lib");
+    let compiled_res_zip = aab_dir.join("compiled_res.zip");
+    let proto_apk = aab_dir.join("base_proto.apk");
+    let base_module_dir = aab_dir.join("base");
+    let base_module_zip = aab_dir.join("base.zip");
+    let dst_aab = aab_dir.join(format!("{}.aab", to_snakecase(app_label)));
+
+    mkdir(&staged_assets_dir)?;
+    mkdir(&staged_libs_dir)?;
+
+    Ok(AabPaths {
+        staged_assets_dir,
+        staged_libs_dir,
+        compiled_res_zip,
+        proto_apk,
+        base_module_dir,
+        base_module_zip,
+        dst_aab,
+    })
+}
+
+/// Mirror of `add_assets_dir_to_apk` that only stages files into a directory tree
+/// (no aapt invocation). Output structure: `<assets_root>/makepad/<crate>/<asset_subdir>/...`.
+fn stage_makepad_assets_subdir(
+    assets_root: &Path,
+    crate_name: &str,
+    source_dir: &Path,
+    asset_subdir: &str,
+    font_package: &mut FontPackage<'_>,
+) -> Result<(), String> {
+    if !source_dir.is_dir() {
+        return Ok(());
+    }
+    let crate_name = crate_name.replace('-', "_");
+    let dst_dir = assets_root.join(format!("makepad/{crate_name}/{asset_subdir}"));
+    cp_android_runtime_assets(
+        source_dir,
+        &dst_dir,
+        &format!("{crate_name}/{asset_subdir}"),
+        font_package,
+    )
+}
+
+/// Mirror of `add_font_assets_dir_to_apk` that only stages files into a directory tree.
+fn stage_makepad_font_subdir(
+    assets_root: &Path,
+    crate_name: &str,
+    source_dir: &Path,
+    resource_dir: &Path,
+    font_package: &mut FontPackage<'_>,
+) -> Result<(), String> {
+    if !source_dir.is_dir() {
+        return Ok(());
+    }
+    let crate_name = crate_name.replace('-', "_");
+    let dst_dir = assets_root.join(format!("makepad/{crate_name}/fonts"));
+    font_package.copy_tree_filtered(
+        source_dir,
+        &dst_dir,
+        &format!("{crate_name}/fonts"),
+        |relative| {
+            !is_supported_font_asset(relative)
+                || (!is_font_path(relative) && resource_dir.join(relative).is_file())
+        },
+        |_| Ok(()),
+    )
+}
+
+fn stage_aab_assets(
+    build_crate: &str,
+    assets_root: &Path,
+    build_dir: &Path,
+    android_targets: &[AndroidTarget],
+    variant: &AndroidVariant,
+    font_manifest: &FontAssetManifest,
+) -> Result<(), String> {
+    remove_existing_fonts(&assets_root.join("makepad"))?;
+    let mut font_package = FontPackage::new(font_manifest);
+    let build_crate_dir = get_crate_dir(build_crate)?;
+    stage_makepad_assets_subdir(
+        assets_root,
+        build_crate,
+        &build_crate_dir.join("resources"),
+        "resources",
+        &mut font_package,
+    )?;
+    stage_makepad_font_subdir(
+        assets_root,
+        build_crate,
+        &build_crate_dir.join("fonts"),
+        &build_crate_dir.join("resources"),
+        &mut font_package,
+    )?;
+
+    let deps = get_crate_dep_dirs(build_crate, build_dir, &android_targets[0].toolchain());
+    for (name, dep_dir) in deps.iter() {
+        stage_makepad_assets_subdir(
+            assets_root,
+            name,
+            &dep_dir.join("resources"),
+            "resources",
+            &mut font_package,
+        )?;
+        stage_makepad_font_subdir(
+            assets_root,
+            name,
+            &dep_dir.join("fonts"),
+            &dep_dir.join("resources"),
+            &mut font_package,
+        )?;
+    }
+    let _ = variant;
+    font_package.finish()?.print();
+    Ok(())
+}
+
+/// Mirror of `bundle_ndk_shared_deps` that only stages files into `libs_root/<abi>/`.
+fn stage_ndk_shared_deps_for_so(
+    sdk_dir: &Path,
+    host_os: HostOs,
+    urls: &AndroidSDKUrls,
+    android_target: &AndroidTarget,
+    so_path: &Path,
+    abi: &str,
+    libs_root: &Path,
+) -> Result<(), String> {
+    let (_ndk_version, ndk_prebuilt_root) =
+        resolve_ndk_prebuilt_root(sdk_dir, host_os, urls.ndk_version_full)?;
+    let Some(readelf_path) = llvm_readelf_path(&ndk_prebuilt_root) else {
+        return Ok(());
+    };
+    let cwd = std::env::current_dir().unwrap();
+    let output = shell_env_cap(
+        &[],
+        &cwd,
+        readelf_path.to_str().unwrap(),
+        &["-d", so_path.to_str().unwrap()],
+    )?;
+    let clang_triple = android_target.clang();
+    let sysroot_lib_dir = ndk_prebuilt_root.join("sysroot/usr/lib").join(clang_triple);
+    for line in output.lines() {
+        if !line.contains("(NEEDED)") {
+            continue;
+        }
+        let lib_name = match line.find('[').and_then(|start| {
+            line[start + 1..]
+                .find(']')
+                .map(|end| &line[start + 1..start + 1 + end])
+        }) {
+            Some(name) => name,
+            None => continue,
+        };
+        let candidate = sysroot_lib_dir.join(lib_name);
+        if !candidate.exists() || !candidate.is_file() {
+            continue;
+        }
+        let api_level_stub = sysroot_lib_dir
+            .join(urls.sdk_version.to_string())
+            .join(lib_name);
+        if api_level_stub.exists() {
+            continue;
+        }
+        let dst_lib = libs_root.join(abi).join(lib_name);
+        if dst_lib.exists() {
+            continue;
+        }
+        cp(&candidate, &dst_lib, false)?;
+        println!("  Bundled NDK shared dep: {lib_name} (for {abi})");
+    }
+    Ok(())
+}
+
+/// Mirror of `bundle_local_shared_deps` that only stages into `libs_root/<abi>/`.
+fn stage_local_shared_deps(
+    sdk_dir: &Path,
+    host_os: HostOs,
+    urls: &AndroidSDKUrls,
+    android_target: &AndroidTarget,
+    so_path: &Path,
+    abi: &str,
+    libs_root: &Path,
+    build_dir: &Path,
+) -> Result<(), String> {
+    let mut pending = vec![so_path.to_path_buf()];
+    let mut visited = HashSet::<String>::new();
+    let search_dirs = [build_dir.to_path_buf(), build_dir.join("deps")];
+    while let Some(current_so) = pending.pop() {
+        for lib_name in read_needed_shared_libs(sdk_dir, host_os, urls, &current_so)? {
+            if !visited.insert(lib_name.clone()) {
+                continue;
+            }
+            let dst_lib = libs_root.join(abi).join(&lib_name);
+            if dst_lib.exists() {
+                continue;
+            }
+            let candidate = search_dirs
+                .iter()
+                .map(|dir| dir.join(&lib_name))
+                .find(|path| path.is_file())
+                .or_else(|| find_rustup_shared_lib(android_target, &lib_name));
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            cp(&candidate, &dst_lib, false)?;
+            stage_ndk_shared_deps_for_so(
+                sdk_dir,
+                host_os,
+                urls,
+                android_target,
+                &dst_lib,
+                abi,
+                libs_root,
+            )?;
+            println!("  Bundled local shared dep: {lib_name} (for {abi})");
+            pending.push(candidate);
+        }
+    }
+    Ok(())
+}
+
+fn stage_aab_native_libs(
+    sdk_dir: &Path,
+    host_os: HostOs,
+    underscore_target: &str,
+    libs_root: &Path,
+    android_targets: &[AndroidTarget],
+    args: &[String],
+    variant: &AndroidVariant,
+    urls: &AndroidSDKUrls,
+) -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().unwrap();
+    let target_dir = cargo_target_dir(&cwd);
+    let profile = get_profile_from_args(args);
+    let mut build_dir = None;
+    for android_target in android_targets {
+        let abi = android_target.abi_identifier();
+        mkdir(&libs_root.join(abi))?;
+
+        let android_target_dir = android_target.toolchain();
+        if profile == "debug" {
+            println!("WARNING - compiling a DEBUG build of the application, this creates a very slow and big app. Try adding --release for a fast, or --profile=small for a small build.");
+        }
+        let src_lib = target_dir.join(format!(
+            "{android_target_dir}/{profile}/lib{underscore_target}.so"
+        ));
+        let current_build_dir = target_dir.join(format!("{android_target_dir}/{profile}"));
+        build_dir = Some(current_build_dir.clone());
+        let dst_lib = libs_root.join(abi).join("libmakepad.so");
+        cp(&src_lib, &dst_lib, false)?;
+
+        stage_ndk_shared_deps_for_so(
+            sdk_dir,
+            host_os,
+            urls,
+            android_target,
+            &dst_lib,
+            abi,
+            libs_root,
+        )?;
+        stage_local_shared_deps(
+            sdk_dir,
+            host_os,
+            urls,
+            android_target,
+            &src_lib,
+            abi,
+            libs_root,
+            &current_build_dir,
+        )?;
+    }
+    if let AndroidVariant::Quest = variant {
+        let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (rel_path, src_lib) in [("arm64-v8a/libopenxr_loader.so", "quest/libopenxr_loader.so")]
+        {
+            let src_lib = cargo_manifest_dir.join(src_lib);
+            let dst_lib = libs_root.join(rel_path);
+            cp(&src_lib, &dst_lib, false)?;
+        }
+    }
+    Ok(build_dir.unwrap())
+}
+
+fn aapt2_compile_resources(
+    sdk_dir: &Path,
+    res_dir: &Path,
+    out_zip: &Path,
+    urls: &AndroidSDKUrls,
+) -> Result<(), String> {
+    let cwd = std::env::current_dir().unwrap();
+    shell_env_cap(
+        &[],
+        &cwd,
+        aapt2_path(sdk_dir, urls).to_str().unwrap(),
+        &[
+            "compile",
+            "--dir",
+            res_dir.to_str().unwrap(),
+            "-o",
+            out_zip.to_str().unwrap(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn aapt2_link_proto_apk(
+    sdk_dir: &Path,
+    manifest_xml: &Path,
+    compiled_res_zip: &Path,
+    assets_dir: &Path,
+    out_apk: &Path,
+    urls: &AndroidSDKUrls,
+) -> Result<(), String> {
+    let cwd = std::env::current_dir().unwrap();
+    let android_jar = android_jar_path(sdk_dir, urls);
+    let android_jar_str = android_jar.to_str().unwrap().to_string();
+    let manifest_str = manifest_xml.to_str().unwrap().to_string();
+    let out_str = out_apk.to_str().unwrap().to_string();
+    let res_zip_str = compiled_res_zip.to_str().unwrap().to_string();
+    let assets_str = assets_dir.to_str().unwrap().to_string();
+
+    let has_assets = assets_dir.is_dir() && ls(assets_dir).map(|v| !v.is_empty()).unwrap_or(false);
+
+    let mut args: Vec<&str> = vec![
+        "link",
+        "--proto-format",
+        "--auto-add-overlay",
+        "-I",
+        &android_jar_str,
+        "--manifest",
+        &manifest_str,
+        "-o",
+        &out_str,
+    ];
+    if has_assets {
+        args.push("-A");
+        args.push(&assets_str);
+    }
+    args.push(&res_zip_str);
+    shell_env_cap(
+        &[],
+        &cwd,
+        aapt2_path(sdk_dir, urls).to_str().unwrap(),
+        &args,
+    )?;
+    Ok(())
+}
+
+/// Repackage a proto-format APK produced by `aapt2 link --proto-format` into
+/// the bundle module layout that bundletool expects, then zip it.
+///
+/// Layout produced under `base_dir`:
+///   manifest/AndroidManifest.xml   <- moved from APK root
+///   dex/classes.dex                <- copied from d8 output
+///   res/...                        <- carried from proto APK as-is
+///   resources.pb                   <- carried from proto APK
+///   assets/...                     <- carried from proto APK (added via aapt2 -A)
+///   lib/<abi>/*.so                 <- copied from staged libs dir
+fn assemble_aab_base_module(
+    sdk_dir: &Path,
+    proto_apk: &Path,
+    classes_dex: &Path,
+    libs_root: &Path,
+    base_dir: &Path,
+    base_zip: &Path,
+) -> Result<(), String> {
+    let _ = rmdir(base_dir);
+    mkdir(base_dir)?;
+
+    // Extract proto APK entries into the base dir, rewriting the manifest path.
+    let mut zip_file =
+        File::open(proto_apk).map_err(|e| format!("Cant open proto APK {:?}: {e}", proto_apk))?;
+    let directory = zip_read_central_directory(&mut zip_file)
+        .map_err(|e| format!("Cant read proto APK {:?}: {:?}", proto_apk, e))?;
+
+    for header in &directory.file_headers {
+        let entry_name = &header.file_name;
+        if entry_name.ends_with('/') {
+            continue;
+        }
+        let data = header
+            .extract(&mut zip_file)
+            .map_err(|e| format!("Failed to extract {entry_name} from proto APK: {:?}", e))?;
+        let dst_rel = if entry_name == "AndroidManifest.xml" {
+            "manifest/AndroidManifest.xml".to_string()
+        } else {
+            entry_name.clone()
+        };
+        let dst_path = base_dir.join(&dst_rel);
+        mkdir(dst_path.parent().unwrap())?;
+        let mut f =
+            File::create(&dst_path).map_err(|e| format!("Cant write {:?}: {e}", dst_path))?;
+        f.write_all(&data)
+            .map_err(|e| format!("Cant write to {:?}: {e}", dst_path))?;
+    }
+
+    // dex/classes.dex
+    cp(classes_dex, &base_dir.join("dex/classes.dex"), false)?;
+
+    // lib/<abi>/*.so (only if the staged libs dir actually has anything).
+    if libs_root.is_dir() && ls(libs_root).map(|v| !v.is_empty()).unwrap_or(false) {
+        cp_all(libs_root, &base_dir.join("lib"), false)?;
+    }
+
+    // Zip the base module using the bundled `jar` tool. `M` flag suppresses
+    // META-INF/MANIFEST.MF; bundletool rejects modules with an unexpected
+    // META-INF entry.
+    let java_home = sdk_dir.join("openjdk");
+    let jar_bin = java_home.join("bin/jar");
+    if base_zip.is_file() {
+        rm(base_zip)?;
+    }
+    shell_env_cap(
+        &[("JAVA_HOME", java_home.to_str().unwrap())],
+        base_dir,
+        jar_bin.to_str().unwrap(),
+        &["cMf", base_zip.to_str().unwrap(), "."],
+    )?;
+
+    Ok(())
+}
+
+fn run_bundletool_build_bundle(
+    sdk_dir: &Path,
+    base_zip: &Path,
+    aab_path: &Path,
+) -> Result<(), String> {
+    let java_home = sdk_dir.join("openjdk");
+    let bundletool = bundletool_jar_path(sdk_dir);
+    if !bundletool.is_file() {
+        return Err(format!(
+            "bundletool jar not found at {:?}. Re-run `cargo makepad android install-toolchain` to download it.",
+            bundletool
+        ));
+    }
+    if aab_path.is_file() {
+        rm(aab_path)?;
+    }
+    let cwd = std::env::current_dir().unwrap();
+    let modules_arg = format!("--modules={}", base_zip.display());
+    let output_arg = format!("--output={}", aab_path.display());
+    shell_env_cap(
+        &[("JAVA_HOME", java_home.to_str().unwrap())],
+        &cwd,
+        java_home.join("bin/java").to_str().unwrap(),
+        &[
+            "-jar",
+            bundletool.to_str().unwrap(),
+            "build-bundle",
+            &modules_arg,
+            &output_arg,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Pick a jarsigner binary from (in order): the bundled JDK, JAVA_HOME, PATH.
+fn resolve_jarsigner(sdk_dir: &Path) -> Option<PathBuf> {
+    let bundled = sdk_dir.join("openjdk/bin/jarsigner");
+    let bundled_exe = sdk_dir.join("openjdk/bin/jarsigner.exe");
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+    if bundled_exe.is_file() {
+        return Some(bundled_exe);
+    }
+    if let Some(java_home) = std::env::var_os("JAVA_HOME") {
+        let from_home = PathBuf::from(&java_home).join("bin/jarsigner");
+        let from_home_exe = PathBuf::from(&java_home).join("bin/jarsigner.exe");
+        if from_home.is_file() {
+            return Some(from_home);
+        }
+        if from_home_exe.is_file() {
+            return Some(from_home_exe);
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            for name in ["jarsigner", "jarsigner.exe"] {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
+pub struct AabSigningOpts {
+    pub keystore: PathBuf,
+    pub storepass: String,
+    pub key_alias: String,
+    pub keypass: String,
+}
+
+fn sign_aab(sdk_dir: &Path, aab_path: &Path, opts: &AabSigningOpts) -> Result<(), String> {
+    let jarsigner = resolve_jarsigner(sdk_dir).ok_or_else(|| {
+        "jarsigner not found. Re-run `cargo makepad android install-toolchain` to extract it, or set JAVA_HOME to a full JDK install."
+            .to_string()
+    })?;
+    let java_home = sdk_dir.join("openjdk");
+    let cwd = std::env::current_dir().unwrap();
+    shell_env_cap(
+        &[("JAVA_HOME", java_home.to_str().unwrap())],
+        &cwd,
+        jarsigner.to_str().unwrap(),
+        &[
+            "-keystore",
+            opts.keystore.to_str().unwrap(),
+            "-storepass",
+            &opts.storepass,
+            "-keypass",
+            &opts.keypass,
+            aab_path.to_str().unwrap(),
+            &opts.key_alias,
+        ],
+    )?;
+    Ok(())
+}
+
+pub struct BuildAabResult {
+    #[allow(dead_code)]
+    pub dst_aab: PathBuf,
+}
+
+pub fn build_aab(
     sdk_dir: &Path,
     host_os: HostOs,
     package_name: Option<String>,
     app_label: Option<String>,
+    version_code: Option<VersionCodeStrategy>,
+    version_name: Option<String>,
+    min_sdk_version: Option<usize>,
     args: &[String],
     android_targets: &[AndroidTarget],
     variant: &AndroidVariant,
-    config: &AndroidConfig,
+    _config: &AndroidConfig,
     urls: &AndroidSDKUrls,
-) -> Result<BuildResult, String> {
+    signing: Option<AabSigningOpts>,
+) -> Result<BuildAabResult, String> {
     let build_crate = get_build_crate_from_args(args)?;
     let binary_name =
         get_package_binary_name(build_crate).unwrap_or_else(|| build_crate.to_string());
-    let underscore_binary_name = binary_name.replace('-', "_");
     let underscore_build_crate = build_crate.replace('-', "_");
 
-    let java_url = package_name.unwrap_or_else(|| format!("dev.makepad.{underscore_binary_name}"));
-    let app_label = app_label.unwrap_or_else(|| underscore_binary_name.clone());
+    let resolved = resolve_packaging_inputs(
+        build_crate,
+        &binary_name,
+        package_name,
+        app_label,
+        version_code,
+        version_name,
+        min_sdk_version,
+        urls,
+    )?;
+    // Apply the per-app min SDK override by mutating a copy of urls. Downstream
+    // code (NDK clang triple, sysroot stub lookup, manifest emission) reads
+    // `urls.sdk_version`, so this single point of override propagates cleanly.
+    let mut effective_urls = *urls;
+    if let Some(min) = resolved.min_sdk_version_override {
+        effective_urls.sdk_version = min;
+    }
+    let urls = &effective_urls;
 
     if let Some(icon) = resolve_app_icon_env(build_crate)? {
         for (var, value) in APP_ICON_ENV_VARS.iter().zip(icon.iter()) {
@@ -1319,7 +2622,7 @@ pub fn build(
         }
     }
 
-    rust_build(
+    let font_manifest = rust_build(
         sdk_dir,
         host_os,
         build_crate,
@@ -1327,10 +2630,198 @@ pub fn build(
         android_targets,
         variant,
         urls,
+        // AAB: statically link `std` so the bundle has no separate libstd.so
+        // (the toolchain's prebuilt one is only 4 KB-page aligned, which fails
+        // Play's 16 KB page-size requirement).
+        false,
     )?;
-    let build_paths = prepare_build(build_crate, &java_url, &app_label, variant, urls)?;
+    // AABs uploaded to Play Store must have `android:debuggable="false"`. Force
+    // it here regardless of cargo profile so we never produce an unshippable AAB.
+    let prep_opts = PrepareBuildOpts {
+        build_crate,
+        java_url: &resolved.java_url,
+        app_label: &resolved.app_label,
+        variant,
+        urls,
+        version_code: resolved.version_code,
+        version_name: &resolved.version_name,
+        debuggable: false,
+    };
+    let build_paths = prepare_build(&prep_opts)?;
+    let aab_paths = prepare_aab_paths(build_crate, &resolved.app_label)?;
 
-    println!("Building APK");
+    println!(
+        "Building AAB (package={}, label={}, versionCode={}, versionName={})",
+        resolved.java_url, resolved.app_label, resolved.version_code, resolved.version_name
+    );
+
+    // Reuse the existing R-class / javac / d8 pipeline; outputs `classes.dex`
+    // into `build_paths.out_dir`.
+    build_r_class(sdk_dir, &build_paths, urls)?;
+    compile_java(sdk_dir, &build_paths, urls)?;
+    build_dex(sdk_dir, &build_paths, urls)?;
+    let classes_dex = build_paths.out_dir.join("classes.dex");
+    if !classes_dex.is_file() {
+        return Err(format!(
+            "d8 did not produce classes.dex at {:?}",
+            classes_dex
+        ));
+    }
+
+    // Stage native libs.
+    let build_dir = stage_aab_native_libs(
+        sdk_dir,
+        host_os,
+        &underscore_build_crate,
+        &aab_paths.staged_libs_dir,
+        android_targets,
+        args,
+        variant,
+        urls,
+    )?;
+
+    // Stage assets (mirrors `add_resources` / `add_assets_dir_to_apk` / font logic).
+    stage_aab_assets(
+        build_crate,
+        &aab_paths.staged_assets_dir,
+        &build_dir,
+        android_targets,
+        variant,
+        &font_manifest,
+    )?;
+
+    // aapt2 compile + link --proto-format. Assets are picked up via -A.
+    aapt2_compile_resources(
+        sdk_dir,
+        &build_paths.res_dir,
+        &aab_paths.compiled_res_zip,
+        urls,
+    )?;
+    aapt2_link_proto_apk(
+        sdk_dir,
+        &build_paths.manifest_file,
+        &aab_paths.compiled_res_zip,
+        &aab_paths.staged_assets_dir,
+        &aab_paths.proto_apk,
+        urls,
+    )?;
+
+    // Repackage proto APK into the bundle module layout, then zip it.
+    assemble_aab_base_module(
+        sdk_dir,
+        &aab_paths.proto_apk,
+        &classes_dex,
+        &aab_paths.staged_libs_dir,
+        &aab_paths.base_module_dir,
+        &aab_paths.base_module_zip,
+    )?;
+
+    // bundletool build-bundle
+    run_bundletool_build_bundle(sdk_dir, &aab_paths.base_module_zip, &aab_paths.dst_aab)?;
+
+    // Sign with jarsigner if a keystore was provided (or default).
+    if let Some(opts) = &signing {
+        sign_aab(sdk_dir, &aab_paths.dst_aab, opts)?;
+    } else {
+        println!("Skipping signing (--no-sign). The AAB is unsigned and will not be accepted by the Play Store as-is.");
+    }
+
+    println!("AAB Build completed: {}", aab_paths.dst_aab.display());
+    if let Some(opts) = &signing {
+        let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if opts.keystore == cargo_manifest_dir.join("debug.keystore") {
+            println!(
+                "NOTE: signed with the bundled debug keystore. The Play Store will reject this AAB. Pass --keystore=<path> --keystore-pass=<pw> --keystore-key-alias=<alias> --keystore-key-pass=<pw> to sign with a release keystore."
+            );
+        }
+    }
+
+    Ok(BuildAabResult {
+        dst_aab: aab_paths.dst_aab,
+    })
+}
+
+pub fn build(
+    sdk_dir: &Path,
+    host_os: HostOs,
+    package_name: Option<String>,
+    app_label: Option<String>,
+    version_code: Option<VersionCodeStrategy>,
+    version_name: Option<String>,
+    min_sdk_version: Option<usize>,
+    args: &[String],
+    android_targets: &[AndroidTarget],
+    variant: &AndroidVariant,
+    _config: &AndroidConfig,
+    urls: &AndroidSDKUrls,
+) -> Result<BuildResult, String> {
+    let build_crate = get_build_crate_from_args(args)?;
+    let binary_name =
+        get_package_binary_name(build_crate).unwrap_or_else(|| build_crate.to_string());
+    let underscore_build_crate = build_crate.replace('-', "_");
+
+    let resolved = resolve_packaging_inputs(
+        build_crate,
+        &binary_name,
+        package_name,
+        app_label,
+        version_code,
+        version_name,
+        min_sdk_version,
+        urls,
+    )?;
+    // Apply the per-app min SDK override; see the same pattern in `build_aab`.
+    let mut effective_urls = *urls;
+    if let Some(min) = resolved.min_sdk_version_override {
+        effective_urls.sdk_version = min;
+    }
+    let urls = &effective_urls;
+
+    if let Some(icon) = resolve_app_icon_env(build_crate)? {
+        for (var, value) in APP_ICON_ENV_VARS.iter().zip(icon.iter()) {
+            std::env::set_var(var, value);
+        }
+    }
+
+    let font_manifest = rust_build(
+        sdk_dir,
+        host_os,
+        build_crate,
+        args,
+        android_targets,
+        variant,
+        urls,
+        // Only debug builds keep `-C prefer-dynamic`, for faster incremental
+        // relinks. Nobody ships a debug apk, and anything else might be shipped.
+        get_profile_from_args(args) == "debug",
+    )?;
+    // For APK builds, debuggable matches the cargo profile: release -> false,
+    // anything else -> true (matches the historical behavior of `cargo makepad
+    // android run`). `MAKEPAD_ANDROID_DEBUGGABLE=1` makes a release APK
+    // debuggable: `proc-pack --proc-toolchain` sets it, so `adb shell run-as`
+    // reaches the source tree the phone builds its apps from.
+    let debuggable = get_profile_from_args(args) != "release"
+        || std::env::var("MAKEPAD_ANDROID_DEBUGGABLE").map(|v| v == "1").unwrap_or(false);
+    let prep_opts = PrepareBuildOpts {
+        build_crate,
+        java_url: &resolved.java_url,
+        app_label: &resolved.app_label,
+        variant,
+        urls,
+        version_code: resolved.version_code,
+        version_name: &resolved.version_name,
+        debuggable,
+    };
+    let build_paths = prepare_build(&prep_opts)?;
+
+    println!(
+        "Building APK (package={}, label={}, versionCode={}, versionName={}, debuggable={})",
+        resolved.java_url,
+        resolved.app_label,
+        resolved.version_code,
+        resolved.version_name,
+        debuggable
+    );
     build_r_class(sdk_dir, &build_paths, urls)?;
     compile_java(sdk_dir, &build_paths, urls)?;
     build_dex(sdk_dir, &build_paths, urls)?;
@@ -1352,7 +2843,7 @@ pub fn build(
         &build_dir,
         android_targets,
         variant,
-        config,
+        &font_manifest,
         urls,
     )?;
     build_zipaligned_apk(sdk_dir, &build_paths, urls)?;
@@ -1361,7 +2852,7 @@ pub fn build(
     println!("APK Build completed");
     Ok(BuildResult {
         dst_apk: build_paths.dst_apk,
-        java_url,
+        java_url: resolved.java_url,
     })
 }
 
@@ -1370,6 +2861,9 @@ pub fn run(
     host_os: HostOs,
     package_name: Option<String>,
     app_label: Option<String>,
+    version_code: Option<VersionCodeStrategy>,
+    version_name: Option<String>,
+    min_sdk_version: Option<usize>,
     args: &[String],
     targets: &[AndroidTarget],
     android_variant: &AndroidVariant,
@@ -1377,11 +2871,15 @@ pub fn run(
     urls: &AndroidSDKUrls,
     devices: Vec<String>,
 ) -> Result<(), String> {
+    let build_crate = get_build_crate_from_args(args)?;
     let result = build(
         sdk_dir,
         host_os,
         package_name,
         app_label,
+        version_code,
+        version_name,
+        min_sdk_version,
         args,
         targets,
         android_variant,
@@ -1392,7 +2890,7 @@ pub fn run(
     let cwd = std::env::current_dir().unwrap();
     // alright so how will we do multiple targets eh
 
-    fn android_start_args(java_url: &str) -> Vec<String> {
+    fn android_start_args(java_url: &str, build_crate: &str) -> Vec<String> {
         let mut args = vec![
             "shell".to_string(),
             "am".to_string(),
@@ -1401,15 +2899,18 @@ pub fn run(
             "-n".to_string(),
             format!("{0}/{0}.MakepadApp", java_url),
         ];
-        if let Ok(studio) = std::env::var("STUDIO") {
-            if !studio.trim().is_empty() {
-                println!("Android launch intent makepad.STUDIO={}", studio);
+        if let Ok(studio_host) = std::env::var("STUDIO_HOST") {
+            if !studio_host.trim().is_empty() {
+                println!("Android launch intent makepad.STUDIO_HOST={}", studio_host);
                 args.push("--es".to_string());
-                args.push("makepad.STUDIO".to_string());
-                args.push(studio);
+                args.push("makepad.STUDIO_HOST".to_string());
+                args.push(studio_host);
+                args.push("--es".to_string());
+                args.push("makepad.STUDIO_CRATE".to_string());
+                args.push(build_crate.to_string());
             }
         } else {
-            println!("Android launch intent makepad.STUDIO is not set");
+            println!("Android launch intent makepad.STUDIO_HOST is not set");
         }
         args
     }
@@ -1428,7 +2929,7 @@ pub fn run(
             ],
         )?;
         println!("Starting android application");
-        let start_args = android_start_args(&result.java_url);
+        let start_args = android_start_args(&result.java_url, build_crate);
         let start_args_refs = start_args
             .iter()
             .map(|arg| arg.as_str())
@@ -1482,7 +2983,7 @@ pub fn run(
         let mut children = Vec::new();
         println!("Starting android application");
         for device in &devices {
-            let start_args = android_start_args(&result.java_url);
+            let start_args = android_start_args(&result.java_url, build_crate);
             let mut device_args = vec!["-s".to_string(), device.clone()];
             device_args.extend(start_args);
             let device_args_refs = device_args
@@ -1687,7 +3188,58 @@ pub fn adb_tcp(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_adb_devices, parse_ip_addr_show, parse_ip_route};
+    use super::{
+        compose_android_rustflags, parse_adb_devices, parse_ip_addr_show, parse_ip_route,
+        stage_makepad_assets_subdir,
+    };
+    use crate::font_assets::{FontAssetManifest, FontPackage};
+    use std::{fs, sync::atomic::{AtomicU64, Ordering}};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cargo-makepad-android-fonts-{}-{name}-{serial}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn mobile_asset_staging_packages_only_manifest_fonts() {
+        let manifest = FontAssetManifest::parse(
+            b"format=makepad.font-assets.v1\nset=Latin\nasset=demo_app/resources/latin.ttf\n",
+        )
+        .unwrap();
+        let root = temp_dir("allowlist");
+        let source = root.join("source");
+        let assets = root.join("assets");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("latin.ttf"), b"latin bytes").unwrap();
+        fs::write(source.join("international.ttf"), b"international bytes").unwrap();
+        fs::write(source.join("theme.ron"), b"theme").unwrap();
+
+        let mut package = FontPackage::new(&manifest);
+        stage_makepad_assets_subdir(
+            &assets,
+            "demo-app",
+            &source,
+            "resources",
+            &mut package,
+        )
+        .unwrap();
+        let inventory = package.finish().unwrap();
+
+        let packaged = assets.join("makepad/demo_app/resources");
+        assert!(packaged.join("latin.ttf").is_file());
+        assert!(!packaged.join("international.ttf").exists());
+        assert!(packaged.join("theme.ron").is_file());
+        assert_eq!(inventory.fonts["demo_app/resources/latin.ttf"], 11);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn parse_adb_devices_filters_ready_targets() {
@@ -1719,6 +3271,46 @@ default via 192.168.0.1 dev wlan0 proto dhcp src 192.168.0.42 metric 303\n\
 192.168.0.0/24 dev wlan0 proto kernel scope link src 192.168.0.42\n";
         assert_eq!(parse_ip_route(output), Some("192.168.0.42".to_string()));
     }
+
+    #[test]
+    fn compose_android_rustflags_adds_prefer_dynamic() {
+        assert_eq!(
+            compose_android_rustflags(None, "--cfg android_target=\"aarch64\"", true),
+            "-C prefer-dynamic --cfg android_target=\"aarch64\""
+        );
+    }
+
+    #[test]
+    fn compose_android_rustflags_preserves_existing_flags() {
+        assert_eq!(
+            compose_android_rustflags(Some("-C debuginfo=1"), "--cfg android_target=\"aarch64\"", true),
+            "-C debuginfo=1 -C prefer-dynamic --cfg android_target=\"aarch64\""
+        );
+    }
+
+    #[test]
+    fn compose_android_rustflags_does_not_duplicate_prefer_dynamic() {
+        assert_eq!(
+            compose_android_rustflags(
+                Some("-C prefer-dynamic -C debuginfo=1"),
+                "--cfg android_target=\"aarch64\"",
+                true,
+            ),
+            "-C prefer-dynamic -C debuginfo=1 --cfg android_target=\"aarch64\""
+        );
+    }
+
+    #[test]
+    fn compose_android_rustflags_omits_prefer_dynamic_when_disabled() {
+        assert_eq!(
+            compose_android_rustflags(
+                Some("-C debuginfo=1"),
+                "--cfg android_target=\"aarch64\"",
+                false,
+            ),
+            "-C debuginfo=1 --cfg android_target=\"aarch64\""
+        );
+    }
 }
 
 pub fn java(sdk_dir: &Path, _host_os: HostOs, args: &[String]) -> Result<(), String> {
@@ -1739,6 +3331,12 @@ pub fn java(sdk_dir: &Path, _host_os: HostOs, args: &[String]) -> Result<(), Str
 
 pub fn javac(sdk_dir: &Path, _host_os: HostOs, args: &[String]) -> Result<(), String> {
     let mut args_out = Vec::new();
+    // Match the APK build path: do not rely on the host default charset (GBK on
+    // Chinese Windows).
+    if !args.iter().any(|a| a == "-encoding") {
+        args_out.push("-encoding");
+        args_out.push("UTF-8");
+    }
     for arg in args {
         args_out.push(arg.as_ref());
     }
@@ -1753,7 +3351,7 @@ pub fn javac(sdk_dir: &Path, _host_os: HostOs, args: &[String]) -> Result<(), St
     Ok(())
 }
 
-fn to_snakecase(label: &str) -> String {
+pub fn to_snakecase(label: &str) -> String {
     let mut snakecase = String::new();
     let mut previous_was_underscore = false;
 

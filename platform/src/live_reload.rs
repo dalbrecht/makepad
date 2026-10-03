@@ -83,13 +83,36 @@ impl CxLiveReloadState {
     }
 }
 
+/// Result of [`Cx::handle_live_edit`], discriminating *why* a LiveEdit
+/// was triggered. Callers use this to decide whether to do the heavyweight
+/// follow-up work (shader cache reset, immediate Event::ScriptReapply
+/// pass) that's only justified when the DSL itself just changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiveEditTrigger {
+    /// Nothing pending — handler should not fire `Event::LiveEdit`.
+    None,
+    /// A `script_mod!` block was hot-reloaded from a file change (file
+    /// watcher on desktop, or `StudioToApp::LiveChange` over the studio
+    /// websocket). The DSL itself changed; widget trees need a full
+    /// re-walk and shader caches may be stale.
+    FileChange,
+    /// A platform caller invoked `cx.request_live_edit()` (e.g. iOS
+    /// rotation re-baking `mod.widgets.SAFE_INSET_PAD_*`). The DSL did
+    /// NOT change; we just need `script_mod` to re-evaluate so source
+    /// expressions referencing changed primitives pick up new values.
+    /// Shader code is unchanged, and any follow-up `ScriptReapply`
+    /// triggered by the LiveEdit handler can be deferred to the next
+    /// event-loop tick to keep each tick light during the animation.
+    Manual,
+}
+
 impl Cx {
     pub fn start_hot_reload_file_observer_if_requested(&mut self) {
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         self.start_desktop_hot_reload_file_observer_if_requested();
     }
 
-    pub fn handle_live_edit(&mut self) -> bool {
+    pub(crate) fn handle_live_edit(&mut self) -> LiveEditTrigger {
         handle_cx_live_edit(self)
     }
 }
@@ -124,7 +147,7 @@ impl Cx {
                     content: change.content,
                 })
                 .map_err(|_| "channel closed".to_string())?;
-                SignalToUI::set_ui_signal();
+                SignalToUI::set_internal_signal();
                 Ok(())
             },
             logger,
@@ -143,7 +166,24 @@ impl Cx {
     }
 }
 
-fn handle_cx_live_edit(cx: &mut Cx) -> bool {
+fn handle_cx_live_edit(cx: &mut Cx) -> LiveEditTrigger {
+    // Process file changes first so a real DSL hot-reload always wins
+    // over a (cheaper) manual request — the file path also updates the
+    // `script_mod_overrides` map that subsequent `script_mod` re-runs
+    // consult, and we want that done before the LiveEdit fires.
+    let file_changed = handle_cx_live_edit_files(cx);
+    let manual = std::mem::take(&mut cx.pending_live_edit_request);
+
+    if file_changed {
+        LiveEditTrigger::FileChange
+    } else if manual {
+        LiveEditTrigger::Manual
+    } else {
+        LiveEditTrigger::None
+    }
+}
+
+fn handle_cx_live_edit_files(cx: &mut Cx) -> bool {
     let pending = std::mem::take(&mut cx.script_data.live_reload.pending_files);
     if pending.is_empty() {
         return false;
@@ -249,14 +289,22 @@ fn handle_cx_live_edit(cx: &mut Cx) -> bool {
     }
 
     *cx.script_data.live_reload.script_mod_overrides.borrow_mut() = next_overrides;
+    // Name the files: a PERSISTENT override at every cold launch means some
+    // file permanently differs from its compiled-in copy — that's a build
+    // staleness bug to chase, not a feature.
+    let override_files: Vec<String> = cx
+        .script_data
+        .live_reload
+        .script_mod_overrides
+        .borrow()
+        .keys()
+        .map(|key| format!("{:?}", key))
+        .collect();
     crate::log!(
-        "hot reload applied {} override(s) from {} file change(s)",
-        cx.script_data
-            .live_reload
-            .script_mod_overrides
-            .borrow()
-            .len(),
-        processed_files
+        "hot reload applied {} override(s) from {} file change(s): {}",
+        override_files.len(),
+        processed_files,
+        override_files.join(", ")
     );
     true
 }
@@ -273,6 +321,14 @@ fn collect_compiled_sites_for_file(
         let ScriptSource::Mod(script_mod) = &body.source else {
             continue;
         };
+        // `script_apply_eval!` bodies are tagged with `__script_source__` as the
+        // first token of their code. They are Rust-driven runtime evals, not static
+        // DSL blocks, so the file extractor cannot match them. Skip them here so
+        // the compiled-site count only reflects `script_mod!` blocks, which the
+        // extractor does understand.
+        if script_mod.code.trim_start().starts_with("__script_source__") {
+            continue;
+        }
         let Some(compiled_file_name) = resolve_matching_script_mod_file(script_mod, file_name)
         else {
             continue;

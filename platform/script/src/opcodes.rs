@@ -120,6 +120,9 @@ impl<'a> ScriptVm<'a> {
             Opcode::CALL_ARGS => self.handle_call_args(),
             Opcode::CALL_EXEC | Opcode::METHOD_CALL_EXEC => {
                 let should_pop_to_me = self.handle_call_exec(opargs);
+                if self.bx.threads.cur_ref().has_execution_limit_exceeded() {
+                    return;
+                }
                 if should_pop_to_me && opargs.is_pop_to_me() {
                     self.pop_to_me();
                 }
@@ -142,6 +145,9 @@ impl<'a> ScriptVm<'a> {
             Opcode::FN_BODY_TYPED => self.handle_fn_body_typed(opargs),
             Opcode::RETURN => {
                 self.handle_return(opargs);
+                if self.bx.threads.cur_ref().has_execution_limit_exceeded() {
+                    return;
+                }
                 if opargs.is_pop_to_me() {
                     self.pop_to_me();
                 }
@@ -150,6 +156,9 @@ impl<'a> ScriptVm<'a> {
             Opcode::RETURN_IF_ERR => {
                 if self.handle_return_if_err(opargs) {
                     // Error case: original fell through to end-of-function check
+                    if self.bx.threads.cur_ref().has_execution_limit_exceeded() {
+                        return;
+                    }
                     if opargs.is_pop_to_me() {
                         self.pop_to_me();
                     }
@@ -220,37 +229,28 @@ impl<'a> ScriptVm<'a> {
             Opcode::TRY_OK => self.handle_try_ok(opargs),
 
             // Destructuring
+            // Frame slots
+            Opcode::SLOTS_FRAME => self.handle_slots_frame(opargs),
+            Opcode::ARGS_TO_SLOTS => self.handle_args_to_slots(opargs),
+            Opcode::PUSH_SLOT => self.handle_push_slot(opargs),
+            Opcode::LET_SLOT => self.handle_let_slot(opargs),
+            Opcode::STORE_SLOT => self.handle_store_slot(opargs),
+            Opcode::ASSIGN_SLOT_ADD => self.handle_assign_slot_add(opargs),
+            Opcode::ASSIGN_SLOT_SUB => self.handle_slot_num_assign_op(opargs, |a, b| a - b),
+            Opcode::ASSIGN_SLOT_MUL => self.handle_slot_num_assign_op(opargs, |a, b| a * b),
+            Opcode::ASSIGN_SLOT_DIV => self.handle_slot_num_assign_op(opargs, |a, b| a / b),
+            Opcode::ASSIGN_SLOT_MOD => self.handle_slot_num_assign_op(opargs, |a, b| a % b),
+
             Opcode::DUP => self.handle_dup(),
             Opcode::DROP => self.handle_drop(),
             Opcode::ARRAY_INDEX_NIL => self.handle_array_index_nil(),
             Opcode::LET_DESTRUCT_ARRAY_EL => self.handle_let_destruct_array_el(opargs),
             Opcode::LET_DESTRUCT_OBJECT_EL => self.handle_let_destruct_object_el(),
 
-            opcode => {
-                let ip = self.bx.threads.cur_ref().trap.ip;
-                let loc = self.bx.code.ip_to_loc(ip);
-                if let Some(loc) = loc {
-                    eprintln!(
-                        "UNDEFINED OPCODE {} (raw={}) at {} (ip body={}, index={})",
-                        opcode,
-                        opcode.raw(),
-                        loc,
-                        ip.body,
-                        ip.index
-                    );
-                } else {
-                    eprintln!(
-                        "UNDEFINED OPCODE {} (raw={}) at ip body={}, index={}",
-                        opcode,
-                        opcode.raw(),
-                        ip.body,
-                        ip.index
-                    );
-                }
-                self.bx.threads.cur().trap.goto_next();
-            }
+            _ => self.bail("undefined VM opcode"),
         }
-        if opargs.is_pop_to_me() {
+        // A limit failure leaves the operand stack short; never pop to me then.
+        if opargs.is_pop_to_me() && !self.bx.threads.cur_ref().has_execution_limit_exceeded() {
             self.pop_to_me();
         }
     }

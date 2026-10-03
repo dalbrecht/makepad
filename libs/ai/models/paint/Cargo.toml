@@ -1,0 +1,17 @@
+[package]
+name = "makepad-ai-paint"
+version = "0.1.0"
+edition = "2021"
+description = "Hunyuan3D-Paint family. Was libs/pbr_paint (aiarch.md §1)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[features]
+default = []
+# Validation taps for the first experimental CUDA graph section. This is not a
+# complete Hunyuan executor and deliberately does not register a model backend.
+cuda-taps = ["dep:makepad-ai-common"]
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+makepad-ai-common = { path = "../common", optional = true }

@@ -1,10 +1,33 @@
 use crate::cx::Cx;
 use crate::event::Event;
+use crate::font_policy::FontSet;
 use crate::ui_runner::UiRunner;
 use makepad_script::{ScriptValue, ScriptVm};
 
 #[cfg(target_env = "ohos")]
 pub use napi_ohos;
+
+/// Windows desktop apps are linked as windowed programs (no console of
+/// their own when started from Explorer). Started from a terminal, such a
+/// program has no stdout: join the terminal's console so its output shows
+/// there. A pipe — another program reading stdout, like an MCP client of
+/// `--mcp` — and console builds already have a stdout and are left alone.
+pub fn attach_parent_console() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(which: u32) -> isize;
+            fn AttachConsole(process: u32) -> i32;
+        }
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if out == 0 || out == -1 {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
 
 pub fn should_run_stdin_loop_from_env() -> bool {
     std::env::args().any(|v| v == "--stdin-loop")
@@ -16,13 +39,13 @@ pub fn should_run_stdin_loop_from_env() -> bool {
         })
 }
 
-#[cfg(headless)]
-pub(crate) fn should_disable_headless_draw_from_args() -> bool {
+#[cfg(gpusim)]
+pub(crate) fn should_disable_gpusim_draw_from_args() -> bool {
     std::env::args().any(|v| v == "--no-draw")
 }
 
-#[cfg(headless)]
-pub(crate) fn headless_draw_cycles_from_args() -> Option<usize> {
+#[cfg(gpusim)]
+pub(crate) fn gpusim_draw_cycles_from_args() -> Option<usize> {
     let mut args = std::env::args();
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--draws=") {
@@ -41,51 +64,148 @@ pub(crate) fn headless_draw_cycles_from_args() -> Option<usize> {
     None
 }
 
-fn normalize_studio_http_from_studio_var(studio: &str) -> String {
-    let studio = studio.trim().trim_end_matches('/');
-    if studio.is_empty() {
+fn normalize_studio_host(host: &str) -> String {
+    let host = host.trim().trim_end_matches('/');
+    if host.is_empty() {
         return String::new();
     }
 
-    if studio.contains("://") {
-        studio.to_string()
+    let (scheme, rest) = if let Some((scheme, rest)) = host.split_once("://") {
+        (scheme, rest)
     } else {
-        format!("http://{studio}")
+        ("http", host)
+    };
+    let host_port = rest
+        .split_once(['/', '?', '#'])
+        .map(|(host_port, _)| host_port)
+        .unwrap_or(rest)
+        .trim();
+    if host_port.is_empty() {
+        return String::new();
     }
+    format!("{scheme}://{host_port}")
 }
 
-#[cfg(any(test, target_os = "linux"))]
-pub(crate) fn extract_studio_build_id(studio: &str) -> Option<String> {
-    let studio = studio.trim().trim_end_matches('/');
-    if studio.is_empty() {
-        return None;
-    }
-
-    let without_scheme = studio
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(studio);
-    let path = without_scheme
-        .split_once('/')
-        .map(|(_, path)| path)
-        .unwrap_or("");
-
-    if let Some(rest) = path.strip_prefix("app/") {
-        let build_id = rest.split('/').next()?;
-        if !build_id.is_empty() {
-            return Some(build_id.to_string());
+fn studio_query_value(studio: &str, key: &str) -> Option<String> {
+    let query = studio.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (pair_key, pair_value) = pair.split_once('=').unwrap_or((pair, ""));
+        if pair_key == key {
+            let pair_value = pair_value.trim();
+            if !pair_value.is_empty() {
+                return Some(pair_value.to_string());
+            }
         }
     }
-
     None
 }
 
-pub fn resolve_studio_http() -> String {
-    std::env::var("STUDIO")
+pub(crate) fn extract_studio_build_id(studio: &str) -> Option<String> {
+    studio_query_value(studio, "build").or_else(|| {
+        let studio = studio.trim().trim_end_matches('/');
+        if studio.is_empty() {
+            return None;
+        }
+
+        let without_scheme = studio
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(studio);
+        let path = without_scheme
+            .split_once('/')
+            .map(|(_, path)| path)
+            .unwrap_or("");
+
+        if let Some(rest) = path.strip_prefix("app/") {
+            let build_id = rest.split('/').next()?;
+            if !build_id.is_empty() {
+                return Some(build_id.to_string());
+            }
+        }
+
+        None
+    })
+}
+
+pub(crate) fn extract_studio_crate_name(studio: &str) -> Option<String> {
+    studio_query_value(studio, "crate")
+}
+
+pub(crate) fn resolve_studio_host() -> String {
+    std::env::var("STUDIO_HOST")
         .ok()
-        .map(|studio| normalize_studio_http_from_studio_var(&studio))
-        .filter(|studio_http| !studio_http.is_empty())
+        .or_else(|| std::env::var("STUDIO").ok())
+        .map(|studio| normalize_studio_host(&studio))
+        .filter(|studio_host| !studio_host.is_empty())
         .unwrap_or_default()
+}
+
+pub(crate) fn resolve_studio_build() -> Option<String> {
+    std::env::var("STUDIO_BUILD")
+        .ok()
+        .and_then(|build| {
+            let build = build.trim();
+            (!build.is_empty()).then(|| build.to_string())
+        })
+        .or_else(|| {
+            std::env::var("STUDIO")
+                .ok()
+                .and_then(|studio| extract_studio_build_id(&studio))
+        })
+}
+
+pub(crate) fn resolve_studio_crate() -> Option<String> {
+    std::env::var("STUDIO_CRATE")
+        .ok()
+        .and_then(|crate_name| {
+            let crate_name = crate_name.trim();
+            (!crate_name.is_empty()).then(|| crate_name.to_string())
+        })
+        .or_else(|| {
+            std::env::var("STUDIO")
+                .ok()
+                .and_then(|studio| extract_studio_crate_name(&studio))
+        })
+}
+
+fn build_studio_http(
+    studio_host: &str,
+    studio_build: Option<&str>,
+    studio_crate: Option<&str>,
+) -> String {
+    let studio_host = normalize_studio_host(studio_host);
+    if studio_host.is_empty() {
+        return String::new();
+    }
+
+    let studio_build = studio_build
+        .map(str::trim)
+        .filter(|build| !build.is_empty());
+    let studio_crate = studio_crate
+        .map(str::trim)
+        .filter(|crate_name| !crate_name.is_empty());
+
+    if studio_build.is_none() && studio_crate.is_none() {
+        return String::new();
+    }
+
+    let mut query = Vec::new();
+    if let Some(build) = studio_build {
+        query.push(format!("build={build}"));
+    }
+    if let Some(crate_name) = studio_crate {
+        query.push(format!("crate={crate_name}"));
+    }
+    format!("{studio_host}/app?{}", query.join("&"))
+}
+
+pub fn resolve_studio_http() -> String {
+    let studio_host = resolve_studio_host();
+    build_studio_http(
+        &studio_host,
+        resolve_studio_build().as_deref(),
+        resolve_studio_crate().as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -101,6 +221,28 @@ mod tests {
         assert_eq!(
             extract_studio_build_id("http://127.0.0.1:8001/app/77"),
             Some("77".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_studio_build_and_crate_from_query_url() {
+        let studio = "http://127.0.0.1:8001/app?build=77&crate=makepad-example-xr";
+        assert_eq!(extract_studio_build_id(studio), Some("77".to_string()));
+        assert_eq!(
+            extract_studio_crate_name(studio),
+            Some("makepad-example-xr".to_string())
+        );
+    }
+
+    #[test]
+    fn build_studio_http_uses_query_identity() {
+        assert_eq!(
+            build_studio_http("127.0.0.1:8001", Some("77"), Some("makepad-example-xr"),),
+            "http://127.0.0.1:8001/app?build=77&crate=makepad-example-xr"
+        );
+        assert_eq!(
+            build_studio_http("127.0.0.1:8001", None, Some("makepad-example-xr")),
+            "http://127.0.0.1:8001/app?crate=makepad-example-xr"
         );
     }
 }
@@ -129,9 +271,220 @@ pub trait AppMain {
     }
 }
 
+/// Internal helper for [`app_main!`]. Emits the boxed event-handler
+/// closure that every platform entry point hands to `Cx::new`. Captures
+/// its own `app` and `app_value` slots, so the four
+/// platform entry points (desktop, Android activity, OHOS, wasm32) all
+/// share a single source of truth for `Event::Startup` / `LiveEdit` /
+/// `ScriptReapply` / `handle_event` dispatch.
+///
+/// `cx.start_hot_reload_file_observer_if_requested()` is called
+/// unconditionally — its body is `#[cfg]`-gated to desktop OSes, so on
+/// android / ohos / wasm32 it's a compile-time no-op.
+///
+/// Not part of the public API. Use [`app_main!`] instead.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! _app_main_event_closure {
+    ($app:ident) => {
+        $crate::_app_main_event_closure!($app, |_cx: &mut Cx| {})
+    };
+    ($app:ident, $configure:expr) => {{
+        // This app's build inputs (package dir, icons), read in the app
+        // crate so they never rebuild platform; before `init_cx_os`.
+        $crate::app_meta::set_app_build_meta($crate::_app_build_meta!());
+        // Event dispatch already excludes synchronous re-entry. Plain captured slots
+        // also survive a caught wasm panic=abort trap; a RefCell borrow flag would not
+        // be released because wasm does not unwind the trapped Rust stack.
+        let mut app: Option<$app> = None;
+        let mut app_value: Option<$crate::ScriptObjectRef> = None;
+        let mut configure = $crate::app_main_configure($configure);
+        Box::new(move |cx: &mut Cx, event: &Event| {
+            if let Event::Startup = event {
+                // The binary's say before anything of the app runs: what
+                // this build is, as globals on `Cx` the app's `script_mod`
+                // and startup read (`app_main!`'s `configure:` clause).
+                configure(cx);
+                // Font resource registration happens inside AppMain::script_mod,
+                // so freeze the app_main! choice before that code can run.
+                cx.freeze_font_set();
+                $crate::startup_trace("Startup: script_mod begin");
+                app = Some(cx.with_vm(|vm| {
+                    let value = <$app as AppMain>::script_mod(vm);
+                    $crate::startup_trace("Startup: script_mod eval done");
+                    if let Some(obj) = value.as_object() {
+                        app_value = Some(vm.heap_mut().new_object_ref(obj));
+                    }
+                    let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
+                    $crate::startup_trace("Startup: app from_value done");
+                    <$app as AppMain>::after_new_from_script(vm, &mut app);
+                    app
+                }));
+                $crate::startup_trace("Startup: handler done");
+                cx.start_hot_reload_file_observer_if_requested();
+            }
+            if let Event::LiveEdit = event {
+                let style_reload = std::mem::take(&mut cx.pending_style_reload);
+                if let Some(app) = app.as_mut() {
+                    // Style reapply keeps ScriptReapply. Otherwise Reload when
+                    // the DSL changed on disk, Rebake when `script_mod` only
+                    // re-ran to pick up new heap primitives.
+                    let live_edit_apply = if style_reload {
+                        $crate::Apply::ScriptReapply
+                    } else {
+                        cx.live_edit_apply()
+                    };
+                    cx.with_vm(|vm| {
+                        let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
+                        if let Some(obj) = value.as_object() {
+                            app_value = Some(vm.heap_mut().new_object_ref(obj));
+                        }
+                        <$app as $crate::ScriptApply>::script_apply(
+                            app,
+                            vm,
+                            &live_edit_apply,
+                            &mut $crate::Scope::empty(),
+                            value,
+                        );
+                    });
+                }
+            }
+            if let Event::ScriptReapply = event {
+                if let Some(app) = app.as_mut() {
+                    let value = app_value
+                        .as_ref()
+                        .map(|r| $crate::ScriptValue::from(r.as_object()));
+                    if let Some(value) = value {
+                        cx.with_vm(|vm| {
+                            <$app as $crate::ScriptApply>::script_apply(
+                                app,
+                                vm,
+                                &$crate::Apply::ScriptReapply,
+                                &mut $crate::Scope::empty(),
+                                value,
+                            );
+                        });
+                    }
+                }
+            }
+            if let Some(app) = app.as_mut() {
+                <dyn AppMain>::handle_event(app, cx, event);
+            }
+        }) as Box<dyn FnMut(&mut Cx, &Event)>
+    }};
+}
+
+/// Construct the application context with its manifest-backed font choice
+/// already immutable. Every platform entry point generated by `app_main!`
+/// goes through this function before it can dispatch `Event::Startup` and
+/// therefore before `AppMain::script_mod` can run.
+#[doc(hidden)]
+pub fn new_cx_with_font_set(
+    event_handler: Box<dyn FnMut(&mut Cx, &Event)>,
+    font_set: FontSet,
+) -> Cx {
+    let mut cx = Cx::new(event_handler);
+    assert!(cx.set_font_set(font_set));
+    cx.freeze_font_set();
+    cx
+}
+
+/// Pins the type of an `app_main!` `configure:` closure so a bare
+/// `|cx| {...}` infers `&mut Cx` without an annotation.
+#[doc(hidden)]
+pub fn app_main_configure<F: FnMut(&mut Cx)>(f: F) -> F {
+    f
+}
+
+/// The application entry point, for every platform at once.
+///
+/// `configure: |cx| {...}` is the binary's say before anything of the app
+/// runs — it is called once, at `Event::Startup`, before
+/// `AppMain::script_mod`. A binary that links an app LIBRARY uses it to
+/// hand the app its build (`cx.set_global(...)`), which the library's
+/// `script_mod` reads through `vm.cx_mut()` and its startup through `cx`:
+/// one mechanism on desktop, Android, OHOS and the web, and no statics.
 #[macro_export]
 macro_rules! app_main {
-    ( $ app: ident) => {
+    ( $app:ident ) => {
+        $crate::app_main!($app, configure: |_cx: &mut Cx| {});
+    };
+    ( $app:ident, configure: $configure:expr ) => {
+        #[cfg(target_arch = "wasm32")]
+        $crate::app_main!(@impl $app, $crate::FontSet::Latin, $crate::LATIN_FONT_ASSET_PACKAGE_MANIFEST, [], $configure);
+        #[cfg(not(target_arch = "wasm32"))]
+        $crate::app_main!(@impl $app, $crate::FontSet::International, $crate::INTERNATIONAL_FONT_ASSET_MANIFEST, [], $configure);
+    };
+    ( $app:ident, font_assets: [$($asset:expr),* $(,)?] ) => {
+        $crate::app_main!($app, font_assets: [$($asset),*], configure: |_cx: &mut Cx| {});
+    };
+    ( $app:ident, font_assets: [$($asset:expr),* $(,)?], configure: $configure:expr ) => {
+        #[cfg(target_arch = "wasm32")]
+        $crate::app_main!(@impl $app, $crate::FontSet::Latin, $crate::LATIN_FONT_ASSET_PACKAGE_MANIFEST, [$($asset),*], $configure);
+        #[cfg(not(target_arch = "wasm32"))]
+        $crate::app_main!(@impl $app, $crate::FontSet::International, $crate::INTERNATIONAL_FONT_ASSET_MANIFEST, [$($asset),*], $configure);
+    };
+    ( $app:ident, font_set: Latin ) => {
+        $crate::app_main!($app, font_set: Latin, configure: |_cx: &mut Cx| {});
+    };
+    ( $app:ident, font_set: Latin, configure: $configure:expr ) => {
+        $crate::app_main!(@impl $app, $crate::FontSet::Latin, $crate::LATIN_FONT_ASSET_PACKAGE_MANIFEST, [], $configure);
+    };
+    ( $app:ident, font_set: International ) => {
+        $crate::app_main!($app, font_set: International, configure: |_cx: &mut Cx| {});
+    };
+    ( $app:ident, font_set: International, configure: $configure:expr ) => {
+        $crate::app_main!(@impl $app, $crate::FontSet::International, $crate::INTERNATIONAL_FONT_ASSET_MANIFEST, [], $configure);
+    };
+    ( $app:ident, font_set: Latin, font_assets: [$($asset:expr),* $(,)?] ) => {
+        $crate::app_main!($app, font_set: Latin, font_assets: [$($asset),*], configure: |_cx: &mut Cx| {});
+    };
+    ( $app:ident, font_set: Latin, font_assets: [$($asset:expr),* $(,)?], configure: $configure:expr ) => {
+        $crate::app_main!(@impl $app, $crate::FontSet::Latin, $crate::LATIN_FONT_ASSET_PACKAGE_MANIFEST, [$($asset),*], $configure);
+    };
+    ( $app:ident, font_set: International, font_assets: [$($asset:expr),* $(,)?] ) => {
+        $crate::app_main!($app, font_set: International, font_assets: [$($asset),*], configure: |_cx: &mut Cx| {});
+    };
+    ( $app:ident, font_set: International, font_assets: [$($asset:expr),* $(,)?], configure: $configure:expr ) => {
+        $crate::app_main!(@impl $app, $crate::FontSet::International, $crate::INTERNATIONAL_FONT_ASSET_MANIFEST, [$($asset),*], $configure);
+    };
+    (@impl $app:ident, $font_set:expr, $manifest:expr, [$($asset:expr),*], $configure:expr) => {
+        // The payload is line-oriented UTF-8. Lane B reads this section from
+        // freshly linked wasm before any optional custom-section stripping.
+        const MAKEPAD_EXTRA_FONT_ASSETS: &[&str] = &[$($asset),*];
+        #[used]
+        #[cfg_attr(target_arch = "wasm32", link_section = "makepad.font-assets.v1")]
+        #[cfg_attr(
+            all(not(target_arch = "wasm32"), target_vendor = "apple"),
+            link_section = "__DATA,__mp_font_v1"
+        )]
+        #[cfg_attr(
+            all(not(target_arch = "wasm32"), not(target_vendor = "apple")),
+            link_section = ".makepad.font-assets.v1"
+        )]
+        static MAKEPAD_FONT_ASSETS_V1: [u8; $crate::font_asset_manifest_len(
+            $manifest,
+            MAKEPAD_EXTRA_FONT_ASSETS,
+        )] = $crate::extend_font_asset_manifest($manifest, MAKEPAD_EXTRA_FONT_ASSETS);
+
+        // The executable's own Info.plist (see app_meta.rs): the application
+        // menu's title of an unbundled launch. Read here, in the app crate,
+        // a bundle name rebuilds only the app.
+        #[cfg(target_os = "macos")]
+        const MAKEPAD_BUNDLE_NAME: &str = match option_env!("MAKEPAD_BUNDLE_NAME") {
+            Some(name) => name,
+            None => $crate::app_meta::DEFAULT_BUNDLE_NAME,
+        };
+        #[cfg(target_os = "macos")]
+        const MAKEPAD_BUNDLE_IDENTIFIER: Option<&str> = option_env!("MAKEPAD_BUNDLE_IDENTIFIER");
+        #[cfg(target_os = "macos")]
+        #[used]
+        #[link_section = "__TEXT,__info_plist"]
+        static MAKEPAD_INFO_PLIST: [u8; $crate::app_meta::info_plist_len(
+            MAKEPAD_BUNDLE_NAME,
+            MAKEPAD_BUNDLE_IDENTIFIER,
+        )] = $crate::app_meta::info_plist(MAKEPAD_BUNDLE_NAME, MAKEPAD_BUNDLE_IDENTIFIER);
+
         #[cfg(not(any(target_os = "android", target_env = "ohos")))]
         fn main() {
             app_main();
@@ -139,51 +492,44 @@ macro_rules! app_main {
 
         #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_env = "ohos")))]
         pub fn app_main() {
+            $crate::attach_parent_console();
+            // `--mcp`: a stdio relay to the running app's MCP endpoint for
+            // Claude Desktop. Before anything else exists: no window, no
+            // GPU, no audio, and stdout carries only JSON-RPC.
+            if $crate::mcp_relay::requested() {
+                std::process::exit($crate::mcp_relay::run());
+            }
             Cx::init_log();
+            $crate::startup_trace("main-entered (dyld done)");
             if Cx::pre_start() {
                 return;
             }
+            $crate::startup_trace("pre_start (objc classes)");
 
-            let app = std::rc::Rc::new(std::cell::RefCell::new(None));
-            let mut cx = std::rc::Rc::new(std::cell::RefCell::new(Cx::new(Box::new(
-                move |cx, event| {
-                    if let Event::Startup = event {
-                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
-                            let value = <$app as AppMain>::script_mod(vm);
-                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
-                            <$app as AppMain>::after_new_from_script(vm, &mut app);
-                            app
-                        }));
-                        cx.start_hot_reload_file_observer_if_requested();
-                    }
-                    if let Event::LiveEdit = event {
-                        let mut app_ref = app.borrow_mut();
-                        if let Some(app) = app_ref.as_mut() {
-                            cx.with_vm(|vm| {
-                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
-                                <$app as $crate::ScriptApply>::script_apply(
-                                    app,
-                                    vm,
-                                    &$crate::Apply::Reload,
-                                    &mut $crate::Scope::empty(),
-                                    value,
-                                );
-                            });
-                        }
-                    }
-                    if let Some(app) = &mut *app.borrow_mut() {
-                        <dyn AppMain>::handle_event(app, cx, event);
-                    }
-                },
-            ))));
+            // The event-handler closure (which captures `app` and
+            // `app_value` Rcs internally) is shared across all four
+            // platform entry points via `_app_main_event_closure!`.
+            let mut cx = std::rc::Rc::new(std::cell::RefCell::new(
+                $crate::new_cx_with_font_set(
+                $crate::_app_main_event_closure!($app, $configure),
+                $font_set,
+            )));
             cx.borrow_mut().init_script_vm();
+            $crate::startup_trace("Cx::init_script_vm (vm + std script)");
             let studio_http = $crate::resolve_studio_http();
             cx.borrow_mut().init_websockets(&studio_http);
             if $crate::should_run_stdin_loop_from_env() {
                 cx.borrow_mut().in_makepad_studio = true;
+                // A hosted child must never outlive its host, whatever its
+                // event loop happens to be busy with.
+                $crate::memory_watchdog::start_stdin_orphan_watchdog();
             }
             //cx.borrow_mut().init_websockets("");
             cx.borrow_mut().init_cx_os();
+            $crate::startup_trace("init_cx_os (deps loaded)");
+            // `--remote`: a localhost HTTP control surface for agents / tests.
+            // No-op unless the flag (or MAKEPAD_REMOTE) is present.
+            $crate::remote::start_if_requested(&mut cx.borrow_mut());
             Cx::event_loop(cx);
         }
 
@@ -219,41 +565,34 @@ macro_rules! app_main {
             $crate::os::linux::android::android_jni::apply_studio_env_from_activity(activity);
             Cx::android_entry(activity, || {
                 let studio_http = $crate::resolve_studio_http();
-                let app = std::rc::Rc::new(std::cell::RefCell::new(None));
-                let mut cx = Box::new(Cx::new(Box::new(move |cx, event| {
-                    if let Event::Startup = event {
-                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
-                            let value = <$app as AppMain>::script_mod(vm);
-                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
-                            <$app as AppMain>::after_new_from_script(vm, &mut app);
-                            app
-                        }));
-                        cx.start_hot_reload_file_observer_if_requested();
-                    }
-                    if let Event::LiveEdit = event {
-                        let mut app_ref = app.borrow_mut();
-                        if let Some(app) = app_ref.as_mut() {
-                            cx.with_vm(|vm| {
-                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
-                                <$app as $crate::ScriptApply>::script_apply(
-                                    app,
-                                    vm,
-                                    &$crate::Apply::Reload,
-                                    &mut $crate::Scope::empty(),
-                                    value,
-                                );
-                            });
-                        }
-                    }
-                    if let Some(app) = &mut *app.borrow_mut() {
-                        <dyn AppMain>::handle_event(app, cx, event);
-                    }
-                })));
+                let mut cx = Box::new($crate::new_cx_with_font_set(
+                    $crate::_app_main_event_closure!($app, $configure),
+                    $font_set,
+                ));
                 cx.init_script_vm();
                 cx.init_websockets(&studio_http);
                 cx.init_cx_os();
                 cx
             })
+        }
+
+        /// The entry of a hosted child PROCESS on Android: the WM's launcher
+        /// `dlopen`s this library in a process of its own and calls this
+        /// (os/linux/android/android_hosted.rs). No JVM, no Activity: the app
+        /// talks to its host over the host's hub and draws into its frames.
+        #[cfg(target_os = "android")]
+        #[no_mangle]
+        pub extern "C" fn makepad_hosted_main() {
+            $crate::os::linux::android::android_hosted::set_hosted();
+            Cx::init_log();
+            let studio_http = $crate::resolve_studio_http();
+            let mut cx = Box::new($crate::new_cx_with_font_set(
+                $crate::_app_main_event_closure!($app, $configure),
+                $font_set,
+            ));
+            cx.init_websockets(&studio_http);
+            cx.init_cx_os();
+            cx.android_hosted_event_loop();
         }
 
         #[cfg(target_env = "ohos")]
@@ -263,36 +602,10 @@ macro_rules! app_main {
             env: $crate::napi_ohos::Env,
         ) -> $crate::napi_ohos::Result<()> {
             Cx::ohos_init(exports, env, || {
-                let app = std::rc::Rc::new(std::cell::RefCell::new(None));
-                let mut cx = Box::new(Cx::new(Box::new(move |cx, event| {
-                    if let Event::Startup = event {
-                        *app.borrow_mut() = Some(cx.with_vm(|vm| {
-                            let value = <$app as AppMain>::script_mod(vm);
-                            let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
-                            <$app as AppMain>::after_new_from_script(vm, &mut app);
-                            app
-                        }));
-                        cx.start_hot_reload_file_observer_if_requested();
-                    }
-                    if let Event::LiveEdit = event {
-                        let mut app_ref = app.borrow_mut();
-                        if let Some(app) = app_ref.as_mut() {
-                            cx.with_vm(|vm| {
-                                let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
-                                <$app as $crate::ScriptApply>::script_apply(
-                                    app,
-                                    vm,
-                                    &$crate::Apply::Reload,
-                                    &mut $crate::Scope::empty(),
-                                    value,
-                                );
-                            });
-                        }
-                    }
-                    if let Some(app) = &mut *app.borrow_mut() {
-                        <dyn AppMain>::handle_event(app, cx, event);
-                    }
-                })));
+                let mut cx = Box::new($crate::new_cx_with_font_set(
+                    $crate::_app_main_event_closure!($app, $configure),
+                    $font_set,
+                ));
                 cx.init_script_vm();
                 let studio_http = $crate::resolve_studio_http();
                 cx.init_websockets(&studio_http);
@@ -309,35 +622,10 @@ macro_rules! app_main {
         #[cfg(target_arch = "wasm32")]
         pub extern "C" fn create_wasm_app() -> u32 {
             Cx::init_log();
-            let app = std::rc::Rc::new(std::cell::RefCell::new(None));
-            let mut cx = Box::new(Cx::new(Box::new(move |cx, event| {
-                if let Event::Startup = event {
-                    *app.borrow_mut() = Some(cx.with_vm(|vm| {
-                        let value = <$app as AppMain>::script_mod(vm);
-                        let mut app = <$app as $crate::ScriptNew>::script_from_value(vm, value);
-                        <$app as AppMain>::after_new_from_script(vm, &mut app);
-                        app
-                    }));
-                }
-                if let Event::LiveEdit = event {
-                    let mut app_ref = app.borrow_mut();
-                    if let Some(app) = app_ref.as_mut() {
-                        cx.with_vm(|vm| {
-                            let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
-                            <$app as $crate::ScriptApply>::script_apply(
-                                app,
-                                vm,
-                                &$crate::Apply::Reload,
-                                &mut $crate::Scope::empty(),
-                                value,
-                            );
-                        });
-                    }
-                }
-                if let Some(app) = &mut *app.borrow_mut() {
-                    <dyn AppMain>::handle_event(app, cx, event);
-                }
-            })));
+            let mut cx = Box::new($crate::new_cx_with_font_set(
+                $crate::_app_main_event_closure!($app, $configure),
+                $font_set,
+            ));
             let studio_http = $crate::resolve_studio_http();
             cx.init_websockets(&studio_http);
             cx.init_cx_os();
@@ -364,6 +652,65 @@ macro_rules! app_main {
             cx.os.from_wasm.take().unwrap().release_ownership()
         }
     };
+}
+
+#[cfg(test)]
+mod font_set_macro_compile_test {
+    #![allow(dead_code, unused_mut)]
+
+    use crate::*;
+
+    #[derive(Script, ScriptHook)]
+    struct ExplicitFontApp {}
+
+    impl AppMain for ExplicitFontApp {
+        fn script_mod(_vm: &mut ScriptVm) -> ScriptValue {
+            NIL
+        }
+
+        fn handle_event(&mut self, _cx: &mut Cx, _event: &Event) {}
+    }
+
+    app_main!(
+        ExplicitFontApp,
+        font_set: International,
+        font_assets: [
+            "example/resources/Custom.ttf",
+            "makepad_widgets/resources/NotoColorEmoji.ttf",
+        ]
+    );
+
+    #[test]
+    fn explicit_font_set_macro_form_compiles_with_international_manifest() {
+        const EXTRAS: &[&str] = &[
+            "example/resources/Custom.ttf",
+            "makepad_widgets/resources/NotoColorEmoji.ttf",
+        ];
+        const N: usize = font_asset_manifest_len(INTERNATIONAL_FONT_ASSET_MANIFEST, EXTRAS);
+        const EXPECTED: [u8; N] =
+            extend_font_asset_manifest(INTERNATIONAL_FONT_ASSET_MANIFEST, EXTRAS);
+        assert_eq!(MAKEPAD_FONT_ASSETS_V1, EXPECTED);
+        let manifest = std::str::from_utf8(&MAKEPAD_FONT_ASSETS_V1).unwrap();
+        assert_eq!(manifest.matches("NotoColorEmoji.ttf").count(), 1);
+        assert!(manifest.contains("example/resources/Custom.ttf"));
+        // Optional widget fonts only ship when declared.
+        assert!(!manifest.contains("NewCMMath-Regular.otf"));
+        assert!(!manifest.contains("Inter.ttf"));
+        assert!(!manifest.contains("RobotoFlex.ttf"));
+    }
+
+    #[test]
+    fn every_entry_point_uses_a_pre_frozen_font_selection() {
+        for set in [FontSet::Latin, FontSet::International] {
+            let cx = new_cx_with_font_set(Box::new(|_, _| {}), set);
+            assert_eq!(cx.font_set(), set);
+            assert!(cx.is_font_set_frozen());
+        }
+
+        let source = include_str!("app_main.rs");
+        let constructor_call = ["$crate::new_cx", "_with_font_set("].concat();
+        assert_eq!(source.matches(constructor_call.as_str()).count(), 5);
+    }
 }
 
 #[cfg(target_env = "ohos")]

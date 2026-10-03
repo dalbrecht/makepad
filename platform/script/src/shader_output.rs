@@ -33,6 +33,8 @@ pub struct ShaderSampler {
     pub address: SamplerAddress,
     pub coord: SamplerCoord,
     pub is_video: bool,
+    /// Compare reference <= stored depth, then linearly filter visibility.
+    pub compare: bool,
 }
 
 impl Default for ShaderSampler {
@@ -42,6 +44,7 @@ impl Default for ShaderSampler {
             address: SamplerAddress::ClampToEdge,
             coord: SamplerCoord::Normalized,
             is_video: false,
+            compare: false,
         }
     }
 }
@@ -117,12 +120,35 @@ pub enum ShaderIoKind {
 pub struct ScopeUniformSource {
     /// The source object to read the value from
     pub source_obj: ScriptObject,
-    /// The key to read from the source object  
+    /// The key to read from the source object
     pub key: LiveId,
     /// The name used in the shader (may be prefixed for collision avoidance)
     pub shader_name: LiveId,
     /// The pod type of this uniform
     pub ty: ScriptPodType,
+    /// `Some(i)`: this slot is `ShaderOutput::table_consts[i]` — an
+    /// annotated literal lifted out of the code — and is filled from the
+    /// table's current value, never from the heap.
+    pub table_const: Option<usize>,
+}
+
+/// A numeric literal inside a shader fn body that carried a `/** … */`
+/// annotation and was compiled under [`ShaderOutput::const_table`]: it is
+/// read from the scope-uniform buffer at draw time instead of being folded
+/// into the code, so its value can be hot-patched with zero recompiles. The
+/// source is never rewritten by a patch — the span is context for whoever
+/// eventually edits it (the ledger hands it to the AI).
+#[derive(Debug, Clone)]
+pub struct ShaderTableConst {
+    /// The scope-uniform io name this constant occupies (`ct0`, `ct1`, …).
+    pub shader_name: LiveId,
+    /// The annotation text as written (hint grammar not yet parsed).
+    pub doc: String,
+    /// The literal's value in the source.
+    pub value: f64,
+    /// Where the literal sits: the immediate's ip (resolves to file:line:col
+    /// through `ScriptCode::ip_to_loc`).
+    pub ip: ScriptIp,
 }
 
 /// Tracks a uniform buffer defined in the script scope (e.g., `let buf = shader.uniform_buffer(...)`)
@@ -198,6 +224,15 @@ pub struct ShaderOutput {
     pub scope_uniforms: Vec<ScopeUniformSource>,
     pub scope_uniform_buffers: Vec<ScopeUniformBufferSource>,
     pub scope_textures: Vec<ScopeTextureSource>,
+    /// Compile flag: lift `/** name */`-annotated float literals in fn
+    /// bodies into hot-patchable table constants ([`ShaderTableConst`])
+    /// instead of folding them into the emitted code. Off (the default)
+    /// emits byte-identical code to a compiler without the feature.
+    pub const_table: bool,
+    /// The lifted literals, in emission order; each also appears as a
+    /// `ShaderIoKind::ScopeUniform` io and a [`ScopeUniformSource`] with
+    /// `table_const: Some(index)`.
+    pub table_consts: Vec<ShaderTableConst>,
     /// Per-texture sampler bindings inferred during shader lowering.
     /// Entries are `(texture_expr, sampler_index)`.
     pub texture_sampler_bindings: Vec<(String, usize)>,
@@ -205,10 +240,73 @@ pub struct ShaderOutput {
     pub hlsl_needs_tex_size: bool,
     /// Set to true if any errors occurred during shader compilation
     pub has_errors: bool,
+    /// Human-readable messages for every error behind [`Self::has_errors`].
+    /// Backends log these with the shader's identity when they refuse to
+    /// build the pipeline — a shader must never fail into a silent
+    /// fallback. Populated via [`Self::push_error`]; also collects messages
+    /// that would otherwise vanish (entry-point compiles run under `NoTrap`,
+    /// which discards `script_err_*!` messages, and errors queued on a
+    /// nested function compiler's trap are never drained by anyone).
+    pub errors: Vec<String>,
     /// True if this shader uses screen-space derivatives (dFdx/dFdy).
     pub uses_derivatives: bool,
     /// Monotonic temporary id source for Rust backend expression hoisting.
     pub rust_tmp_counter: usize,
+    /// Monotonic id source for loop-guard locals, so nested guards never
+    /// collide (see [`crate::shader_control::LOOP_GUARD_MAX_ITERS`]).
+    pub loop_guard_counter: usize,
+    /// Total emitted source bytes across every function body compiled into
+    /// this shader. Bounded by [`MAX_EMITTED_BYTES`]: a call graph that
+    /// branches (each call site *inlines* via `compile_fn`) expands
+    /// exponentially with depth, and `recur_block` only stops true
+    /// recursion — not `f1` calling `f2` twice calling `f3` twice.
+    pub emitted_bytes: usize,
+    /// Set once the emitted-size budget is blown, so the error is raised
+    /// exactly once rather than at every subsequent write.
+    pub size_exceeded: bool,
+    /// The scope objects whose methods this shader calls, in the order it
+    /// first calls them: a method's name prefix is its object's place here
+    /// (`scope0_`, `scope1_`, …). The object's heap index would do for
+    /// uniqueness but changes whenever the module is evaluated again (a
+    /// style reload), which made the same shader's source text differ and
+    /// the GPU compile it again; the order of first use does not change.
+    pub scope_prefixes: Vec<usize>,
+}
+
+/// Ceiling on total emitted shader source. Real shaders here run to tens of
+/// kilobytes (the largest built-in measured ~29 KB), so this is roughly 30x
+/// headroom while still catching exponential inlining long before it can
+/// exhaust memory or hang the compiler.
+pub const MAX_EMITTED_BYTES: usize = 1 << 20;
+
+impl ShaderOutput {
+    /// Unique local name for a loop guard, so nested `loop{}` bodies each get
+    /// their own counter instead of shadowing one another.
+    pub(crate) fn next_loop_guard(&mut self) -> String {
+        let n = self.loop_guard_counter;
+        self.loop_guard_counter += 1;
+        format!("_mp_loop_guard_{n}")
+    }
+
+    /// Record a compile error so the backend can report it with the shader's
+    /// identity. Never silent: every `has_errors = true` must leave at least
+    /// one message here.
+    pub fn push_error(&mut self, msg: String) {
+        self.has_errors = true;
+        self.errors.push(msg);
+    }
+
+    /// All collected error messages, one per line — what a backend logs when
+    /// it refuses to build the pipeline.
+    pub fn error_report(&self) -> String {
+        if self.errors.is_empty() {
+            // has_errors was set without a message — still say something.
+            "shader compile failed (no diagnostic captured; this is a compiler bug, please report)"
+                .to_string()
+        } else {
+            self.errors.join("\n")
+        }
+    }
 }
 
 /// Mapping of uniform buffer type names to their assigned buffer indices
@@ -238,10 +336,52 @@ pub struct ShaderFn {
     pub args: Vec<ScriptPodType>,
     pub fnobj: ScriptObject,
     pub out: String,
+    pub callees: Vec<usize>,
     pub ret: ScriptPodType,
 }
 
 impl ShaderOutput {
+    pub fn validate_vertex_fetch_io(
+        &mut self,
+        heap: &ScriptHeap,
+        kind: &ShaderIoKind,
+        name: LiveId,
+        ty: ScriptPodType,
+    ) {
+        let pod_ty = &heap.pod_type_ref(ty).ty;
+        let message = match kind {
+            ShaderIoKind::DynInstance | ShaderIoKind::RustInstance
+                if pod_ty.has_compact_format() =>
+            {
+                Some(format!(
+                    "compact vertex format in instance field `{name}` is unsupported; instance buffers are f32-backed"
+                ))
+            }
+            ShaderIoKind::VertexBuffer if !pod_ty.vertex_layout_supported() => {
+                Some(format!(
+                    "vertex format in `{name}` cannot contain nested structs, arrays, matrices, or non-float vectors"
+                ))
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            if !self.errors.iter().any(|error| error == &message) {
+                self.push_error(message);
+            }
+        }
+    }
+
+    fn validate_collected_vertex_fetch_io(&mut self, heap: &ScriptHeap) {
+        let io: Vec<_> = self
+            .io
+            .iter()
+            .map(|io| (io.kind.clone(), io.name, io.ty))
+            .collect();
+        for (kind, name, ty) in io {
+            self.validate_vertex_fetch_io(heap, &kind, name, ty);
+        }
+    }
+
     pub fn next_rust_tmp_id(&mut self) -> usize {
         let id = self.rust_tmp_counter;
         self.rust_tmp_counter = self.rust_tmp_counter.wrapping_add(1);
@@ -307,6 +447,8 @@ impl ShaderOutput {
     /// Note: RustInstance and DynInstance are handled separately - RustInstance via
     /// pre_collect_rust_instance_io (from Rust type properties), DynInstance during compilation.
     pub fn pre_collect_shader_io(&mut self, vm: &mut ScriptVm, io_self: ScriptObject) {
+        self.backend.register_ids();
+
         // Use recursion to process from deepest prototype first (no temporary Vec needed)
         self.pre_collect_shader_io_recursive(vm, io_self);
 
@@ -316,6 +458,7 @@ impl ShaderOutput {
                 vm.bx.heap.pod_type_name_if_not_set(io.ty, io.name);
             }
         }
+        self.validate_collected_vertex_fetch_io(&vm.bx.heap);
     }
 
     fn pre_collect_shader_io_recursive(&mut self, vm: &ScriptVm, obj: ScriptObject) {
@@ -438,7 +581,8 @@ impl ShaderOutput {
 
     pub fn create_struct_defs(&mut self, vm: &ScriptVm, out: &mut String) {
         let mut plain_structs = self.structs.clone();
-        let mut packed_structs = BTreeSet::new();
+        let mut raw_logical_structs = BTreeSet::new();
+        let mut packed_only_structs = BTreeSet::new();
 
         for io in &self.io {
             let ty = io.ty;
@@ -446,31 +590,42 @@ impl ShaderOutput {
                 continue;
             }
 
-            if matches!(self.backend, ShaderBackend::Metal)
-                && matches!(
-                    io.kind,
+            if matches!(self.backend, ShaderBackend::Metal) {
+                match io.kind {
                     ShaderIoKind::UniformBuffer
-                        | ShaderIoKind::VertexBuffer
-                        | ShaderIoKind::RustInstance
-                        | ShaderIoKind::DynInstance
-                )
-            {
-                packed_structs.insert(ty);
+                    | ShaderIoKind::RustInstance
+                    | ShaderIoKind::DynInstance => {
+                        packed_only_structs.insert(ty);
+                    }
+                    ShaderIoKind::VertexBuffer => {
+                        raw_logical_structs.insert(ty);
+                    }
+                    _ => {
+                        plain_structs.insert(ty);
+                    }
+                }
             } else {
                 plain_structs.insert(ty);
             }
         }
 
-        for ty in &packed_structs {
+        // Metal fetches packed bytes into `*Raw` structs, then decodes into
+        // distinct logical structs used by shader expressions.
+        plain_structs.extend(raw_logical_structs.iter().copied());
+        packed_only_structs.retain(|ty| !raw_logical_structs.contains(ty));
+        for ty in &packed_only_structs {
             plain_structs.remove(ty);
         }
 
         self.structs.extend(plain_structs.iter().copied());
-        self.structs.extend(packed_structs.iter().copied());
+        self.structs.extend(raw_logical_structs.iter().copied());
+        self.structs.extend(packed_only_structs.iter().copied());
 
         if matches!(self.backend, ShaderBackend::Metal) {
             self.backend
-                .pod_struct_defs_mixed(&vm.bx.heap, &plain_structs, &packed_structs, out);
+                .pod_struct_defs_packed(&vm.bx.heap, &packed_only_structs, out);
+            self.backend
+                .pod_struct_defs_mixed(&vm.bx.heap, &plain_structs, &raw_logical_structs, out);
         } else {
             self.backend
                 .pod_struct_defs(&vm.bx.heap, &self.structs, out);

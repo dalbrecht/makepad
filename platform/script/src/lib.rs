@@ -1,3 +1,7 @@
+// Shader-language constants intentionally preserve their published numeric
+// spellings rather than depending on Rust's host-side constants.
+#![allow(clippy::approx_constant)]
+
 pub use makepad_error_log;
 pub use makepad_live_id;
 pub use makepad_live_id::makepad_live_id_macros;
@@ -14,10 +18,14 @@ macro_rules! script_eval {
 }
 
 pub mod colorhex;
+mod clock;
+pub mod docs;
+pub mod equality;
 pub mod gen_index;
 pub mod heap;
 pub mod mod_gc;
 pub mod mod_html;
+pub mod math_aot;
 pub mod mod_math;
 pub mod mod_pod;
 pub mod mod_regex;
@@ -40,6 +48,7 @@ pub mod function;
 pub mod gc;
 pub mod handle;
 pub mod json;
+mod key_code;
 pub mod numeric;
 pub mod opcode;
 pub mod opcodes;
@@ -48,6 +57,7 @@ pub mod opcodes_calls;
 pub mod opcodes_control;
 pub mod opcodes_loops;
 pub mod opcodes_ops;
+pub mod opcodes_slots;
 pub mod opcodes_vars;
 pub mod pod;
 pub mod pod_heap;
@@ -77,6 +87,7 @@ pub mod vm;
 
 pub use apply::*;
 pub use array::*;
+pub use docs::*;
 pub use function::*;
 pub use gc::*;
 pub use handle::*;
@@ -85,6 +96,7 @@ pub use makepad_live_id::*;
 pub use makepad_script_derive::*;
 pub use object::*;
 pub use string::*;
+pub use string_heap::*;
 pub use thread::*;
 pub use traits::*;
 pub use trap::*;

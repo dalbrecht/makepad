@@ -51,6 +51,8 @@ pub type GLsizeiptr = isize;
 
 pub const TRUE: GLboolean = 1;
 pub const ARRAY_BUFFER: GLenum = 0x8892;
+pub const COPY_READ_BUFFER: GLenum = 0x8F36;
+pub const COPY_WRITE_BUFFER: GLenum = 0x8F37;
 pub const ELEMENT_ARRAY_BUFFER: GLenum = 0x8893;
 pub const TEXTURE0: GLenum = 0x84C0;
 pub const TEXTURE_2D: GLenum = 0x0DE1;
@@ -63,6 +65,7 @@ pub const TEXTURE_CUBE_MAP_POSITIVE_Z: GLenum = 0x8519;
 pub const TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum = 0x851A;
 pub const TRIANGLES: GLenum = 0x0004;
 pub const UNSIGNED_INT: GLenum = 0x1405;
+pub const UNSIGNED_SHORT: GLenum = 0x1403;
 pub const INT: GLenum = 0x1404;
 pub const DEPTH_TEST: GLenum = 0x0B71;
 pub const LEQUAL: GLenum = 0x0203;
@@ -100,8 +103,10 @@ pub const TEXTURE_BORDER_COLOR: GLenum = 0x1004;
 pub const DEBUG_OUTPUT: GLenum = 0x92E0;
 
 pub const RGBA: GLenum = 0x1908;
+pub const RGBA32F: GLenum = 0x8814;
 pub const BGRA: GLenum = 0x80E1;
 pub const RED: GLenum = 0x1903;
+pub const R32F: GLenum = 0x822E;
 pub const RG: GLenum = 0x8227;
 pub const R8: GLenum = 0x8229;
 pub const UNSIGNED_BYTE: GLenum = 0x1401;
@@ -118,6 +123,8 @@ pub const TEXTURE_WRAP_R: GLenum = 0x8072;
 pub const CLAMP_TO_EDGE: GLenum = 0x812F;
 pub const CLAMP_TO_BORDER: GLenum = 0x812D;
 pub const PROGRAM_BINARY_LENGTH: GLenum = 0x8741;
+pub const MAX_SHADER_COMPILER_THREADS_KHR: GLenum = 0x91B0;
+pub const COMPLETION_STATUS_KHR: GLenum = 0x91B1;
 pub const NO_ERROR: GLenum = 0x0;
 pub const UNPACK_ALIGNMENT: GLenum = 0x0CF5;
 pub const UNPACK_ROW_LENGTH: GLenum = 0x0CF2;
@@ -132,8 +139,12 @@ pub const TEXTURE_EXTERNAL_OES: GLenum = 0x8D65;
 pub const EXTENSIONS: GLenum = 0x1F03;
 pub const VENDOR: GLenum = 0x1F00;
 pub const RENDERER: GLenum = 0x1F01;
+pub const VERSION: GLenum = 0x1F02;
+pub const SHADING_LANGUAGE_VERSION: GLenum = 0x8B8C;
 pub const SCISSOR_TEST: GLenum = 0x0C11;
 pub const CULL_FACE: GLenum = 0x0B44;
+pub const CW: GLenum = 0x0900;
+pub const CCW: GLenum = 0x0901;
 pub const BACK: GLenum = 0x0405;
 pub const DONT_CARE: GLenum = 0x1100;
 pub const UNIFORM_BUFFER: GLenum = 0x8A11;
@@ -195,6 +206,7 @@ pub type TglRenderbufferStorage = unsafe extern "C" fn(
 ) -> ();
 pub type TglDisable = unsafe extern "C" fn(cap: GLenum) -> ();
 pub type TglCullFace = unsafe extern "C" fn(mode: GLenum) -> ();
+pub type TglFrontFace = unsafe extern "C" fn(mode: GLenum) -> ();
 pub type TglFramebufferRenderbuffer = unsafe extern "C" fn(
     target: GLenum,
     attachment: GLenum,
@@ -238,7 +250,9 @@ pub type TglCompileShader = unsafe extern "C" fn(shader: GLuint) -> ();
 pub type TglCreateProgram = unsafe extern "C" fn() -> GLuint;
 pub type TglAttachShader = unsafe extern "C" fn(program: GLuint, shader: GLuint) -> ();
 pub type TglLinkProgram = unsafe extern "C" fn(program: GLuint) -> ();
+pub type TglDeleteProgram = unsafe extern "C" fn(program: GLuint) -> ();
 pub type TglDeleteShader = unsafe extern "C" fn(shader: GLuint) -> ();
+pub type TglMaxShaderCompilerThreadsKHR = unsafe extern "C" fn(count: GLuint) -> ();
 pub type TglUniform1fv =
     unsafe extern "C" fn(location: GLint, count: GLsizei, value: *const GLfloat) -> ();
 pub type TglGenTextures = unsafe extern "C" fn(n: GLsizei, textures: *mut GLuint) -> ();
@@ -271,6 +285,14 @@ pub type TglGetTexLevelParameteriv =
     unsafe extern "C" fn(target: GLenum, level: GLint, pname: GLenum, params: *mut GLint) -> ();
 pub type TglDeleteTextures = unsafe extern "C" fn(n: GLsizei, textures: *const GLuint) -> ();
 pub type TglGenBuffers = unsafe extern "C" fn(n: GLsizei, buffers: *mut GLuint) -> ();
+pub type TglCopyBufferSubData = unsafe extern "C" fn(
+    read_target: GLenum,
+    write_target: GLenum,
+    read_offset: isize,
+    write_offset: isize,
+    size: isize,
+);
+pub type TglBufferSubData = unsafe extern "C" fn(target: GLenum, offset: isize, size: isize, data: *const std::ffi::c_void);
 pub type TglBufferData = unsafe extern "C" fn(
     target: GLenum,
     size: GLsizeiptr,
@@ -286,6 +308,10 @@ pub type TglSamplerParameteri =
     unsafe extern "C" fn(sampler: GLuint, pname: GLenum, param: GLint) -> ();
 pub type TglFlush = unsafe extern "C" fn() -> ();
 pub type TglFinish = unsafe extern "C" fn() -> ();
+/// `glWaitSync` — wait on a share-group `GLsync` in the current context.
+pub type TglWaitSync =
+    unsafe extern "C" fn(sync: *const raw::c_void, flags: GLbitfield, timeout: u64) -> ();
+pub type TglIsTexture = unsafe extern "C" fn(texture: GLuint) -> GLboolean;
 pub type TglGetProgramBinary = unsafe extern "C" fn(
     program: GLuint,
     bufSize: GLsizei,
@@ -416,6 +442,7 @@ pub struct LibGl {
     pub glRenderbufferStorage: TglRenderbufferStorage,
     pub glDisable: TglDisable,
     pub glCullFace: TglCullFace,
+    pub glFrontFace: TglFrontFace,
     pub glFramebufferRenderbuffer: TglFramebufferRenderbuffer,
     pub glFramebufferTexture2D: TglFramebufferTexture2D,
     pub glGetShaderiv: TglGetShaderiv,
@@ -430,7 +457,9 @@ pub struct LibGl {
     pub glCreateProgram: TglCreateProgram,
     pub glAttachShader: TglAttachShader,
     pub glLinkProgram: TglLinkProgram,
+    pub glDeleteProgram: TglDeleteProgram,
     pub glDeleteShader: TglDeleteShader,
+    pub glMaxShaderCompilerThreadsKHR: Option<TglMaxShaderCompilerThreadsKHR>,
     pub glUniform1fv: TglUniform1fv,
     pub glGenTextures: TglGenTextures,
     pub glTexParameteri: TglTexParameteri,
@@ -440,6 +469,8 @@ pub struct LibGl {
     pub glGetTexLevelParameteriv: TglGetTexLevelParameteriv,
     pub glGenBuffers: TglGenBuffers,
     pub glBufferData: TglBufferData,
+    pub glBufferSubData: TglBufferSubData,
+    pub glCopyBufferSubData: TglCopyBufferSubData,
     pub glUniform1i: TglUniform1i,
     pub glGetError: TglGetError,
     pub glGenSamplers: Option<TglGenSamplers>,
@@ -451,6 +482,8 @@ pub struct LibGl {
     pub glReadPixels: TglReadPixels,
     pub glFlush: TglFlush,
     pub glFinish: TglFinish,
+    pub glWaitSync: Option<TglWaitSync>,
+    pub glIsTexture: Option<TglIsTexture>,
     pub glGetProgramBinary: TglGetProgramBinary,
     pub glProgramBinary: TglProgramBinary,
     pub glDeleteTextures: TglDeleteTextures,
@@ -475,6 +508,14 @@ pub struct LibGl {
     pub glFramebufferTextureMultiviewOVR: Option<TglFramebufferTextureMultiviewOVR>,
     pub glFramebufferTextureMultisampleMultiviewOVR:
         Option<TglFramebufferTextureMultisampleMultiviewOVR>,
+    // Extension checks we only need to run once per context.
+    pub(crate) parallel_compile: std::sync::OnceLock<bool>,
+    pub(crate) oes_external_listed: std::sync::OnceLock<bool>,
+    // The OS build and GL driver tag at the end of Android's program cache filenames.
+    #[cfg(not(ohos_sim))]
+    pub(crate) android_cache_suffix: std::sync::OnceLock<String>,
+    #[cfg(not(ohos_sim))]
+    pub(crate) stale_cache_sweep: std::sync::Once,
 }
 
 macro_rules! load {
@@ -629,6 +670,7 @@ impl LibGl {
             )?,
             glDisable: load!(loadfn, TglDisable, "glDisable")?,
             glCullFace: load!(loadfn, TglCullFace, "glCullFace")?,
+            glFrontFace: load!(loadfn, TglFrontFace, "glFrontFace")?,
             glFramebufferRenderbuffer: load!(
                 loadfn,
                 TglFramebufferRenderbuffer,
@@ -688,7 +730,20 @@ impl LibGl {
                 "glAttachObjectARB"
             )?,
             glLinkProgram: load!(loadfn, TglLinkProgram, "glLinkProgram", "glLinkProgramARB")?,
+            glDeleteProgram: load!(
+                loadfn,
+                TglDeleteProgram,
+                "glDeleteProgram",
+                "glDeleteProgramARB"
+            )?,
             glDeleteShader: load!(loadfn, TglDeleteShader, "glDeleteShader")?,
+            glMaxShaderCompilerThreadsKHR: load!(
+                loadfn,
+                TglMaxShaderCompilerThreadsKHR,
+                "glMaxShaderCompilerThreadsKHR",
+                "glMaxShaderCompilerThreadsARB"
+            )
+            .ok(),
             glUniform1fv: load!(loadfn, TglUniform1fv, "glUniform1fv", "glUniform1fvARB")?,
             glGenTextures: load!(loadfn, TglGenTextures, "glGenTextures")?,
             glTexParameteri: load!(loadfn, TglTexParameteri, "glTexParameteri")?,
@@ -703,6 +758,13 @@ impl LibGl {
             glDeleteTextures: load!(loadfn, TglDeleteTextures, "glDeleteTextures")?,
             glGenBuffers: load!(loadfn, TglGenBuffers, "glGenBuffers", "glGenBuffersARB")?,
             glBufferData: load!(loadfn, TglBufferData, "glBufferData", "glBufferDataARB")?,
+            glBufferSubData: load!(loadfn, TglBufferSubData, "glBufferSubData", "glBufferSubDataARB")?,
+            glCopyBufferSubData: load!(
+                loadfn,
+                TglCopyBufferSubData,
+                "glCopyBufferSubData",
+                "glCopyBufferSubDataNV"
+            )?,
             glUniform1i: load!(loadfn, TglUniform1i, "glUniform1i", "glUniform1iARB")?,
             glGetError: load!(loadfn, TglGetError, "glGetError")?,
             glGenSamplers: load!(loadfn, TglGenSamplers, "glGenSamplers").ok(),
@@ -711,6 +773,8 @@ impl LibGl {
             glSamplerParameteri: load!(loadfn, TglSamplerParameteri, "glSamplerParameteri").ok(),
             glFlush: load!(loadfn, TglFlush, "glFlush")?,
             glFinish: load!(loadfn, TglFinish, "glFinish")?,
+            glWaitSync: load!(loadfn, TglWaitSync, "glWaitSync").ok(),
+            glIsTexture: load!(loadfn, TglIsTexture, "glIsTexture").ok(),
             glClearDepthf: load!(loadfn, TglClearDepthf, "glClearDepthf", "glClearDepthfOES")?,
             glGetProgramBinary: load!(
                 loadfn,
@@ -796,6 +860,12 @@ impl LibGl {
                 "glFramebufferTextureMultisampleMultiviewOVR"
             )
             .ok(),
+            parallel_compile: Default::default(),
+            oes_external_listed: Default::default(),
+            #[cfg(not(ohos_sim))]
+            android_cache_suffix: Default::default(),
+            #[cfg(not(ohos_sim))]
+            stale_cache_sweep: std::sync::Once::new(),
         })
     }
 }

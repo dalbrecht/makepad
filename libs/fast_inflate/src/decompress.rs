@@ -536,8 +536,21 @@ pub fn deflate_decompress(
     input: &[u8],
     output: &mut [u8],
 ) -> Result<(usize, usize), DecompressError> {
+    deflate_decompress_from(input, output, 0)
+}
+
+/// Decompress raw DEFLATE into `output[start..]`. Bytes before `start` are
+/// history the matcher may read (MSZIP 32K window across cabinet blocks).
+pub fn deflate_decompress_from(
+    input: &[u8],
+    output: &mut [u8],
+    start: usize,
+) -> Result<(usize, usize), DecompressError> {
+    if start > output.len() {
+        return Err(DecompressError::InsufficientSpace);
+    }
     let mut d = Decompressor::new();
-    deflate_decompress_with(&mut d, input, output)
+    deflate_decompress_with(&mut d, input, output, start)
 }
 
 /// Decompress raw DEFLATE data using a reusable decompressor.
@@ -545,6 +558,7 @@ fn deflate_decompress_with(
     d: &mut Decompressor,
     input: &[u8],
     output: &mut [u8],
+    start: usize,
 ) -> Result<(usize, usize), DecompressError> {
     let in_len = input.len();
     let out_len = output.len();
@@ -553,7 +567,7 @@ fn deflate_decompress_with(
     let in_fastloop_end = in_len.saturating_sub(FASTLOOP_MAX_BYTES_READ);
 
     let mut in_pos: usize = 0;
-    let mut out_pos: usize = 0;
+    let mut out_pos: usize = start;
 
     let mut bitbuf: BitBuf = 0;
     let mut bitsleft: u32 = 0;
@@ -1134,7 +1148,7 @@ fn deflate_decompress_with(
     safety_check!(overread_count <= (bitsleft >> 3) as usize);
 
     let actual_in_pos = in_pos - (bitsleft >> 3) as usize + overread_count;
-    Ok((actual_in_pos, out_pos))
+    Ok((actual_in_pos, out_pos - start))
 }
 
 // --- Zlib wrapper ---
@@ -1176,7 +1190,7 @@ fn zlib_decompress_with(
     }
 
     let deflate_data = &input[2..];
-    let (consumed, written) = deflate_decompress_with(d, deflate_data, output)?;
+    let (consumed, written) = deflate_decompress_with(d, deflate_data, output, 0)?;
 
     let footer_start = 2 + consumed;
     if footer_start + ZLIB_FOOTER_SIZE > input.len() {
@@ -1203,7 +1217,7 @@ pub fn deflate_decompress_vec(input: &[u8]) -> Result<Vec<u8>, DecompressError> 
     let mut capacity = (input.len() * 3).max(INITIAL_VEC_CAPACITY);
     loop {
         let mut output = vec![0u8; capacity];
-        match deflate_decompress_with(&mut d, input, &mut output) {
+        match deflate_decompress_with(&mut d, input, &mut output, 0) {
             Ok((_consumed, written)) => {
                 output.truncate(written);
                 return Ok(output);
@@ -1253,7 +1267,9 @@ pub fn zlib_decompress_vec_with_hint(
     size_hint: usize,
 ) -> Result<Vec<u8>, DecompressError> {
     let mut d = Decompressor::new();
-    let mut capacity = size_hint;
+    // A zero hint would double forever (0*2 == 0 never exceeds the cap);
+    // start from a real floor so the retry loop terminates.
+    let mut capacity = size_hint.max(4096);
     loop {
         let mut output = vec![0u8; capacity];
         match zlib_decompress_with(&mut d, input, &mut output) {
@@ -1356,7 +1372,7 @@ fn gzip_decompress_with(
     }
 
     let deflate_data = &input[pos..];
-    let (consumed, written) = deflate_decompress_with(d, deflate_data, output)?;
+    let (consumed, written) = deflate_decompress_with(d, deflate_data, output, 0)?;
 
     let footer_start = pos + consumed;
     if footer_start + 8 > input.len() {
@@ -1549,12 +1565,8 @@ mod tests {
 
     #[test]
     fn test_uncompressed_block() {
-        use std::io::Write;
         let input = b"This is uncompressed data that should be stored as-is";
-        let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::none());
-        encoder.write_all(input).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let compressed = crate::deflate_compress(input, 0);
 
         let mut output = vec![0u8; input.len()];
         let (_, written) = deflate_decompress(&compressed, &mut output).unwrap();
@@ -1590,11 +1602,8 @@ mod tests {
 
     #[test]
     fn test_cross_compressed_flate2_to_rust() {
-        use std::io::Write;
         let data = b"Cross-library compatibility test! ".repeat(5000);
-        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
-        encoder.write_all(&data).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let compressed = crate::zlib_compress(&data, 9);
 
         let mut output = vec![0u8; data.len()];
         let (_, written) = zlib_decompress(&compressed, &mut output).unwrap();
@@ -1654,12 +1663,8 @@ mod tests {
 
     #[test]
     fn test_zlib_decompress_vec() {
-        use std::io::Write;
         let data = b"Hello, this is a test of the auto-sizing zlib decompressor!".repeat(100);
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&data).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let compressed = crate::zlib_compress(&data, 6);
 
         let result = zlib_decompress_vec(&compressed).unwrap();
         assert_eq!(result, data);
@@ -1667,12 +1672,8 @@ mod tests {
 
     #[test]
     fn test_deflate_decompress_vec() {
-        use std::io::Write;
         let data = b"Auto-sizing deflate decompression test data!".repeat(200);
-        let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&data).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let compressed = crate::deflate_compress(&data, 6);
 
         let result = deflate_decompress_vec(&compressed).unwrap();
         assert_eq!(result, data);
@@ -1680,12 +1681,8 @@ mod tests {
 
     #[test]
     fn test_zlib_decompress_vec_with_hint_correct() {
-        use std::io::Write;
         let data = b"Hint test with correct size".repeat(50);
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&data).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let compressed = crate::zlib_compress(&data, 6);
 
         let result = zlib_decompress_vec_with_hint(&compressed, data.len()).unwrap();
         assert_eq!(result, data);
@@ -1693,12 +1690,8 @@ mod tests {
 
     #[test]
     fn test_zlib_decompress_vec_with_hint_too_small() {
-        use std::io::Write;
         let data = b"Hint test with undersized hint".repeat(100);
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&data).unwrap();
-        let compressed = encoder.finish().unwrap();
+        let compressed = crate::zlib_compress(&data, 6);
 
         let result = zlib_decompress_vec_with_hint(&compressed, 10).unwrap();
         assert_eq!(result, data);

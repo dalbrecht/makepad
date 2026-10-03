@@ -9,10 +9,10 @@ use ohos_sys::xcomponent::{
     OH_NativeXComponent_GetXComponentSize, OH_NativeXComponent_RegisterCallback,
     OH_NativeXComponent_TouchEvent, OH_NativeXComponent_TouchEventType,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 
 use super::raw_file::RawFileMgr;
 
@@ -23,15 +23,14 @@ struct VSyncParams {
     pub tx: mpsc::Sender<FromOhosMessage>,
 }
 
-thread_local! {
-    static OHOS_MSG_TX: RefCell<Option<mpsc::Sender<FromOhosMessage>>> = RefCell::new(None);
-}
+static OHOS_MSG_TX: Mutex<Option<mpsc::Sender<FromOhosMessage>>> = Mutex::new(None);
 
 pub fn send_from_ohos_message(message: FromOhosMessage) {
-    OHOS_MSG_TX.with(|tx| {
-        let mut tx = tx.borrow_mut();
-        tx.as_mut().unwrap().send(message).unwrap();
-    });
+    if let Ok(tx) = OHOS_MSG_TX.lock() {
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(message);
+        }
+    }
 }
 
 #[napi]
@@ -120,13 +119,14 @@ extern "C" fn on_dispatch_touch_event_cb(component: *mut OH_NativeXComponent, wi
     let touch_event = unsafe { touch_event.assume_init() };
 
     let mut touches = Vec::with_capacity(touch_event.numPoints as usize);
+    let mut cancelled = Vec::new();
     for idx in 0..touch_event.numPoints {
         let point = &(touch_event.touchPoints[idx as usize]);
         let touch_state = match point.type_ {
             OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_DOWN => TouchState::Start,
             OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_UP => TouchState::Stop,
             OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_MOVE => TouchState::Move,
-            OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_CANCEL => TouchState::Move,
+            OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_CANCEL => TouchState::Stop,
             _ => {
                 crate::error!(
                     "Failed to dispatch call for touch Event {:?}",
@@ -135,7 +135,7 @@ extern "C" fn on_dispatch_touch_event_cb(component: *mut OH_NativeXComponent, wi
                 TouchState::Move
             }
         };
-        touches.push(TouchPoint {
+        let touch = TouchPoint {
             state: touch_state,
             abs: dvec2(point.x as f64, point.y as f64),
             time: point.timeStamp as f64 / 1000000000.0,
@@ -145,9 +145,19 @@ extern "C" fn on_dispatch_touch_event_cb(component: *mut OH_NativeXComponent, wi
             radius: dvec2(1.0, 1.0),
             handled: Cell::new(Area::Empty),
             sweep_lock: Cell::new(Area::Empty),
-        })
+        };
+        if matches!(point.type_, OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_CANCEL) {
+            cancelled.push(touch);
+        } else {
+            touches.push(touch);
+        }
     }
-    send_from_ohos_message(FromOhosMessage::Touch(touches));
+    if !cancelled.is_empty() {
+        send_from_ohos_message(FromOhosMessage::TouchCancel(cancelled));
+    }
+    if !touches.is_empty() {
+        send_from_ohos_message(FromOhosMessage::Touch(touches));
+    }
     //crate::log!("OnDispatchTouchEventCallBack");
 }
 
@@ -177,7 +187,7 @@ extern "C" fn on_frame_cb(
 }
 
 pub fn init_globals(from_ohos_tx: mpsc::Sender<FromOhosMessage>) {
-    OHOS_MSG_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(from_ohos_tx));
+    *OHOS_MSG_TX.lock().unwrap() = Some(from_ohos_tx);
 }
 
 pub fn register_xcomponent_callbacks(env: &Env, xcomponent: &JsObject) {
@@ -268,6 +278,7 @@ pub enum FromOhosMessage {
     SurfaceDestroyed,
     VSync,
     Touch(Vec<TouchPoint>),
+    TouchCancel(Vec<TouchPoint>),
     TextInput(TextInputEvent),
     DeleteLeft(i32),
     ResizeTextIME(bool, i32),

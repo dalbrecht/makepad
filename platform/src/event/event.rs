@@ -8,14 +8,16 @@ use {
         draw_list::DrawListId,
         //midi::{Midi1InputData, MidiInputInfo},
         event::{
-            drag_drop::*, finger::*, game_input::*, keyboard::*, network::*, video_playback::*,
-            window::*, xr::*,
+            drag_drop::*, finger::*, game_input::*, keyboard::*, location::*, network::*,
+            video_playback::*, window::*, xr::*,
         },
         //makepad_live_compiler::LiveEditEvent,
         makepad_live_id::LiveId,
+        makepad_math::Vec2Index,
         makepad_script::*,
         midi::MidiPortsEvent,
         permission::PermissionResult,
+        storage::StorageResponsesEvent,
         video::VideoInputsEvent,
         window::WindowId,
     },
@@ -57,6 +59,14 @@ pub enum Event {
     ///
     /// [`onDestroy`]: https://developer.android.com/reference/android/app/Activity#onDestroy()
     Shutdown,
+
+    /// The application has been asked to quit.
+    ///
+    /// This is sent before [`Event::Shutdown`] for graceful quit requests such
+    /// as application-menu Quit and polite process termination signals.
+    /// Handlers may set `handled` to `true` to defer or cancel the quit, for
+    /// example while showing a confirmation dialog.
+    QuitRequested(QuitRequestedEvent),
 
     /// The application has been started in the foreground and is now visible to the user,
     /// but is not yet actively receiving user input.
@@ -124,6 +134,20 @@ pub enum Event {
 
     Draw(DrawEvent),
     LiveEdit,
+    /// Request from `Cx::request_script_reapply()` to re-apply the widget
+    /// tree via `Apply::ScriptReapply` *without* re-running `script_mod!`.
+    ///
+    /// This is useful when something like a Splash-level script object
+    /// has been modified at runtime (e.g., `script_eval!`) and the application
+    /// wants every widget in the widget tree to pick up that new modified object value.
+    ///
+    /// Unlike `Event::LiveEdit`, this preserves any heap object values that have
+    /// already been modified at runtime. It also walks the tree with
+    /// `Apply::ScriptReapply` (rather than `Apply::Reload`) so that field
+    /// types whose canonical mutation path is an imperative setter
+    /// (e.g. `Label::set_text`) can early-return and keep their runtime
+    /// value instead of being clobbered by the stale DSL literal.
+    ScriptReapply,
     /// A window has gained focus and is now the active window receiving user input.
     WindowGotFocus(WindowId),
     /// A window has lost focus and is no longer the active window receiving user input.
@@ -140,6 +164,9 @@ pub enum Event {
     WindowGeomChange(WindowGeomChangeEvent),
     VirtualKeyboard(VirtualKeyboardEvent),
     ClearAtlasses,
+    /// Clear all hover/pressed visual state, e.g. after an overlay that
+    /// swallowed the hover-outs (a context menu) has closed.
+    ClearHover,
 
     /// The raw event that occurs when the user presses a mouse button down.
     ///
@@ -169,6 +196,12 @@ pub enum Event {
     /// Do not match upon or handle this event directly; instead, use the family of
     /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit`].
     TouchUpdate(TouchUpdateEvent),
+    /// A press taken away before it lifted (see [`FingerCancelEvent`]):
+    /// dispatched by the owner of a claimed gesture to its children, or by
+    /// a host that cancels a finger. Handle it through `hits()`, which
+    /// turns it into the capture's terminal `Hit::FingerUp` with
+    /// `cancelled: true`.
+    FingerCancel(FingerCancelEvent),
     /// The raw event that occurs when the user finishes a long press touch/click.
     ///
     /// Do not match upon or handle this event directly; instead, use the family of
@@ -180,9 +213,18 @@ pub enum Event {
     /// Do not match upon or handle this event directly; instead use the family of
     /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit::FingerScroll`].
     Scroll(ScrollEvent), // this is the MouseWheel / touch scroll event sent by the OS
+    /// The raw event of a trackpad pinch (macOS magnify, Wayland pointer gestures).
+    ///
+    /// Do not match upon or handle this event directly; instead use the family of
+    /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit::FingerPinch`].
+    Pinch(PinchEvent),
 
     Timer(TimerEvent),
 
+    /// An app-facing channel has something for the UI thread: a `ToUISender`
+    /// sent, a task-pool job finished, a texture readback completed. This is a
+    /// broadcast to every widget with no payload, so each handler polls its
+    /// own queue. Makepad's own machinery never raises it.
     Signal,
     Trigger(TriggerEvent),
     MacosMenuCommand(LiveId),
@@ -190,6 +232,7 @@ pub enum Event {
     KeyFocusLost(KeyFocusEvent),
     KeyDown(KeyEvent),
     KeyUp(KeyEvent),
+    PhysicalKeyboard(PhysicalKeyboardEvent),
     TextInput(TextInputEvent),
     TextRangeReplace(TextRangeReplaceEvent),
     TextCopy(TextClipboardEvent),
@@ -210,6 +253,8 @@ pub enum Event {
     MidiPorts(MidiPortsEvent),
     VideoInputs(VideoInputsEvent),
     NetworkResponses(NetworkResponsesEvent),
+    /// Results of asynchronous operations submitted through [`Cx::storage`].
+    Storage(StorageResponsesEvent),
 
     VideoPlaybackPrepared(VideoPlaybackPreparedEvent),
     VideoTextureUpdated(VideoTextureUpdatedEvent),
@@ -220,10 +265,11 @@ pub enum Event {
     VideoYuvTexturesReady(VideoYuvTexturesReady),
     VideoSeekableRanges(VideoSeekableRangesEvent),
     VideoBufferedRanges(VideoBufferedRangesEvent),
+    VideoTracksChanged(VideoTracksChangedEvent),
 
     /// The "go back" navigational button or gesture was performed.
     ///
-    /// Tip: use the [`Event::consume_back_pressed()`] method to handle this event
+    /// Tip: use the [`Event::back_pressed()`] method to handle this event
     /// instead of matching on it directly.
     ///
     /// Once a widget has handled this event, it should set the `handled` flag to `true`
@@ -234,6 +280,12 @@ pub enum Event {
 
     /// Permission check or request result
     PermissionResult(PermissionResult),
+
+    /// A position fix from the platform location service
+    /// (see [`Cx::start_location_updates`]).
+    LocationUpdate(LocationUpdateEvent),
+    /// Location updates cannot be delivered (permission denied / no service).
+    LocationError(LocationErrorEvent),
 
     #[cfg(target_arch = "wasm32")]
     ToWasmMsg(ToWasmMsgEvent),
@@ -248,6 +300,7 @@ impl Event {
         match v {
             1 => "Startup",
             2 => "Shutdown",
+            67 => "QuitRequested",
 
             3 => "Foreground",
             4 => "Background",
@@ -269,14 +322,17 @@ impl Event {
             17 => "WindowGeomChange",
             18 => "VirtualKeyboard",
             19 => "ClearAtlasses",
+            72 => "ClearHover",
 
             20 => "MouseDown",
             21 => "MouseMove",
             59 => "TweakRay",
             22 => "MouseUp",
             23 => "TouchUpdate",
+            75 => "FingerCancel",
             24 => "LongPress",
             25 => "Scroll",
+            74 => "Pinch",
 
             26 => "Timer",
 
@@ -287,6 +343,7 @@ impl Event {
             31 => "KeyFocusLost",
             32 => "KeyDown",
             33 => "KeyUp",
+            68 => "PhysicalKeyboard",
             34 => "TextInput",
             35 => "TextRangeReplace",
             36 => "TextCopy",
@@ -300,6 +357,7 @@ impl Event {
             42 => "MidiPorts",
             43 => "VideoInputs",
             44 => "NetworkResponses",
+            73 => "Storage",
 
             45 => "VideoPlaybackPrepared",
             46 => "VideoTextureUpdated",
@@ -310,6 +368,7 @@ impl Event {
             63 => "VideoSeekableRanges",
             64 => "VideoBufferedRanges",
             65 => "VideoYuvTexturesReady",
+            71 => "VideoTracksChanged",
             51 => "MouseLeave",
             52 => "Actions",
             53 => "BackPressed",
@@ -323,6 +382,9 @@ impl Event {
             60 => "Custom",
             61 => "PopupDismissed",
             62 => "SelectionHandleDrag",
+            66 => "ScriptReapply",
+            69 => "LocationUpdate",
+            70 => "LocationError",
             _ => panic!(),
         }
     }
@@ -331,6 +393,7 @@ impl Event {
         match self {
             Self::Startup => 1,
             Self::Shutdown => 2,
+            Self::QuitRequested(_) => 67,
 
             Self::Foreground => 3,
             Self::Background => 4,
@@ -352,6 +415,7 @@ impl Event {
             Self::WindowGeomChange(_) => 17,
             Self::VirtualKeyboard(_) => 18,
             Self::ClearAtlasses => 19,
+            Self::ClearHover => 72,
             Self::PopupDismissed(_) => 61,
 
             Self::MouseDown(_) => 20,
@@ -359,8 +423,10 @@ impl Event {
             Self::TweakRay(_) => 59,
             Self::MouseUp(_) => 22,
             Self::TouchUpdate(_) => 23,
+            Self::FingerCancel(_) => 75,
             Self::LongPress(_) => 24,
             Self::Scroll(_) => 25,
+            Self::Pinch(_) => 74,
 
             Self::Timer(_) => 26,
 
@@ -371,6 +437,7 @@ impl Event {
             Self::KeyFocusLost(_) => 31,
             Self::KeyDown(_) => 32,
             Self::KeyUp(_) => 33,
+            Self::PhysicalKeyboard(_) => 68,
             Self::TextInput(_) => 34,
             Self::TextRangeReplace(_) => 35,
             Self::TextCopy(_) => 36,
@@ -386,6 +453,7 @@ impl Event {
             Self::MidiPorts(_) => 42,
             Self::VideoInputs(_) => 43,
             Self::NetworkResponses(_) => 44,
+            Self::Storage(_) => 73,
 
             Self::VideoPlaybackPrepared(_) => 45,
             Self::VideoTextureUpdated(_) => 46,
@@ -396,16 +464,20 @@ impl Event {
             Self::VideoSeekableRanges(_) => 63,
             Self::VideoBufferedRanges(_) => 64,
             Self::VideoYuvTexturesReady(_) => 65,
+            Self::VideoTracksChanged(_) => 71,
             Self::MouseLeave(_) => 51,
             Self::Actions(_) => 52,
             Self::BackPressed { .. } => 53,
             Self::PermissionResult(_) => 54,
+            Self::LocationUpdate(_) => 69,
+            Self::LocationError(_) => 70,
 
             #[cfg(target_arch = "wasm32")]
             Self::ToWasmMsg(_) => 55,
 
             Self::XrLocal(_) => 57,
             Self::Custom(_) => 60,
+            Self::ScriptReapply => 66,
         }
     }
 
@@ -421,6 +493,67 @@ impl Event {
             }
         }
         false
+    }
+
+    /// Whether a scroll view already moved by this [`Scroll`](Self::Scroll)
+    /// event's delta along `axis`. Always `false` for any other event.
+    ///
+    /// A scroll event reaches the widgets nearest the pointer first and the
+    /// scroll views around them after, so a scroll view that checks this
+    /// before applying a delta leaves alone a wheel an inner one has used.
+    pub fn scroll_handled(&self, axis: Vec2Index) -> bool {
+        match self {
+            Self::Scroll(e) => match axis {
+                Vec2Index::X => e.handled_x.get(),
+                Vec2Index::Y => e.handled_y.get(),
+            },
+            _ => false,
+        }
+    }
+
+    /// Marks this [`Scroll`](Self::Scroll) event's delta along `axis` as used,
+    /// so the scroll views around the caller leave it alone.
+    ///
+    /// Call it only after moving by the delta. A scroll view pinned at the
+    /// edge the delta points past leaves the delta for the views around it,
+    /// the way a `ScrollBar` at its limit does. Does nothing for any other
+    /// event.
+    pub fn set_scroll_handled(&self, axis: Vec2Index) {
+        if let Self::Scroll(e) = self {
+            match axis {
+                Vec2Index::X => e.handled_x.set(true),
+                Vec2Index::Y => e.handled_y.set(true),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuitReason {
+    /// The app requested a quit programmatically.
+    App,
+    /// The user chose a native/application menu Quit command.
+    Menu,
+    /// The process received a polite termination signal, such as Ctrl+C or SIGTERM.
+    Signal,
+}
+
+#[derive(Debug)]
+pub struct QuitRequestedEvent {
+    pub reason: QuitReason,
+    pub handled: Cell<bool>,
+}
+
+impl QuitRequestedEvent {
+    pub fn new(reason: QuitReason) -> Self {
+        Self {
+            reason,
+            handled: Cell::new(false),
+        }
+    }
+
+    pub fn handle(&self) {
+        self.handled.set(true);
     }
 }
 
@@ -438,6 +571,7 @@ pub enum Hit {
     ImeAction(ImeActionEvent),
 
     FingerScroll(FingerScrollEvent),
+    FingerPinch(FingerPinchEvent),
     FingerDown(FingerDownEvent),
     FingerMove(FingerMoveEvent),
     FingerHoverIn(FingerHoverEvent),
@@ -465,7 +599,10 @@ impl Event {
             | Self::MouseMove(_)
             | Self::TweakRay(_)
             | Self::TouchUpdate(_)
-            | Self::Scroll(_) => true,
+            | Self::Scroll(_)
+            | Self::Pinch(_)
+            | Self::BackPressed { .. } => true,
+            Self::KeyDown(key) | Self::KeyUp(key) if key.key_code == KeyCode::Escape => true,
             _ => false,
         }
     }
@@ -945,18 +1082,21 @@ impl Ease {
 pub enum VirtualKeyboardEvent {
     WillShow {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
         duration: f64,
         ease: Ease,
     },
     WillHide {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
         duration: f64,
         ease: Ease,
     },
     DidShow {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
     },
     DidHide {

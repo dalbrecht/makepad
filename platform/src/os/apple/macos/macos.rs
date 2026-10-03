@@ -1,16 +1,19 @@
+use crate::frame_trace::TickSource;
+use crate::present_trace::{Cause as PresentCause, Stage as PresentStage};
 use {
     crate::{
         cx::{Cx, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
         draw_pass::CxDrawPassParent,
         event::{
+            drag_drop::{DragEvent, DragItem, DragResponse, DropEvent},
             video_playback::{
                 CameraPreviewMode, VideoBufferedRangesEvent, VideoDecodingErrorEvent,
                 VideoPlaybackPreparedEvent, VideoPlaybackResourcesReleasedEvent,
                 VideoSeekableRangesEvent, VideoTextureUpdatedEvent, VideoYuvTexturesReady,
             },
-            drag_drop::{DragEvent, DragItem, DragResponse, DropEvent},
-            Event, GameInputEventChannel, MouseButton, MouseUpEvent, VideoSource, WindowGeom,
+            Event, GameInputEventChannel, MouseButton, MouseUpEvent, QuitReason, VideoSource,
+            WindowGeom,
         },
         makepad_live_id::*,
         makepad_math::*,
@@ -23,7 +26,10 @@ use {
                 apple_video_player::AppleUnifiedVideoPlayer,
                 apple_webview::MacosSystemBrowser,
                 macos::{
-                    macos_app::{init_macos_app_global, with_macos_app, MacosApp},
+                    macos_app::{
+                        activate_cocoa_window_on_pointer_down, init_macos_app_global,
+                        with_macos_app, MacosApp,
+                    },
                     macos_event::MacosEvent,
                     macos_window::MacosWindow,
                 },
@@ -45,9 +51,116 @@ use {
         collections::HashMap,
         rc::Rc,
         sync::{Arc, Mutex},
-        time::Instant,
+        time::{Duration, Instant},
     },
 };
+
+/// NSWindowOcclusionStateVisible: some part of the window is on screen.
+const NS_WINDOW_OCCLUSION_STATE_VISIBLE: usize = 1 << 1;
+
+/// Presented-handlers normally land within a few vsyncs; a gate closed this
+/// long means they were lost (occlusion, display sleep) and won't come.
+const PRESENT_GATE_STUCK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// In-flight presents at which the gate closes and the beat is skipped: the
+/// drawable pool holds three, so acquiring with fewer outstanding can't block.
+const PRESENT_GATE_IN_FLIGHT: u32 = 3;
+
+/// How long we trust `occlusionState` before presenting anyway. The flag can
+/// stick on "hidden" while the window is really on screen, which used to skip
+/// every beat forever.
+const OCCLUSION_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Private paint-clock used only while a widget owns the mouse. AppKit may
+/// reduce a non-key/occluded view's display-link callbacks to roughly 12 Hz;
+/// a captured drag must retain the panel's full refresh cadence.
+const POINTER_CAPTURE_TIMER_ID: u64 = u64::MAX;
+
+fn fastest_display_interval() -> f64 {
+    unsafe {
+        let screens: ObjcId = msg_send![class!(NSScreen), screens];
+        let count: usize = msg_send![screens, count];
+        let mut max_fps: i64 = 60;
+        for i in 0..count {
+            let screen: ObjcId = msg_send![screens, objectAtIndex: i];
+            let fps: i64 = msg_send![screen, maximumFramesPerSecond];
+            max_fps = max_fps.max(fps);
+        }
+        1.002 / max_fps.max(1) as f64
+    }
+}
+
+fn set_metal_layer_background_color(layer: ObjcId, alpha: f64) {
+    unsafe {
+        let color = CGColorCreateGenericRGB(0.0, 0.0, 0.0, alpha);
+        let () = msg_send![layer, setBackgroundColor: color];
+        CFRelease(color as *const std::ffi::c_void);
+    }
+}
+
+// The legacy display-link path has no nonblocking nextDrawable API.
+// One long-lived worker owns acquisition; the UI consumes a ready retained
+// drawable or leaves the pass dirty. At most one acquisition is outstanding.
+struct DrawableWorker {
+    request: std::sync::mpsc::SyncSender<()>,
+    ready: std::sync::mpsc::Receiver<Option<RcObjcId>>,
+    pending: bool,
+    wait_ns: Arc<std::sync::atomic::AtomicU64>,
+    started: Option<Instant>,
+}
+
+impl DrawableWorker {
+    fn new(layer: ObjcId) -> Self {
+        let layer = RcObjcId::from_unowned(NonNull::new(layer).unwrap());
+        let (request, requests) = std::sync::mpsc::sync_channel(1);
+        let (ready, replies) = std::sync::mpsc::sync_channel(1);
+        let wait_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let measured = wait_ns.clone();
+        std::thread::Builder::new().name("makepad-drawable".into()).spawn(move || {
+            while requests.recv().is_ok() {
+                let pool: ObjcId = unsafe { msg_send![class!(NSAutoreleasePool), new] };
+                let start = Instant::now();
+                let drawable: ObjcId = unsafe { msg_send![layer.as_id(), nextDrawable] };
+                measured.store(start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Release);
+                let drawable = NonNull::new(drawable).map(RcObjcId::from_unowned);
+                unsafe { let _: () = msg_send![pool, release]; }
+                if ready.try_send(drawable).is_err() { break; }
+                crate::thread::wake_ui_loop();
+            }
+        }).expect("drawable acquisition worker");
+        Self { request, ready: replies, pending: false, wait_ns, started: None }
+    }
+
+    fn take(&mut self) -> Option<RcObjcId> {
+        let result = if self.pending {
+            match self.ready.try_recv() {
+                Ok(drawable) => { self.pending = false; self.started = None; drawable }
+                Err(_) => None,
+            }
+        } else { None };
+        if !self.pending && self.request.try_send(()).is_ok() { self.pending = true; self.started = Some(Instant::now()); }
+        result
+    }
+
+    /// Acquire on the UI thread, for a beat whose prefetched drawable can't be
+    /// used. The pool was just rebuilt for the new size, so this doesn't block.
+    fn acquire_now(&mut self, layer: ObjcId) -> Option<RcObjcId> {
+        let pool: ObjcId = unsafe { msg_send![class!(NSAutoreleasePool), new] };
+        let start = Instant::now();
+        let drawable: ObjcId = unsafe { msg_send![layer, nextDrawable] };
+        self.wait_ns.store(start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Release);
+        let drawable = NonNull::new(drawable).map(RcObjcId::from_unowned);
+        unsafe { let _: () = msg_send![pool, release]; }
+        drawable
+    }
+}
+
+/// A remote grab whose window has no drawable yet stays pending across
+/// beats (the worker's acquisition is polled, never awaited on the UI
+/// thread) for this long before the capture fails.
+const REMOTE_DRAWABLE_RETRY_LIMIT: std::time::Duration = std::time::Duration::from_millis(1000);
+/// The beat at which a pending remote present is retried.
+pub(super) const REMOTE_PRESENT_RETRY: std::time::Duration = std::time::Duration::from_millis(16);
 
 #[derive(Clone)]
 pub struct MetalWindow {
@@ -57,6 +170,20 @@ pub struct MetalWindow {
     pub ca_layer: ObjcId,
     pub cocoa_window: Box<MacosWindow>,
     pub is_resizing: bool,
+    /// Frames acquired but not yet on glass. Present-gated pacing skips a
+    /// paint beat instead of letting `nextDrawable` block the main thread
+    /// when the compositor consumes frames unevenly (mirrored/scaled
+    /// displays throttle in 10-25ms phases).
+    /// Packed: low 32 bits are the count, high 32 bits are a reset generation,
+    /// so a handler armed before a watchdog reset can't decrement a newer count.
+    pub in_flight_presents: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    drawable_worker: std::rc::Rc<std::cell::RefCell<Option<DrawableWorker>>>,
+    /// When the present gate started skipping beats, so a gate whose
+    /// handlers were lost can be forced back open instead of wedging.
+    gate_closed_since: Option<Instant>,
+    /// When we started skipping beats because the window reported itself
+    /// hidden, so a stale `occlusionState` can't skip forever.
+    occluded_since: Option<Instant>,
 }
 
 impl MetalWindow {
@@ -82,24 +209,30 @@ impl MetalWindow {
             let () = msg_send![ca_layer, setDisplaySyncEnabled: YES];
             let () = msg_send![ca_layer, setNeedsDisplayOnBoundsChange: YES];
             let () = msg_send![ca_layer, setAutoresizingMask: (1 << 4) | (1 << 1)];
-            let () = msg_send![ca_layer, setAllowsNextDrawableTimeout: NO];
+            let () = msg_send![ca_layer, setAllowsNextDrawableTimeout: YES];
             let () = msg_send![ca_layer, setDelegate: cocoa_window.view];
-            let () = msg_send![ca_layer, setBackgroundColor: CGColorCreateGenericRGB(0.0, 0.0, 0.0, 1.0)];
+            set_metal_layer_background_color(ca_layer, 1.0);
 
             let view = cocoa_window.view;
             let () = msg_send![view, setWantsBestResolutionOpenGLSurface: YES];
             let () = msg_send![view, setWantsLayer: YES];
             let () = msg_send![view, setLayerContentsPlacement: 11];
             let () = msg_send![view, setLayer: ca_layer];
+            // `NSView.layer` owns the layer now; balance CAMetalLayer `new`.
+            let () = msg_send![ca_layer, release];
         }
 
         MetalWindow {
             is_resizing: false,
+            drawable_worker: Default::default(),
             window_id,
             cal_size: Vec2d::default(),
             ca_layer,
             window_geom: cocoa_window.get_window_geom(),
             cocoa_window,
+            in_flight_presents: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gate_closed_since: None,
+            occluded_since: None,
         }
     }
 
@@ -123,35 +256,67 @@ impl MetalWindow {
             let () = msg_send![ca_layer, setDisplaySyncEnabled: YES];
             let () = msg_send![ca_layer, setNeedsDisplayOnBoundsChange: YES];
             let () = msg_send![ca_layer, setAutoresizingMask: (1 << 4) | (1 << 1)];
-            let () = msg_send![ca_layer, setAllowsNextDrawableTimeout: NO];
+            let () = msg_send![ca_layer, setAllowsNextDrawableTimeout: YES];
             let () = msg_send![ca_layer, setDelegate: cocoa_window.view];
-            let () = msg_send![ca_layer, setBackgroundColor: CGColorCreateGenericRGB(0.0, 0.0, 0.0, 1.0)];
+            set_metal_layer_background_color(ca_layer, 1.0);
 
             let view = cocoa_window.view;
             let () = msg_send![view, setWantsBestResolutionOpenGLSurface: YES];
             let () = msg_send![view, setWantsLayer: YES];
             let () = msg_send![view, setLayerContentsPlacement: 11];
             let () = msg_send![view, setLayer: ca_layer];
+            // `NSView.layer` owns the layer now; balance CAMetalLayer `new`.
+            let () = msg_send![ca_layer, release];
         }
 
         MetalWindow {
             is_resizing: false,
+            drawable_worker: Default::default(),
             window_id,
             cal_size: Vec2d::default(),
             ca_layer,
             window_geom: cocoa_window.get_window_geom(),
             cocoa_window,
+            in_flight_presents: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gate_closed_since: None,
+            occluded_since: None,
         }
     }
 
     pub(crate) fn start_resize(&mut self) {
         self.is_resizing = true;
-        let () = unsafe { msg_send![self.ca_layer, setPresentsWithTransaction: YES] };
+        let () = unsafe { msg_send![self.ca_layer, setPresentsWithTransaction: NO] };
     }
 
     pub(crate) fn stop_resize(&mut self) {
         self.is_resizing = false;
         let () = unsafe { msg_send![self.ca_layer, setPresentsWithTransaction: NO] };
+    }
+
+    /// Drops and recreates the layer's drawable pool the way a real window
+    /// resize does, reclaiming drawables whose presented-handlers never fired.
+    /// Each size goes in its own committed transaction, since two writes in one
+    /// transaction coalesce to no net change and the pool survives untouched.
+    pub(crate) fn rebuild_drawable_pool(&mut self) {
+        let s = self.cal_size;
+        for height in [s.y + 1.0, s.y] {
+            unsafe {
+                let () = msg_send![class!(CATransaction), begin];
+                let () = msg_send![class!(CATransaction), setDisableActions: YES];
+                let () =
+                    msg_send![self.ca_layer, setDrawableSize: CGSize {width: s.x, height: height}];
+                let () = msg_send![class!(CATransaction), commit];
+                let () = msg_send![class!(CATransaction), flush];
+            }
+        }
+        // Bump the generation as we zero the count, so the overdue handlers
+        // (late, not lost) can't steal decrements from newer frames.
+        let _ = self.in_flight_presents.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |w| Some(((w >> 32).wrapping_add(1)) << 32),
+        );
+        self.gate_closed_since = None;
     }
 
     pub(crate) fn resize_core_animation_layer(&mut self, _metal_cx: &MetalCx) -> bool {
@@ -170,11 +335,16 @@ impl MetalWindow {
             false
         }
     }
-}
 
-fn defer_platform_op(platform_ops: &mut Vec<CxOsOp>, op: CxOsOp) -> bool {
-    platform_ops.insert(0, op);
-    platform_ops.len() > 1
+    /// The worker vends a drawable it acquired a beat ago, so one that predates
+    /// a resize still has the old texture size. Painting into it lands the frame
+    /// in a corner of the texture and leaves the rest of the layer unpainted.
+    fn drawable_matches_layer(&self, drawable: ObjcId) -> bool {
+        let texture: ObjcId = unsafe { msg_send![drawable, texture] };
+        let width: u64 = unsafe { msg_send![texture, width] };
+        let height: u64 = unsafe { msg_send![texture, height] };
+        (width as f64 - self.cal_size.x).abs() < 1.0 && (height as f64 - self.cal_size.y).abs() < 1.0
+    }
 }
 
 pub(crate) struct MacosNativeCameraPreview {
@@ -335,19 +505,149 @@ impl Drop for MacosNativeCameraPreview {
     }
 }
 
+/// Set by the delegate boundaries when a panic was contained; consumed by
+/// the next timer tick, which redraws from a clean slate.
+static CONTAINED_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn note_contained_panic() {
+    CONTAINED_PANIC.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn take_contained_panic() -> bool {
+    CONTAINED_PANIC.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 const KEEP_ALIVE_COUNT: usize = 5;
 const TIMER0_DOWNSHIFT_IDLE_SECS: f64 = 0.2;
 
 impl Cx {
+    /// Seal one remote command's UI state into a presenting command buffer.
+    /// This is deliberately not Paint: Paint advances animations/media before
+    /// Draw and would move the capture past its arming boundary.
+    /// Seal a remote grab or wait=1 input frame on `window_id`: `Some(true)`
+    /// submitted, `Some(false)` failed, `None` the window's drawable is still
+    /// being acquired (the pass stays dirty; the caller polls again on the
+    /// next beat, up to `REMOTE_DRAWABLE_RETRY_LIMIT`).
+    fn present_remote_window(
+        &mut self,
+        window_id: WindowId,
+        metal_windows: &mut Vec<MetalWindow>,
+        metal_cx: &mut MetalCx,
+    ) -> Option<bool> {
+        let started = Instant::now();
+        if !metal_windows.iter().any(|window| window.window_id == window_id) {
+            return Some(false);
+        }
+        self.os.remote_present_window = Some(window_id);
+        self.os.remote_presented = None;
+        self.handle_actions();
+        if self.need_redrawing() {
+            let time = with_macos_app(|app| app.time_now());
+            self.call_draw_event(time);
+            self.mtl_compile_shaders(metal_cx);
+        }
+        self.request_remote_window_present(window_id);
+        self.handle_repaint(metal_windows, metal_cx);
+        self.os.remote_present_window = None;
+        crate::trace!(
+            "remote.grab",
+            "sealed window={} repaint={} submitted={:?} submit_ms={:.3}",
+            window_id.id(),
+            self.repaint_id,
+            self.os.remote_presented,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        self.ensure_timer0_started();
+        match self.os.remote_presented {
+            Some(presented) => {
+                self.os.remote_present_waiting = None;
+                Some(presented)
+            }
+            None => {
+                let since = match self.os.remote_present_waiting {
+                    Some((id, since)) if id == window_id => since,
+                    _ => started,
+                };
+                self.os.remote_present_waiting = Some((window_id, since));
+                if started.duration_since(since) >= REMOTE_DRAWABLE_RETRY_LIMIT {
+                    self.os.remote_present_waiting = None;
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn update_macos_pointer_capture_pacing(&mut self) {
+        // Capture pacing drives the AppKit display link. A --stdin-loop
+        // child has no AppKit app and is paced by its host's Tick, so the
+        // whole dance is moot there — and touching MACOS_APP would panic.
+        if self.in_makepad_studio {
+            return;
+        }
+        let active =
+            self.fingers.any_areas_captured() || with_macos_app(|app| app.mouse_pointer_lock);
+        if active == self.os.pointer_capture_pacing {
+            return;
+        }
+        if active {
+            with_macos_app(|app| {
+                app.pause_display_link();
+                app.stop_timer(0);
+                app.start_timer(POINTER_CAPTURE_TIMER_ID, fastest_display_interval(), true);
+            });
+            self.os.pointer_capture_pacing = true;
+            self.os.timer0_armed = true;
+            self.os.timer0_idle_since = None;
+        } else {
+            with_macos_app(|app| app.stop_timer(POINTER_CAPTURE_TIMER_ID));
+            self.os.pointer_capture_pacing = false;
+            // The capture clock replaced whichever normal source was armed.
+            // Re-arm the per-window links (or their timer fallback) now.
+            self.os.timer0_armed = false;
+            self.ensure_timer0_started();
+        }
+    }
+
+    /// Bring this app's windows to the front, as if the user clicked its Dock icon.
+    /// Useful for test automation driving an unfocused (or occluded) instance.
+    /// `orderFrontRegardless` raises the windows even when macOS's cooperative
+    /// activation rules deny the app focus.
+    pub fn macos_activate_app(&mut self) {
+        if !super::macos_app::focus_allowed() {
+            // The process was launched to stay out of the user's way.
+            return;
+        }
+        unsafe {
+            let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+            let () = msg_send![ns_app, activateIgnoringOtherApps: YES];
+            with_macos_app(|app| {
+                for (window, _view) in &app.cocoa_windows {
+                    if std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_some() {
+                        continue;
+                    }
+                    let () = msg_send![*window, orderFrontRegardless];
+                }
+            });
+        }
+    }
+
     pub fn event_loop(cx: Rc<RefCell<Cx>>) {
+        // Before anything reads a relative path or loads a resource.
+        let dev_launch = dev_launch_begin();
         cx.borrow_mut().self_ref = Some(cx.clone());
         cx.borrow_mut().os_type = OsType::Macos;
+        crate::startup_trace("event_loop: MetalCx::new begin");
         let metal_cx: Rc<RefCell<MetalCx>> = Rc::new(RefCell::new(MetalCx::new()));
+        crate::startup_trace("event_loop: MetalCx::new done");
 
         // store device object ID for double buffering
         cx.borrow_mut().os.metal_device = Some(metal_cx.borrow().device);
+        cx.borrow_mut().publish_metal_device_for_media();
 
         //let cx = Rc::new(RefCell::new(self));
+        cx.borrow_mut().set_physical_keyboard_state(true);
         if crate::app_main::should_run_stdin_loop_from_env() {
             let mut cx = cx.borrow_mut();
             cx.in_makepad_studio = true;
@@ -359,16 +659,35 @@ impl Cx {
         init_macos_app_global(Box::new({
             let cx = cx.clone();
             move |event| {
+                use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
                 let mut cx_ref = cx.borrow_mut();
                 let mut metal_cx = metal_cx.borrow_mut();
                 let mut metal_windows = metal_windows.borrow_mut();
-                let event_flow =
-                    cx_ref.cocoa_event_callback(event, &mut metal_cx, &mut metal_windows);
+                // A panic unwinds on to the callback boundary that contains
+                // it (`shielded`), and `do_callback` keeps this callback:
+                // put `Cx` back in order first, so the next event finds it
+                // consistent (as on iOS).
+                let event_flow = match catch_unwind(AssertUnwindSafe(|| {
+                    cx_ref.cocoa_event_callback(event, &mut metal_cx, &mut metal_windows)
+                })) {
+                    Ok(event_flow) => event_flow,
+                    Err(payload) => {
+                        cx_ref.recover_after_caught_panic();
+                        drop(metal_windows);
+                        drop(metal_cx);
+                        drop(cx_ref);
+                        resume_unwind(payload);
+                    }
+                };
                 let executor = cx_ref.executor.take().unwrap();
                 drop(cx_ref);
-                executor.run_until_stalled();
-                let mut cx_ref = cx.borrow_mut();
-                cx_ref.executor = Some(executor);
+                // Put the executor back even if a spawned task panics, so the
+                // `take` above can't hand a `None` to the next event.
+                let stalled = catch_unwind(AssertUnwindSafe(|| executor.run_until_stalled()));
+                cx.borrow_mut().executor = Some(executor);
+                if let Err(payload) = stalled {
+                    resume_unwind(payload);
+                }
                 event_flow
             }
         }));
@@ -379,19 +698,85 @@ impl Cx {
         if cx.borrow().need_redrawing() {
             cx.borrow_mut().ensure_timer0_started();
         }
+        crate::startup_trace("event_loop: entering AppKit loop");
         MacosApp::event_loop();
+        if let Some(dir) = dev_launch {
+            // The app closed its own windows rather than being killed, which is
+            // the only outcome the runner can read as a clean exit.
+            let _ = std::fs::write(dir.join("status"), "0\n");
+        }
     }
+
+    // `pass_root_window` now lives in os/cx_shared.rs — the Windows frame-latency
+    // beat needs the exact same lookup, so it is shared rather than duplicated.
 
     pub(crate) fn handle_repaint(
         &mut self,
         metal_windows: &mut Vec<MetalWindow>,
         metal_cx: &mut MetalCx,
     ) {
+        {
+            static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+            if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                crate::startup_trace("handle_repaint #1 begin");
+            }
+        }
         let mut passes_todo = Vec::new();
         self.compute_pass_repaint_order(&mut passes_todo);
+        // A beat with nothing to paint still services the backend's
+        // retirement debt (the maintenance a paint used to carry): it never
+        // dirties a pass, and its receipt lets the app's wake stop.
+        if passes_todo.is_empty()
+            && (self.draw_lists.has_pending_instance_retirements() || metal_cx.allocation_retry_due())
+        {
+            self.maintain_instance_retirements(metal_cx);
+        }
+        metal_cx.present_trace = (!passes_todo.is_empty()).then(|| crate::present_trace::begin(self.repaint_id + 1)).flatten();
+        let _trace_end = crate::present_trace::RequestEnd(metal_cx.present_trace.clone());
+        // The per-window present gate below is too late to bound a frame:
+        // dependency order encodes its offscreen passes first. When the gate
+        // skips `nextDrawable`, those passes would otherwise keep queueing on
+        // every display-link beat, retaining all transient Metal allocations
+        // until the GPU eventually catches up. Bound whole repaints by GPU
+        // completion before the first pass allocates or encodes anything.
+        metal_cx.begin_repaint();
+        if let Some(trace) = &metal_cx.present_trace { trace.inflight(metal_cx.frames_in_flight()); }
+        metal_cx.trace_memory_once_per_second();
+        if metal_cx.frames_in_flight() >= PRESENT_GATE_IN_FLIGHT as usize
+        {
+            metal_cx.backpressure_skips = metal_cx.backpressure_skips.saturating_add(1);
+            if let Some(trace) = &metal_cx.present_trace { trace.cause(PresentCause::RepaintsInFlight); }
+            return;
+        }
         self.repaint_id += 1;
-        let time_now = with_macos_app(|app| app.time_now() as f32);
+        let time_now = self
+            .os
+            .link_flip_time
+            .map(|t| t as f32)
+            .unwrap_or_else(|| with_macos_app(|app| app.time_now() as f32));
+        let scope = self.os.link_scope;
         for draw_pass_id in &passes_todo {
+            // Remote capture only spends a present on its requested window.
+            if let Some(window) = self.os.remote_present_window {
+                if self.pass_root_window(*draw_pass_id) != Some(window) {
+                    self.repaint_pass(*draw_pass_id);
+                    continue;
+                }
+            }
+            // Per-window pacing: during a LinkFire beat only the firing
+            // window's pass tree paints; everything else stays dirty for
+            // its OWN flip.
+            if let Some(scope) = scope {
+                if let Some(window_id) = self.pass_root_window(*draw_pass_id) {
+                    let matches = metal_windows.iter().any(|mw| {
+                        mw.window_id == window_id && mw.cocoa_window.window as usize == scope
+                    });
+                    if !matches {
+                        self.repaint_pass(*draw_pass_id);
+                        continue;
+                    }
+                }
+            }
             match self.passes[*draw_pass_id].parent.clone() {
                 CxDrawPassParent::Xr => {}
                 CxDrawPassParent::Window(window_id) => {
@@ -400,40 +785,229 @@ impl Cx {
                     {
                         //let dpi_factor = metal_window.window_geom.dpi_factor;
                         metal_window.resize_core_animation_layer(&metal_cx);
-                        let drawable: ObjcId =
-                            unsafe { msg_send![metal_window.ca_layer, nextDrawable] };
+                        use std::sync::atomic::Ordering;
+                        let in_flight = (metal_window.in_flight_presents.load(Ordering::Acquire)
+                            & 0xffff_ffff) as u32;
+                        let remote_present = self.os.remote_present_window == Some(window_id);
+                        // An occluded window gets no compositor vsync: presents never reach
+                        // glass and an exhausted pool would block nextDrawable forever.
+                        // Skip and keep the pass dirty, but only for so long, since this
+                        // flag can stick on "hidden" while the window is really on screen.
+                        let inherited_occlusion_gate = (self.os.pointer_capture_pacing
+                            || remote_present)
+                            && metal_window.occluded_since.is_some();
+                        let occlusion: usize = if !self.os.pointer_capture_pacing || remote_present
+                        {
+                            unsafe { msg_send![metal_window.cocoa_window.window, occlusionState] }
+                        } else {
+                            NS_WINDOW_OCCLUSION_STATE_VISIBLE
+                        };
+                        // The occlusion bit alone never gates a present: macOS
+                        // reported a window maximised on an 8K display occluded
+                        // for seconds and the window went dead. Only an occluded
+                        // window whose drawable pool is exhausted (the compositor
+                        // consuming nothing) skips its beat, and probes every
+                        // OCCLUSION_PROBE_INTERVAL; a window with a free drawable
+                        // presents whatever the bit says.
+                        if occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE == 0 {
+                            let now = Instant::now();
+                            let since = *metal_window.occluded_since.get_or_insert(now);
+                            if in_flight >= PRESENT_GATE_IN_FLIGHT {
+                                metal_window
+                                    .gate_closed_since
+                                    .get_or_insert_with(Instant::now);
+                                if !remote_present && now.duration_since(since) < OCCLUSION_PROBE_INTERVAL {
+                                    if let Some(trace) = &metal_cx.present_trace { trace.cause(PresentCause::Occluded); }
+                                    self.repaint_pass(*draw_pass_id);
+                                    continue;
+                                }
+                                // the probe: present once, the next probe in an interval
+                                metal_window.occluded_since = Some(now);
+                            }
+                        } else {
+                            metal_window.occluded_since = None;
+                        }
+                        if remote_present {
+                            crate::trace!(
+                                "remote.grab",
+                                "present window={} occluded={} in_flight={}",
+                                window_id.id(),
+                                occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE == 0,
+                                in_flight
+                            );
+                        }
+                        let acquired = {
+                            let mut worker = metal_window.drawable_worker.borrow_mut();
+                            let worker = worker.get_or_insert_with(|| DrawableWorker::new(metal_window.ca_layer));
+                            // a remote grab on a beat without a drawable
+                            // leaves the pass dirty and is polled again on
+                            // the next beat: never a wait on the UI thread
+                            let drawable = match worker.take() {
+                                Some(stale) if !metal_window.drawable_matches_layer(stale.as_id()) => {
+                                    crate::trace!("present", "drawable predates the layer's resize, reacquiring");
+                                    drop(stale);
+                                    // Only while the pool has a free drawable. Exhausted, the
+                                    // acquire would block the UI thread on the compositor, which
+                                    // is what the worker exists to avoid; skip and stay dirty.
+                                    (in_flight < PRESENT_GATE_IN_FLIGHT)
+                                        .then(|| worker.acquire_now(metal_window.ca_layer))
+                                        .flatten()
+                                }
+                                drawable => drawable,
+                            };
+                            if let Some(trace) = &metal_cx.present_trace {
+                                trace.drawable_wait(worker.started.map_or(0, |t| t.elapsed().as_nanos() as u64).max(worker.wait_ns.load(Ordering::Acquire)));
+                                if drawable.is_none() && worker.pending { trace.cause(PresentCause::DrawableWait); }
+                            }
+                            drawable
+                        };
+                        // A ready drawable proves compositor capacity even if
+                        // presented callbacks are late/lost. Acquisition is on
+                        // the worker, so callback debt cannot starve this beat.
+                        // It also ends an occlusion probe: the window is being
+                        // consumed, the bit was stale.
+                        if acquired.is_some() {
+                            metal_window.occluded_since = None;
+                        }
+                        // Present-gated pacing: with display sync on, a full
+                        // drawable pool makes nextDrawable BLOCK the main
+                        // thread until the compositor consumes a frame
+                        // (10-25ms phases on mirrored/scaled displays). Skip
+                        // this beat and keep the pass dirty; the next timer
+                        // beat retries with the pool drained and event
+                        // handling never stalls behind vsync.
+                        if acquired.is_none() && in_flight >= PRESENT_GATE_IN_FLIGHT {
+                            if inherited_occlusion_gate
+                                || (remote_present
+                                    && occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE == 0)
+                            {
+                                // A just-activated drag may inherit three
+                                // presents that an occluded compositor never
+                                // acknowledged. Do not spend the first 250 ms
+                                // of the gesture in the background watchdog.
+                                metal_window.rebuild_drawable_pool();
+                                metal_window.gate_closed_since = None;
+                            } else {
+                                let now = Instant::now();
+                                let since = *metal_window.gate_closed_since.get_or_insert(now);
+                                if now.duration_since(since) < PRESENT_GATE_STUCK_TIMEOUT {
+                                    if let Some(trace) = &metal_cx.present_trace { trace.cause(PresentCause::PresentsInFlight); }
+                                    self.repaint_pass(*draw_pass_id);
+                                    continue;
+                                }
+                                // Handlers this overdue are lost, so reclaim their
+                                // drawables before the present below can block on
+                                // an exhausted pool.
+                                // Quiet while hidden: the probe above trips this every time.
+                                if metal_window.occluded_since.is_none() {
+                                    crate::error!(
+                                        "present gate stuck for {:?} with {} in flight, rebuilding drawable pool",
+                                        now.duration_since(since), in_flight,
+                                    );
+                                }
+                                metal_window.rebuild_drawable_pool();
+                            }
+                        }
+                        metal_window.gate_closed_since = None;
+                        // PerfMonitor: a presented window frame starts here;
+                        // nextDrawable is where vsync/pool pressure blocks
+                        // the main thread, so it gets its own channel.
+                        self.perf_monitor
+                            .frame_boundary(with_macos_app(|app| app.time_now()));
+                        let drawable = acquired.as_ref().map_or(nil, RcObjcId::as_id);
                         if drawable == nil {
+                            if let Some(trace) = &metal_cx.present_trace { trace.cause(PresentCause::NoDrawable); }
+                            self.repaint_pass(*draw_pass_id);
                             return;
                         }
-                        self.passes[*draw_pass_id].set_time(time_now);
-                        if metal_window.is_resizing {
+                        let generation = {
+                            let prev = metal_window
+                                .in_flight_presents
+                                .fetch_add(1, Ordering::AcqRel);
+                            (prev >> 32) as u32
+                        };
+                        let in_flight = metal_window.in_flight_presents.clone();
+                        let trace = metal_cx.present_trace.clone();
+                        let () = unsafe {
+                            msg_send![
+                                drawable,
+                                addPresentedHandler: &objc_block!(move | drawable_: ObjcId | {
+                                    {
+                                        static FIRST: std::sync::atomic::AtomicBool =
+                                            std::sync::atomic::AtomicBool::new(true);
+                                        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                                            crate::startup_trace("FIRST PRESENT ON GLASS");
+                                            crate::startup_trace_flush("cumulative at first present");
+                                        }
+                                    }
+                                    if let Some(trace) = &trace {
+                                        let t: f64 = unsafe { msg_send![drawable_, presentedTime] };
+                                        trace.presented(unsafe { CACurrentMediaTime() }, t);
+                                    }
+                                    // No-op if a watchdog reset happened since this present.
+                                    let _ = in_flight.fetch_update(
+                                        std::sync::atomic::Ordering::AcqRel,
+                                        std::sync::atomic::Ordering::Acquire,
+                                        |w| ((w >> 32) as u32 == generation && w & 0xffff_ffff != 0)
+                                            .then(|| w - 1),
+                                    );
+                                })
+                            ]
+                        };
+                        let uniforms_gen = self.next_uniform_gen();
+                        if let Some(trace) = &metal_cx.present_trace { trace.mark(PresentStage::Draw); }
+                        self.passes[*draw_pass_id].set_time(time_now, uniforms_gen);
+                        let presented = if metal_window.is_resizing {
                             self.draw_pass(
                                 *draw_pass_id,
                                 metal_cx,
                                 DrawPassMode::Resizing(drawable),
-                            );
+                            )
                         } else {
                             self.draw_pass(
                                 *draw_pass_id,
                                 metal_cx,
-                                DrawPassMode::Drawable(drawable),
+                                DrawPassMode::Drawable(drawable, None),
+                            )
+                        };
+                        if remote_present {
+                            self.os.remote_presented = Some(presented);
+                        }
+                        // The pass bailed before presenting, so its handler never
+                        // fires. Give the count back or the gate closes for good.
+                        if !presented {
+                            let _ = metal_window.in_flight_presents.fetch_update(
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                                |w| {
+                                    ((w >> 32) as u32 == generation && w & 0xffff_ffff != 0)
+                                        .then(|| w - 1)
+                                },
                             );
                         }
                     }
                 }
+                // Offscreen passes get the SAME stamp as the window pass
+                // that consumes them (it was wall-now per pass: a child
+                // pass and its consumer could disagree by the encode time
+                // between them, and neither matched NextFrame).
                 CxDrawPassParent::DrawPass(_) => {
                     //let dpi_factor = self.get_delegated_dpi_factor(parent_pass_id);
-                    self.passes[*draw_pass_id]
-                        .set_time(with_macos_app(|app| app.time_now() as f32));
+                    let uniforms_gen = self.next_uniform_gen();
+                    self.passes[*draw_pass_id].set_time(time_now, uniforms_gen);
                     self.draw_pass(*draw_pass_id, metal_cx, DrawPassMode::Texture);
                 }
                 CxDrawPassParent::None => {
-                    self.passes[*draw_pass_id]
-                        .set_time(with_macos_app(|app| app.time_now() as f32));
+                    let uniforms_gen = self.next_uniform_gen();
+                    self.passes[*draw_pass_id].set_time(time_now, uniforms_gen);
                     self.draw_pass(*draw_pass_id, metal_cx, DrawPassMode::Texture);
                 }
             }
         }
+        // NextFrame/worker wakes need not dirty a pass. The queued receipt
+        // added to Atlas settlement must still be serviced and cleared on
+        // these beats, including work deferred by the last repaint's budget.
+        self.finish_metal_instance_retirements(metal_cx);
     }
 
     pub(crate) fn handle_networking_events(&mut self) {
@@ -461,18 +1035,54 @@ impl Cx {
     }
 
     fn ensure_timer0_started(&mut self) {
+        if self.os.pointer_capture_pacing {
+            return;
+        }
+        // FRAME-FLIP pacing: the display link IS the refresh — one beat per
+        // actual flip, phase-locked, tracking the window's own panel. The
+        // NSTimer stays as the fallback (no window yet, pre-macOS-14) and
+        // as the idle heartbeat. NSView.displayLink never fires for a window
+        // that is not on screen — hidden eval/test runs (MAKEPAD_HIDE_WINDOWS)
+        // pace on the timer or they freeze.
+        let want_link = std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_none()
+            && !with_macos_app(|app| app.all_windows_miniaturized());
+        // Self-heal: a window close invalidated the link while the beat
+        // thought itself armed — re-anchor on a surviving window.
+        if self.os.timer0_armed && want_link && with_macos_app(|app| app.display_link_needs_rearm())
+        {
+            self.os.timer0_armed = false;
+        }
         if !self.os.timer0_armed {
             with_macos_app(|app| app.stop_timer(0));
-            with_macos_app(|app| app.start_timer(0, 0.008, true));
+            if want_link && with_macos_app(|app| app.ensure_display_link()) {
+                self.os.timer0_armed = true;
+                self.os.timer0_idle_since = None;
+                return;
+            }
+            // Pace the paint clock to the fastest attached display. The old
+            // fixed 8ms beat against an 8.33ms (120Hz) refresh: presents
+            // outran vsync, the drawable pool drifted full and nextDrawable
+            // blocked the main thread in a ~25-frame sawtooth (rough/smooth
+            // phases as the beat drifted through vblank alignment). Matching
+            // the refresh period (+0.2% so NSTimer lateness drains the queue
+            // instead of accumulating) keeps acquisition non-blocking.
+            let interval = fastest_display_interval();
+            with_macos_app(|app| app.start_timer(0, interval, true));
             self.os.timer0_armed = true;
             self.os.timer0_idle_since = None;
         }
     }
 
     fn ensure_timer0_stopped(&mut self) {
+        if self.os.pointer_capture_pacing {
+            return;
+        }
         if self.os.timer0_armed {
-            with_macos_app(|app| app.stop_timer(0));
-            with_macos_app(|app| app.start_timer(0, 0.2, true));
+            with_macos_app(|app| {
+                app.pause_display_link();
+                app.stop_timer(0);
+                app.start_timer(0, 0.2, true);
+            });
             self.os.timer0_armed = false;
         }
     }
@@ -483,9 +1093,31 @@ impl Cx {
         metal_cx: &mut MetalCx,
         metal_windows: &mut Vec<MetalWindow>,
     ) -> EventFlow {
+        let _phase = crate::thread::ui_phase(crate::thread::UiPhase::NativeEvent);
+        // Poll with the renderer available, before native input/signal/timer
+        // handlers can change the state being grabbed. Link callbacks retain
+        // exclusive ownership of their supplied drawable; remote wakes and
+        // deadlines use a separate unscoped event after that callback returns.
+        if self.os.link_scope.is_none() && !matches!(&event, MacosEvent::LinkFire { .. }) {
+            let pending = crate::remote::poll_macos(self, |cx, window| {
+                cx.present_remote_window(window, metal_windows, metal_cx)
+            });
+            let mut deadline = crate::remote::next_grab_deadline();
+            if pending {
+                // a present waiting on its drawable is polled on the next beat
+                let retry = Instant::now() + REMOTE_PRESENT_RETRY;
+                deadline = Some(deadline.map_or(retry, |d| d.min(retry)));
+            }
+            with_macos_app(|app| app.schedule_remote_capture(deadline));
+        }
         if let EventFlow::Exit = self.handle_platform_ops(metal_windows, metal_cx) {
             self.call_event_handler(&Event::Shutdown);
             return EventFlow::Exit;
+        }
+        if matches!(&event, MacosEvent::Timer(e)
+            if e.timer_id == super::macos_app::REMOTE_CAPTURE_TIMER_ID)
+        {
+            return EventFlow::Wait;
         }
         // send a mouse up when dragging starts
         match &event {
@@ -493,15 +1125,45 @@ impl Cx {
             | MacosEvent::MouseMove(_)
             | MacosEvent::MouseUp(_)
             | MacosEvent::Scroll(_)
+            | MacosEvent::Pinch(_)
             | MacosEvent::KeyDown(_)
             | MacosEvent::KeyUp(_)
             | MacosEvent::TextInput(_) => {
                 self.os.keep_alive_counter = KEEP_ALIVE_COUNT;
                 self.os.timer0_idle_since = None;
                 self.ensure_timer0_started();
+                crate::os::apple::metal::note_input_event();
             }
             MacosEvent::Timer(te) => {
-                if te.timer_id == 0 {
+                if take_contained_panic() {
+                    // Per-draw state (Cx2d) is rebuilt every frame, so a
+                    // redraw is a clean slate; the exploded view is the
+                    // usual suspect and leaves first.
+                    self.sploded_recover_after_panic();
+                    self.redraw_all();
+                }
+                if te.timer_id == 0 || te.timer_id == POINTER_CAPTURE_TIMER_ID {
+                    // Catch paint-clock stalls in the
+                    // act — was the gap a LATE FIRE (runloop starved / OS
+                    // deferred the NSTimer) or a SLOW CALLBACK (our work)?
+                    let trace_t0 = if crate::makepad_error_log::trace_enabled("timer") {
+                        thread_local! {
+                            static LAST_FIRE: std::cell::Cell<Option<std::time::Instant>> =
+                                const { std::cell::Cell::new(None) };
+                        }
+                        let now = std::time::Instant::now();
+                        LAST_FIRE.with(|last| {
+                            if let Some(prev) = last.replace(Some(now)) {
+                                let gap_ms = prev.elapsed().as_secs_f64() * 1000.0;
+                                if gap_ms > 20.0 {
+                                    crate::trace!("timer", "fire-to-fire gap {:.1}ms", gap_ms);
+                                }
+                            }
+                        });
+                        Some(now)
+                    } else {
+                        None
+                    };
                     let mut needs_timer = false;
 
                     if self.screenshot_requests.len() > 0 {
@@ -514,11 +1176,16 @@ impl Cx {
                     }
 
                     // check signals
-                    if SignalToUI::check_and_clear_ui_signal() {
+                    let internal_signal = SignalToUI::check_and_clear_internal_signal();
+                    let ui_signal = SignalToUI::check_and_clear_ui_signal();
+                    if internal_signal || ui_signal {
+                        self.handle_termination_signal();
                         self.handle_media_signals();
                         self.handle_script_signals();
-                        self.call_event_handler(&Event::Signal);
                         needs_timer = true;
+                    }
+                    if ui_signal {
+                        self.call_event_handler(&Event::Signal);
                     }
 
                     if SignalToUI::check_and_clear_action_signal() {
@@ -526,13 +1193,28 @@ impl Cx {
                         needs_timer = true;
                     }
                     self.poll_control_channel();
+                    // A `--remote` request in flight (a queued command, a grab
+                    // waiting on the GPU, a `wait=1` caller) keeps the paint
+                    // clock at full rate so the answer lands in one frame
+                    // instead of one idle poll. Idle cost when nothing is
+                    // pending: none.
+                    if crate::remote::needs_ticks() {
+                        needs_timer = true;
+                    }
+                    if self.os.pointer_capture_pacing {
+                        needs_timer = true;
+                    }
                     self.handle_actions();
 
                     if self.any_passes_dirty()
                         || self.need_redrawing()
                         || !self.new_next_frames.is_empty()
                         || self.demo_time_repaint
-                        || !self.os.video_players.is_empty()
+                        || self
+                            .os
+                            .video_players
+                            .values()
+                            .any(|player| player.needs_poll())
                     {
                         needs_timer = true;
                     }
@@ -550,17 +1232,66 @@ impl Cx {
                             self.os.timer0_idle_since = Some(now);
                         }
                     }
+                    let step_t = trace_t0.map(|_| std::time::Instant::now());
                     self.run_live_edit_if_needed("macos");
+                    let live_edit_ms = step_t.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+                    let step_t = trace_t0.map(|_| std::time::Instant::now());
                     self.handle_networking_events();
+                    let net_ms = step_t.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+                    let step_t = trace_t0.map(|_| std::time::Instant::now());
                     self.handle_gamepad_events();
-                    self.cocoa_event_callback(MacosEvent::Paint, metal_cx, metal_windows);
+                    let pad_ms = step_t.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+                    let paint_t = trace_t0.map(|_| std::time::Instant::now());
+                    // Propagate Exit from the inner Paint dispatch. The
+                    // signal handling above (Ctrl+C / SIGTERM) calls
+                    // `request_quit`, which queues a `CxOsOp::Quit`; that op
+                    // is drained by `handle_platform_ops` at the top of this
+                    // recursive call and surfaces as `EventFlow::Exit`
+                    // (after `Event::Shutdown` is dispatched). If we ignore
+                    // the return value here and fall through to
+                    // `EventFlow::Wait`, `do_callback` overwrites the just-
+                    // set Exit and the main loop blocks indefinitely on the
+                    // next NSEvent — the symptom being a Ctrl+C that runs
+                    // the user's `QuitRequested` / `Shutdown` handlers but
+                    // never actually exits.
+                    if let EventFlow::Exit =
+                        self.cocoa_event_callback(MacosEvent::Paint, metal_cx, metal_windows)
+                    {
+                        return EventFlow::Exit;
+                    }
+                    let paint_ms = paint_t.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
                     // Run garbage collection if needed - safe moment after paint, before waiting
+                    let gc_t0 = std::time::Instant::now();
+                    let mut did_gc = false;
                     self.with_vm(|vm| {
                         if vm.heap().needs_gc() {
                             vm.gc();
+                            did_gc = true;
                         }
                     });
+                    if did_gc {
+                        self.perf_monitor.add(
+                            crate::perf_monitor::PERF_CHANNEL_GC,
+                            gc_t0.elapsed().as_micros() as u64,
+                        );
+                    }
+
+                    if let Some(t0) = trace_t0 {
+                        let took_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        if took_ms > 10.0 {
+                            crate::trace!(
+                                "timer",
+                                "slow callback {:.1}ms (live_edit {:.1} net {:.1} pad {:.1} paint {:.1} gc {:.1})",
+                                took_ms,
+                                live_edit_ms.unwrap_or(0.0),
+                                net_ms.unwrap_or(0.0),
+                                pad_ms.unwrap_or(0.0),
+                                paint_ms.unwrap_or(0.0),
+                                if did_gc { gc_t0.elapsed().as_secs_f64() * 1000.0 } else { 0.0 },
+                            );
+                        }
+                    }
 
                     // block till the next timer
                     return EventFlow::Wait;
@@ -570,6 +1301,13 @@ impl Cx {
         }
         //self.process_desktop_pre_event(&mut event);
         match event {
+            MacosEvent::AppQuitRequested => {
+                self.request_quit(QuitReason::App);
+                if let EventFlow::Exit = self.handle_platform_ops(metal_windows, metal_cx) {
+                    self.call_event_handler(&Event::Shutdown);
+                    return EventFlow::Exit;
+                }
+            }
             MacosEvent::WindowGotFocus(window_id) => {
                 // repaint all window passes. Metal sometimes doesnt flip buffers when hidden/no focus
                 for window in metal_windows.iter_mut() {
@@ -580,6 +1318,8 @@ impl Cx {
                 self.call_event_handler(&Event::WindowGotFocus(window_id));
             }
             MacosEvent::WindowLostFocus(window_id) => {
+                // The pointer lock cannot outlive the window's focus.
+                with_macos_app(|app| app.release_pointer_lock_on_focus_loss());
                 self.call_event_handler(&Event::WindowLostFocus(window_id));
             }
             MacosEvent::PopupDismissed(event) => {
@@ -601,10 +1341,10 @@ impl Cx {
                     .iter_mut()
                     .find(|w| w.window_id == re.window_id)
                 {
-                    self.windows[re.window_id].os_dpi_factor = Some(re.new_geom.dpi_factor);
-                    if let Some(dpi_override) = self.windows[re.window_id].dpi_override {
-                        re.new_geom.inner_size *= re.new_geom.dpi_factor / dpi_override;
-                        re.new_geom.dpi_factor = dpi_override;
+                    {
+                        let cx_window = &mut self.windows[re.window_id];
+                        cx_window.os_dpi_factor = Some(re.new_geom.dpi_factor);
+                        re.new_geom = cx_window.native_window_geom_to_layout(re.new_geom);
                     }
                     window.window_geom = re.new_geom.clone();
                     self.windows[re.window_id].window_geom = re.new_geom.clone();
@@ -621,23 +1361,95 @@ impl Cx {
                 // ok lets not redraw all, just this window
                 self.call_event_handler(&Event::WindowGeomChange(re));
             }
+            MacosEvent::WindowMiniaturizeChange => {
+                // This is the last beat we get once the Dock takes the window,
+                // so swap the paint clock over now.
+                if with_macos_app(|app| app.all_windows_miniaturized()) {
+                    self.ensure_timer0_stopped();
+                } else {
+                    // The links are only paused, not dropped, so the armed flag
+                    // would early-out before anything unpauses them.
+                    self.os.timer0_armed = false;
+                    self.ensure_timer0_started();
+                }
+            }
             MacosEvent::WindowClosed(wc) => {
                 // lets remove the window from the set
                 let window_id = wc.window_id;
+                // `CxOsOp::CloseWindow` clears `is_created` *before* asking Cocoa
+                // to close, so a window still marked created at this point was
+                // dismissed by the human (close button / Cmd-W) rather than by
+                // the app. Say which, on stdout, so an agent watching the log
+                // does not read a deliberate dismissal as a crash.
+                let user_closed = crate::remote::take_window_close_requested(window_id.id())
+                    || self.windows[window_id].is_created;
+                let title = self.windows[window_id].create_title.clone();
                 self.call_event_handler(&Event::WindowClosed(wc));
 
                 self.windows[window_id].is_created = false;
+                if user_closed {
+                    crate::remote::note_user_closed_window(window_id.id(), &title);
+                }
                 if let Some(index) = metal_windows.iter().position(|w| w.window_id == window_id) {
-                    metal_windows.remove(index);
+                    let metal_window = metal_windows.remove(index);
+                    with_macos_app(|app| app.retire_cocoa_window(metal_window.cocoa_window));
                     if metal_windows.len() == 0 {
+                        if user_closed {
+                            crate::remote::note_user_closed_last_window();
+                        }
                         self.call_event_handler(&Event::Shutdown);
                         return EventFlow::Exit;
                     }
                 }
             }
+            MacosEvent::LinkFire {
+                window,
+                time,
+                primary,
+                drawable: _,
+                target_presentation_time,
+            } => {
+                self.os.link_scope = Some(window as usize);
+                self.os.link_flip_time = Some(time);
+                self.os.link_target_presentation_time = target_presentation_time;
+                let flow = if primary {
+                    // The primary link drives the WHOLE beat — identical to
+                    // the timer-0 path (signals, actions, next-frames, then
+                    // paint), just clocked by the flip.
+                    self.cocoa_event_callback(
+                        MacosEvent::Timer(crate::event::TimerEvent {
+                            time: Some(time),
+                            timer_id: 0,
+                        }),
+                        metal_cx,
+                        metal_windows,
+                    )
+                } else {
+                    // A secondary window's flip: paint that window only.
+                    self.cocoa_event_callback(MacosEvent::Paint, metal_cx, metal_windows)
+                };
+                self.os.link_scope = None;
+                self.os.link_flip_time = None;
+                self.os.link_target_presentation_time = 0.0;
+                if let EventFlow::Exit = flow {
+                    return EventFlow::Exit;
+                }
+                // Block till the next flip — the same "block till the next
+                // timer" the timer-0 beat returns. The link is armed by
+                // definition while it fires, so falling through to the gate
+                // below answered Poll, and Poll is nextEvent(distantPast) in
+                // a tight loop: the main thread spun at 100% CPU for the
+                // whole frame between flips, in every link-paced app whose
+                // clock never idled.
+                return EventFlow::Wait;
+            }
             MacosEvent::Paint => {
                 // Poll video players for new frames and preparation status
-                let has_video_players = !self.os.video_players.is_empty();
+                let has_video_players = self
+                    .os
+                    .video_players
+                    .values()
+                    .any(|player| player.needs_poll());
                 if has_video_players {
                     let mut video_events = Vec::new();
                     for (_video_id, player) in self.os.video_players.iter_mut() {
@@ -696,11 +1508,15 @@ impl Cx {
                                     video_id: player.video_id,
                                     current_position_ms: player.current_position_ms(),
                                     yuv: crate::event::video_playback::VideoYuvMetadata {
-                                        enabled: player.is_software_mode(),
+                                        enabled: player.yuv_shader_enabled(),
                                         matrix: player.yuv_matrix(),
                                         biplanar: player.yuv_biplanar() > 0.5,
+                                        full_range: player.yuv_full_range(),
                                         rotation_steps: 0.0,
+                                        external: false,
+                                        array: false,
                                     },
+                                    rgba_gl_2d: false,
                                 },
                             ));
                         }
@@ -711,8 +1527,27 @@ impl Cx {
                 }
 
                 let has_next_frames = self.new_next_frames.len() != 0;
-                let time_now = with_macos_app(|app| app.time_now());
+                // ONE `now` per beat for everything a redraw consumes: on a
+                // display-link beat it is the flip's TARGET timestamp
+                // (`LinkFire.time`), which until now only reached the pass
+                // uniforms while NextFrame and Draw were stamped wall-now —
+                // so a transport stepping on NextFrame and a shader reading
+                // `draw_pass.time` disagreed by the callback's latency, and
+                // NextFrame deltas jittered with the run loop instead of
+                // ticking at the frame period. Unscoped beats (NSTimer,
+                // hidden windows) keep wall-now. Windows already does this
+                // (`paint_tick(flip_time)`), transport design-v2 §3 / §8 step 0.
+                let link_flip_time = self.os.link_flip_time;
+                let time_now = with_macos_app(|app| {
+                    let wake = app.time_now();
+                    match link_flip_time {
+                        Some(flip) => app.frame_trace.tick(TickSource::Link, wake, Some(flip)),
+                        None => app.frame_trace.tick(TickSource::Timer, wake, None),
+                    }
+                    link_flip_time.unwrap_or(wake)
+                });
                 if has_next_frames {
+                    with_macos_app(|app| app.frame_trace.next_frame(time_now));
                     self.call_next_frame_event(time_now);
                 }
                 let needs_redrawing = self.need_redrawing();
@@ -721,6 +1556,10 @@ impl Cx {
                     self.mtl_compile_shaders(&metal_cx);
                 }
                 let has_dirty_passes = self.any_passes_dirty();
+                with_macos_app(|app| {
+                    let now = app.time_now();
+                    app.frame_trace.maybe_print(now);
+                });
                 // Start timer if we have work
                 if has_next_frames
                     || needs_redrawing
@@ -738,16 +1577,32 @@ impl Cx {
                 self.handle_repaint(metal_windows, metal_cx);
             }
             MacosEvent::MouseDown(mut e) => {
+                if !self.windows.is_valid(e.window_id) || !self.windows[e.window_id].is_created {
+                    return EventFlow::Wait;
+                }
+                self.activate_window_on_pointer_down(e.window_id);
                 self.dpi_override_scale(&mut e.abs, e.window_id);
                 self.fingers.process_tap_count(e.abs, e.time);
                 self.fingers.mouse_down(e.button, e.window_id);
                 self.call_event_handler(&Event::MouseDown(e.into()));
+                self.update_pointer_capture_pacing();
             }
             MacosEvent::MouseMove(mut e) => {
+                if !self.windows.is_valid(e.window_id) || !self.windows[e.window_id].is_created {
+                    return EventFlow::Wait;
+                }
                 self.dpi_override_scale(&mut e.abs, e.window_id);
                 let abs = e.abs;
                 let modifiers = e.modifiers;
                 self.call_event_handler(&Event::MouseMove(e.into()));
+                // AppKit requires beginDraggingSession to receive the live
+                // NSEvent that initiated the pointer drag. The ordinary
+                // platform-op drain happens at the start of the *next*
+                // callback, when currentEvent may already be a timer, paint,
+                // or mouse-up. Pull out only this explicit cross-app op now;
+                // every other platform operation keeps its established
+                // deferred semantics.
+                self.handle_pending_external_drag(metal_windows);
                 if let Some(items) = self.os.internal_drag_items.as_ref() {
                     self.call_event_handler(&Event::Drag(DragEvent {
                         modifiers,
@@ -762,6 +1617,9 @@ impl Cx {
                 self.fingers.switch_captures();
             }
             MacosEvent::MouseUp(mut e) => {
+                if !self.windows.is_valid(e.window_id) || !self.windows[e.window_id].is_created {
+                    return EventFlow::Wait;
+                }
                 self.dpi_override_scale(&mut e.abs, e.window_id);
                 let button = e.button;
                 let abs = e.abs;
@@ -769,6 +1627,7 @@ impl Cx {
                 self.call_event_handler(&Event::MouseUp(e.into()));
                 self.fingers.mouse_up(button);
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
+                self.update_pointer_capture_pacing();
                 if button == MouseButton::PRIMARY {
                     if let Some(items) = self.os.internal_drag_items.take() {
                         self.call_event_handler(&Event::Drop(DropEvent {
@@ -784,22 +1643,48 @@ impl Cx {
                 }
             }
             MacosEvent::Scroll(mut e) => {
+                if !self.windows.is_valid(e.window_id) || !self.windows[e.window_id].is_created {
+                    return EventFlow::Wait;
+                }
                 self.dpi_override_scale(&mut e.abs, e.window_id);
                 self.call_event_handler(&Event::Scroll(e.into()));
             }
+            MacosEvent::Pinch(mut e) => {
+                if !self.windows.is_valid(e.window_id) || !self.windows[e.window_id].is_created {
+                    return EventFlow::Wait;
+                }
+                self.dpi_override_scale(&mut e.abs, e.window_id);
+                self.call_event_handler(&Event::Pinch(e));
+            }
             MacosEvent::WindowDragQuery(mut e) => {
+                if !self.windows.is_valid(e.window_id) || !self.windows[e.window_id].is_created {
+                    return EventFlow::Wait;
+                }
                 self.dpi_override_scale(&mut e.abs, e.window_id);
                 self.call_event_handler(&Event::WindowDragQuery(e))
             }
             MacosEvent::WindowCloseRequested(e) => {
-                self.call_event_handler(&Event::WindowCloseRequested(e))
+                // Only the native close button / Cmd-W reach `windowShouldClose:`;
+                // an app closing its own window does not. So an accepted request
+                // here means the human dismissed the window — remember it, and
+                // report it when the close actually lands.
+                let window_id = e.window_id;
+                let accept_close = e.accept_close.clone();
+                self.call_event_handler(&Event::WindowCloseRequested(e));
+                if accept_close.get() {
+                    crate::remote::note_window_close_requested(window_id.id());
+                }
             }
             MacosEvent::TextInput(e) => self.call_event_handler(&Event::TextInput(e)),
-            MacosEvent::Drag(e) => {
+            MacosEvent::Drag(window_id, mut e) => {
+                // External drags arrive in native-logical coordinates; remap into
+                // layout space when a dpi_override is set on the window.
+                self.dpi_override_scale(&mut e.abs, window_id);
                 self.call_event_handler(&Event::Drag(e));
                 self.drag_drop.cycle_drag();
             }
-            MacosEvent::Drop(e) => {
+            MacosEvent::Drop(window_id, mut e) => {
+                self.dpi_override_scale(&mut e.abs, window_id);
                 self.call_event_handler(&Event::Drop(e));
                 self.drag_drop.cycle_drag();
             }
@@ -843,16 +1728,25 @@ impl Cx {
             }
         }
 
-        // Determine the event flow based on whether we have work to do
-        if self.any_passes_dirty()
+        // Determine the event flow based on whether we have work to do.
+        if self.os.timer0_armed {
+            // The paint clock is armed — display link, its timer fallback,
+            // or the pointer-capture timer — and all three are main-run-loop
+            // sources: they fire INSIDE a blocking nextEvent and run the
+            // beat there. Polling on top of them adds nothing but a
+            // nextEvent(distantPast) spin until the next beat, and since
+            // every input event lands here, that was a full frame of 100%
+            // CPU per mouse move for as long as the clock stayed armed.
+            EventFlow::Wait
+        } else if self.any_passes_dirty()
             || self.need_redrawing()
             || self.new_next_frames.len() != 0
             || self.os.keep_alive_counter > 0
             || self.screenshot_requests.len() > 0
             || self.demo_time_repaint
-            || self.os.timer0_armed
         {
-            // We have work to do or timer is running
+            // Work pending but no clock to deliver it: poll until the 0.2 s
+            // heartbeat re-arms the beat.
             EventFlow::Poll
         } else {
             // No work pending and timer is stopped - we can wait
@@ -860,8 +1754,39 @@ impl Cx {
         }
     }
 
-    fn dpi_override_scale(&self, pos: &mut Vec2d, window_id: WindowId) {
-        *pos = self.windows[window_id].remap_dpi_override(*pos)
+    fn start_external_drag_now(
+        &mut self,
+        metal_windows: &mut [MetalWindow],
+        window_id: WindowId,
+        items: Vec<DragItem>,
+    ) {
+        let started = metal_windows
+            .iter_mut()
+            .find(|window| window.window_id == window_id)
+            .is_some_and(|window| window.cocoa_window.start_external_dragging(items));
+        if !started {
+            crate::error!("could not start external file drag");
+            // A native session normally emits DragEnd from its AppKit source
+            // callback. A rejected start needs the same completion signal so
+            // application gesture guards can recover immediately.
+            self.call_event_handler(&Event::DragEnd);
+        }
+    }
+
+    fn handle_pending_external_drag(&mut self, metal_windows: &mut [MetalWindow]) {
+        let Some(index) = self
+            .platform_ops
+            .iter()
+            .rposition(|op| matches!(op, CxOsOp::StartExternalDragging { .. }))
+        else {
+            return;
+        };
+        let Some(CxOsOp::StartExternalDragging { window_id, items }) =
+            self.platform_ops.remove(index)
+        else {
+            unreachable!();
+        };
+        self.start_external_drag_now(metal_windows, window_id, items);
     }
 
     fn handle_platform_ops(
@@ -869,15 +1794,16 @@ impl Cx {
         metal_windows: &mut Vec<MetalWindow>,
         metal_cx: &MetalCx,
     ) -> EventFlow {
-        while let Some(op) = self.platform_ops.pop() {
+        while let Some(op) = self.platform_ops.pop_front() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     let window = &mut self.windows[window_id];
+                    let (create_position, create_inner_size) = window.create_geom();
                     let mut metal_window = MetalWindow::new(
                         window_id,
                         &metal_cx,
-                        window.create_inner_size.unwrap_or(dvec2(800., 600.)),
-                        window.create_position,
+                        create_inner_size,
+                        create_position,
                         &window.create_title,
                         window.is_fullscreen,
                         window.macos,
@@ -887,9 +1813,7 @@ impl Cx {
                     let layer_opaque = if visuals.transparent { NO } else { YES };
                     let layer_alpha = if visuals.transparent { 0.0 } else { 1.0 };
                     let () = unsafe { msg_send![metal_window.ca_layer, setOpaque: layer_opaque] };
-                    let () = unsafe {
-                        msg_send![metal_window.ca_layer, setBackgroundColor: CGColorCreateGenericRGB(0.0, 0.0, 0.0, layer_alpha)]
-                    };
+                    set_metal_layer_background_color(metal_window.ca_layer, layer_alpha);
                     window.window_geom = metal_window.window_geom.clone();
                     metal_windows.push(metal_window);
                     window.is_created = true;
@@ -1011,10 +1935,7 @@ impl Cx {
                 }
                 CxOsOp::SetTopmost(window_id, is_topmost) => {
                     if metal_windows.is_empty() {
-                        if defer_platform_op(
-                            &mut self.platform_ops,
-                            CxOsOp::SetTopmost(window_id, is_topmost),
-                        ) {
+                        if self.defer_platform_op(CxOsOp::SetTopmost(window_id, is_topmost)) {
                             continue;
                         }
                         break;
@@ -1036,26 +1957,53 @@ impl Cx {
                         let layer_alpha = if visuals.transparent { 0.0 } else { 1.0 };
                         let () =
                             unsafe { msg_send![metal_window.ca_layer, setOpaque: layer_opaque] };
-                        let () = unsafe {
-                            msg_send![metal_window.ca_layer, setBackgroundColor: CGColorCreateGenericRGB(0.0, 0.0, 0.0, layer_alpha)]
-                        };
+                        set_metal_layer_background_color(metal_window.ca_layer, layer_alpha);
                     }
                 }
-                CxOsOp::ShowTextIME(area, pos, _config) => {
-                    let pos = area.clipped_rect(self).pos + pos;
+                CxOsOp::ShowTextIME(area, cursor_rect, _config) => {
+                    // Convert both corners of the caret line rect (area-relative,
+                    // logical px) into window content-view points so the height is
+                    // scaled correctly along with the position.
+                    let area_pos = area.clipped_rect(self).pos;
+                    let window_id = self
+                        .get_window_id_of(&area)
+                        .unwrap_or(CxWindowPool::id_zero());
+                    let top_left = self.windows[window_id]
+                        .layout_vec2d_to_native_points(area_pos + cursor_rect.pos);
+                    let bottom_right = self.windows[window_id].layout_vec2d_to_native_points(
+                        area_pos + cursor_rect.pos + cursor_rect.size,
+                    );
+                    let ime_rect = Rect {
+                        pos: top_left,
+                        size: bottom_right - top_left,
+                    };
                     metal_windows.iter_mut().for_each(|w| {
                         w.cocoa_window.set_ime_active(true);
-                        w.cocoa_window.set_ime_spot(pos);
+                        w.cocoa_window.set_ime_rect(ime_rect);
                     });
                 }
                 CxOsOp::HideTextIME => {
                     metal_windows.iter_mut().for_each(|w| {
                         w.cocoa_window.set_ime_active(false);
-                        w.cocoa_window.set_ime_spot(dvec2(0.0, 0.0));
+                        w.cocoa_window.set_ime_rect(Rect::default());
                     });
                 }
                 CxOsOp::SetCursor(cursor) => {
                     with_macos_app(|app| app.set_mouse_cursor(cursor));
+                }
+                CxOsOp::LockMousePointer(lock) => {
+                    with_macos_app(|app| {
+                        app.mouse_pointer_lock = lock;
+                        app.apply_pointer_lock_effects(lock);
+                    });
+                    self.update_macos_pointer_capture_pacing();
+                }
+                CxOsOp::RepinMousePointer => {
+                    with_macos_app(|app| app.repin_pointer());
+                }
+                CxOsOp::PinMousePointer(on) => {
+                    with_macos_app(|app| app.set_pointer_pin(on));
+                    self.update_macos_pointer_capture_pacing();
                 }
                 CxOsOp::StartTimer {
                     timer_id,
@@ -1072,6 +2020,9 @@ impl Cx {
                     // from mouse move/up) instead of OS-level drag, which delays
                     // DragEnd by ~1 second due to the macOS fly-back animation.
                     self.os.internal_drag_items = Some(Arc::new(items));
+                }
+                CxOsOp::StartExternalDragging { window_id, items } => {
+                    self.start_external_drag_now(metal_windows, window_id, items);
                 }
                 CxOsOp::UpdateMacosMenu(menu) => with_macos_app(|app| app.update_macos_menu(&menu)),
                 CxOsOp::HttpRequest {
@@ -1252,6 +2203,12 @@ impl Cx {
                 } => {
                     self.handle_permission_request(permission, request_id);
                 }
+                CxOsOp::StartLocationUpdates => {
+                    self.apple_start_location_updates();
+                }
+                CxOsOp::StopLocationUpdates => {
+                    self.apple_stop_location_updates();
+                }
                 CxOsOp::PrepareVideoPlayback(
                     video_id,
                     source,
@@ -1322,12 +2279,9 @@ impl Cx {
                     );
                     self.os.video_players.insert(video_id, player);
                     // Notify widget so it can bind textures to shader slots
-                    self.call_event_handler(&Event::VideoYuvTexturesReady(VideoYuvTexturesReady {
-                        video_id,
-                        tex_y,
-                        tex_u,
-                        tex_v,
-                    }));
+                    self.call_event_handler(&Event::VideoYuvTexturesReady(
+                        VideoYuvTexturesReady::planes(video_id, tex_y, tex_u, tex_v),
+                    ));
                     // Keep timer alive so we can poll for video frames
                     self.ensure_timer0_started();
                 }
@@ -1410,6 +2364,8 @@ impl Cx {
                         player.set_playback_rate(rate);
                     }
                 }
+                // Track selection is currently implemented on Linux GStreamer only.
+                CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
                 CxOsOp::PrepareAudioPlayback(video_id, source, autoplay, should_loop) => {
                     use crate::texture::TextureId;
                     let player = AppleUnifiedVideoPlayer::new(
@@ -1464,6 +2420,7 @@ impl Cx {
             Permission::Camera => self.check_camera_permission_status(),
             Permission::HeadsetCamera => crate::permission::PermissionStatus::DeniedPermanent,
             Permission::SceneAccess => crate::permission::PermissionStatus::DeniedPermanent,
+            Permission::Location => Self::apple_location_permission_status(),
         };
 
         self.call_event_handler(&crate::event::Event::PermissionResult(
@@ -1481,6 +2438,7 @@ impl Cx {
             Permission::Camera => self.check_camera_permission_status(),
             Permission::HeadsetCamera => crate::permission::PermissionStatus::DeniedPermanent,
             Permission::SceneAccess => crate::permission::PermissionStatus::DeniedPermanent,
+            Permission::Location => Self::apple_location_permission_status(),
         };
         match status {
             crate::permission::PermissionStatus::NotDetermined => match permission {
@@ -1490,6 +2448,7 @@ impl Cx {
                 Permission::Camera => self.macos_request_camera_permission(permission, request_id),
                 Permission::HeadsetCamera => {}
                 Permission::SceneAccess => {}
+                Permission::Location => self.apple_request_location_permission(request_id),
             },
             _ => {
                 self.call_event_handler(&crate::event::Event::PermissionResult(
@@ -1565,41 +2524,6 @@ impl Cx {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defer_platform_op_breaks_when_requeued_op_is_alone() {
-        let window_id = WindowId(0, 0);
-        let mut platform_ops = Vec::new();
-
-        assert!(!defer_platform_op(
-            &mut platform_ops,
-            CxOsOp::SetTopmost(window_id, true),
-        ));
-        assert_eq!(platform_ops, vec![CxOsOp::SetTopmost(window_id, true)]);
-    }
-
-    #[test]
-    fn defer_platform_op_continues_when_other_ops_are_pending() {
-        let window_id = WindowId(0, 0);
-        let mut platform_ops = vec![CxOsOp::CreateWindow(window_id)];
-
-        assert!(defer_platform_op(
-            &mut platform_ops,
-            CxOsOp::SetTopmost(window_id, true),
-        ));
-        assert_eq!(
-            platform_ops,
-            vec![
-                CxOsOp::SetTopmost(window_id, true),
-                CxOsOp::CreateWindow(window_id)
-            ]
-        );
-    }
-}
-
 impl CxOsApi for Cx {
     fn pre_start() -> bool {
         init_apple_classes_global();
@@ -1608,15 +2532,9 @@ impl CxOsApi for Cx {
 
     fn init_cx_os(&mut self) {
         self.os.start_time = Some(Instant::now());
-        if let Some(item) = std::option_env!("MAKEPAD_PACKAGE_DIR") {
+        if let Some(item) = crate::app_meta::package_dir() {
             self.package_root = Some(item.to_string());
         }
-        //self.live_expand();
-        #[cfg(debug_assertions)]
-        if !Self::has_studio_web_socket() {
-            //self.start_disk_live_file_watcher(100);
-        }
-        //self.live_scan_dependencies();
 
         #[cfg(apple_bundle)]
         self.apple_bundle_load_dependencies();
@@ -1626,15 +2544,28 @@ impl CxOsApi for Cx {
         let sender = self.os.game_input_events.sender.clone();
         self.os.apple_game_input = Some(AppleGameInput::init(move |event| {
             let _ = sender.send(event);
-            SignalToUI::set_ui_signal();
+            SignalToUI::set_internal_signal();
         }));
     }
 
-    fn spawn_thread<F>(&mut self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        std::thread::spawn(f);
+    fn activate_window_on_pointer_down(&mut self, window_id: WindowId) {
+        // A --stdin-loop child never installs the AppKit app: it has no
+        // cocoa windows to activate, and forwarded clicks must not unwrap
+        // the missing global.
+        let window = super::macos_app::try_with_macos_app(|app| app.cocoa_window_for_id(window_id))
+            .flatten();
+        if let Some(window) = window {
+            if activate_cocoa_window_on_pointer_down(window) {
+                // AppKit's delegate callback is synchronous and bridge input
+                // runs inside our event callback, where the delegate cannot
+                // re-enter it. Deliver the focus transition once here.
+                self.call_event_handler(&Event::WindowGotFocus(window_id));
+            }
+        }
+    }
+
+    fn update_pointer_capture_pacing(&mut self) {
+        self.update_macos_pointer_capture_pacing();
     }
 
     fn start_stdin_service(&mut self) {
@@ -1649,6 +2580,7 @@ impl CxOsApi for Cx {
     }
 
     fn open_url(&mut self, url: &str, _in_place: OpenUrlInPlace) {
+        if self.script_data.std.host_io_only() { return; }
         // Use the macOS `open` command to open URLs
         let _ = std::process::Command::new("open").arg(url).spawn();
     }
@@ -1670,8 +2602,25 @@ impl CxOsApi for Cx {
 pub struct CxOs {
     /// For how long to keep the timer alive when the app is idle
     pub(crate) keep_alive_counter: usize,
+    /// While a LinkFire beat runs: paint ONLY passes rooted in this cocoa
+    /// window (as usize), and stamp them with `link_flip_time` — the flip's
+    /// target timestamp in app time. None = the NSTimer/idle beat: paint
+    /// everything, stamp wall-now.
+    pub(crate) link_scope: Option<usize>,
+    pub(crate) link_flip_time: Option<f64>,
+    /// Core Animation media-time domain for the update's target.
+    pub(crate) link_target_presentation_time: f64,
     /// Indicates wether the main timer is armed
     pub(crate) timer0_armed: bool,
+    /// A widget owns the mouse, so the private full-refresh timer replaces
+    /// AppKit's throttleable per-window display-link clock until release.
+    pub(crate) pointer_capture_pacing: bool,
+    /// Set only while sealing an external grab or wait=1 input frame.
+    remote_present_window: Option<WindowId>,
+    /// Whether that frame was submitted (`None`: no drawable on this beat).
+    remote_presented: Option<bool>,
+    /// The window whose remote present is pending on a drawable, and since when.
+    remote_present_waiting: Option<(WindowId, Instant)>,
     /// Start time of the current idle stretch while timer0 is armed.
     pub(crate) timer0_idle_since: Option<f64>,
     pub(crate) media: CxAppleMedia,
@@ -1692,4 +2641,41 @@ pub struct CxOs {
     pub(crate) native_camera_previews: HashMap<LiveId, MacosNativeCameraPreview>,
     pub(crate) system_browsers: HashMap<LiveId, MacosSystemBrowser>,
     pub(crate) internal_drag_items: Option<Arc<Vec<DragItem>>>,
+}
+
+/// Completes the handshake with a development runner, if one launched us.
+///
+/// `cargo run` normally starts a bare executable, which macOS gives no bundle
+/// identity: microphone, speech, location and similar prompts are then attributed
+/// to the terminal or editor that spawned it, and are denied outright when that
+/// process lacks the matching usage description. A development runner works around
+/// this by launching a real `.app` through LaunchServices instead.
+///
+/// That costs three things the runner cannot recover on its own, because
+/// LaunchServices forks the process and starts it in `/`: it never learns the
+/// app's pid (so it has nothing to forward a Ctrl-C to), it cannot pass on the
+/// terminal's working directory, and it never sees the app's exit code. All three
+/// are only knowable in-process, so report them through the directory named by
+/// `MAKEPAD_DEV_LAUNCH_DIR`: adopt `MAKEPAD_DEV_WORKING_DIR`, write `pid` on the
+/// way in, and `status` on the way out.
+///
+/// Both variables are set only by such a runner, so an app launched any other way
+/// does nothing here.
+fn dev_launch_begin() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var_os("MAKEPAD_DEV_LAUNCH_DIR")?);
+    let report = || -> std::io::Result<()> {
+        let working_dir = std::env::var_os("MAKEPAD_DEV_WORKING_DIR").ok_or_else(|| {
+            std::io::Error::other("the development runner supplied no working directory")
+        })?;
+        std::env::set_current_dir(working_dir)?;
+        std::fs::write(dir.join("pid"), format!("{}\n", std::process::id()))
+    };
+    if let Err(error) = report() {
+        // The runner is waiting on that pid, so fail here rather than leave it
+        // watching a process it cannot see.
+        eprintln!("makepad: could not complete the development launch: {error}");
+        let _ = std::fs::write(dir.join("status"), "1\n");
+        std::process::exit(1);
+    }
+    Some(dir)
 }

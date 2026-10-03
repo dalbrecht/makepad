@@ -149,6 +149,7 @@ impl Cx {
             }
 
             Some(LinuxOwnedImage {
+                vulkan: None,
                 drm_format: crate::os::linux::dma_buf::DrmFormat { fourcc, modifiers },
                 plane: LinuxOwnedImagePlane {
                     dma_buf_fd: os::fd::OwnedFd::from_raw_fd(dma_buf_fd),
@@ -159,6 +160,8 @@ impl Cx {
         }
     }
 
+    /// Also reachable in a Vulkan-capable build that fell back to OpenGL.
+    #[cfg(any(not(use_vulkan), all(target_os = "linux", not(linux_direct))))]
     pub fn upload_presentable_image_software_buffer(
         &mut self,
         texture: &Texture,
@@ -345,6 +348,7 @@ impl OpenglWindow {
         inner_size: Vec2d,
         position: Option<Vec2d>,
         title: &str,
+        app_id: &str,
         is_fullscreen: bool,
     ) -> OpenglWindow {
         // Checked "downcast" of the EGL platform display to a X11 display.
@@ -389,6 +393,7 @@ impl OpenglWindow {
         let custom_window_chrome = false;
         xlib_window.init(
             title,
+            app_id,
             inner_size,
             position,
             is_fullscreen,

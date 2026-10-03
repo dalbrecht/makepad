@@ -14,7 +14,7 @@ script_mod! {
         draw_call: uniform_buffer(draw.DrawCallUniforms)
         draw_pass: uniform_buffer(draw.DrawPassUniforms)
         draw_list: uniform_buffer(draw.DrawListUniforms)
-        geom: vertex_buffer(geom.VectorVertex, geom.VectorGeom)
+        geom: vertex_buffer(geom.VectorVertexPacked, geom.VectorGeomPacked)
         gradient_texture: texture_2d(float)
 
         v_tcoord: varying(vec2f)
@@ -33,22 +33,29 @@ script_mod! {
 
         vertex: fn() {
             let pos = vec2(self.geom.x, self.geom.y);
-            self.v_tcoord = vec2(self.geom.u, self.geom.v);
-            self.v_color = vec4(self.geom.color_r, self.geom.color_g, self.geom.color_b, self.geom.color_a);
+            // uv.y <= 1 is cap coverage; round-cap carriers use
+            // uv.y = 1 + cap_axis, where cap_axis runs 0..1 from centre to tip.
+            let g_uv = unpack2f16(self.geom.uv)
+            let g_color = unpack4u8(self.geom.color)
+            let g_p0s = unpack2f16(self.geom.p0s)
+            let g_p12 = unpack2f16(self.geom.p12)
+            let g_p3c = unpack2f16(self.geom.p3c)
+            self.v_tcoord = g_uv;
+            self.v_color = g_color;
             self.v_stroke_mult = self.geom.stroke_mult;
             self.v_stroke_dist = self.geom.stroke_dist;
-            self.v_shape_id = self.geom.shape_id;
-            self.v_param0 = self.geom.param0;
-            self.v_param1 = self.geom.param1;
-            self.v_param2 = self.geom.param2;
-            self.v_param3 = self.geom.param3;
+            self.v_shape_id = g_p0s.y;
+            self.v_param0 = g_p0s.x;
+            self.v_param1 = g_p12.x;
+            self.v_param2 = g_p12.y;
+            self.v_param3 = g_p3c.x;
             self.v_param4 = self.geom.param4;
             self.v_param5 = self.geom.param5;
             let shifted = pos + self.draw_list.view_shift;
             self.v_world = shifted;
 
             // Early clip rejection in local space.
-            let cr = self.geom.clip_radius;
+            let cr = unpack2f16(self.geom.p3c).y;
             let is_shadow = self.geom.stroke_mult < -0.5;
             if cr > 0.0 && !is_shadow {
                 let clip = vec4(
@@ -218,7 +225,13 @@ script_mod! {
             );
             if local.x < clip.x || local.y < clip.y
                 || local.x > clip.z || local.y > clip.w {
-                return vec4(0.0, 0.0, 0.0, 0.0)
+                // Transparent fragments still write depth. That is normally
+                // invisible, but an embedded vector canvas can contain page-
+                // sized geometry extending far beyond its widget clip; those
+                // zero-alpha fragments would then hide every lower-depth
+                // sibling drawn later in the pass. Discard outside the clip
+                // so both color and depth stay confined to the widget.
+                discard()
             }
             // geometry shadow mode: stroke_mult == -2.0
             // v interpolates 1.0 (edge) to 0.0 (3*blur out), stroke_dist = blur
@@ -243,17 +256,44 @@ script_mod! {
             }
             let color = self.get_color();
             var alpha = 0.0;
-            if self.v_stroke_mult > 1e5 {
+            let cap = self.v_tcoord.y;
+            let cap_axis = max(cap - 1.0, 0.0);
+            let round_sd = 1.0 - length(vec2(self.v_tcoord.x * 2.0 - 1.0, cap_axis));
+            let round_fw = length(vec2(dFdx(round_sd), dFdy(round_sd)));
+            // Wide analytic fill fringe. Its tcoord.x is signed across the
+            // nominal edge (0 exactly on the path, positive inside, negative
+            // outside). Dividing by its screen derivative recovers signed
+            // distance in device pixels, so the coverage remains one pixel
+            // wide under zoom, rotation and non-uniform projection. The
+            // carrier may be deliberately much wider than the visible ramp;
+            // discard its zero-coverage tail so it cannot write depth.
+            //
+            // stroke_mult = 2e6 is reserved for this mode. Ordinary fills
+            // keep their established 1e6 sentinel.
+            if cap > 1.0 {
+                alpha = clamp(round_sd / max(round_fw, 0.001), 0.0, 1.0)
+                    * self.get_stroke_mask();
+                if alpha * color.w <= 0.004 {
+                    discard()
+                }
+            } else if self.v_stroke_mult > 1.5e6 {
+                let sd = self.v_tcoord.x;
+                let fw = length(vec2(dFdx(sd), dFdy(sd)));
+                alpha = clamp(0.5 + sd / max(fw, 0.001), 0.0, 1.0);
+                if alpha * color.w <= 0.004 {
+                    discard()
+                }
+            } else if self.v_stroke_mult > 1e5 {
                 let d = self.v_tcoord.x * 2.0;
                 let fw = length(vec2(dFdx(d), dFdy(d)));
                 alpha = clamp(d / max(fw, 0.001), 0.0, 1.0);
             } else {
                 let sd = 1.0 - abs(self.v_tcoord.x * 2.0 - 1.0);
                 let fw = length(vec2(dFdx(sd), dFdy(sd)));
-                let cap = self.v_tcoord.y;
                 let cap_fw = length(vec2(dFdx(cap), dFdy(cap)));
                 let cap_alpha = smoothstep(0.0, max(cap_fw, 0.001), cap);
-                alpha = clamp(sd / max(fw, 0.001), 0.0, 1.0) * cap_alpha * self.get_stroke_mask();
+                alpha = clamp(sd / max(fw, 0.001), 0.0, 1.0)
+                    * cap_alpha * self.get_stroke_mask();
             }
             return color * alpha
         }
@@ -265,8 +305,29 @@ script_mod! {
 pub struct DrawVector {
     #[rust]
     pub many_instances: Option<ManyInstances>,
+    /// Geometry slots this `DrawVector` has uploaded into during the current
+    /// frame.
+    ///
+    /// A draw call only records a `geometry_id`; the vertex data itself lives
+    /// in `cx.geometries[id]`. A widget may open several begin/end sessions in
+    /// one frame (a score page draws its paper, then its batches, then its
+    /// overlays), and each `end()` issues its own draw call. Handing every
+    /// session the same slot therefore made all of the frame's draw calls
+    /// render whatever the *last* session happened to upload. The pool is
+    /// rewound at the start of every frame, so it only ever grows to the
+    /// widest single frame.
     #[rust]
-    pub geometry: Option<Geometry>,
+    pub geometry_pool: Vec<Geometry>,
+    #[rust]
+    geometry_cursor: usize,
+    #[rust]
+    geometry_redraw_id: u64,
+    /// The slot the most recent session bound, so `submit_existing_geometry`
+    /// can point a new draw call at an already uploaded mesh.
+    #[rust]
+    pub geometry: Option<GeometryId>,
+    #[rust]
+    geometry_slot: Option<usize>,
     #[rust]
     pub path: VectorPath,
     #[rust]
@@ -292,6 +353,15 @@ pub struct DrawVector {
     pub cur_zbias: f32,
     #[rust]
     pub cur_gradient_row_v: f32,
+    /// Fill AA fringe (path-local units); set so the baked fringe lands at ~1 device px after GPU scaling. 0.0 = use 1.0.
+    #[rust]
+    pub cur_fill_aa: f32,
+    /// Stroke AA fringe (path-local units); like `cur_fill_aa` but for strokes. 0.0 = use the caller's aa.
+    #[rust]
+    pub cur_stroke_aa: f32,
+    /// Curve flatten tolerance (path-local units); set ~`device_px / device_scale` for constant on-screen smoothness. 0.0 = use 0.25.
+    #[rust]
+    pub cur_tolerance: f32,
     // Effect bounding box (world-space): [min_x, min_y, max_x, max_y]
     // When set, stored in param1-param4 for solid-painted shapes with shader_id > 0,
     // enabling the pixel shader to compute proper UV coordinates from v_world.
@@ -427,6 +497,11 @@ impl DrawVector {
         miter_limit: f32,
         aa: f32,
     ) {
+        let tolerance = if self.cur_tolerance > 0.0 {
+            self.cur_tolerance
+        } else {
+            0.25
+        };
         let mut tv = std::mem::take(&mut self.tess_verts);
         let mut ti = std::mem::take(&mut self.tess_indices);
         self.cur_stroke_mult = tessellate_path_stroke(
@@ -439,6 +514,7 @@ impl DrawVector {
             join,
             miter_limit,
             aa,
+            tolerance,
         );
         self.append_geometry(&tv, &ti);
         self.tess_verts = tv;
@@ -446,7 +522,12 @@ impl DrawVector {
     }
 
     pub fn fill(&mut self) {
-        self.fill_opts(LineJoin::Miter, 4.0, 1.0);
+        let aa = if self.cur_fill_aa > 0.0 {
+            self.cur_fill_aa
+        } else {
+            1.0
+        };
+        self.fill_opts(LineJoin::Miter, 4.0, aa);
     }
 
     /// Fill with GPU-expandable fringe encoding (used by DrawSvg cache remapping).
@@ -459,6 +540,11 @@ impl DrawVector {
     }
 
     fn fill_opts_mode(&mut self, join: LineJoin, miter_limit: f32, aa: f32, gpu_expand_fill: bool) {
+        let tolerance = if self.cur_tolerance > 0.0 {
+            self.cur_tolerance
+        } else {
+            0.25
+        };
         let mut tv = std::mem::take(&mut self.tess_verts);
         let mut ti = std::mem::take(&mut self.tess_indices);
         tessellate_path_fill(
@@ -470,6 +556,7 @@ impl DrawVector {
             miter_limit,
             aa,
             gpu_expand_fill,
+            tolerance,
         );
         self.cur_stroke_mult = 1e6;
         self.append_geometry(&tv, &ti);
@@ -624,7 +711,60 @@ impl DrawVector {
         if self.acc_verts.is_empty() || self.acc_indices.is_empty() {
             return;
         }
+        self.finish_gradient_texture(cx);
+        let slot = self.acquire_geometry_slot(cx);
+        let geometry_id = self.geometry_pool[slot].geometry_id();
+        let (mut indices, mut packed) = self.pack_geometry();
+        self.geometry_pool[slot].update_with_recycled_buffers(cx.cx.cx, &mut indices, &mut packed);
+        self.geometry = Some(geometry_id);
+        self.geometry_slot = Some(slot);
+        self.submit_geometry(cx, geometry_id);
+    }
 
+    /// As [`Self::end`], but the mesh goes into `geometry`, which the caller
+    /// keeps: it outlives the frame and is drawn again by
+    /// [`Self::submit_geometry`] without tessellating or uploading anything.
+    /// A `DrawSvg` keeps one such mesh per size it is drawn at, so an icon
+    /// that only moves costs an instance per frame. Nothing is uploaded or
+    /// drawn when the session produced no geometry; the caller checks
+    /// [`Self::has_geometry`] first when that matters.
+    pub fn end_into(&mut self, cx: &mut Cx2d, geometry: &Geometry) {
+        if self.acc_verts.is_empty() || self.acc_indices.is_empty() {
+            return;
+        }
+        self.finish_gradient_texture(cx);
+        let (mut indices, mut packed) = self.pack_geometry();
+        geometry.update_with_recycled_buffers(cx.cx.cx, &mut indices, &mut packed);
+        self.submit_geometry(cx, geometry.geometry_id());
+    }
+
+    /// Whether the session since [`Self::begin`] produced any mesh.
+    pub fn has_geometry(&self) -> bool {
+        !self.acc_verts.is_empty() && !self.acc_indices.is_empty()
+    }
+
+    /// A draw call plus an instance for a mesh already on the GPU (from
+    /// [`Self::end_into`] or a previous [`Self::end`]).
+    pub fn submit_geometry(&mut self, cx: &mut Cx2d, geometry_id: GeometryId) {
+        self.draw_vars.geometry_id = Some(geometry_id);
+        cx.new_draw_call(&self.draw_vars);
+        if self.draw_vars.can_instance() {
+            let new_area = cx.add_aligned_instance(&self.draw_vars);
+            self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
+        }
+    }
+
+    /// The accumulated vertices packed for the GPU, and the index list, as
+    /// the buffers a `Geometry` swaps in.
+    fn pack_geometry(&self) -> (Vec<u32>, Vec<f32>) {
+        (self.acc_indices.clone(), crate::vector::pack_vector_vertices(&self.acc_verts))
+    }
+
+    /// Uploads the gradient rows this session rasterized (one texture per
+    /// `DrawVector`; the rows of a document are the same at every size, so
+    /// the texture is shared by every mesh of it) and turns the row indices
+    /// baked into the vertices into texture V coordinates.
+    fn finish_gradient_texture(&mut self, cx: &mut Cx2d) {
         // Build and upload gradient texture if we have gradient rows
         if self.gradient_row_count > 0 {
             const TEX_WIDTH: usize = 2048;
@@ -671,28 +811,40 @@ impl DrawVector {
                 }
             }
         }
+    }
 
-        let geom = self.geometry.get_or_insert_with(|| Geometry::new(cx.cx.cx));
-        geom.update_with_recycled_buffers(cx.cx.cx, &mut self.acc_indices, &mut self.acc_verts);
-        self.draw_vars.geometry_id = Some(geom.geometry_id());
-        cx.new_draw_call(&self.draw_vars);
-        if self.draw_vars.can_instance() {
-            let new_area = cx.add_aligned_instance(&self.draw_vars);
-            self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
+    /// Rewind the per-frame geometry pool when a new frame has started, then
+    /// hand out the next free slot. See `geometry_pool`.
+    fn acquire_geometry_slot(&mut self, cx: &mut Cx2d) -> usize {
+        self.rewind_geometry_pool(cx);
+        let slot = self.geometry_cursor;
+        self.geometry_cursor += 1;
+        if slot >= self.geometry_pool.len() {
+            let geometry = Geometry::new(cx.cx.cx);
+            self.geometry_pool.push(geometry);
+        }
+        slot
+    }
+
+    fn rewind_geometry_pool(&mut self, cx: &mut Cx2d) {
+        let redraw_id = cx.cx.cx.redraw_id;
+        if self.geometry_redraw_id != redraw_id {
+            self.geometry_redraw_id = redraw_id;
+            self.geometry_cursor = 0;
         }
     }
 
     /// Submit the already uploaded geometry as a draw call without rebuilding or reuploading.
     pub fn submit_existing_geometry(&mut self, cx: &mut Cx2d) -> bool {
-        let Some(geom) = self.geometry.as_ref() else {
+        let (Some(geometry_id), Some(slot)) = (self.geometry, self.geometry_slot) else {
             return false;
         };
-        self.draw_vars.geometry_id = Some(geom.geometry_id());
-        cx.new_draw_call(&self.draw_vars);
-        if self.draw_vars.can_instance() {
-            let new_area = cx.add_aligned_instance(&self.draw_vars);
-            self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
-        }
+        // The mesh stays where it is, so keep its slot reserved for the rest of
+        // the frame: a later `end()` must not upload over what this draw call
+        // is pointing at.
+        self.rewind_geometry_pool(cx);
+        self.geometry_cursor = self.geometry_cursor.max(slot + 1);
+        self.submit_geometry(cx, geometry_id);
         true
     }
 

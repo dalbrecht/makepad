@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::{c_void, CString};
 
 use crate::{
@@ -15,7 +16,35 @@ pub struct OpenglCx {
 
     pub egl_platform: egl_sys::EGLenum,
     pub egl_platform_display: *mut c_void,
+
+    /// Buffer swap interval requested on the window surface. On X11, `1` enables vsync
+    /// so `eglSwapBuffers` blocks until the next refresh, capping the render loop at the
+    /// display rate. Without this, content that drives a continuous redraw (e.g. any
+    /// shader whose mapping `uses_time`, which forces `demo_time_repaint`) would spin
+    /// the event loop rendering as fast as possible, pinning a CPU/GPU core. On Wayland
+    /// this is `0`: Mesa implements interval `1` by waiting for the previous frame's
+    /// `wl_surface::frame` callback inside `eglSwapBuffers`, and compositors withhold
+    /// those callbacks for occluded or minimized windows, which would block the whole
+    /// event loop; the render loop is capped by explicit frame-callback pacing instead
+    /// (see `linux_wayland.rs`). Set the `MAKEPAD_NO_VSYNC` env var to request `0`
+    /// (uncapped) for benchmarking.
+    pub swap_interval: egl_sys::EGLint,
+
+    /// Once-per-outage latch for `eglMakeCurrent` failures. Both the windowed path in
+    /// `draw_pass_to_window` and `make_current` run every frame, so an unlatched log would
+    /// fill the terminal. Cleared on the next success, so a later outage is reported again.
+    pub make_current_error_logged: Cell<bool>,
+    /// Once-per-outage latch for `eglSwapBuffers` failures.
+    pub swap_error_logged: Cell<bool>,
+    /// Time spent inside `eglSwapBuffers` since the Wayland paint cycle last
+    /// cleared it. A driver may throttle there even at swap interval 0 (NVIDIA
+    /// does); the frame pacer subtracts that wait from a cycle's CPU cost.
+    pub swap_wait: Cell<std::time::Duration>,
 }
+
+/// `EGL_CONTEXT_LOST`. EGL reports this when the context and every GL object made from it
+/// have been destroyed by a power-management event or a GPU reset.
+pub const EGL_CONTEXT_LOST: u32 = 0x300E;
 
 fn egl_error_name(error: egl_sys::EGLint) -> &'static str {
     match error as u32 {
@@ -208,6 +237,16 @@ impl OpenglCx {
         })
         .expect("Cant load openGL functions");
 
+        // Wayland windows must not block in eglSwapBuffers; see the `swap_interval`
+        // field docs.
+        let swap_interval = if std::env::var_os("MAKEPAD_NO_VSYNC").is_some()
+            || egl_platform == egl_sys::EGL_PLATFORM_WAYLAND_KHR
+        {
+            0
+        } else {
+            1
+        };
+
         OpenglCx {
             libegl,
             libgl,
@@ -217,54 +256,125 @@ impl OpenglCx {
 
             egl_platform,
             egl_platform_display,
+            swap_interval,
+            make_current_error_logged: Cell::new(false),
+            swap_error_logged: Cell::new(false),
+            swap_wait: Cell::new(std::time::Duration::ZERO),
         }
     }
 
-    pub fn make_current(&self) {
+    /// Returns whether the context became current. A `false` means every GL call that
+    /// follows runs with no current context and is silently dropped, so callers that can
+    /// skip their GL work should.
+    pub fn make_current(&self) -> bool {
+        unsafe {
+            let ok = (self.libegl.eglMakeCurrent.unwrap())(
+                self.egl_display,
+                egl_sys::EGL_NO_SURFACE,
+                egl_sys::EGL_NO_SURFACE,
+                self.egl_context,
+            );
+            if ok == 0 {
+                // `eglGetError` is called outside the latch: it clears EGL's per-thread
+                // error, and skipping it would leak a stale code into the next report.
+                let egl_error = (self.libegl.eglGetError.unwrap())();
+                self.report_egl_error("eglMakeCurrent(no surface)", egl_error);
+                return false;
+            }
+            self.make_current_error_logged.set(false);
+            true
+        }
+    }
+
+    /// Makes this context current on `egl_surface` for both drawing and reading.
+    ///
+    /// Wayland must bind the target surface before resizing its `wl_egl_window`:
+    /// some EGL implementations defer a resize of a non-current surface until
+    /// the next swap, which would render one frame with mismatched buffer geometry.
+    pub(crate) fn make_current_with_surface(&self, egl_surface: egl_sys::EGLSurface) -> bool {
+        unsafe {
+            let ok = (self.libegl.eglMakeCurrent.unwrap())(
+                self.egl_display,
+                egl_surface,
+                egl_surface,
+                self.egl_context,
+            );
+            if ok == 0 {
+                // `eglGetError` is called outside the latch: it clears EGL's per-thread
+                // error, and skipping it would leak a stale code into the next report.
+                let egl_error = (self.libegl.eglGetError.unwrap())();
+                self.report_egl_error("eglMakeCurrent(window surface)", egl_error);
+                return false;
+            }
+            self.make_current_error_logged.set(false);
+            true
+        }
+    }
+
+    /// Logs an `eglMakeCurrent` failure once per outage, naming a lost context explicitly
+    /// so a report of "the window went black" arrives with its cause attached.
+    fn report_egl_error(&self, what: &str, egl_error: egl_sys::EGLint) {
+        if self.make_current_error_logged.replace(true) {
+            return;
+        }
+        crate::error!(
+            "{} failed error=0x{:04x} ({})",
+            what,
+            egl_error as u32,
+            egl_error_name(egl_error)
+        );
+        if egl_error as u32 == EGL_CONTEXT_LOST {
+            crate::error!(
+                "EGL reports the context was lost (GPU reset or power-management event). Every GL \n                 object made from it is dead; this process cannot render again without a full \n                 context rebuild, which this backend does not perform."
+            );
+        }
+    }
+
+    /// Release the EGL context from this thread so GStreamer's GL thread can
+    /// activate shared/sibling contexts (required for GLMemory DMA-Buf upload).
+    pub fn clear_current(&self) {
         unsafe {
             (self.libegl.eglMakeCurrent.unwrap())(
                 self.egl_display,
                 egl_sys::EGL_NO_SURFACE,
                 egl_sys::EGL_NO_SURFACE,
-                self.egl_context,
+                egl_sys::EGL_NO_CONTEXT,
             );
         }
     }
 }
 
 impl Cx {
+    /// Renders the pass and swaps it to the window surface. Returns whether the buffer
+    /// swap succeeded; the Wayland backend uses this to know a commit carrying its
+    /// frame-callback request was actually submitted.
     pub fn draw_pass_to_window(
         &mut self,
         draw_pass_id: DrawPassId,
         egl_surface: egl_sys::EGLSurface,
         pix_width: f64,
         pix_height: f64,
-    ) {
+    ) -> bool {
         let draw_list_id = self.passes[draw_pass_id].main_draw_list_id.unwrap();
-
+        let frame_started = std::time::Instant::now();
         unsafe {
             let gl = self.os.gl();
             let opengl_cx = self.os.opengl_cx.as_ref().unwrap();
-            let make_current_ok = (opengl_cx.libegl.eglMakeCurrent.unwrap())(
-                opengl_cx.egl_display,
-                egl_surface,
-                egl_surface,
-                opengl_cx.egl_context,
-            );
-            if make_current_ok == 0 {
-                let egl_error = (opengl_cx.libegl.eglGetError.unwrap())();
-                crate::error!(
-                    "eglMakeCurrent failed surface={:?} error=0x{:04x} ({})",
-                    egl_surface,
-                    egl_error as u32,
-                    egl_error_name(egl_error)
-                );
-                return;
+            if !opengl_cx.make_current_with_surface(egl_surface) {
+                return false;
+            }
+            // Apply the configured swap interval (vsync) on the now-current window surface.
+            // Re-applied per frame because it is surface-scoped and surfaces are recreated
+            // on resize; the call is cheap and idempotent.
+            if let Some(egl_swap_interval) = opengl_cx.libegl.eglSwapInterval {
+                (egl_swap_interval)(opengl_cx.egl_display, opengl_cx.swap_interval);
             }
             (gl.glViewport)(0, 0, pix_width.floor() as i32, pix_height.floor() as i32);
         }
+        let bound = std::time::Instant::now();
 
-        self.setup_render_pass(draw_pass_id);
+        self.setup_render_pass(draw_pass_id, false);
+        let setup_done = std::time::Instant::now();
 
         self.passes[draw_pass_id].paint_dirty = false;
 
@@ -300,7 +410,7 @@ impl Cx {
 
         self.render_view(draw_pass_id, draw_list_id, &mut zbias, zbias_step);
 
-        if std::env::var_os("MAKEPAD_GL_READBACK").is_some() {
+        if crate::makepad_error_log::trace_enabled("gl.readback") {
             let mut pixel = [0u8; 4];
             let cx = (pix_width.floor() as i32) / 2;
             let cy = (pix_height.floor() as i32) / 2;
@@ -316,7 +426,8 @@ impl Cx {
                     pixel.as_mut_ptr() as *mut _,
                 );
             }
-            crate::log!(
+            crate::trace!(
+                "gl.readback",
                 "GL readback size={}x{} center=({}, {}) rgba=({}, {}, {}, {})",
                 pix_width.floor() as i32,
                 pix_height.floor() as i32,
@@ -360,8 +471,16 @@ impl Cx {
         }
 
         // Studio screenshot readback: read framebuffer pixels before swap.
-        let request_ids = self.take_studio_screenshot_request_ids(0);
-        if !request_ids.is_empty() {
+        let capture_window_id = self.get_pass_window_id(draw_pass_id).map(|w| w.id());
+        // Targeted at this pass's window: a `--remote` `/g?w=N` grab records the
+        // window it asked for, and an untargeted take (`None`) never matches one,
+        // so every remote grab on the OpenGL backend used to time out. Studio and
+        // file-sink requests carry no window and still match any pass.
+        let request_ids = self.take_studio_screenshot_request_ids_for_window(0, capture_window_id);
+        // A continuous capture sink (the ScreenCap recorder) is standing
+        // permission rather than a queued request, so it is asked separately.
+        let wants_capture = crate::screen_capture::capture_wants_window(capture_window_id);
+        if !request_ids.is_empty() || wants_capture {
             let w = pix_width.floor() as u32;
             let h = pix_height.floor() as u32;
             let mut pixels = vec![0u8; (w * h * 4) as usize];
@@ -386,9 +505,12 @@ impl Cx {
                     pixels.swap(top + x, bot + x);
                 }
             }
+            crate::screen_capture::deliver_capture_frame(capture_window_id, w, h, &pixels);
             // Encode as PNG.
-            if let Ok(png) = Self::encode_rgba_as_png(w, h, &pixels) {
-                Self::send_studio_screenshot_response(request_ids, w, h, png);
+            if !request_ids.is_empty() {
+                if let Ok(png) = Self::encode_rgba_as_png(w, h, &pixels) {
+                    Self::send_studio_screenshot_response(request_ids, w, h, png);
+                }
             }
         }
 
@@ -422,17 +544,45 @@ impl Cx {
 
         unsafe {
             let opengl_cx = self.os.opengl_cx.as_ref().unwrap();
-            let swap_ok =
-                (opengl_cx.libegl.eglSwapBuffers.unwrap())(opengl_cx.egl_display, egl_surface);
+            let render_done = std::time::Instant::now();
+            let swap_ok = {
+                let _phase = crate::thread::ui_phase(crate::thread::UiPhase::GpuWait);
+                (opengl_cx.libegl.eglSwapBuffers.unwrap())(opengl_cx.egl_display, egl_surface)
+            };
+            opengl_cx
+                .swap_wait
+                .set(opengl_cx.swap_wait.get() + render_done.elapsed());
             if swap_ok == 0 {
+                // `eglGetError` is called outside the latch: it clears EGL's per-thread
+                // error, and skipping it would leak a stale code into the next report.
                 let egl_error = (opengl_cx.libegl.eglGetError.unwrap())();
-                crate::error!(
-                    "eglSwapBuffers failed surface={:?} error=0x{:04x} ({})",
-                    egl_surface,
-                    egl_error as u32,
-                    egl_error_name(egl_error)
+                if !opengl_cx.swap_error_logged.replace(true) {
+                    crate::error!(
+                        "eglSwapBuffers failed surface={:?} error=0x{:04x} ({})",
+                        egl_surface,
+                        egl_error as u32,
+                        egl_error_name(egl_error)
+                    );
+                    if egl_error as u32 == EGL_CONTEXT_LOST {
+                        crate::error!(
+                            "EGL reports the context was lost (GPU reset or power-management event). \n                             Every GL object made from it is dead; this process cannot render \n                             again without a full context rebuild, which this backend does not \n                             perform."
+                        );
+                    }
+                }
+            } else {
+                opengl_cx.swap_error_logged.set(false);
+                crate::trace!(
+                    "gpu.present",
+                    "present time={:.6} backend=gl render_ms={:.3} swap_ms={:.3} bind_ms={:.3} setup_ms={:.3} draw_ms={:.3}",
+                    crate::cx_api::CxOsApi::seconds_since_app_start(self),
+                    render_done.duration_since(frame_started).as_secs_f64() * 1000.0,
+                    render_done.elapsed().as_secs_f64() * 1000.0,
+                    bound.duration_since(frame_started).as_secs_f64() * 1000.0,
+                    setup_done.duration_since(bound).as_secs_f64() * 1000.0,
+                    render_done.duration_since(setup_done).as_secs_f64() * 1000.0
                 );
             }
+            swap_ok != 0
         }
     }
 }

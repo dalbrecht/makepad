@@ -43,7 +43,25 @@ pub fn derive_widget_node_impl(input: TokenStream) -> TokenStream {
         let mut cast_fields = Vec::new();
         let mut find_fields = Vec::new();
         let mut redraw_fields = Vec::new();
+        // Every `#[live]` field whose type is a draw shader (`Draw…`): the
+        // widget's material layers, exposed as (name, area) so a design
+        // tool can mirror any layer's live draw call, not only the area's.
+        let mut layer_fields = Vec::new();
         for field in &mut fields {
+            if field.attrs.iter().any(|v| v.name == "live") {
+                let ty = field.ty.to_string();
+                // Draw shader structs only — not the draw-list / pass /
+                // draw-state plumbing that shares the prefix.
+                if ty.starts_with("Draw")
+                    && !ty.contains('<')
+                    && !ty.starts_with("DrawList")
+                    && !ty.starts_with("DrawPass")
+                    && !ty.starts_with("DrawState")
+                    && !ty.starts_with("DrawStep")
+                {
+                    layer_fields.push(field.name.clone());
+                }
+            }
             if field.attrs.iter().any(|v| v.name == "walk") {
                 walk_field = Some(field.name.clone());
             }
@@ -148,6 +166,9 @@ pub fn derive_widget_node_impl(input: TokenStream) -> TokenStream {
             tb.add("    fn redraw(&mut self, cx:&mut Cx) { self.")
                 .ident(wrap_field)
                 .add(".redraw(cx)}");
+            tb.add("    fn set_scroll_pos(&mut self, cx:&mut Cx, v:Vec2d) { self.")
+                .ident(wrap_field)
+                .add(".set_scroll_pos(cx, v)}");
             tb.add("    fn visible(&self)->bool{ self.")
                 .ident(wrap_field)
                 .add(".visible()}");
@@ -161,6 +182,11 @@ pub fn derive_widget_node_impl(input: TokenStream) -> TokenStream {
             tb.add("       self.")
                 .ident(wrap_field)
                 .add(".children(visit)");
+            tb.add("   }");
+            tb.add("   fn cancel_children_impl(&self, visit:&mut dyn FnMut(LiveId, WidgetRef))->bool{");
+            tb.add("       self.visible() && self.")
+                .ident(wrap_field)
+                .add(".visit_cancel(visit)");
             tb.add("   }");
             tb.add("   fn skip_widget_tree_search(&self)->bool{");
             tb.add("       self.")
@@ -249,6 +275,18 @@ pub fn derive_widget_node_impl(input: TokenStream) -> TokenStream {
                     "Need either a field marked redraw or deref or wrap to find redraw method",
                 );
             }
+            if !layer_fields.is_empty() {
+                tb.add("    fn layer_areas(&self) -> Vec<(&'static str, Area)> { vec![");
+                for layer_field in &layer_fields {
+                    tb.add(&format!("(\"{0}\", self.{0}.area()),", layer_field));
+                }
+                tb.add("    ] }");
+            }
+            if let Some(deref_field) = &deref_field {
+                tb.add("    fn set_scroll_pos(&mut self, cx:&mut Cx, v:Vec2d) { self.")
+                    .ident(deref_field)
+                    .add(".set_scroll_pos(cx, v)}");
+            }
             if !find_fields.is_empty() {
                 tb.add("    fn children(&self, visit:&mut dyn FnMut(LiveId, WidgetRef)){");
                 for find_field in &find_fields {
@@ -257,6 +295,14 @@ pub fn derive_widget_node_impl(input: TokenStream) -> TokenStream {
                         .add(".children(visit);");
                 }
                 tb.add("    }");
+                tb.add("    fn cancel_children_impl(&self, visit:&mut dyn FnMut(LiveId, WidgetRef))->bool{");
+                tb.add("    if !self.visible() { return false; }");
+                for find_field in &find_fields {
+                    tb.add("    self.")
+                        .ident(find_field)
+                        .add(".visit_cancel(visit);");
+                }
+                tb.add("    true }");
                 tb.add("    fn find_widgets_from_point(&self, cx:&Cx, point:DVec2, found:&mut dyn FnMut(&WidgetRef)){");
                 for find_field in &find_fields {
                     tb.add("    self.")
@@ -312,11 +358,22 @@ pub fn derive_widget_node_impl(input: TokenStream) -> TokenStream {
                         .add(".selection_get_full_text(); if !v.is_empty() { return v; } }");
                 }
                 tb.add("        String::new() }");
+                if deref_field.is_none() {
+                    tb.add("    fn set_scroll_pos(&mut self, cx:&mut Cx, v:Vec2d) {");
+                    for find_field in &find_fields {
+                        tb.add("        self.").ident(find_field).add(".set_scroll_pos(cx, v);");
+                    }
+                    tb.add("    }");
+                }
             } else if let Some(deref_field) = &deref_field {
                 tb.add("   fn children(&self, visit:&mut dyn FnMut(LiveId, WidgetRef)){");
                 tb.add("       self.")
                     .ident(deref_field)
                     .add(".children(visit)");
+                tb.add("   }");
+                tb.add("   fn cancel_children_impl(&self, visit:&mut dyn FnMut(LiveId, WidgetRef))->bool{");
+                tb.add("       self.visible() && self.")
+                    .ident(deref_field).add(".visit_cancel(visit)");
                 tb.add("   }");
                 tb.add("   fn skip_widget_tree_search(&self)->bool{");
                 tb.add("       self.")
