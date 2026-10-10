@@ -18,10 +18,23 @@ use {
             metal::{DrawPassMode, MetalCx},
         },
         thread::SignalToUI,
+        makepad_objc_sys::objc_block,
         window::CxWindowPool,
     },
     std::{cell::RefCell, rc::Rc, time::Instant},
 };
+
+pub(crate) fn wake_ui_event_loop() {
+    unsafe {
+        let main_thread_block = objc_block!(move || {});
+        let main_queue: ObjcId = msg_send![class!(NSOperationQueue), mainQueue];
+        let operation: ObjcId = msg_send![
+            class!(NSBlockOperation),
+            blockOperationWithBlock: &main_thread_block
+        ];
+        let () = msg_send![main_queue, addOperation: operation];
+    }
+}
 
 impl Cx {
     pub fn trace(val: &str) {
@@ -123,9 +136,13 @@ impl Cx {
         match &event {
             TvosEvent::Timer(te) => {
                 if te.timer_id == 0 {
-                    if SignalToUI::check_and_clear_ui_signal() {
+                    let internal_signal = SignalToUI::check_and_clear_internal_signal();
+                    let ui_signal = SignalToUI::check_and_clear_ui_signal();
+                    if internal_signal || ui_signal {
                         self.handle_media_signals();
                         self.handle_script_signals();
+                    }
+                    if ui_signal {
                         self.call_event_handler(&Event::Signal);
                     }
                     if SignalToUI::check_and_clear_action_signal() {
@@ -195,7 +212,7 @@ impl Cx {
     }
 
     fn handle_platform_ops(&mut self, _metal_cx: &MetalCx) {
-        while let Some(op) = self.platform_ops.pop() {
+        while let Some(op) = self.platform_ops.pop_front() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     let window = &mut self.windows[window_id];
@@ -253,6 +270,12 @@ impl Cx {
                 CxOsOp::UpdateSelectionHandles { .. } => {}
                 CxOsOp::HideSelectionHandles => {}
                 CxOsOp::AccessibilityUpdate(_) => {}
+                CxOsOp::StartExternalDragging { .. } => {
+                    crate::error!("external file dragging is not implemented on tvOS");
+                    self.call_event_handler(&Event::DragEnd);
+                }
+                // Track selection is currently implemented on Linux GStreamer only.
+                CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
                 CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
@@ -276,13 +299,6 @@ impl CxOsApi for Cx {
         self.native_load_dependencies();
     }
 
-    fn spawn_thread<F>(&mut self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        std::thread::spawn(f);
-    }
-
     fn seconds_since_app_start(&self) -> f64 {
         Instant::now()
             .duration_since(self.os.start_time.unwrap())
@@ -290,6 +306,7 @@ impl CxOsApi for Cx {
     }
 
     fn open_url(&mut self, _url: &str, _in_place: OpenUrlInPlace) {
+        if self.script_data.std.host_io_only() { return; }
         crate::error!("open_url not implemented on this platform");
     }
 

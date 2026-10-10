@@ -12,6 +12,39 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+/// Appends `bytes` with the same replacement behavior as
+/// `String::from_utf8_lossy` without materializing an unbounded intermediate
+/// string before the destination sink can apply its limit.
+pub(crate) fn append_utf8_lossy<S: ScriptStringSink>(mut bytes: &[u8], out: &mut S) {
+    while !bytes.is_empty() && !out.is_full() {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                out.append_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to != 0 {
+                    let valid = std::str::from_utf8(&bytes[..valid_up_to])
+                        .expect("UTF-8 errors report valid prefixes");
+                    out.append_str(valid);
+                    if out.is_full() {
+                        break;
+                    }
+                }
+
+                out.append_char('\u{FFFD}');
+                if out.is_full() {
+                    break;
+                }
+
+                let invalid_len = error.error_len().unwrap_or(bytes.len() - valid_up_to);
+                bytes = &bytes[valid_up_to + invalid_len..];
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ScriptArrayRef {
     pub(crate) roots: Rc<RefCell<HashMap<ScriptArray, usize>>>,
@@ -175,6 +208,31 @@ pub enum ScriptArrayStorage {
 }
 
 impl ScriptArrayStorage {
+    /// Backing allocation retained by this storage, excluding the enum
+    /// itself. The retained-heap estimate uses capacity instead of logical
+    /// length so a cleared or sparsely written collection cannot hide
+    /// already-reserved memory from the host's accounting boundary.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::ScriptValue(values) => values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ScriptValue>()),
+            Self::F32(values) => values.capacity().saturating_mul(4),
+            Self::U32(values) => values.capacity().saturating_mul(4),
+            Self::U16(values) => values.capacity().saturating_mul(2),
+            Self::U8(values) => values.capacity(),
+        }
+    }
+
+    pub(crate) fn allocation_element_bytes(&self) -> usize {
+        match self {
+            Self::ScriptValue(_) => std::mem::size_of::<ScriptValue>(),
+            Self::F32(_) | Self::U32(_) => 4,
+            Self::U16(_) => 2,
+            Self::U8(_) => 1,
+        }
+    }
+
     pub fn clear(&mut self) {
         match self {
             Self::ScriptValue(v) => v.clear(),
@@ -432,6 +490,31 @@ impl ScriptArrayStorage {
             }
         }
     }
+
+    /// Exact length for typed character arrays and ScriptValue arrays; a
+    /// conservative bound for lossy UTF-8 byte arrays (each bad byte can
+    /// become one three-byte replacement character).
+    pub(crate) fn to_string_len_upper_bound(&self, heap: &ScriptHeap) -> usize {
+        match self {
+            Self::U8(bytes) => bytes.len().checked_mul(3).unwrap_or(usize::MAX),
+            Self::ScriptValue(values) => values.iter().fold(0usize, |len, value| {
+                len.checked_add(heap.cast_to_string_len(*value))
+                    .unwrap_or(usize::MAX)
+            }),
+            Self::F32(values) => values.iter().fold(0usize, |len, value| {
+                let char_len = std::char::from_u32(*value as u32).map_or(0, char::len_utf8);
+                len.checked_add(char_len).unwrap_or(usize::MAX)
+            }),
+            Self::U32(values) => values.iter().fold(0usize, |len, value| {
+                let char_len = std::char::from_u32(*value).map_or(0, char::len_utf8);
+                len.checked_add(char_len).unwrap_or(usize::MAX)
+            }),
+            Self::U16(values) => values.iter().fold(0usize, |len, value| {
+                let char_len = std::char::from_u32(*value as u32).map_or(0, char::len_utf8);
+                len.checked_add(char_len).unwrap_or(usize::MAX)
+            }),
+        }
+    }
 }
 
 pub struct ScriptArrayData {
@@ -457,10 +540,15 @@ impl ScriptArrayData {
             &[],
             |vm, args| {
                 if let Some(arr) = script_value!(vm, args.self).as_array() {
+                    let max_len = vm
+                        .bx
+                        .heap
+                        .array_storage(arr)
+                        .to_string_len_upper_bound(&vm.bx.heap);
                     return vm
                         .bx
                         .heap
-                        .new_string_with(|heap, s| {
+                        .new_string_with_preflight(max_len, "converting an array to a string", |heap, s| {
                             heap.array_storage(arr).to_string(heap, s);
                         })
                         .into();
@@ -473,15 +561,18 @@ impl ScriptArrayData {
             if let Some(array) = script_value!(vm, args.self).as_array(){
                 // Take json_parser out to avoid borrow conflict
                 let mut json_parser = std::mem::take(&mut vm.bx.threads.cur().json_parser);
-                let result = vm.bx.heap.array_mut_self_with(array, |heap, storage|{
-                    match storage{
-                        ScriptArrayStorage::U8(bytes)=>{
-                             let v = String::from_utf8_lossy(bytes);
-                            json_parser.read_json(v.as_ref(), heap)
+                let result = vm.bx.heap.temp_bounded_string_with(|heap, temp| {
+                    let is_byte_array = match heap.array_storage(array) {
+                        ScriptArrayStorage::U8(bytes) => {
+                            append_utf8_lossy(bytes, temp);
+                            true
                         }
-                        _=>{
-                            NIL // Error handled below
-                        }
+                        _ => false,
+                    };
+                    if is_byte_array && !temp.is_full() {
+                        json_parser.read_json(temp.as_str(), heap)
+                    } else {
+                        NIL // Error handled below
                     }
                 });
                 vm.bx.threads.cur().json_parser = json_parser;
@@ -506,11 +597,20 @@ impl ScriptArrayData {
                 if let Some(arr) = script_value!(vm, args.self).as_array() {
                     // Take json_parser out to avoid borrow conflict
                     let mut json_parser = std::mem::take(&mut vm.bx.threads.cur().json_parser);
-                    let result = vm.bx.heap.temp_string_with(|heap, temp| {
+                    let max_len = vm
+                        .bx
+                        .heap
+                        .array_storage(arr)
+                        .to_string_len_upper_bound(&vm.bx.heap);
+                    let result = vm.bx.heap.temp_string_with_preflight(
+                        max_len,
+                        "converting an array for JSON parsing",
+                        |heap, temp| {
                         let storage = heap.array_storage(arr);
                         storage.to_string(heap, temp);
                         json_parser.read_json(temp, heap)
-                    });
+                        },
+                    ).unwrap_or(NIL);
                     vm.bx.threads.cur().json_parser = json_parser;
                     return result;
                 }
@@ -668,6 +768,25 @@ impl ScriptArrayData {
             true
         } else {
             false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_utf8_lossy_matches_std() {
+        for bytes in [
+            b"valid".as_slice(),
+            b"prefix\xFFsuffix".as_slice(),
+            b"\xF0\x9F\x92".as_slice(),
+            b"\xC3\xA9\xFF\x80".as_slice(),
+        ] {
+            let mut out = String::new();
+            append_utf8_lossy(bytes, &mut out);
+            assert_eq!(out, String::from_utf8_lossy(bytes).as_ref());
         }
     }
 }

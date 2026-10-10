@@ -27,44 +27,129 @@ pub struct CxScriptResource {
     pub dependency_path: Option<String>,
     pub web_url: Option<String>,
     pub data: CxScriptResourceData,
-    pub handle: ScriptHandle,
+    /// One handle per script heap that references this resource, WITH the
+    /// heap it belongs to. Handle values are heap-local (a handle indexes
+    /// its owning heap's handle table, and each heap's GC marks/sweeps it),
+    /// so two isolates hand out equal values for different files: the pair
+    /// is the identity, never the number alone (a clock module's alarm
+    /// glyph once resolved to the host's speaker icon that way).
+    pub handles: Vec<(usize, ScriptHandle)>,
 }
 
 impl CxScriptResource {
+    /// Bytes held by this resource once loaded; 0 while pending or failed.
+    pub fn loaded_len(&self) -> usize {
+        match &self.data {
+            CxScriptResourceData::Loaded(data) => data.len(),
+            _ => 0,
+        }
+    }
+
     pub fn is_error(&self) -> bool {
         matches!(self.data, CxScriptResourceData::Error(_))
+    }
+
+    pub fn has_handle(&self, heap_key: usize, handle: ScriptHandle) -> bool {
+        self.handles.contains(&(heap_key, handle))
     }
 }
 
 /// Tracks an in-flight HTTP request that will populate a resource
 pub struct CxScriptHttpResource {
     pub request_id: LiveId,
-    pub handle: ScriptHandle,
+    pub abs_path: String,
 }
 
 #[derive(Default)]
 pub struct CxScriptResources {
     pub resources: Rc<RefCell<Vec<CxScriptResource>>>,
-    pub handles_by_abs_path: Rc<RefCell<HashMap<String, ScriptHandle>>>,
+    /// Per-heap path cache: (heap_key, abs_path) → that heap's LOCAL handle.
+    /// Never hand one heap's cached handle to another heap (see
+    /// [`CxScriptResource::handles`]).
+    pub handles_by_abs_path: Rc<RefCell<HashMap<(usize, String), ScriptHandle>>>,
     pub http_resources: Vec<CxScriptHttpResource>,
+    /// Bumped whenever a resource is registered or its load state moves
+    /// (a load attempted, an HTTP response or error). A consumer that
+    /// caches a negative answer ("this resource cannot be read") keys it on
+    /// this, so a resource that appears later is asked for again.
+    pub generation: std::cell::Cell<u64>,
 }
 
 impl CxScriptResources {
-    pub fn get_handle_by_abs_path(&self, abs_path: &str) -> Option<ScriptHandle> {
-        self.handles_by_abs_path.borrow().get(abs_path).copied()
+    /// Resolve a heap-local resource handle before storing it in Cx-owned
+    /// renderer state. Different script heaps can use the same handle value.
+    pub fn path_for_handle(&self, heap_key: usize, handle: ScriptHandle) -> Option<String> {
+        self.handles_by_abs_path.borrow().iter()
+            .find(|((heap, _), value)| *heap == heap_key && **value == handle)
+            .map(|((_, path), _)| path.clone())
     }
-
-    pub fn insert_resource(&self, resource: CxScriptResource) {
+    pub fn get_handle_by_abs_path(&self, heap_key: usize, abs_path: &str) -> Option<ScriptHandle> {
         self.handles_by_abs_path
-            .borrow_mut()
-            .insert(resource.abs_path.clone(), resource.handle);
-        self.resources.borrow_mut().push(resource);
+            .borrow()
+            .get(&(heap_key, abs_path.to_string()))
+            .copied()
     }
 
-    /// Get the data for a resource by handle
-    pub fn get_data(&self, handle: ScriptHandle) -> Option<Rc<Vec<u8>>> {
+    /// Forget everything heaps in `dead` owned — call this the moment a script
+    /// heap is dropped WHOLESALE, rather than collected.
+    ///
+    /// A `heap_key` is an allocation address, so a heap that dies frees its key
+    /// for the next heap to land on. The per-handle [`CxScriptResourceGc`] only
+    /// runs when the owning heap's own GC sweeps that handle, which never
+    /// happens for a heap that is simply dropped — so its `(heap_key, path)`
+    /// entries outlive it, and the NEXT heap allocated at that address is
+    /// handed a dead heap's handle index for a path it asks about. That index
+    /// means nothing in the new heap's own (usually smaller) handle table, and
+    /// nothing notices at the time: the value sits in a font object until that
+    /// heap's next GC walks it and indexes out of bounds, in code that did
+    /// nothing wrong.
+    pub fn gc_heaps(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        let mut handles = self.handles_by_abs_path.borrow_mut();
+        handles.retain(|(heap, _), _| !dead.contains(heap));
+        prune_resource_handles(&mut self.resources.borrow_mut(), &handles);
+    }
+
+    pub fn insert_resource(&self, heap_key: usize, resource: CxScriptResource) {
+        self.handles_by_abs_path.borrow_mut().insert(
+            (heap_key, resource.abs_path.clone()),
+            resource.handles[0].1,
+        );
+        self.resources.borrow_mut().push(resource);
+        self.bump_generation();
+    }
+
+    /// See [`Self::generation`].
+    pub fn bump_generation(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+    }
+
+    /// Attach an additional heap's local handle to an existing resource entry
+    /// (by path). Returns true if the entry existed.
+    pub fn attach_handle_for_path(
+        &self,
+        heap_key: usize,
+        abs_path: &str,
+        handle: ScriptHandle,
+    ) -> bool {
+        let mut resources = self.resources.borrow_mut();
+        if let Some(res) = resources.iter_mut().find(|v| v.abs_path == abs_path) {
+            res.handles.push((heap_key, handle));
+            self.handles_by_abs_path
+                .borrow_mut()
+                .insert((heap_key, abs_path.to_string()), handle);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get the data for a resource by its owning heap and handle.
+    pub fn get_data(&self, heap_key: usize, handle: ScriptHandle) -> Option<Rc<Vec<u8>>> {
         let resources = self.resources.borrow();
-        if let Some(res) = resources.iter().find(|v| v.handle == handle) {
+        if let Some(res) = resources.iter().find(|v| v.has_handle(heap_key, handle)) {
             if let CxScriptResourceData::Loaded(data) = &res.data {
                 return Some(data.clone());
             }
@@ -80,11 +165,11 @@ impl CxScriptResources {
             .iter()
             .position(|r| r.request_id == request_id)
         {
-            let handle = self.http_resources[idx].handle;
-            self.http_resources.remove(idx);
+            let path = self.http_resources.remove(idx).abs_path;
             let mut resources = self.resources.borrow_mut();
-            if let Some(res) = resources.iter_mut().find(|r| r.handle == handle) {
+            if let Some(res) = resources.iter_mut().find(|r| r.abs_path == path) {
                 res.data = CxScriptResourceData::Loaded(Rc::new(data));
+                self.bump_generation();
                 return true;
             }
         }
@@ -99,11 +184,11 @@ impl CxScriptResources {
             .iter()
             .position(|r| r.request_id == request_id)
         {
-            let handle = self.http_resources[idx].handle;
-            self.http_resources.remove(idx);
+            let path = self.http_resources.remove(idx).abs_path;
             let mut resources = self.resources.borrow_mut();
-            if let Some(res) = resources.iter_mut().find(|r| r.handle == handle) {
+            if let Some(res) = resources.iter_mut().find(|r| r.abs_path == path) {
                 res.data = CxScriptResourceData::Error(error);
+                self.bump_generation();
                 return true;
             }
         }
@@ -143,8 +228,13 @@ impl CxScriptResources {
 //       3. error
 // ---------------------------------------------------------------------------
 
-/// Try to load a resource from the packaged location on iOS/tvOS.
-#[cfg(any(target_os = "ios", target_os = "tvos"))]
+/// Try to load a resource from the packaged location on Apple platforms
+/// using NSBundle to resolve the app bundle's resource path.
+#[cfg(any(
+    target_os = "ios",
+    target_os = "tvos",
+    all(target_os = "macos", apple_bundle)
+))]
 fn load_packaged_resource(cx: &Cx, dep_path: &str) -> Option<Rc<Vec<u8>>> {
     let bundle_path = if let Some(root) = cx.package_root.as_deref() {
         format!("{}/{}", root, dep_path)
@@ -156,17 +246,19 @@ fn load_packaged_resource(cx: &Cx, dep_path: &str) -> Option<Rc<Vec<u8>>> {
 
 /// Try to load a resource from the packaged location on desktop.
 /// Returns None when not in packaged mode (package_root is None).
+///
+/// A relative `package_root` (the desktop packagers use `.` beside the executable) is searched
+/// both from the working directory and from the executable's own directory, because a launcher
+/// is free to start the process anywhere — see `crate::os::cx_native::exe_relative_path`.
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(any(target_os = "android", target_os = "ios", target_os = "tvos"))
+    not(any(target_os = "android", target_os = "ios", target_os = "tvos")),
+    not(all(target_os = "macos", apple_bundle))
 ))]
 fn load_packaged_resource(cx: &Cx, dep_path: &str) -> Option<Rc<Vec<u8>>> {
     let root = cx.package_root.as_deref()?;
     let full_path = format!("{}/{}", root, dep_path);
-    let mut file = File::open(&full_path).ok()?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).ok()?;
-    Some(Rc::new(data))
+    crate::os::cx_native::read_file_cwd_or_exe_relative(&cx.package_paths, &full_path).map(Rc::new)
 }
 
 /// Load a file directly from the filesystem (desktop/mobile only, not wasm).
@@ -180,77 +272,111 @@ fn load_file_direct(abs_path: &str) -> Option<Result<Rc<Vec<u8>>, String>> {
     }
 }
 
-fn should_skip_eager_resource_load(abs_path: &str) -> bool {
-    is_heavy_bundled_fallback_font_path(abs_path)
+#[cfg(target_arch = "wasm32")]
+fn web_resource_request_path(cx: &Cx, dep_path: &str) -> String {
+    let mut base_path = String::new();
+    if let crate::cx::OsType::Web(params) = &cx.os_type {
+        base_path = web_resource_base_path(&params.pathname);
+    }
+    if base_path.is_empty() {
+        dep_path.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            base_path.trim_end_matches('/'),
+            dep_path.trim_start_matches('/')
+        )
+    }
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
-fn remapped_small_font_dependency_path(path: &str) -> Option<&'static str> {
-    match path.replace('\\', "/").as_str() {
-        "makepad_widgets/resources/GoNotoKurrent-Bold.ttf" => {
-            Some("makepad_widgets/resources/IBMPlexSans-SemiBold.ttf")
-        }
-        "makepad_widgets/resources/GoNotoKurrent-Regular.ttf" => {
-            Some("makepad_widgets/resources/IBMPlexSans-Text.ttf")
-        }
-        "makepad_widgets/resources/LXGWWenKaiRegular.ttf" => {
-            Some("makepad_widgets/resources/IBMPlexSans-Text.ttf")
-        }
-        "makepad_widgets/resources/LXGWWenKaiBold.ttf" => {
-            Some("makepad_widgets/resources/IBMPlexSans-Text.ttf")
-        }
-        "makepad_widgets/resources/NotoColorEmoji.ttf" => {
-            Some("makepad_widgets/resources/IBMPlexSans-Text.ttf")
-        }
-        _ => None,
+fn web_resource_base_path(pathname: &str) -> String {
+    let pathname = pathname.trim_end_matches('/');
+    if pathname.is_empty() {
+        return String::new();
     }
+
+    let last_segment = pathname.rsplit('/').next().unwrap_or_default();
+    let base_path = if last_segment.contains('.') {
+        pathname.rsplit_once('/').map_or("", |(base, _)| base)
+    } else {
+        pathname
+    };
+    base_path.trim_start_matches('/').to_string()
 }
 
-#[cfg(target_arch = "wasm32")]
-fn web_resource_request_path(cx: &Cx, dep_path: &str) -> String {
-    if let crate::cx::OsType::Web(params) = &cx.os_type {
-        if params.small_font_aliases {
-            if let Some(remapped) = remapped_small_font_dependency_path(dep_path) {
-                return remapped.to_string();
-            }
-        }
+fn register_crate_resource_parts(
+    vm: &mut ScriptVm,
+    res_type: ScriptHandleType,
+    crate_part: &str,
+    file_path: &str,
+) -> ScriptValue {
+    let Some((abs_path, dependency_path, web_url)) =
+        resolve_crate_resource_paths(vm, crate_part, file_path)
+    else {
+        return NIL;
+    };
+    let heap_key = vm.bx.heap.heap_key();
+    let cx = vm.host.cx_mut();
+    if let Some(existing) = cx
+        .script_data
+        .resources
+        .get_handle_by_abs_path(heap_key, &abs_path)
+    {
+        return existing.into();
     }
-    dep_path.to_string()
+
+    let handle_gc = CxScriptResourceGc {
+        resources: cx.script_data.resources.resources.clone(),
+        handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
+        handle: ScriptHandle::ZERO,
+        heap_key,
+    };
+    let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
+
+    if cx
+        .script_data
+        .resources
+        .attach_handle_for_path(heap_key, &abs_path, handle)
+    {
+        return handle.into();
+    }
+
+    cx.script_data.resources.insert_resource(
+        heap_key,
+        CxScriptResource {
+            abs_path,
+            dependency_path,
+            web_url,
+            data: CxScriptResourceData::NotLoaded,
+            handles: vec![(heap_key, handle)],
+        },
+    );
+    handle.into()
 }
 
-fn is_heavy_bundled_fallback_font_path(path: &str) -> bool {
-    if !is_widgets_resources_path(path) {
+/// Register a stable logical `crate_name/path` without evaluating a second
+/// script branch. FontPolicy uses this to turn only its selected members into
+/// resource handles.
+pub fn register_crate_resource_path(vm: &mut ScriptVm, logical_path: &str) -> ScriptValue {
+    let Some((crate_part, file_path)) = logical_path.split_once('/') else {
+        return NIL;
+    };
+    let res_type = vm.handle_type(id_lut!(res));
+    register_crate_resource_parts(vm, res_type, crate_part, file_path)
+}
+
+fn font_policy_declares_path(font_set: crate::FontSet, dependency_path: Option<&str>) -> bool {
+    let Some(dependency_path) = dependency_path else {
         return false;
-    }
-    matches!(
-        resource_basename(path),
-        Some(name)
-            if name.eq_ignore_ascii_case("LXGWWenKaiRegular.ttf")
-                || name.eq_ignore_ascii_case("LXGWWenKaiBold.ttf")
-                || name.eq_ignore_ascii_case("NotoColorEmoji.ttf")
-    )
-}
-
-fn is_widgets_resources_path(path: &str) -> bool {
-    let mut prev_is_widgets = false;
-    for component in path.split(['/', '\\']) {
-        let is_resources = component.eq_ignore_ascii_case("resources");
-        if prev_is_widgets && is_resources {
-            return true;
-        }
-        prev_is_widgets = component.eq_ignore_ascii_case("widgets");
-    }
-    false
-}
-
-fn resource_basename(path: &str) -> Option<&str> {
-    path.rsplit(['/', '\\']).next()
+    };
+    font_set.policy().declares_asset_path(dependency_path)
 }
 
 impl Cx {
     fn load_script_resource_impl(
         &mut self,
-        handle: ScriptHandle,
+        path: &str,
         #[cfg(target_arch = "wasm32")] crate_manifests: &HashMap<String, String>,
     ) {
         // On wasm, skip loading if we haven't received ToWasmInit yet (os_type is Unknown).
@@ -262,17 +388,19 @@ impl Cx {
         let is_packaged = self.package_root.is_some();
 
         #[cfg(target_arch = "wasm32")]
-        let mut pending_http = None::<(LiveId, ScriptHandle, String)>;
+        let mut pending_http = None::<(LiveId, String)>;
 
         {
             let mut resources = self.script_data.resources.resources.borrow_mut();
-            let Some(res) = resources.iter_mut().find(|res| res.handle == handle) else {
+            let Some(res) = resources.iter_mut().find(|res| res.abs_path == path) else {
                 return;
             };
 
             if !matches!(res.data, CxScriptResourceData::NotLoaded) {
                 return;
             }
+            // Every path below leaves NotLoaded (Loaded, Loading or Error).
+            self.script_data.resources.bump_generation();
 
             #[cfg(target_arch = "wasm32")]
             if res.dependency_path.is_none() {
@@ -305,7 +433,7 @@ impl Cx {
                 if let Some(url) = res.web_url.clone() {
                     let request_id = LiveId::unique();
                     res.data = CxScriptResourceData::Loading;
-                    pending_http = Some((request_id, res.handle, url));
+                    pending_http = Some((request_id, url));
                 } else {
                     res.data = CxScriptResourceData::Error(format!(
                         "Failed to load resource: {} (dep: {:?}, packaged: {})",
@@ -343,24 +471,58 @@ impl Cx {
         }
 
         #[cfg(target_arch = "wasm32")]
-        if let Some((request_id, handle, url)) = pending_http {
+        if let Some((request_id, url)) = pending_http {
             self.script_data
                 .resources
                 .http_resources
-                .push(CxScriptHttpResource { request_id, handle });
-            self.http_request(request_id, HttpRequest::new(url, Default::default()));
+                .push(CxScriptHttpResource { request_id, abs_path: path.to_string() });
+            // This fetches the app's own package file, which a restricted isolate's draw can need too,
+            // so it skips the guard that `http_request` applies to guest requests.
+            if let Err(err) = self.net.http_start(request_id, HttpRequest::new(url, Default::default())) {
+                crate::error!("http_request failed for {}: {}", request_id.0, err);
+            }
         }
     }
 
-    pub fn load_script_resource(&mut self, handle: ScriptHandle) {
+    pub fn load_script_resource(&mut self, heap_key: usize, handle: ScriptHandle) {
+        let Some(path) = self.get_resource_abs_path(heap_key, handle) else { return };
+        self.load_script_resource_by_path(&path);
+    }
+
+    /// Load a resource whose identity was resolved in its owning script heap.
+    pub fn load_script_resource_by_path(&mut self, path: &str) {
         #[cfg(target_arch = "wasm32")]
         let crate_manifests = self.script_data.crate_manifests.borrow().clone();
 
         self.load_script_resource_impl(
-            handle,
+            path,
             #[cfg(target_arch = "wasm32")]
             &crate_manifests,
         );
+    }
+
+    /// Start every resource declared by the selected application font set.
+    /// This changes timing only: it never adds resources beyond FontPolicy.
+    pub fn preload_font_set(&mut self) {
+        let policy = self.font_set().policy();
+        let paths = {
+            let resources = self.script_data.resources.resources.borrow();
+            policy
+                .assets
+                .iter()
+                .filter_map(|asset| {
+                    resources
+                        .iter()
+                        .find(|resource| {
+                            resource.dependency_path.as_deref() == Some(asset.resource_path)
+                        })
+                        .map(|resource| resource.abs_path.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for path in paths {
+            self.load_script_resource_by_path(&path);
+        }
     }
 
     /// Load all script resources that are still pending.
@@ -382,99 +544,191 @@ impl Cx {
         #[cfg(target_arch = "wasm32")]
         let crate_manifests = self.script_data.crate_manifests.borrow().clone();
 
-        let handles = {
+        let font_set = self.font_set();
+        let paths = {
             let resources = self.script_data.resources.resources.borrow();
             resources
                 .iter()
-                .filter(|res| !should_skip_eager_resource_load(&res.abs_path))
-                .map(|res| res.handle)
+                .filter(|resource| {
+                    !font_policy_declares_path(font_set, resource.dependency_path.as_deref())
+                })
+                .map(|res| res.abs_path.clone())
                 .collect::<Vec<_>>()
         };
 
-        for handle in handles {
+        let _mp_t0 = self.seconds_since_app_start();
+        let _mp_n = paths.len();
+        for path in paths {
             self.load_script_resource_impl(
-                handle,
+                &path,
                 #[cfg(target_arch = "wasm32")]
                 &crate_manifests,
             );
+        }
+        if crate::startup_trace_enabled() {
+            let bytes: usize = self
+                .script_data
+                .resources
+                .resources
+                .borrow()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    CxScriptResourceData::Loaded(d) => Some(d.len()),
+                    _ => None,
+                })
+                .sum();
+            crate::startup_trace(&format!(
+                "load_all_script_resources ({} files, {:.2} MB, {:.2} ms)",
+                _mp_n,
+                bytes as f64 / (1024.0 * 1024.0),
+                (self.seconds_since_app_start() - _mp_t0).max(0.0) * 1000.0
+            ));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{remapped_small_font_dependency_path, should_skip_eager_resource_load};
+    use super::{font_policy_declares_path, web_resource_base_path};
 
     #[test]
-    fn skips_only_heavy_widgets_fallback_fonts() {
-        assert!(should_skip_eager_resource_load(
-            "/tmp/widgets/resources/LXGWWenKaiRegular.ttf"
+    fn heap_local_resource_handles_do_not_alias_font_bytes_or_http_responses() {
+        use super::*;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let handle = ScriptHandle::ZERO;
+        for (heap, path, bytes) in [(1, "test://icon.svg", b"<svg>".to_vec()), (2, "test://font.ttf", b"font".to_vec())] {
+            cx.script_data.resources.insert_resource(heap, CxScriptResource {
+                abs_path: path.into(), dependency_path: None, web_url: None,
+                data: CxScriptResourceData::Loaded(Rc::new(bytes)), handles: vec![(heap, handle)],
+            });
+        }
+        let path = cx.script_data.resources.path_for_handle(2, handle).unwrap();
+        assert_eq!(cx.get_resource_font_bytes_by_path(&path).unwrap().as_slice(), b"font");
+        let request_id = LiveId::unique();
+        cx.script_data.resources.http_resources.push(CxScriptHttpResource { request_id, abs_path: path });
+        assert!(cx.script_data.resources.handle_http_response(request_id, b"new font".to_vec()));
+        assert_eq!(cx.get_resource_font_bytes_by_path("test://font.ttf").unwrap().as_slice(), b"new font");
+        assert_eq!(cx.get_resource_font_bytes_by_path("test://icon.svg").unwrap().as_slice(), b"<svg>");
+    }
+
+    #[test]
+    fn equal_handle_values_in_two_heaps_name_their_own_resources() {
+        use super::*;
+        // Two isolates mint handle value ZERO for different files: the host's
+        // speaker icon and a module's alarm glyph. Each heap gets its own bytes.
+        let cx = Cx::new(Box::new(|_, _| {}));
+        let handle = ScriptHandle::ZERO;
+        for (heap, path, bytes) in [(1, "apps/wm/resources/icons/volume-0.svg", b"<svg speaker>".to_vec()), (2, "apps/clock/resources/icons/alarm.svg", b"<svg bell>".to_vec())] {
+            cx.script_data.resources.insert_resource(heap, CxScriptResource {
+                abs_path: path.into(), dependency_path: None, web_url: None,
+                data: CxScriptResourceData::Loaded(Rc::new(bytes)), handles: vec![(heap, handle)],
+            });
+        }
+        assert_eq!(cx.get_resource(1, handle).unwrap().as_slice(), b"<svg speaker>");
+        assert_eq!(cx.get_resource(2, handle).unwrap().as_slice(), b"<svg bell>");
+        assert_eq!(cx.get_resource_abs_path(2, handle).as_deref(), Some("apps/clock/resources/icons/alarm.svg"));
+        assert!(cx.get_resource(3, handle).is_none(), "a heap that never registered it sees nothing");
+        // The same file from a third heap shares the entry, still by pair.
+        assert!(cx.script_data.resources.attach_handle_for_path(3, "apps/clock/resources/icons/alarm.svg", handle));
+        assert_eq!(cx.get_resource(3, handle).unwrap().as_slice(), b"<svg bell>");
+    }
+
+    #[test]
+    fn collecting_a_heap_keeps_other_heaps_equal_resource_handles() {
+        use super::*;
+        let resources = CxScriptResources::default();
+        let handle = ScriptHandle::ZERO;
+        for (heap, path) in [(1, "icon.svg"), (2, "font.ttf")] {
+            resources.insert_resource(heap, CxScriptResource {
+                abs_path: path.into(), dependency_path: None, web_url: None,
+                data: CxScriptResourceData::NotLoaded, handles: vec![(heap, handle)],
+            });
+        }
+        resources.attach_handle_for_path(3, "font.ttf", handle);
+        let mut gc = CxScriptResourceGc {
+            resources: resources.resources.clone(), handles_by_abs_path: resources.handles_by_abs_path.clone(),
+            heap_key: 1, handle,
+        };
+        gc.gc();
+        assert_eq!(resources.resources.borrow().len(), 1);
+        assert_eq!(resources.path_for_handle(2, handle).as_deref(), Some("font.ttf"));
+        resources.gc_heaps(&[2]);
+        assert_eq!(resources.resources.borrow().len(), 1);
+        assert_eq!(resources.path_for_handle(3, handle).as_deref(), Some("font.ttf"));
+        resources.gc_heaps(&[3]);
+        assert!(resources.resources.borrow().is_empty());
+    }
+
+    #[test]
+    fn eager_resource_loading_defers_the_selected_font_policy() {
+        assert!(font_policy_declares_path(
+            crate::FontSet::Latin,
+            Some("makepad_widgets/resources/IBMPlexSans-Text.ttf")
         ));
-        assert!(should_skip_eager_resource_load(
-            "/tmp/widgets/resources/LXGWWenKaiBold.ttf"
+        assert!(font_policy_declares_path(
+            crate::FontSet::Latin,
+            Some("makepad_widgets/resources/LXGWWenKaiRegular.ttf")
         ));
-        assert!(should_skip_eager_resource_load(
-            "/tmp/widgets/resources/NotoColorEmoji.ttf"
-        ));
-        assert!(!should_skip_eager_resource_load(
-            "/tmp/widgets/resources/IBMPlexSans-Text.ttf"
-        ));
-        assert!(!should_skip_eager_resource_load(
-            "/tmp/app/resources/LXGWWenKaiRegular.ttf"
+        assert!(font_policy_declares_path(
+            crate::FontSet::International,
+            Some("makepad_widgets/resources/LXGWWenKaiRegular.ttf")
         ));
     }
 
     #[test]
-    fn remaps_only_known_small_font_fallback_dependency_paths() {
+    fn derives_web_resource_base_path_from_browser_pathname() {
+        assert_eq!(web_resource_base_path("/"), "");
+        assert_eq!(web_resource_base_path("/index.html"), "");
         assert_eq!(
-            remapped_small_font_dependency_path("makepad_widgets/resources/LXGWWenKaiRegular.ttf"),
-            Some("makepad_widgets/resources/IBMPlexSans-Text.ttf")
+            web_resource_base_path("/makepad-example-splash/"),
+            "makepad-example-splash"
         );
         assert_eq!(
-            remapped_small_font_dependency_path("makepad_widgets/resources/LXGWWenKaiBold.ttf"),
-            Some("makepad_widgets/resources/IBMPlexSans-Text.ttf")
+            web_resource_base_path("/makepad-example-splash/index.html"),
+            "makepad-example-splash"
         );
         assert_eq!(
-            remapped_small_font_dependency_path("makepad_widgets/resources/NotoColorEmoji.ttf"),
-            Some("makepad_widgets/resources/IBMPlexSans-Text.ttf")
-        );
-        assert_eq!(
-            remapped_small_font_dependency_path("makepad_widgets/resources/IBMPlexSans-Text.ttf"),
-            None
-        );
-        assert_eq!(
-            remapped_small_font_dependency_path("app/resources/LXGWWenKaiRegular.ttf"),
-            None
+            web_resource_base_path("/examples/splash/index.html"),
+            "examples/splash"
         );
     }
 }
 
 pub struct CxScriptResourceGc {
     pub resources: Rc<RefCell<Vec<CxScriptResource>>>,
-    pub handles_by_abs_path: Rc<RefCell<HashMap<String, ScriptHandle>>>,
+    pub handles_by_abs_path: Rc<RefCell<HashMap<(usize, String), ScriptHandle>>>,
     pub handle: ScriptHandle,
+    /// Heap identity of the VM this handle was minted in — the Gc must only
+    /// detach ITS heap's handle/cache entry, never the whole shared entry.
+    pub heap_key: usize,
+}
+
+/// Keep only references still owned by a living heap, grouped by resource
+/// path so equal local handles in different heaps cannot delete each other.
+fn prune_resource_handles(
+    resources: &mut Vec<CxScriptResource>,
+    handles: &HashMap<(usize, String), ScriptHandle>,
+) {
+    let mut live: HashMap<&str, Vec<(usize, ScriptHandle)>> = HashMap::new();
+    for ((heap, path), handle) in handles {
+        live.entry(path.as_str()).or_default().push((*heap, *handle));
+    }
+    resources.retain_mut(|resource| {
+        let Some(owners) = live.get(resource.abs_path.as_str()) else { return false };
+        resource.handles.retain(|handle| owners.contains(handle));
+        !resource.handles.is_empty()
+    });
 }
 
 impl ScriptHandleGc for CxScriptResourceGc {
     fn gc(&mut self) {
-        let mut removed_paths = Vec::new();
-        self.resources.borrow_mut().retain(|v| {
-            if v.handle == self.handle {
-                removed_paths.push(v.abs_path.clone());
-                false
-            } else {
-                true
-            }
-        });
-        if !removed_paths.is_empty() {
-            let mut handles_by_abs_path = self.handles_by_abs_path.borrow_mut();
-            for abs_path in removed_paths {
-                if handles_by_abs_path.get(&abs_path).copied() == Some(self.handle) {
-                    handles_by_abs_path.remove(&abs_path);
-                }
-            }
-        }
+        // The numeric handle is only meaningful in its owning heap. Removing
+        // every matching number can erase another isolate's fonts or icons.
+        let mut handles = self.handles_by_abs_path.borrow_mut();
+        handles.retain(|(heap, _), handle| *heap != self.heap_key || *handle != self.handle);
+        prune_resource_handles(&mut self.resources.borrow_mut(), &handles);
     }
+
     fn set_handle(&mut self, handle: ScriptHandle) {
         self.handle = handle
     }
@@ -709,9 +963,10 @@ pub fn script_mod(vm: &mut ScriptVm) {
     // Get the path of the resource
     vm.set_handle_getter(res_type, |vm, pself, prop| {
         if let Some(handle) = pself.as_handle() {
+            let heap_key = vm.bx.heap.heap_key();
             let cx = vm.host.cx_mut();
             let resources = cx.script_data.resources.resources.borrow();
-            if let Some(res) = resources.iter().find(|v| v.handle == handle) {
+            if let Some(res) = resources.iter().find(|v| v.has_handle(heap_key, handle)) {
                 match prop {
                     _ if prop == id!(path) => {
                         let path = res.abs_path.clone();
@@ -761,6 +1016,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
         id_lut!(load_all_resources),
         script_args_def!(value = NIL),
         move |vm, args| {
+            if vm.host.cx_mut().script_data.std.host_io_only() {
+                return script_err_io!(vm.trap(), "external resources require a host request");
+            }
             let value = script_value!(vm, args.value);
             let cx = vm.host.cx_mut();
             cx.load_all_script_resources();
@@ -775,14 +1033,22 @@ pub fn script_mod(vm: &mut ScriptVm) {
         id_lut!(file_resource),
         script_args_def!(path = NIL),
         move |vm, args| {
+            if vm.host.cx_mut().script_data.std.host_io_only() {
+                return script_err_io!(vm.trap(), "external resources require a host request");
+            }
             let path = script_value!(vm, args.path);
             if !path.is_string_like() {
                 return script_err_type_mismatch!(vm.trap(), "invalid res arg type");
             }
 
             if let Some(abs_path) = vm.string_with(path, |_vm, s| s.to_string()) {
+                let heap_key = vm.bx.heap.heap_key();
                 let cx = vm.host.cx_mut();
-                if let Some(existing) = cx.script_data.resources.get_handle_by_abs_path(&abs_path) {
+                if let Some(existing) = cx
+                    .script_data
+                    .resources
+                    .get_handle_by_abs_path(heap_key, &abs_path)
+                {
                     return existing.into();
                 }
 
@@ -790,16 +1056,30 @@ pub fn script_mod(vm: &mut ScriptVm) {
                     resources: cx.script_data.resources.resources.clone(),
                     handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
                     handle: ScriptHandle::ZERO,
+                    heap_key,
                 };
                 let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
 
-                cx.script_data.resources.insert_resource(CxScriptResource {
-                    abs_path,
-                    dependency_path: None,
-                    web_url: None,
-                    data: CxScriptResourceData::NotLoaded,
-                    handle,
-                });
+                // Another heap may already track this path — attach our local
+                // handle to the shared entry instead of duplicating it.
+                if cx
+                    .script_data
+                    .resources
+                    .attach_handle_for_path(heap_key, &abs_path, handle)
+                {
+                    return handle.into();
+                }
+
+                cx.script_data.resources.insert_resource(
+                    heap_key,
+                    CxScriptResource {
+                        abs_path,
+                        dependency_path: None,
+                        web_url: None,
+                        data: CxScriptResourceData::NotLoaded,
+                        handles: vec![(heap_key, handle)],
+                    },
+                );
 
                 return handle.into();
             }
@@ -815,6 +1095,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
         id_lut!(crate_resource),
         script_args_def!(path = NIL),
         move |vm, args| {
+            if vm.host.cx_mut().script_data.std.host_io_only() {
+                return script_err_io!(vm.trap(), "external resources require a host request");
+            }
             let path = script_value!(vm, args.path);
             if !path.is_string_like() {
                 return script_err_type_mismatch!(vm.trap(), "invalid res arg type");
@@ -823,39 +1106,8 @@ pub fn script_mod(vm: &mut ScriptVm) {
             let path_string = vm.string_with(path, |_vm, s| s.to_string());
 
             if let Some(path_string) = path_string {
-                // Parse "crate:path" format
                 if let Some((crate_part, file_path)) = parse_crate_path(&path_string) {
-                    if let Some((abs_path, dependency_path, web_url)) =
-                        resolve_crate_resource_paths(vm, crate_part, file_path)
-                    {
-                        let cx = vm.host.cx_mut();
-                        if let Some(existing) =
-                            cx.script_data.resources.get_handle_by_abs_path(&abs_path)
-                        {
-                            return existing.into();
-                        }
-
-                        let handle_gc = CxScriptResourceGc {
-                            resources: cx.script_data.resources.resources.clone(),
-                            handles_by_abs_path: cx
-                                .script_data
-                                .resources
-                                .handles_by_abs_path
-                                .clone(),
-                            handle: ScriptHandle::ZERO,
-                        };
-                        let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
-
-                        cx.script_data.resources.insert_resource(CxScriptResource {
-                            abs_path,
-                            dependency_path,
-                            web_url,
-                            data: CxScriptResourceData::NotLoaded,
-                            handle,
-                        });
-
-                        return handle.into();
-                    }
+                    return register_crate_resource_parts(vm, res_type, crate_part, file_path);
                 }
             }
 
@@ -870,14 +1122,21 @@ pub fn script_mod(vm: &mut ScriptVm) {
         id_lut!(http_resource),
         script_args_def!(url = NIL),
         move |vm, args| {
+            if vm.host.cx_mut().script_data.std.host_io_only() {
+                return script_err_io!(vm.trap(), "external resources require a host request");
+            }
             let url = script_value!(vm, args.url);
             if !url.is_string_like() {
                 return script_err_type_mismatch!(vm.trap(), "invalid res arg type");
             }
 
             if let Some(url_string) = vm.string_with(url, |_vm, s| s.to_string()) {
+                let heap_key = vm.bx.heap.heap_key();
                 let cx = vm.host.cx_mut();
-                if let Some(existing) = cx.script_data.resources.get_handle_by_abs_path(&url_string)
+                if let Some(existing) = cx
+                    .script_data
+                    .resources
+                    .get_handle_by_abs_path(heap_key, &url_string)
                 {
                     return existing.into();
                 }
@@ -885,24 +1144,36 @@ pub fn script_mod(vm: &mut ScriptVm) {
                     resources: cx.script_data.resources.resources.clone(),
                     handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
                     handle: ScriptHandle::ZERO,
+                    heap_key,
                 };
                 let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
 
+                if cx
+                    .script_data
+                    .resources
+                    .attach_handle_for_path(heap_key, &url_string, handle)
+                {
+                    return handle.into();
+                }
+
                 // Create the resource in Loading state
-                cx.script_data.resources.insert_resource(CxScriptResource {
-                    abs_path: url_string.clone(),
-                    dependency_path: None,
-                    web_url: None,
-                    data: CxScriptResourceData::Loading,
-                    handle,
-                });
+                cx.script_data.resources.insert_resource(
+                    heap_key,
+                    CxScriptResource {
+                        abs_path: url_string.clone(),
+                        dependency_path: None,
+                        web_url: None,
+                        data: CxScriptResourceData::Loading,
+                        handles: vec![(heap_key, handle)],
+                    },
+                );
 
                 // Fire the HTTP request
                 let request_id = LiveId::unique();
                 cx.script_data
                     .resources
                     .http_resources
-                    .push(CxScriptHttpResource { request_id, handle });
+                    .push(CxScriptHttpResource { request_id, abs_path: url_string.clone() });
                 cx.http_request(request_id, HttpRequest::new(url_string, Default::default()));
 
                 return handle.into();
@@ -927,21 +1198,26 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 );
             };
 
+            let heap_key = vm.bx.heap.heap_key();
             let cx = vm.host.cx_mut();
             let handle_gc = CxScriptResourceGc {
                 resources: cx.script_data.resources.resources.clone(),
                 handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
                 handle: ScriptHandle::ZERO,
+                heap_key,
             };
             let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
 
-            cx.script_data.resources.insert_resource(CxScriptResource {
-                abs_path: format!("binary://{}", LiveId::unique().0),
-                dependency_path: None,
-                web_url: None,
-                data: CxScriptResourceData::Loaded(Rc::new(bytes)),
-                handle,
-            });
+            cx.script_data.resources.insert_resource(
+                heap_key,
+                CxScriptResource {
+                    abs_path: format!("binary://{}", LiveId::unique().0),
+                    dependency_path: None,
+                    web_url: None,
+                    data: CxScriptResourceData::Loaded(Rc::new(bytes)),
+                    handles: vec![(heap_key, handle)],
+                },
+            );
 
             handle.into()
         },

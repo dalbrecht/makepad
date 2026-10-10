@@ -24,11 +24,16 @@ public class MakepadNative {
     public native static void surfaceOnSurfaceDestroyed(Surface surface);
     public static native void surfaceOnLongClick(float x, float y, int pointerId, long timeMillis);
     public static native void surfaceOnTouch(MotionEvent event);
+    // A move's batched samples, oldest first (`historyIndex`), and then the
+    // event itself, each with its time in nanoseconds (uptime clock).
+    public static native void surfaceOnTouchHistory(MotionEvent event, int historyIndex, long timeNanos);
+    public static native void surfaceOnTouchNanos(MotionEvent event, long timeNanos);
     public native static void surfaceOnSurfaceChanged(Surface surface, int width, int height);
-    public native static void surfaceOnKeyDown(int keycode, int meta_state);
+    public native static void surfaceOnKeyDown(int keycode, int meta_state, boolean is_repeat);
     public native static void surfaceOnKeyUp(int keycode, int meta_state);
     public native static void surfaceOnCharacter(int character);
     public native static void surfaceOnResizeTextIME(int keyboard_height, boolean is_open);
+    public native static void surfaceOnPhysicalKeyboardChanged(boolean connected);
     public native static void surfaceOnSafeAreaInsets(float top, float right, float bottom, float left);
 
     // networking
@@ -62,8 +67,21 @@ public class MakepadNative {
     // midi
     public native static void onMidiDeviceOpened(String name, Object midi_device);
     
+    // file and folder dialogs (Storage Access Framework).
+    // An empty uris array means the user cancelled.
+    public native static void onFileDialogResult(int requestCode, String[] uris);
+
     // permissions
     public native static void onPermissionResult(String permission, int requestId, int status);
+
+    // location
+    public native static void onLocationUpdate(
+        double longitude, double latitude, float accuracy,
+        boolean hasAltitude, double altitude,
+        boolean hasSpeed, float speed,
+        boolean hasBearing, float bearing,
+        long timeMillis);
+    public native static void onLocationError(int code, String message);
 
     // video playback
     public static native void onVideoPlaybackPrepared(long videoId, int videoWidth, int videoHeight, long duration, VideoPlayer surfaceTexture);

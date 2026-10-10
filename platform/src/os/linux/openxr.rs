@@ -171,11 +171,14 @@ impl Cx {
     pub(crate) fn openxr_handle_repaint(
         &mut self,
         frame: &CxOpenXrFrame,
+        #[cfg_attr(not(use_vulkan), allow(unused_variables))]
         xr_cpu: &mut XrFrameCpuBreakdown,
     ) {
         //opengl_cx.make_current();
         let mut passes_todo = Vec::new();
+        #[cfg(use_vulkan)]
         let mut xr_render_cpu_ms = 0.0f64;
+        #[cfg(use_vulkan)]
         let mut saw_xr_vulkan_pass = false;
         self.compute_pass_repaint_order(&mut passes_todo);
         self.repaint_id += 1;
@@ -188,7 +191,9 @@ impl Cx {
             .and_then(|session| session.vulkan.as_ref())
             .is_some();
         for draw_pass_id in &passes_todo {
-            self.passes[*draw_pass_id].set_time(self.os.timers.time_now() as f32);
+            let uniforms_gen = self.next_uniform_gen();
+            self.passes[*draw_pass_id]
+                .set_time(self.os.timers.time_now() as f32, uniforms_gen);
             match self.passes[*draw_pass_id].parent.clone() {
                 CxDrawPassParent::Xr => {
                     #[cfg(use_vulkan)]
@@ -240,7 +245,23 @@ impl Cx {
                 }
             }
         }
-        self.os.xr_render_cpu_time_ms = saw_xr_vulkan_pass.then_some(xr_render_cpu_ms);
+        #[cfg(use_vulkan)]
+        {
+            self.os.xr_render_cpu_time_ms = saw_xr_vulkan_pass.then_some(xr_render_cpu_ms);
+        }
+        // Offscreen passes without an XR view after them stay recorded in the
+        // repaint slot until submitted.
+        #[cfg(all(use_vulkan, target_os = "android"))]
+        if let Some(mut vulkan) = self.os.vulkan.take() {
+            if let Err(err) = vulkan.end_repaint() {
+                crate::error!("Android Vulkan repaint submit failed: {err}");
+            }
+            self.os.vulkan = Some(vulkan);
+        }
+        #[cfg(not(use_vulkan))]
+        {
+            self.os.xr_render_cpu_time_ms = None;
+        }
     }
 
     pub(crate) fn openxr_handle_drawing(&mut self) {
@@ -672,6 +693,7 @@ impl CxOpenXr {
         &mut self,
         display: &CxAndroidDisplay,
         #[cfg(use_vulkan)] vulkan: Option<&mut CxVulkan>,
+        #[cfg(use_vulkan)] spawner: &crate::thread::ThreadSpawner,
         options: CxOpenXrOptions,
         os_type: &OsType,
     ) -> Result<(), String> {
@@ -685,6 +707,8 @@ impl CxOpenXr {
             display,
             #[cfg(use_vulkan)]
             vulkan,
+            #[cfg(use_vulkan)]
+            spawner,
             options,
         )?);
         if let Some(session) = &mut self.session {
@@ -1024,11 +1048,12 @@ impl CxOpenXrSession {
         instance: XrInstance,
         display: &CxAndroidDisplay,
         #[cfg(use_vulkan)] vulkan: Option<&mut CxVulkan>,
+        #[cfg(use_vulkan)] spawner: &crate::thread::ThreadSpawner,
         options: CxOpenXrOptions,
     ) -> Result<CxOpenXrSession, String> {
         #[cfg(use_vulkan)]
         if let Some(vulkan) = vulkan {
-            return Self::create_session_vulkan(xr, system_id, instance, vulkan, options);
+            return Self::create_session_vulkan(xr, system_id, instance, vulkan, spawner, options);
         }
 
         Self::create_session_gles(xr, system_id, instance, display, options)

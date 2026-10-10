@@ -55,6 +55,14 @@ pub struct ScriptPodBuiltins {
     pub pod_mat4x2f: ScriptPodType,
     pub pod_mat4x3f: ScriptPodType,
     pub pod_mat4x4f: ScriptPodType,
+    pub pod_f16x2: ScriptPodType,
+    pub pod_f16x4: ScriptPodType,
+    pub pod_u16x2: ScriptPodType,
+    pub pod_i16x2: ScriptPodType,
+    pub pod_unorm16x2: ScriptPodType,
+    pub pod_snorm16x2: ScriptPodType,
+    pub pod_unorm8x4: ScriptPodType,
+    pub pod_snorm8x4: ScriptPodType,
 }
 
 impl ScriptPodBuiltins {
@@ -219,6 +227,71 @@ pub fn define_pod_module(heap: &mut ScriptHeap, native: &mut ScriptNative) -> Sc
     let pod_mat4x3f = heap.pod_def_mat(pod, id_lut!(mat4x3f), ScriptPodMat::Mat4x3f);
     let pod_mat4x4f = heap.pod_def_mat(pod, id_lut!(mat4x4f), ScriptPodMat::Mat4x4f);
 
+    let pod_f16x2 = heap.pod_def_atom(
+        pod,
+        id_lut!(f16x2),
+        None,
+        ScriptPodTy::Packed(ScriptPodPacked::F16x2),
+        id_lut!(pod_f16x2),
+        ScriptValue::NIL,
+    );
+    let pod_f16x4 = heap.pod_def_atom(
+        pod,
+        id_lut!(f16x4),
+        None,
+        ScriptPodTy::Packed(ScriptPodPacked::F16x4),
+        id_lut!(pod_f16x4),
+        ScriptValue::NIL,
+    );
+    let pod_u16x2 = heap.pod_def_atom(
+        pod,
+        id_lut!(u16x2),
+        None,
+        ScriptPodTy::Packed(ScriptPodPacked::U16x2),
+        id_lut!(pod_u16x2),
+        ScriptValue::NIL,
+    );
+    let pod_i16x2 = heap.pod_def_atom(
+        pod,
+        id_lut!(i16x2),
+        None,
+        ScriptPodTy::Packed(ScriptPodPacked::I16x2),
+        id_lut!(pod_i16x2),
+        ScriptValue::NIL,
+    );
+    let pod_unorm16x2 = heap.pod_def_atom(
+        pod,
+        id_lut!(unorm16x2),
+        None,
+        ScriptPodTy::Packed(ScriptPodPacked::U16x2Norm),
+        id_lut!(pod_unorm16x2),
+        ScriptValue::NIL,
+    );
+    let pod_snorm16x2 = heap.pod_def_atom(
+        pod,
+        id_lut!(snorm16x2),
+        None,
+        ScriptPodTy::Packed(ScriptPodPacked::I16x2Norm),
+        id_lut!(pod_snorm16x2),
+        ScriptValue::NIL,
+    );
+    let pod_unorm8x4 = heap.pod_def_atom(
+        pod,
+        id_lut!(unorm8x4),
+        None,
+        ScriptPodTy::Packed(ScriptPodPacked::U8x4Norm),
+        id_lut!(pod_unorm8x4),
+        ScriptValue::NIL,
+    );
+    let pod_snorm8x4 = heap.pod_def_atom(
+        pod,
+        id_lut!(snorm8x4),
+        None,
+        ScriptPodTy::Packed(ScriptPodPacked::I8x4Norm),
+        id_lut!(pod_snorm8x4),
+        ScriptValue::NIL,
+    );
+
     // Add mix method for all pod types (f32, vec2f, vec3f, vec4f, etc.)
     // self.mix(other, alpha) -> mix(self, other, alpha)
     native.add_type_method(
@@ -269,6 +342,60 @@ pub fn define_pod_module(heap: &mut ScriptHeap, native: &mut ScriptNative) -> Sc
         },
     );
 
+    // Vector convenience methods, GDScript-style: v.length(), v.normalized(),
+    // a.dot(b), a.cross(b). The DSL guides teach these idioms; without them
+    // every steering AI has to hand-roll sqrt(dx*dx + ...). Registered under
+    // BOTH pod reduxes: runtime vec values dispatch as REDUX_POD_TYPE (13),
+    // heap pods as REDUX_POD (12).
+    for redux in [ScriptValueType::REDUX_POD, ScriptValueType::REDUX_POD_TYPE] {
+        native.add_type_method(heap, redux, id!(length), script_args!(), |vm, args| {
+            let trap = vm.bx.threads.cur_ref().trap.pass();
+            let sself = vm.bx.heap.value(args, id!(self).into(), trap);
+            let ip = vm.bx.threads.cur_ref().trap.ip;
+            let nv = NumericValue::from_script_value_heap(&vm.bx.heap, sself, ip);
+            ScriptValue::from_f64(nv.length())
+        });
+        for method in [id!(normalized), id!(normalize)] {
+            native.add_type_method(heap, redux, method, script_args!(), |vm, args| {
+                let trap = vm.bx.threads.cur_ref().trap.pass();
+                let sself = vm.bx.heap.value(args, id!(self).into(), trap);
+                let ip = vm.bx.threads.cur_ref().trap.ip;
+                let nv = NumericValue::from_script_value_heap(&vm.bx.heap, sself, ip);
+                nv.normalize().to_script_value_heap(&mut vm.bx.heap, &vm.bx.code)
+            });
+        }
+        native.add_type_method(
+            heap,
+            redux,
+            id!(dot),
+            script_args!(other = 0.0),
+            |vm, args| {
+                let trap = vm.bx.threads.cur_ref().trap.pass();
+                let sself = vm.bx.heap.value(args, id!(self).into(), trap);
+                let other = vm.bx.heap.value(args, id!(other).into(), trap);
+                let ip = vm.bx.threads.cur_ref().trap.ip;
+                let a = NumericValue::from_script_value_heap(&vm.bx.heap, sself, ip);
+                let b = NumericValue::from_script_value_heap(&vm.bx.heap, other, ip);
+                ScriptValue::from_f64(a.dot(b))
+            },
+        );
+        native.add_type_method(
+            heap,
+            redux,
+            id!(cross),
+            script_args!(other = 0.0),
+            |vm, args| {
+                let trap = vm.bx.threads.cur_ref().trap.pass();
+                let sself = vm.bx.heap.value(args, id!(self).into(), trap);
+                let other = vm.bx.heap.value(args, id!(other).into(), trap);
+                let ip = vm.bx.threads.cur_ref().trap.ip;
+                let a = NumericValue::from_script_value_heap(&vm.bx.heap, sself, ip);
+                let b = NumericValue::from_script_value_heap(&vm.bx.heap, other, ip);
+                a.cross(b).to_script_value_heap(&mut vm.bx.heap, &vm.bx.code)
+            },
+        );
+    }
+
     let ps = ScriptPodBuiltins {
         pod_void,
         pod_struct,
@@ -304,6 +431,14 @@ pub fn define_pod_module(heap: &mut ScriptHeap, native: &mut ScriptNative) -> Sc
         pod_mat4x2f,
         pod_mat4x3f,
         pod_mat4x4f,
+        pod_f16x2,
+        pod_f16x4,
+        pod_u16x2,
+        pod_i16x2,
+        pod_unorm16x2,
+        pod_snorm16x2,
+        pod_unorm8x4,
+        pod_snorm8x4,
     };
     ps
 }

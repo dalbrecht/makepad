@@ -2,8 +2,9 @@ use {
     crate::{
         cx_draw::CxDraw,
         draw_list_2d::DrawList2d,
-        makepad_math::{Vec2Index, Vec2d},
-        makepad_platform::{DrawListId, LiveId},
+        makepad_math::{Rect, Vec2Index, Vec2d},
+        makepad_platform::{DrawListId, DrawPassId, LiveId},
+        makepad_script::ScriptNew,
         turtle::{AlignEntry, FinishedWalk, Turtle, Walk},
     },
     std::{ops::Deref, ops::DerefMut},
@@ -12,6 +13,11 @@ use {
 pub struct Cx2d<'a, 'b> {
     pub cx: &'b mut CxDraw<'a>,
     pub(crate) overlay_id: Option<DrawListId>,
+    pub(crate) overlay_pass_id: Option<DrawPassId>,
+    pub(crate) overlay_draw_depth: usize,
+    /// Increments once per overlay sub-list begun this frame; stamped onto the
+    /// sub-list so the Overlay can composite in draw order.
+    pub(crate) overlay_seq: u64,
 
     //pub (crate) overlay_sweep_lock: Option<Rc<RefCell<Area>>>,
     pub(crate) turtles: Vec<Turtle>,
@@ -21,6 +27,139 @@ pub struct Cx2d<'a, 'b> {
     pub(crate) align_list: Vec<AlignEntry>,
     pub(crate) draw_call_parent_stack: Vec<u64>,
     pub(crate) draw_call_parent_next: u64,
+    /// The wireframe used by the exploded z-layer view to give every turtle
+    /// scope a visible frame. Built on first use so an app that never opens
+    /// the mode never constructs it.
+    pub(crate) sploded_hairline: Option<Box<crate::shader::draw_sploded_hairline::DrawSplodedHairline>>,
+    /// Every frame emitted this draw, to suppress the concentric near-copies
+    /// a widget's internal layout turtles produce.
+    pub(crate) sploded_hairline_seen: Vec<Rect>,
+    /// The exploded BODY pass, set by `SplodedStack::begin_scene`. Frames
+    /// are emitted only into draw lists bound to THAT pass — the tweaker's
+    /// panel and every popup are overlay lists bound to the flat window
+    /// pass (even though they draw while the body is open) and must look
+    /// exactly as they do with the mode off.
+    pub sploded_scene: Option<DrawPassId>,
+}
+
+// Owned by the drawing context, so separate contexts and nested Cx2d draws
+// cannot alias scratch storage. A finished draw returns its high-water capacity.
+#[derive(Default)]
+struct Cx2dScratch {
+    turtles: Vec<Turtle>,
+    finished_rows: Vec<usize>,
+    finished_walks: Vec<FinishedWalk>,
+    turtle_clips: Vec<(Vec2d, Vec2d)>,
+    align_list: Vec<AlignEntry>,
+    draw_call_parent_stack: Vec<u64>,
+    sploded_hairline_seen: Vec<Rect>,
+}
+
+#[derive(Default)]
+struct Cx2dScratchPool(Vec<Cx2dScratch>);
+
+impl Drop for Cx2d<'_, '_> {
+    fn drop(&mut self) {
+        self.turtles.clear();
+        self.finished_rows.clear();
+        self.finished_walks.clear();
+        self.turtle_clips.clear();
+        self.align_list.clear();
+        self.draw_call_parent_stack.clear();
+        self.sploded_hairline_seen.clear();
+        self.cx.global::<Cx2dScratchPool>().0.push(Cx2dScratch {
+            turtles: std::mem::take(&mut self.turtles),
+            finished_rows: std::mem::take(&mut self.finished_rows),
+            finished_walks: std::mem::take(&mut self.finished_walks),
+            turtle_clips: std::mem::take(&mut self.turtle_clips),
+            align_list: std::mem::take(&mut self.align_list),
+            draw_call_parent_stack: std::mem::take(&mut self.draw_call_parent_stack),
+            sploded_hairline_seen: std::mem::take(&mut self.sploded_hairline_seen),
+        });
+    }
+}
+
+/// Where the draw context's stacks stood when a host handed it to a guest
+/// whose draw may not return — a module tile's root, drawn under
+/// `catch_unwind`. [`Cx2d::unwind_to`] cuts them back to it: the turtles,
+/// alignment, clips and parent chain the guest left open, the passes and
+/// draw lists it began, the overlay scope it was inside — so the host's
+/// own `end_*` calls pair again and the frame finishes. What the guest
+/// already recorded into the current draw list stays for this frame; the
+/// host redraws it.
+#[derive(Clone, Copy, Debug)]
+pub struct DrawUnwindMark {
+    turtles: usize,
+    finished_rows: usize,
+    finished_walks: usize,
+    turtle_clips: usize,
+    align_list: usize,
+    draw_call_parent_stack: usize,
+    pass_stack: usize,
+    draw_list_stack: usize,
+    overlay_id: Option<DrawListId>,
+    overlay_pass_id: Option<DrawPassId>,
+    overlay_draw_depth: usize,
+    overlay_seq: u64,
+    nesting_depth: usize,
+}
+
+impl DrawUnwindMark {
+    /// Every stack that has to pair — turtles, clips, the parent chain,
+    /// passes, draw lists, the overlay scope, the nesting depth — stands
+    /// where it did in `other`. What a frame accumulates until its root
+    /// turtle ends (finished walks, alignment entries) is not a stack and
+    /// is not compared.
+    pub fn is_balanced_with(&self, other: &DrawUnwindMark) -> bool {
+        self.turtles == other.turtles
+            && self.turtle_clips == other.turtle_clips
+            && self.draw_call_parent_stack == other.draw_call_parent_stack
+            && self.pass_stack == other.pass_stack
+            && self.draw_list_stack == other.draw_list_stack
+            && self.overlay_id == other.overlay_id
+            && self.overlay_pass_id == other.overlay_pass_id
+            && self.overlay_draw_depth == other.overlay_draw_depth
+            && self.nesting_depth == other.nesting_depth
+    }
+}
+
+impl<'a, 'b> Cx2d<'a, 'b> {
+    pub fn unwind_mark(&self) -> DrawUnwindMark {
+        DrawUnwindMark {
+            turtles: self.turtles.len(),
+            finished_rows: self.finished_rows.len(),
+            finished_walks: self.finished_walks.len(),
+            turtle_clips: self.turtle_clips.len(),
+            align_list: self.align_list.len(),
+            draw_call_parent_stack: self.draw_call_parent_stack.len(),
+            pass_stack: self.cx.pass_stack.len(),
+            draw_list_stack: self.cx.draw_list_stack.len(),
+            overlay_id: self.overlay_id,
+            overlay_pass_id: self.overlay_pass_id,
+            overlay_draw_depth: self.overlay_draw_depth,
+            overlay_seq: self.overlay_seq,
+            nesting_depth: self.cx.cx.nesting_depth,
+        }
+    }
+
+    /// Back to `mark`, dropping everything begun after it. Only ever deeper
+    /// stacks are cut: a mark taken before a guest's draw is always at or
+    /// below where the guest left them.
+    pub fn unwind_to(&mut self, mark: DrawUnwindMark) {
+        self.turtles.truncate(mark.turtles);
+        self.finished_rows.truncate(mark.finished_rows);
+        self.finished_walks.truncate(mark.finished_walks);
+        self.turtle_clips.truncate(mark.turtle_clips);
+        self.align_list.truncate(mark.align_list);
+        self.draw_call_parent_stack.truncate(mark.draw_call_parent_stack);
+        self.cx.pass_stack.truncate(mark.pass_stack);
+        self.cx.draw_list_stack.truncate(mark.draw_list_stack);
+        self.overlay_id = mark.overlay_id;
+        self.overlay_pass_id = mark.overlay_pass_id;
+        self.overlay_draw_depth = mark.overlay_draw_depth;
+        self.overlay_seq = mark.overlay_seq;
+        self.cx.cx.nesting_depth = mark.nesting_depth;
+    }
 }
 
 impl<'a, 'b> Deref for Cx2d<'a, 'b> {
@@ -37,20 +176,102 @@ impl<'a, 'b> DerefMut for Cx2d<'a, 'b> {
 
 impl<'a, 'b> Cx2d<'a, 'b> {
     pub fn new(cx: &'b mut CxDraw<'a>) -> Self {
-        let mut draw_call_parent_stack = Vec::with_capacity(256);
+        let mut scratch = cx.global::<Cx2dScratchPool>().0.pop().unwrap_or_default();
+        scratch.turtle_clips.reserve(1024usize.saturating_sub(scratch.turtle_clips.len()));
+        scratch.finished_rows.reserve(1024usize.saturating_sub(scratch.finished_rows.len()));
+        scratch.finished_walks.reserve(1024usize.saturating_sub(scratch.finished_walks.len()));
+        scratch.turtles.reserve(64usize.saturating_sub(scratch.turtles.len()));
+        scratch.align_list.reserve(65536usize.saturating_sub(scratch.align_list.len()));
+        scratch.draw_call_parent_stack.reserve(256);
+        let mut draw_call_parent_stack = scratch.draw_call_parent_stack;
         // Root scope id.
         draw_call_parent_stack.push(1);
         Self {
             overlay_id: None,
+            overlay_pass_id: None,
+            overlay_draw_depth: 0,
+            overlay_seq: 0,
             cx,
-            turtle_clips: Vec::with_capacity(1024),
-            finished_rows: Vec::with_capacity(1024),
-            finished_walks: Vec::with_capacity(1024),
-            turtles: Vec::with_capacity(64),
-            align_list: Vec::with_capacity(4096),
+            turtle_clips: scratch.turtle_clips,
+            finished_rows: scratch.finished_rows,
+            finished_walks: scratch.finished_walks,
+            turtles: scratch.turtles,
+            align_list: scratch.align_list,
             draw_call_parent_stack,
             draw_call_parent_next: 2,
+            sploded_hairline: None,
+            sploded_hairline_seen: scratch.sploded_hairline_seen,
+            sploded_scene: None,
         }
+    }
+
+    pub fn is_drawing_overlay(&self) -> bool {
+        self.overlay_draw_depth > 0
+    }
+
+    /// Draw one turtle scope's wireframe frame, while — and only while — the
+    /// exploded z-layer view is up.
+    ///
+    /// A parent whose children fill it completely has no pixels of its own in
+    /// flat 2D; in the exploded view its plane would be an invisible gap. This
+    /// gives every nesting level a frame to see, and to click.
+    ///
+    /// Costs nothing when the mode is off: one bool test, and the wireframe is
+    /// never even constructed.
+    pub(crate) fn draw_sploded_hairline(&mut self, rect: Rect) {
+        let Some(scene_pass) = self.sploded_scene else {
+            return;
+        };
+        if !self.cx.sploded_hairlines_active() {
+            return;
+        }
+        if rect.size.x < 1.0 || rect.size.y < 1.0 {
+            return;
+        }
+        let Some(list_id) = self.draw_list_stack.last() else {
+            return;
+        };
+        // Only the body explodes: a turtle closing inside an overlay list
+        // (panel, popup) draws on the window pass and gets no frame.
+        if self.cx.draw_lists[*list_id].draw_pass_id != Some(scene_pass) {
+            return;
+        }
+        // A widget nests several layout turtles that resolve to nearly the
+        // same rect, so drawing one frame per turtle stacks concentric copies
+        // a couple of pixels apart. At any readable stroke weight those
+        // compound into a solid slab — which breaks the mode's whole point,
+        // because a solid plane has to mean the APP painted there. One frame
+        // per distinct rect keeps every container visible and every plane
+        // honest.
+        let level = self.cx.nesting_depth as f32;
+        const NEAR: f64 = 3.0;
+        if self.sploded_hairline_seen.iter().any(|s| {
+            (s.pos.x - rect.pos.x).abs() < NEAR
+                && (s.pos.y - rect.pos.y).abs() < NEAR
+                && (s.size.x - rect.size.x).abs() < NEAR
+                && (s.size.y - rect.size.y).abs() < NEAR
+        }) {
+            return;
+        }
+        self.sploded_hairline_seen.push(rect);
+        if self.sploded_hairline.is_none() {
+            // `script_new_with_default` — not `script_new` — because the
+            // registered type default is where the shader binding lives.
+            let hairline = self.cx.with_vm(|vm| {
+                crate::shader::draw_sploded_hairline::DrawSplodedHairline::script_new_with_default(
+                    vm,
+                )
+            });
+            if hairline.draw_vars.draw_shader_id.is_none() {
+                crate::makepad_platform::error!(
+                    "sploded hairline: shader did not bind; scope frames disabled"
+                );
+            }
+            self.sploded_hairline = Some(Box::new(hairline));
+        }
+        let mut hairline = self.sploded_hairline.take().unwrap();
+        hairline.draw_scope(self, rect, level);
+        self.sploded_hairline = Some(hairline);
     }
 
     #[inline]

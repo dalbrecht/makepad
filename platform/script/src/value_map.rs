@@ -2,56 +2,172 @@ use crate::makepad_live_id::LiveId;
 
 use std::ops::{Index, IndexMut};
 
-// On wasm32, we use Vec<(K,V)> to work around an LLVM wasm32 codegen bug that
-// miscompiles HashMap::insert, silently dropping keys during Makepad's DSL
-// evaluation. Vec + linear scan is immune because it uses only array indexing
-// and equality comparison — operations too simple for LLVM to miscompile.
-// Performance is equivalent for the small maps used here (typically 3-57 entries).
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashMap;
+
+// On wasm32, ValueMap never uses HashMap. LLVM's wasm32 backend miscompiles
+// HashMap::insert, silently dropping keys during Makepad's DSL evaluation
+// (notably `vertex` on shader prototype objects). Vec + linear scan is immune
+// because it uses only array indexing and equality comparison.
 // See: https://github.com/dalbrecht/makepad/issues/6
 //
-// On native targets (x86, ARM), HashMap is used for O(1) lookups since the LLVM
-// codegen bug does not affect these architectures.
+// On native targets, this is the upstream hybrid: small maps stay a Vec, and
+// past SPILL_AT they spill to a HashMap.
 
+// Idea taken from the `nohash_hasher` crate.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub struct ValueHasher(u64);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::hash::Hasher for ValueHasher {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!();
+    }
+    fn write_u8(&mut self, _n: u8) {
+        unreachable!();
+    }
+    fn write_u16(&mut self, _n: u16) {
+        unreachable!();
+    }
+    fn write_u32(&mut self, _n: u32) {
+        unreachable!();
+    }
+    #[inline(always)]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+    fn write_usize(&mut self, _n: usize) {
+        unreachable!();
+    }
+    fn write_i8(&mut self, _n: i8) {
+        unreachable!();
+    }
+    fn write_i16(&mut self, _n: i16) {
+        unreachable!();
+    }
+    fn write_i32(&mut self, _n: i32) {
+        unreachable!();
+    }
+    fn write_i64(&mut self, _n: i64) {
+        unreachable!();
+    }
+    fn write_isize(&mut self, _n: isize) {
+        unreachable!();
+    }
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Copy, Clone, Default)]
+pub struct ValueHasherBuilder {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::hash::BuildHasher for ValueHasherBuilder {
+    type Hasher = ValueHasher;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> ValueHasher {
+        ValueHasher::default()
+    }
+}
+
+/// Hybrid map: small maps (the common case — scopes, call args, entity
+/// objects) are a plain Vec scanned linearly, which beats hashing both on
+/// hits and (crucially, for scope-chain walks) on misses. Past SPILL_AT
+/// entries the map spills to a HashMap and stays spilled until cleared.
+/// Key order is not part of the map contract (callers track ordering via
+/// ScriptMapTag::order), matching the previous HashMap behavior.
+///
+/// On wasm32 the HashMap spill path is compiled out entirely so LLVM cannot
+/// miscompile HashMap::insert into the DSL evaluation path.
 #[derive(Clone, Debug)]
 pub struct ValueMap<K, V> {
-    #[cfg(target_arch = "wasm32")]
-    entries: Vec<(K, V)>,
+    vec: Vec<(K, V)>,
     #[cfg(not(target_arch = "wasm32"))]
-    entries: std::collections::HashMap<K, V>,
-}
-
-// --- Default impl ---
-
-#[cfg(target_arch = "wasm32")]
-impl<K, V> Default for ValueMap<K, V>
-where
-    K: Eq + Copy + From<LiveId> + std::fmt::Debug,
-{
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
+    spill: Option<Box<HashMap<K, V, ValueHasherBuilder>>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+const SPILL_AT: usize = 16;
+
 impl<K, V> Default for ValueMap<K, V>
 where
-    K: Eq + Copy + std::hash::Hash + From<LiveId> + std::fmt::Debug,
+    K: std::cmp::Eq + Copy + From<LiveId> + std::fmt::Debug,
 {
     fn default() -> Self {
         Self {
-            entries: std::collections::HashMap::new(),
+            vec: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            spill: None,
         }
     }
 }
 
-// --- Core methods: wasm32 (Vec backend) ---
+pub enum ValueMapIter<'a, K, V> {
+    Vec(std::slice::Iter<'a, (K, V)>),
+    #[cfg(not(target_arch = "wasm32"))]
+    Map(std::collections::hash_map::Iter<'a, K, V>),
+}
 
-#[cfg(target_arch = "wasm32")]
-impl<K: Eq + Copy, V> ValueMap<K, V> {
+pub enum ValueMapIterMut<'a, K, V> {
+    Vec(std::slice::IterMut<'a, (K, V)>),
+    #[cfg(not(target_arch = "wasm32"))]
+    Map(std::collections::hash_map::IterMut<'a, K, V>),
+}
+
+impl<'a, K, V> Iterator for ValueMapIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Vec(it) => it.next().map(|(k, v)| (&*k, v)),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Map(it) => it.next(),
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Vec(it) => it.size_hint(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Map(it) => it.size_hint(),
+        }
+    }
+}
+
+impl<'a, K, V> Iterator for ValueMapIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Vec(it) => it.next().map(|(k, v)| (k, v)),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Map(it) => it.next(),
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Vec(it) => it.size_hint(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Map(it) => it.size_hint(),
+        }
+    }
+}
+
+impl<K, V> ValueMap<K, V>
+where
+    K: std::cmp::Eq + std::hash::Hash + Copy,
+{
+    #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
-        for (k, v) in &self.entries {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(spill) = &self.spill {
+            return spill.get(key);
+        }
+        for (k, v) in self.vec.iter() {
             if k == key {
                 return Some(v);
             }
@@ -59,206 +175,149 @@ impl<K: Eq + Copy, V> ValueMap<K, V> {
         None
     }
 
+    #[inline]
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        for (k, v) in &mut self.entries {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(spill) = &mut self.spill {
+            return spill.get_mut(key);
+        }
+        for (k, v) in self.vec.iter_mut() {
             if k == key {
                 return Some(v);
             }
         }
         None
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        for (k, v) in &mut self.entries {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(spill) = &mut self.spill {
+            return spill.insert(key, value);
+        }
+        for (k, v) in self.vec.iter_mut() {
             if *k == key {
-                let old = std::mem::replace(v, value);
-                return Some(old);
+                return Some(std::mem::replace(v, value));
             }
         }
-        self.entries.push((key, value));
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.vec.len() >= SPILL_AT {
+            let mut map = Box::new(HashMap::with_capacity_and_hasher(
+                self.vec.len() + 1,
+                ValueHasherBuilder {},
+            ));
+            for (k, v) in self.vec.drain(..) {
+                map.insert(k, v);
+            }
+            map.insert(key, value);
+            self.spill = Some(map);
+            return None;
+        }
+        self.vec.push((key, value));
         None
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        if let Some(pos) = self.entries.iter().position(|(k, _)| k == key) {
-            Some(self.entries.swap_remove(pos).1)
-        } else {
-            None
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(spill) = &mut self.spill {
+            return spill.remove(key);
         }
+        for (i, (k, _)) in self.vec.iter().enumerate() {
+            if k == key {
+                return Some(self.vec.swap_remove(i).1);
+            }
+        }
+        None
     }
 
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.entries.iter().any(|(k, _)| k == key)
+    #[inline]
+    /// Bytes retained by the backing storage (compact vector capacity plus
+    /// spilled hash-table capacity with a per-bucket control allowance).
+    pub fn retained_bytes(&self) -> usize {
+        let entry = std::mem::size_of::<(K, V)>();
+        let vec_bytes = self.vec.capacity().saturating_mul(entry);
+        // wasm32 compiles the HashMap spill out, so retained size is the vec only.
+        #[cfg(not(target_arch = "wasm32"))]
+        let spill_bytes = self.spill.as_ref().map_or(0, |spill| {
+            spill.capacity().saturating_mul(
+                entry
+                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(2))
+                    .saturating_add(1),
+            )
+        });
+        #[cfg(target_arch = "wasm32")]
+        let spill_bytes = 0;
+        vec_bytes.saturating_add(spill_bytes)
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(spill) = &self.spill {
+            return spill.len();
+        }
+        self.vec.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
+    /// Clears entries. Keeps the vec's capacity for slot reuse, but drops a
+    /// spilled hashmap so a reused slot starts in (cheap) linear mode again.
     pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.entries.iter().map(|(k, v)| (k, v))
-    }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
-        self.entries.iter_mut().map(|(k, v)| (&*k, v))
-    }
-
-    pub fn entry(&mut self, key: K) -> VecMapEntry<'_, K, V> {
-        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
-            VecMapEntry::Occupied(OccupiedEntry {
-                entries: &mut self.entries,
-                index: pos,
-            })
-        } else {
-            VecMapEntry::Vacant(VacantEntry {
-                entries: &mut self.entries,
-                key,
-            })
+        self.vec.clear();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.spill = None;
         }
     }
-}
 
-// --- Core methods: native (HashMap backend) ---
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<K: Eq + Copy + std::hash::Hash, V> ValueMap<K, V> {
-    pub fn get(&self, key: &K) -> Option<&V> {
-        self.entries.get(key)
-    }
-
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.entries.get_mut(key)
-    }
-
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.entries.insert(key, value)
-    }
-
-    pub fn remove(&mut self, key: &K) -> Option<V> {
-        self.entries.remove(key)
-    }
-
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.entries.contains_key(key)
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.entries.iter()
-    }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
-        self.entries.iter_mut()
-    }
-
-    pub fn entry(&mut self, key: K) -> VecMapEntry<'_, K, V> {
-        match self.entries.entry(key) {
-            std::collections::hash_map::Entry::Occupied(occ) => {
-                VecMapEntry::Occupied(OccupiedEntry { inner: occ })
-            }
-            std::collections::hash_map::Entry::Vacant(vac) => {
-                VecMapEntry::Vacant(VacantEntry { inner: vac })
-            }
+    #[inline]
+    pub fn iter(&self) -> ValueMapIter<'_, K, V> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(spill) = &self.spill {
+            return ValueMapIter::Map(spill.iter());
         }
+        ValueMapIter::Vec(self.vec.iter())
+    }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> ValueMapIterMut<'_, K, V> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(spill) = &mut self.spill {
+            return ValueMapIterMut::Map(spill.iter_mut());
+        }
+        ValueMapIterMut::Vec(self.vec.iter_mut())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, v)| v)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
     }
 }
 
-// --- Entry types ---
-
-pub enum VecMapEntry<'a, K, V> {
-    Occupied(OccupiedEntry<'a, K, V>),
-    Vacant(VacantEntry<'a, K, V>),
-}
-
-// --- OccupiedEntry ---
-
-#[cfg(target_arch = "wasm32")]
-pub struct OccupiedEntry<'a, K, V> {
-    entries: &'a mut Vec<(K, V)>,
-    index: usize,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub struct OccupiedEntry<'a, K: 'a, V: 'a> {
-    inner: std::collections::hash_map::OccupiedEntry<'a, K, V>,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl<'a, K, V> OccupiedEntry<'a, K, V> {
-    pub fn get_mut(&mut self) -> &mut V {
-        &mut self.entries[self.index].1
-    }
-
-    pub fn remove(self) -> V {
-        self.entries.swap_remove(self.index).1
+impl<'a, K, V> IntoIterator for &'a ValueMap<K, V>
+where
+    K: std::cmp::Eq + std::hash::Hash + Copy,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = ValueMapIter<'a, K, V>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl<'a, K, V> OccupiedEntry<'a, K, V> {
-    pub fn get_mut(&mut self) -> &mut V {
-        self.inner.get_mut()
-    }
-
-    pub fn remove(self) -> V {
-        self.inner.remove()
-    }
-}
-
-// --- VacantEntry ---
-
-#[cfg(target_arch = "wasm32")]
-pub struct VacantEntry<'a, K, V> {
-    entries: &'a mut Vec<(K, V)>,
-    key: K,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub struct VacantEntry<'a, K: 'a, V: 'a> {
-    inner: std::collections::hash_map::VacantEntry<'a, K, V>,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl<'a, K, V> VacantEntry<'a, K, V> {
-    pub fn insert(self, value: V) -> &'a mut V {
-        self.entries.push((self.key, value));
-        let len = self.entries.len();
-        &mut self.entries[len - 1].1
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<'a, K: 'a, V: 'a> VacantEntry<'a, K, V> {
-    pub fn insert(self, value: V) -> &'a mut V {
-        self.inner.insert(value)
-    }
-}
-
-// --- Index / IndexMut ---
-
-#[cfg(target_arch = "wasm32")]
 impl<K, V> Index<K> for ValueMap<K, V>
 where
-    K: Eq + Copy + From<LiveId>,
+    K: std::cmp::Eq + std::hash::Hash + Copy + From<LiveId>,
 {
     type Output = V;
     fn index(&self, index: K) -> &Self::Output {
@@ -266,31 +325,9 @@ where
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl<K, V> Index<K> for ValueMap<K, V>
-where
-    K: Eq + Copy + std::hash::Hash + From<LiveId>,
-{
-    type Output = V;
-    fn index(&self, index: K) -> &Self::Output {
-        self.get(&index).unwrap()
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
 impl<K, V> IndexMut<K> for ValueMap<K, V>
 where
-    K: Eq + Copy + From<LiveId>,
-{
-    fn index_mut(&mut self, index: K) -> &mut Self::Output {
-        self.get_mut(&index).unwrap()
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<K, V> IndexMut<K> for ValueMap<K, V>
-where
-    K: Eq + Copy + std::hash::Hash + From<LiveId>,
+    K: std::cmp::Eq + std::hash::Hash + Copy + From<LiveId>,
 {
     fn index_mut(&mut self, index: K) -> &mut Self::Output {
         self.get_mut(&index).unwrap()

@@ -55,7 +55,16 @@ unsafe impl Send for MidiInput {}
 
 impl MidiInput {
     pub fn receive(&mut self) -> Option<(MidiPortId, MidiData)> {
-        self.0.as_mut().unwrap().receive()
+        // Injected messages first, and before the device is touched at all,
+        // so a run with no hardware still exercises everything downstream of
+        // here. Inert — one relaxed load — until something arms it.
+        if let Some(injected) = crate::midi_inject::take_incoming() {
+            return Some(injected);
+        }
+        // A handle that was never given a backend yields nothing rather than
+        // panicking. `MidiInput` derives Default, so one exists from the
+        // moment a struct holding it is built until the app fills it in.
+        self.0.as_mut()?.receive()
     }
 }
 
@@ -65,7 +74,10 @@ unsafe impl Send for MidiOutput {}
 
 impl MidiOutput {
     pub fn send(&self, port: Option<MidiPortId>, data: MidiData) {
-        let output = self.0.as_ref().unwrap();
+        // Recorded before it goes, so what the app sends to a controller can
+        // be read back by a test with no controller to look at.
+        crate::midi_inject::record_outgoing(port.unwrap_or_default(), data);
+        let Some(output) = self.0.as_ref() else { return };
         output.send(port, data);
     }
 }
@@ -183,6 +195,8 @@ impl Into<MidiData> for MidiProgramChange {
     }
 }
 
+/// Channel pressure. Unlike polyphonic aftertouch this is a TWO-byte message:
+/// one 7-bit pressure value, so only the first data byte is part of it.
 #[derive(Clone, Copy, Debug)]
 pub struct MidiChannelAftertouch {
     pub channel: u8,
@@ -192,15 +206,14 @@ pub struct MidiChannelAftertouch {
 impl Into<MidiData> for MidiChannelAftertouch {
     fn into(self) -> MidiData {
         MidiData {
-            data: [
-                0xD0 | self.channel,
-                (((self.value as u32) >> 7) & 0x7f) as u8,
-                ((self.value as u32) & 0x7f) as u8,
-            ],
+            data: [0xD0 | self.channel, (self.value & 0x7f) as u8, 0],
         }
     }
 }
 
+/// 14-bit pitch bend, 0..=16383 with 8192 as centre. On the wire the two data
+/// bytes are LSB FIRST (status, LSB, MSB) — the opposite of the order they are
+/// usually written in, and the classic way this message gets encoded backwards.
 #[derive(Clone, Copy, Debug)]
 pub struct MidiPitchBend {
     pub channel: u8,
@@ -212,8 +225,8 @@ impl Into<MidiData> for MidiPitchBend {
         MidiData {
             data: [
                 0xE0 | self.channel,
-                (((self.bend as u32) >> 7) & 0x7f) as u8,
                 ((self.bend as u32) & 0x7f) as u8,
+                (((self.bend as u32) >> 7) & 0x7f) as u8,
             ],
         }
     }
@@ -298,11 +311,11 @@ impl MidiData {
             }),
             0xD => MidiEvent::ChannelAftertouch(MidiChannelAftertouch {
                 channel,
-                value: ((self.data[1] as u16) << 7) | self.data[2] as u16,
+                value: self.data[1] as u16,
             }),
             0xE => MidiEvent::PitchBend(MidiPitchBend {
                 channel,
-                bend: ((self.data[1] as u16) << 7) | self.data[2] as u16,
+                bend: ((self.data[2] as u16) << 7) | self.data[1] as u16,
             }),
             0xF => MidiEvent::System(MidiSystem {
                 channel,
@@ -310,6 +323,59 @@ impl MidiData {
                 lo: self.data[2],
             }),
             _ => MidiEvent::Unknown(*self),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pitch bend is little-endian on the wire: status, LSB, MSB. Encoding it
+    /// MSB-first still round-trips through our own decoder, so only a check
+    /// against the actual bytes catches it.
+    #[test]
+    fn pitch_bend_data_bytes_are_lsb_then_msb() {
+        let data: MidiData = MidiPitchBend { channel: 0, bend: 8192 }.into();
+        assert_eq!(data.data, [0xE0, 0x00, 0x40]);
+
+        // One step above centre moves the LSB only.
+        let data: MidiData = MidiPitchBend { channel: 3, bend: 8193 }.into();
+        assert_eq!(data.data, [0xE3, 0x01, 0x40]);
+
+        // Full range end points.
+        let data: MidiData = MidiPitchBend { channel: 0, bend: 0 }.into();
+        assert_eq!(data.data, [0xE0, 0x00, 0x00]);
+        let data: MidiData = MidiPitchBend { channel: 0, bend: 16383 }.into();
+        assert_eq!(data.data, [0xE0, 0x7f, 0x7f]);
+    }
+
+    #[test]
+    fn pitch_bend_round_trips_through_the_wire_bytes() {
+        for bend in [0u16, 1, 8191, 8192, 8193, 16383] {
+            let data: MidiData = MidiPitchBend { channel: 5, bend }.into();
+            match data.decode() {
+                MidiEvent::PitchBend(pb) => {
+                    assert_eq!(pb.bend, bend);
+                    assert_eq!(pb.channel, 5);
+                }
+                other => panic!("expected pitch bend, got {:?}", other),
+            }
+        }
+    }
+
+    /// Channel pressure carries one 7-bit value, so the third byte is not part
+    /// of the message and must not be folded into the value.
+    #[test]
+    fn channel_aftertouch_is_a_two_byte_message() {
+        let data: MidiData = MidiChannelAftertouch { channel: 2, value: 64 }.into();
+        assert_eq!(data.data, [0xD2, 64, 0]);
+
+        // A stale third byte must not leak into the decoded value.
+        let data = MidiData { data: [0xD2, 64, 0x7f] };
+        match data.decode() {
+            MidiEvent::ChannelAftertouch(at) => assert_eq!(at.value, 64),
+            other => panic!("expected channel aftertouch, got {:?}", other),
         }
     }
 }

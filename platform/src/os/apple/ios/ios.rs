@@ -1,22 +1,27 @@
 use {
     crate::{
         cx::{Cx, IosParams, OsType},
-        cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
+        cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace, ScreenEdges},
         draw_pass::CxDrawPassParent,
         event::{
+            drag_drop::{DragEvent, DragItem, DragResponse, DropEvent},
             video_playback::{
                 CameraPreviewMode, VideoBufferedRangesEvent, VideoDecodingErrorEvent,
                 VideoPlaybackPreparedEvent, VideoPlaybackResourcesReleasedEvent,
                 VideoSeekableRangesEvent, VideoSource, VideoTextureUpdatedEvent,
                 VideoYuvTexturesReady,
             },
-            drag_drop::{DragEvent, DragItem, DragResponse, DropEvent},
-            Event, KeyEvent, TextInputEvent, TextRangeReplaceEvent,
+            CharOffset, Event, FullTextState, KeyEvent, TextInputEvent,
+            VirtualKeyboardEvent,
         },
         makepad_live_id::*,
         makepad_objc_sys::objc_block,
         media_api::CxMediaApi,
         media_plugin::PlaybackPrepared,
+        gpu_texture::{
+            adopt_metal_nv12_biplanar, detach_metal_nv12_present, MetalNv12Frame,
+            MetalNv12PresentCache,
+        },
         os::{
             apple::{
                 apple_sys::*,
@@ -26,6 +31,7 @@ use {
                 ios::{
                     ios_app::{self, init_ios_app_global, with_ios_app, IosApp},
                     ios_event::IosEvent,
+                    ios_file_dialog,
                 },
             },
             apple_classes::init_apple_classes_global,
@@ -37,15 +43,17 @@ use {
         texture::{CxTexturePool, Texture, TextureFormat, TextureId},
         thread::SignalToUI,
         video::{
-            CameraFrameInputFn, CameraFrameLatest, CameraFrameLayout, CameraFrameRef,
-            VideoFormatId, VideoInputId, MAX_VIDEO_DEVICE_INDEX,
+            CameraColorMatrix, CameraFrameInputFn, CameraFrameLatest, CameraFrameLayout,
+            CameraFrameRef, VideoFormatId, VideoInputId, MAX_VIDEO_DEVICE_INDEX,
         },
+        video_decode::yuv::YuvColorMatrix,
         window::CxWindowPool,
         DVec2, Rect,
     },
     std::{
         cell::RefCell,
         collections::HashMap,
+        panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
         rc::Rc,
         sync::{
             mpsc::{channel, Receiver, Sender},
@@ -54,6 +62,18 @@ use {
         time::Instant,
     },
 };
+
+pub(crate) fn wake_ui_event_loop() {
+    unsafe {
+        let main_thread_block = objc_block!(move || {});
+        let main_queue: ObjcId = msg_send![class!(NSOperationQueue), mainQueue];
+        let operation: ObjcId = msg_send![
+            class!(NSBlockOperation),
+            blockOperationWithBlock: &main_thread_block
+        ];
+        let () = msg_send![main_queue, addOperation: operation];
+    }
+}
 
 pub(crate) struct IosCameraPlayer {
     video_id: LiveId,
@@ -66,7 +86,10 @@ pub(crate) struct IosCameraPlayer {
     prepare_notified: bool,
     yuv_matrix: f32,
     yuv_biplanar: bool,
+    yuv_full_range: bool,
     yuv_metal: AppleYuvMetal,
+    nv12_present: MetalNv12PresentCache,
+    gpu_frame_keep_alive: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     latest_nv12: Arc<Mutex<Option<crate::os::apple::av_capture::AvCapturePixelBuffer>>>,
     i420_frames: CameraFrameLatest,
     camera_access: Option<Arc<Mutex<crate::os::apple::av_capture::AvCaptureAccess>>>,
@@ -139,6 +162,7 @@ impl IosCameraPlayer {
         );
 
         let yuv_metal = AppleYuvMetal::new(metal_device, "iOS camera");
+        let nv12_present = MetalNv12PresentCache::new(metal_device);
 
         Self {
             video_id,
@@ -151,7 +175,10 @@ impl IosCameraPlayer {
             prepare_notified: false,
             yuv_matrix: 0.0,
             yuv_biplanar: false,
+            yuv_full_range: false,
             yuv_metal,
+            nv12_present,
+            gpu_frame_keep_alive: None,
             latest_nv12,
             i420_frames,
             camera_access: Some(camera_access),
@@ -210,21 +237,41 @@ impl IosCameraPlayer {
             self.width = frame.width as u32;
             self.height = frame.height as u32;
             self.yuv_matrix = frame.matrix.as_yuv_uniform();
-            let wrapped = self.yuv_metal.wrap_nv12_cv_pixel_buffer(
-                textures,
-                self.tex_y_id,
-                self.tex_u_id,
-                self.tex_v_id,
+            let matrix = match frame.matrix {
+                CameraColorMatrix::BT601 => YuvColorMatrix::BT601,
+                CameraColorMatrix::BT2020 => YuvColorMatrix::BT2020,
+                CameraColorMatrix::BT709 | CameraColorMatrix::Unknown => YuvColorMatrix::BT709,
+            };
+            if let Some(gpu) = MetalNv12Frame::from_owned_cv_pixel_buffer(
                 frame.pixel_buffer,
-                frame.width as u32,
-                frame.height as u32,
-            );
-            unsafe {
-                CVPixelBufferRelease(frame.pixel_buffer);
-            }
-            if wrapped {
-                self.yuv_biplanar = true;
-                return true;
+                self.width,
+                self.height,
+                matrix,
+            ) {
+                match adopt_metal_nv12_biplanar(
+                    textures,
+                    self.tex_y_id,
+                    self.tex_u_id,
+                    self.tex_v_id,
+                    &gpu,
+                    &mut self.nv12_present,
+                ) {
+                    Ok(()) => {
+                        self.gpu_frame_keep_alive = Some(gpu.keep_alive.clone());
+                        self.yuv_biplanar = true;
+                        self.yuv_full_range = gpu.full_range;
+                        return true;
+                    }
+                    Err(err) => {
+                        crate::error!("VIDEO: iOS camera Metal NV12 adopt failed: {err}");
+                        // Keep the previous zero-copy frame; `gpu` drop only
+                        // releases this failed buffer. Fall through to I420.
+                    }
+                }
+            } else {
+                unsafe {
+                    CVPixelBufferRelease(frame.pixel_buffer);
+                }
             }
         }
 
@@ -241,19 +288,43 @@ impl IosCameraPlayer {
         let cw = width.div_ceil(2);
         let ch = height.div_ceil(2);
 
+        // Leaving biplanar Metal wraps live while uploading Ru8 U/V would reuse
+        // an RGu8 UV (and IOSurface-backed Y) texture — detach first.
+        detach_metal_nv12_present(
+            textures,
+            self.tex_y_id,
+            self.tex_u_id,
+            &mut self.nv12_present,
+        );
+        self.gpu_frame_keep_alive = None;
+
         self.yuv_metal.upload_r8_plane(
             textures,
             self.tex_y_id,
             &frame.planes[0].bytes,
             width,
             height,
+            width,
         );
-        self.yuv_metal
-            .upload_r8_plane(textures, self.tex_u_id, &frame.planes[1].bytes, cw, ch);
-        self.yuv_metal
-            .upload_r8_plane(textures, self.tex_v_id, &frame.planes[2].bytes, cw, ch);
+        self.yuv_metal.upload_r8_plane(
+            textures,
+            self.tex_u_id,
+            &frame.planes[1].bytes,
+            cw,
+            ch,
+            cw,
+        );
+        self.yuv_metal.upload_r8_plane(
+            textures,
+            self.tex_v_id,
+            &frame.planes[2].bytes,
+            cw,
+            ch,
+            cw,
+        );
 
         self.yuv_biplanar = false;
+        self.yuv_full_range = false;
         self.yuv_matrix = frame.matrix.as_yuv_uniform();
 
         true
@@ -267,6 +338,10 @@ impl IosCameraPlayer {
         }
     }
 
+    fn yuv_full_range(&self) -> bool {
+        self.yuv_full_range
+    }
+
     fn cleanup(&mut self) {
         if let Some(frame) = self.latest_nv12.lock().unwrap().take() {
             unsafe {
@@ -274,6 +349,8 @@ impl IosCameraPlayer {
             }
         }
 
+        self.nv12_present.release_textures();
+        self.gpu_frame_keep_alive = None;
         self.yuv_metal.cleanup();
 
         if let Some(cam) = self.camera_access.take() {
@@ -356,8 +433,47 @@ impl Drop for IosNativeCameraPreview {
     }
 }
 
+fn ios_panic_summary(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = if let Some(payload) = info.payload().downcast_ref::<&str>() {
+        (*payload).to_string()
+    } else if let Some(payload) = info.payload().downcast_ref::<String>() {
+        payload.clone()
+    } else {
+        "non-string panic payload".to_string()
+    };
+    let location = info
+        .location()
+        .map(|location| {
+            format!(
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            )
+        })
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let thread = std::thread::current();
+    let thread_name = thread.name().unwrap_or("<unnamed>");
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    format!(
+        "iOS panic hook: thread={thread_name} location={location} payload={payload}\n{backtrace}"
+    )
+}
+
+/// The default hook writes to stderr, which goes nowhere on a device, so route
+/// panics through `error!` (NSLog) while the panicking frame is still on the stack.
+fn install_ios_panic_hook() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::error!("{}", ios_panic_summary(info));
+        previous_hook(info);
+    }));
+}
+
 impl Cx {
     pub fn event_loop(cx: Rc<RefCell<Cx>>) {
+        install_ios_panic_hook();
+
         let data_path = IosApp::get_ios_directory_paths();
 
         // Get device info
@@ -393,16 +509,36 @@ impl Cx {
                 move |event| {
                     let mut cx_ref = cx.borrow_mut();
                     let mut metal_cx = metal_cx.borrow_mut();
-                    let event_flow = cx_ref.ios_event_callback(event, &mut metal_cx);
+                    // `do_callback` catches what unwinds out of here and
+                    // goes on with the next event; `Cx` is put back in
+                    // order first, so that next event finds it consistent.
+                    let event_flow = match catch_unwind(AssertUnwindSafe(|| {
+                        cx_ref.ios_event_callback(event, &mut metal_cx)
+                    })) {
+                        Ok(event_flow) => event_flow,
+                        Err(payload) => {
+                            cx_ref.recover_after_caught_panic();
+                            drop(metal_cx);
+                            drop(cx_ref);
+                            resume_unwind(payload);
+                        }
+                    };
                     let executor = cx_ref.executor.take().unwrap();
                     drop(cx_ref);
-                    executor.run_until_stalled();
+                    // Put the executor back even if a spawned task panics, so
+                    // the `take` above can't hand a `None` to the next event.
+                    let stalled = catch_unwind(AssertUnwindSafe(|| executor.run_until_stalled()));
                     let mut cx_ref = cx.borrow_mut();
                     cx_ref.executor = Some(executor);
+                    drop(cx_ref);
+                    if let Err(payload) = stalled {
+                        resume_unwind(payload);
+                    }
                     event_flow
                 }
             }),
         );
+        cx.borrow_mut().publish_metal_device_for_media();
         // lets set our signal poll timer
 
         // final bit of initflow
@@ -411,11 +547,21 @@ impl Cx {
     }
 
     pub(crate) fn handle_repaint(&mut self, metal_cx: &mut MetalCx) {
+        // Bound whole repaints by GPU completion, as the macOS present gate
+        // does: MTKView beats on regardless, and a phone shell's frame is
+        // ~30 command buffers that would otherwise queue past the pool.
+        metal_cx.begin_repaint();
+        if metal_cx.frames_in_flight() >= crate::os::apple::metal::REPAINTS_IN_FLIGHT_MAX {
+            metal_cx.backpressure_skips = metal_cx.backpressure_skips.saturating_add(1);
+            return;
+        }
         let mut passes_todo = Vec::new();
         self.compute_pass_repaint_order(&mut passes_todo);
         self.repaint_id += 1;
         for draw_pass_id in &passes_todo {
-            self.passes[*draw_pass_id].set_time(with_ios_app(|app| app.time_now() as f32));
+            let uniforms_gen = self.next_uniform_gen();
+            self.passes[*draw_pass_id]
+                .set_time(with_ios_app(|app| app.time_now() as f32), uniforms_gen);
             match self.passes[*draw_pass_id].parent.clone() {
                 CxDrawPassParent::Xr => {}
                 CxDrawPassParent::Window(window_id) => {
@@ -427,7 +573,7 @@ impl Cx {
                     self.draw_pass(*draw_pass_id, metal_cx, DrawPassMode::MTKView(mtk_view));
 
                     // Draw popup window passes as overlays on the same MTKView
-                    for popup_pass_id in &passes_todo.clone() {
+                    for popup_pass_id in &passes_todo {
                         if let CxDrawPassParent::Window(pw_id) = self.passes[*popup_pass_id].parent
                         {
                             let pw = &self.windows[pw_id];
@@ -451,21 +597,27 @@ impl Cx {
             }
         }
 
-        let timestamp_ns = self
-            .os
-            .start_time
-            .map(|start| Instant::now().duration_since(start).as_nanos() as u64)
-            .unwrap_or(0);
-        for index in 0..MAX_VIDEO_DEVICE_INDEX {
-            if let Err(err) = self.video_encoder_capture_texture_frame(index, timestamp_ns) {
-                if err != crate::video::VideoEncodeError::UnsupportedSource
-                    && err != crate::video::VideoEncodeError::EncoderNotStarted
-                {
-                    crate::error!(
-                        "ios video texture capture failed on slot {}: {:?}",
-                        index,
-                        err
-                    );
+        // Only sweep encoder slots if an encoder's actually been set up.
+        // Otherwise we'd burn 32 mutex locks per frame on every iOS app,
+        // and the very first call would lazy-init AvCaptureAccess and
+        // trigger the camera permission prompt for apps that never use it.
+        if self.os.media.av_capture.is_some() {
+            let timestamp_ns = self
+                .os
+                .start_time
+                .map(|start| Instant::now().duration_since(start).as_nanos() as u64)
+                .unwrap_or(0);
+            for index in 0..MAX_VIDEO_DEVICE_INDEX {
+                if let Err(err) = self.video_encoder_capture_texture_frame(index, timestamp_ns) {
+                    if err != crate::video::VideoEncodeError::UnsupportedSource
+                        && err != crate::video::VideoEncodeError::EncoderNotStarted
+                    {
+                        crate::error!(
+                            "ios video texture capture failed on slot {}: {:?}",
+                            index,
+                            err
+                        );
+                    }
                 }
             }
         }
@@ -481,6 +633,39 @@ impl Cx {
         }
     }
 
+    fn drain_ios_text_events(&mut self) {
+        let queued_events = with_ios_app(|app| std::mem::take(&mut app.queued_text_events));
+        let time = with_ios_app(|app| app.time_now());
+        for queued_event in queued_events {
+            match queued_event {
+                ios_app::IosTextInputEvent::SelectionChanged(text, start, end, composition) => {
+                    self.call_event_handler(&Event::TextInput(TextInputEvent {
+                        full_state_sync: Some(FullTextState {
+                            text,
+                            selection: CharOffset(start)..CharOffset(end),
+                            composition: composition.map(|(start, end)| CharOffset(start)..CharOffset(end)),
+                        }),
+                        ..Default::default()
+                    }));
+                }
+                ios_app::IosTextInputEvent::KeyEvent(key_code) => {
+                    self.call_event_handler(&Event::KeyDown(KeyEvent {
+                        key_code,
+                        is_repeat: false,
+                        modifiers: Default::default(),
+                        time,
+                    }));
+                    self.call_event_handler(&Event::KeyUp(KeyEvent {
+                        key_code,
+                        is_repeat: false,
+                        modifiers: Default::default(),
+                        time,
+                    }));
+                }
+            }
+        }
+    }
+
     fn ios_event_callback(&mut self, event: IosEvent, metal_cx: &mut MetalCx) -> EventFlow {
         self.handle_platform_ops(metal_cx);
 
@@ -493,47 +678,47 @@ impl Cx {
                 if te.timer_id == 0 {
                     let vk = with_ios_app(|app| app.virtual_keyboard_event.take());
                     if let Some(vk) = vk {
-                        self.call_event_handler(&Event::VirtualKeyboard(vk));
-                    }
-                    // Drain iOS text events as one batch to avoid re-entrancy from UITextInput callbacks.
-                    let queued_events =
-                        with_ios_app(|app| std::mem::take(&mut app.queued_text_events));
-                    let time = with_ios_app(|app| app.time_now());
-                    for queued_event in queued_events {
-                        match queued_event {
-                            ios_app::IosTextInputEvent::TextInput(input, replace_last) => {
-                                self.call_event_handler(&Event::TextInput(TextInputEvent {
-                                    input,
-                                    replace_last,
-                                    was_paste: false,
-                                    ..Default::default()
-                                }));
-                            }
-                            ios_app::IosTextInputEvent::RangeReplace(start, end, text) => {
-                                self.call_event_handler(&Event::TextRangeReplace(
-                                    TextRangeReplaceEvent { start, end, text },
-                                ));
-                            }
-                            ios_app::IosTextInputEvent::KeyEvent(key_code) => {
-                                self.call_event_handler(&Event::KeyDown(KeyEvent {
-                                    key_code,
-                                    is_repeat: false,
-                                    modifiers: Default::default(),
-                                    time,
-                                }));
-                                self.call_event_handler(&Event::KeyUp(KeyEvent {
-                                    key_code,
-                                    is_repeat: false,
-                                    modifiers: Default::default(),
-                                    time,
-                                }));
+                        let window_id = CxWindowPool::id_zero();
+                        let vk =
+                            self.windows[window_id].native_virtual_keyboard_event_to_layout(vk);
+                        // When the keyboard is going away (user pressed iOS's
+                        // "hide keyboard" button, an external keyboard was
+                        // attached, an inputAccessoryView triggered hide,
+                        // etc.), mark the IME as dismissed so the focused
+                        // TextInput's next `show_text_ime_with_config` call
+                        // is a no-op. Without this, the input still has key
+                        // focus, redraws on the same frame, calls
+                        // `show_text_ime`, and the keyboard pops back up
+                        // (sometimes flipping to whatever language was
+                        // selected last). The flag is cleared automatically
+                        // the next time the user taps a field - see
+                        // `CxKeyboard::set_key_focus`.
+                        if matches!(
+                            vk,
+                            VirtualKeyboardEvent::WillHide { .. }
+                                | VirtualKeyboardEvent::DidHide { .. }
+                        ) {
+                            // With a physical keyboard, iOS auto-hides the soft
+                            // keyboard while the field stays first responder; marking
+                            // the IME dismissed there would freeze set_ime_position
+                            // (and the accent popup) at the focus-time spot.
+                            let has_physical_keyboard =
+                                with_ios_app(|app| app.physical_keyboard_connected());
+                            if !has_physical_keyboard {
+                                self.keyboard.set_text_ime_dismissed();
                             }
                         }
+                        self.call_event_handler(&Event::VirtualKeyboard(vk));
                     }
+                    self.drain_ios_text_events();
                     // check signals
-                    if SignalToUI::check_and_clear_ui_signal() {
+                    let internal_signal = SignalToUI::check_and_clear_internal_signal();
+                    let ui_signal = SignalToUI::check_and_clear_ui_signal();
+                    if internal_signal || ui_signal {
                         self.handle_media_signals();
                         self.handle_script_signals();
+                    }
+                    if ui_signal {
                         self.call_event_handler(&Event::Signal);
                     }
                     if SignalToUI::check_and_clear_action_signal() {
@@ -542,7 +727,14 @@ impl Cx {
 
                     self.run_live_edit_if_needed("ios");
                     self.handle_networking_events();
+                    // The studio control channel and the `--remote` bridge
+                    // (grabs, snapshots, injected input, the log tail): every
+                    // backend services them from its tick through this one call.
+                    self.poll_control_channel();
                     self.handle_permission_events();
+                } else if te.timer_id == ios_app::IOS_TEXT_EVENT_DRAIN_TIMER_ID {
+                    with_ios_app(|app| app.text_event_drain_timer_scheduled = false);
+                    self.drain_ios_text_events();
                 }
             }
             _ => (),
@@ -555,6 +747,9 @@ impl Cx {
             }
             IosEvent::Init => {
                 with_ios_app(|app| app.start_timer(0, 0.008, true));
+                let physical_keyboard_connected =
+                    with_ios_app(|app| app.physical_keyboard_connected());
+                self.set_physical_keyboard_state(physical_keyboard_connected);
                 self.start_studio_websocket_delayed();
                 // Populate display_context and script heap with safe area insets
                 // BEFORE Startup, so app script_mod! definitions can use them.
@@ -563,7 +758,32 @@ impl Cx {
                 self.display_context.safe_area_insets = geom.safe_area_insets;
                 self.update_safe_inset_script_values(geom.safe_area_insets);
                 self.call_event_handler(&Event::Startup);
+                self.call_event_handler(&Event::Foreground);
                 self.redraw_all();
+            }
+            IosEvent::Foreground => {
+                if let Some(event) = with_ios_app(|app| app.sync_physical_keyboard_state()) {
+                    self.update_physical_keyboard_state(event.connected);
+                }
+                self.call_event_handler(&Event::Foreground);
+                self.redraw_all();
+            }
+            IosEvent::Background => {
+                self.call_event_handler(&Event::Background);
+            }
+            IosEvent::Pause => {
+                self.call_event_handler(&Event::Pause);
+            }
+            IosEvent::Resume => {
+                if let Some(event) = with_ios_app(|app| app.sync_physical_keyboard_state()) {
+                    self.update_physical_keyboard_state(event.connected);
+                }
+                self.call_event_handler(&Event::Resume);
+                self.redraw_all();
+            }
+            IosEvent::Shutdown => {
+                self.call_event_handler(&Event::Shutdown);
+                return EventFlow::Exit;
             }
             IosEvent::WindowGotFocus(window_id) => {
                 // repaint all window passes. Metal sometimes doesnt flip buffers when hidden/no focus
@@ -573,9 +793,11 @@ impl Cx {
             IosEvent::WindowLostFocus(window_id) => {
                 self.call_event_handler(&Event::WindowLostFocus(window_id));
             }
-            IosEvent::WindowGeomChange(re) => {
+            IosEvent::WindowGeomChange(mut re) => {
                 let window_id = CxWindowPool::id_zero();
                 let window = &mut self.windows[window_id];
+                window.os_dpi_factor = Some(re.new_geom.dpi_factor);
+                re.new_geom = window.native_window_geom_to_layout(re.new_geom);
                 window.window_geom = re.new_geom.clone();
                 self.call_event_handler(&Event::WindowGeomChange(re));
                 self.redraw_all();
@@ -641,11 +863,15 @@ impl Cx {
                                     video_id: player.video_id,
                                     current_position_ms: player.current_position_ms(),
                                     yuv: crate::event::video_playback::VideoYuvMetadata {
-                                        enabled: player.is_software_mode(),
+                                        enabled: player.yuv_shader_enabled(),
                                         matrix: player.yuv_matrix(),
                                         biplanar: player.yuv_biplanar() > 0.5,
+                                        full_range: player.yuv_full_range(),
                                         rotation_steps: 0.0,
+                                    external: false,
+                                    array: false,
                                     },
+                                rgba_gl_2d: false,
                                 },
                             ));
                         }
@@ -700,8 +926,12 @@ impl Cx {
                                         enabled: true,
                                         matrix: player.yuv_matrix,
                                         biplanar: player.yuv_biplanar() > 0.5,
+                                        full_range: player.yuv_full_range(),
                                         rotation_steps: 0.0,
+                                    external: false,
+                                    array: false,
                                     },
+                                rgba_gl_2d: false,
                                 },
                             ));
                         }
@@ -718,11 +948,69 @@ impl Cx {
                 if self.need_redrawing() {
                     self.call_draw_event(time_now);
                     self.mtl_compile_shaders(&metal_cx);
+                    // The draw just pushed ShowTextIME with the live caret; drain it
+                    // now so set_ime_position re-parks the bridge view this frame
+                    // instead of stranding the op until a later callback (which
+                    // froze the IME caret at its focus-time position).
+                    self.handle_platform_ops(metal_cx);
                 }
                 // ok here we send out to all our childprocesses
                 self.handle_repaint(metal_cx);
+
+                // Run script-VM garbage collection at a safe point after paint, matching
+                // the macOS backend, so the script object heap doesn't grow without bound:
+                // every `eval` / `script_apply_eval!` allocates script objects that are
+                // only reclaimed by `gc()`. `needs_gc()` gates the actual sweep.
+                self.with_vm(|vm| {
+                    if vm.heap().needs_gc() {
+                        vm.gc();
+                    }
+                });
             }
-            IosEvent::TouchUpdate(e) => {
+            IosEvent::TouchCancel(e) => {
+                // `touchesCancelled`: the stopped touches were taken away, not
+                // lifted. Each is cancelled for every capture, dispatched as
+                // `Event::FingerCancel` (raw consumers see a cancel, never a
+                // release; an internal drag ends with no drop) and retired.
+                // Touches still down in the same batch go on as usual.
+                let (stopped, rest): (Vec<_>, Vec<_>) =
+                    e.touches.iter().cloned().partition(|t| t.state == crate::event::TouchState::Stop);
+                let window = &self.windows[e.window_id];
+                let stopped: Vec<_> = stopped
+                    .into_iter()
+                    .map(|mut t| {
+                        t.abs = window.native_vec2d_to_layout(t.abs);
+                        t.radius = window.native_vec2d_to_layout(t.radius);
+                        t
+                    })
+                    .collect();
+                for t in &stopped {
+                    let digit_id: crate::event::DigitId = crate::makepad_live_id::live_id_num!(touch, t.uid).into();
+                    self.fingers.cancel_digit(digit_id);
+                    self.call_event_handler(&Event::FingerCancel(crate::event::FingerCancelEvent {
+                        window_id: e.window_id,
+                        digit_id,
+                        device: crate::event::DigitDevice::Touch { uid: t.uid },
+                        abs: t.abs,
+                        time: e.time,
+                        modifiers: e.modifiers,
+                    }));
+                }
+                if !stopped.is_empty() && self.os.internal_drag_items.take().is_some() {
+                    self.call_event_handler(&Event::DragEnd);
+                    self.drag_drop.cycle_drag();
+                }
+                self.fingers.process_touch_update_end(&stopped);
+                if !rest.is_empty() {
+                    return self.ios_event_callback(IosEvent::TouchUpdate(crate::event::TouchUpdateEvent { touches: rest, ..e }), metal_cx);
+                }
+            }
+            IosEvent::TouchUpdate(mut e) => {
+                let window = &self.windows[e.window_id];
+                for touch in e.touches.iter_mut() {
+                    touch.abs = window.native_vec2d_to_layout(touch.abs);
+                    touch.radius = window.native_vec2d_to_layout(touch.radius);
+                }
                 // Check for outside-click popup dismiss on touch start
                 if e.touches
                     .iter()
@@ -746,9 +1034,11 @@ impl Cx {
 
                 // Synthesize internal drag-and-drop events from touch gestures.
                 if self.os.internal_drag_items.is_some() {
-                    if let Some(touch) = e.touches.iter().find(|t| {
-                        t.state == crate::event::TouchState::Stop
-                    }) {
+                    if let Some(touch) = e
+                        .touches
+                        .iter()
+                        .find(|t| t.state == crate::event::TouchState::Stop)
+                    {
                         if let Some(items) = self.os.internal_drag_items.take() {
                             self.call_event_handler(&Event::Drop(DropEvent {
                                 modifiers: e.modifiers.clone(),
@@ -760,9 +1050,11 @@ impl Cx {
                             self.call_event_handler(&Event::DragEnd);
                             self.drag_drop.cycle_drag();
                         }
-                    } else if let Some(touch) = e.touches.iter().find(|t| {
-                        t.state == crate::event::TouchState::Move
-                    }) {
+                    } else if let Some(touch) = e
+                        .touches
+                        .iter()
+                        .find(|t| t.state == crate::event::TouchState::Move)
+                    {
                         if let Some(items) = self.os.internal_drag_items.as_ref() {
                             self.call_event_handler(&Event::Drag(DragEvent {
                                 modifiers: e.modifiers.clone(),
@@ -778,10 +1070,12 @@ impl Cx {
 
                 self.fingers.process_touch_update_end(&e.touches);
             }
-            IosEvent::LongPress(e) => {
+            IosEvent::LongPress(mut e) => {
+                e.abs = self.windows[e.window_id].native_vec2d_to_layout(e.abs);
                 self.call_event_handler(&Event::LongPress(e.into()));
             }
-            IosEvent::MouseDown(e) => {
+            IosEvent::MouseDown(mut e) => {
+                e.abs = self.windows[e.window_id].native_vec2d_to_layout(e.abs);
                 // Check for outside-click popup dismiss
                 if let Some(popup_window_id) = self.find_popup_to_dismiss_on_mouse(e.abs) {
                     self.dismiss_popup_window(
@@ -793,25 +1087,37 @@ impl Cx {
                 self.fingers.mouse_down(e.button, e.window_id);
                 self.call_event_handler(&Event::MouseDown(e.into()))
             }
-            IosEvent::MouseMove(e) => {
+            IosEvent::MouseMove(mut e) => {
+                e.abs = self.windows[e.window_id].native_vec2d_to_layout(e.abs);
                 self.call_event_handler(&Event::MouseMove(e.into()));
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
                 self.fingers.switch_captures();
             }
-            IosEvent::MouseUp(e) => {
+            IosEvent::MouseUp(mut e) => {
+                e.abs = self.windows[e.window_id].native_vec2d_to_layout(e.abs);
                 let button = e.button;
                 self.call_event_handler(&Event::MouseUp(e.into()));
                 self.fingers.mouse_up(button);
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
             }
-            IosEvent::Scroll(e) => self.call_event_handler(&Event::Scroll(e.into())),
+            IosEvent::Scroll(mut e) => {
+                e.abs = self.windows[e.window_id].native_vec2d_to_layout(e.abs);
+                self.call_event_handler(&Event::Scroll(e.into()));
+            }
             IosEvent::TextInput(e) => self.call_event_handler(&Event::TextInput(e)),
             IosEvent::TextRangeReplace(e) => self.call_event_handler(&Event::TextRangeReplace(e)),
-            IosEvent::SelectionHandleDrag(e) => {
+            IosEvent::SelectionHandleDrag(mut e) => {
+                e.abs = self.windows[CxWindowPool::id_zero()].native_vec2d_to_layout(e.abs);
                 self.call_event_handler(&Event::SelectionHandleDrag(e))
             }
+            IosEvent::PhysicalKeyboard(e) => {
+                self.update_physical_keyboard_state(e.connected);
+            }
 
-            IosEvent::KeyDown(e) => {
+            IosEvent::KeyDown(mut e) => {
+                // A held hardware key can re-fire KeyDown without an intervening
+                // release, so an already-down key marks this event as a repeat.
+                e.is_repeat = self.keyboard.is_key_down(e.key_code);
                 self.keyboard.process_key_down(e.clone());
                 self.call_event_handler(&Event::KeyDown(e))
             }
@@ -822,7 +1128,7 @@ impl Cx {
             IosEvent::TextCopy(e) => self.call_event_handler(&Event::TextCopy(e)),
             IosEvent::TextCut(e) => self.call_event_handler(&Event::TextCut(e)),
             IosEvent::Timer(e) => {
-                if e.timer_id != 0 {
+                if e.timer_id != 0 && e.timer_id != ios_app::IOS_TEXT_EVENT_DRAIN_TIMER_ID {
                     self.handle_script_timer(&e);
                     self.call_event_handler(&Event::Timer(e))
                 }
@@ -832,12 +1138,14 @@ impl Cx {
             }
         }
 
-        // If a script re-apply was requested (e.g., safe area insets changed
-        // on rotation), fire LiveEdit now that all event handlers have returned.
-        if self.pending_script_reapply {
-            self.pending_script_reapply = false;
-            self.call_event_handler(&Event::LiveEdit);
-            self.redraw_all();
+        // After every event, drain any pending re-apply. The cheap gate
+        // (both flags false) keeps the hot path zero-cost; everything
+        // else — picking the right `Event` variant for each flag,
+        // skipping shader-cache reset for manual triggers, deferring a
+        // same-tick `ScriptReapply` follow-up to keep rotation light —
+        // is documented in `run_live_edit_if_needed`.
+        if self.pending_script_reapply || self.pending_live_edit_request {
+            self.run_live_edit_if_needed("ios");
         }
 
         if self.any_passes_dirty()
@@ -855,7 +1163,7 @@ impl Cx {
     }
 
     fn handle_platform_ops(&mut self, metal_cx: &MetalCx) {
-        while let Some(op) = self.platform_ops.pop() {
+        while let Some(op) = self.platform_ops.pop_front() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     let window = &mut self.windows[window_id];
@@ -882,9 +1190,24 @@ impl Cx {
                     window.popup_grab_keyboard = grab_keyboard;
                     window.is_created = true;
                 }
-                CxOsOp::ShowTextIME(_area, pos, config) => {
-                    IosApp::set_ime_position(pos);
+                CxOsOp::ShowTextIME(area, cursor_rect, config) => {
+                    let window_id = CxWindowPool::id_zero();
+                    // iOS can't take the full line box without UIKit drawing a
+                    // native caret from it, so it keeps its caret-free anchoring
+                    // (see ios_text_input.rs) rather than the box-based approach the
+                    // desktop backends use. We still pass the caret-line bottom
+                    // (same point the pre-rect code sent) plus the real line height
+                    // (native points) so the candidate clearance scales with font.
+                    let area_pos = area.clipped_rect(self).pos;
+                    let line_top = self.windows[window_id]
+                        .layout_vec2d_to_native_points(area_pos + cursor_rect.pos);
+                    let caret = self.windows[window_id]
+                        .layout_vec2d_to_native_points(area_pos + cursor_rect.pos + cursor_rect.size);
+                    let line_height = caret.y - line_top.y;
+                    // configure_keyboard may recreate the view; set_ime_position must
+                    // run after so it frames the final view (same-frame parking).
                     IosApp::configure_keyboard(&config);
+                    IosApp::set_ime_position(caret, line_height);
                     IosApp::show_keyboard();
                 }
                 CxOsOp::HideTextIME => {
@@ -893,9 +1216,14 @@ impl Cx {
                 CxOsOp::SyncImeState {
                     text,
                     selection,
-                    composition: _,
+                    composition,
                 } => {
-                    IosApp::set_ime_text(text, selection.end.0);
+                    IosApp::set_ime_text(
+                        text,
+                        selection.start.0,
+                        selection.end.0,
+                        composition.map(|composition| (composition.start.0, composition.end.0)),
+                    );
                 }
                 CxOsOp::StartTimer {
                     timer_id,
@@ -919,6 +1247,12 @@ impl Cx {
                 } => {
                     self.handle_permission_request(permission, request_id);
                 }
+                CxOsOp::StartLocationUpdates => {
+                    self.apple_start_location_updates();
+                }
+                CxOsOp::StopLocationUpdates => {
+                    self.apple_stop_location_updates();
+                }
                 CxOsOp::HttpRequest {
                     request_id,
                     request,
@@ -933,6 +1267,10 @@ impl Cx {
                     rect,
                     keyboard_shift,
                 } => {
+                    let window_id = CxWindowPool::id_zero();
+                    let window = &self.windows[window_id];
+                    let rect = window.layout_rect_to_native_points(rect);
+                    let keyboard_shift = window.layout_points_to_native_points(keyboard_shift);
                     IosApp::show_clipboard_actions(has_selection, rect, keyboard_shift);
                 }
                 CxOsOp::HideClipboardActions => {
@@ -943,9 +1281,17 @@ impl Cx {
                 }
                 CxOsOp::SetPrimarySelection(_) => {}
                 CxOsOp::ShowSelectionHandles { start, end } => {
+                    let window_id = CxWindowPool::id_zero();
+                    let window = &self.windows[window_id];
+                    let start = window.layout_vec2d_to_native_points(start);
+                    let end = window.layout_vec2d_to_native_points(end);
                     IosApp::show_selection_handles(start, end);
                 }
                 CxOsOp::UpdateSelectionHandles { start, end } => {
+                    let window_id = CxWindowPool::id_zero();
+                    let window = &self.windows[window_id];
+                    let start = window.layout_vec2d_to_native_points(start);
+                    let end = window.layout_vec2d_to_native_points(end);
                     IosApp::update_selection_handles(start, end);
                 }
                 CxOsOp::HideSelectionHandles => {
@@ -953,10 +1299,10 @@ impl Cx {
                 }
                 CxOsOp::AccessibilityUpdate(_) => {}
                 CxOsOp::FullscreenWindow(_window_id) => {
-                    with_ios_app(|app| app.set_fullscreen(true));
+                    IosApp::set_fullscreen(true);
                 }
                 CxOsOp::NormalizeWindow(_window_id) => {
-                    with_ios_app(|app| app.set_fullscreen(false));
+                    IosApp::set_fullscreen(false);
                 }
                 CxOsOp::SetCursor(_) => {
                     // no need
@@ -999,18 +1345,18 @@ impl Cx {
                     visible,
                 } => {
                     let rect = area.clipped_rect(self);
-                    with_ios_app(|app| {
-                        let Some(mtk_view) = app.mtk_view else {
-                            return;
-                        };
+                    // Extract mtk_view inside a short borrow, then do UIKit
+                    // view hierarchy ops outside — addSubview/removeFromSuperview/
+                    // setFrame can trigger layout callbacks that re-enter IOS_APP.
+                    let mtk_view = with_ios_app(|app| app.mtk_view);
+                    if let Some(mtk_view) = mtk_view {
                         let host_view: ObjcId = unsafe { msg_send![mtk_view, superview] };
-                        if host_view == nil {
-                            return;
+                        if host_view != nil {
+                            if let Some(browser) = self.os.system_browsers.get_mut(&browser_id) {
+                                browser.update(host_view, rect, visible);
+                            }
                         }
-                        if let Some(browser) = self.os.system_browsers.get_mut(&browser_id) {
-                            browser.update(host_view, rect, visible);
-                        }
-                    });
+                    }
                 }
                 CxOsOp::DetachSystemBrowser { browser_id } => {
                     if let Some(browser) = self.os.system_browsers.get_mut(&browser_id) {
@@ -1116,12 +1462,7 @@ impl Cx {
                         );
                         self.os.camera_players.insert(video_id, player);
                         self.call_event_handler(&Event::VideoYuvTexturesReady(
-                            VideoYuvTexturesReady {
-                                video_id,
-                                tex_y,
-                                tex_u,
-                                tex_v,
-                            },
+                            VideoYuvTexturesReady::planes(video_id, tex_y, tex_u, tex_v),
                         ));
                         continue;
                     }
@@ -1146,12 +1487,7 @@ impl Cx {
                         should_loop,
                     );
                     self.os.video_players.insert(video_id, player);
-                    self.call_event_handler(&Event::VideoYuvTexturesReady(VideoYuvTexturesReady {
-                        video_id,
-                        tex_y,
-                        tex_u,
-                        tex_v,
-                    }));
+                    self.call_event_handler(&Event::VideoYuvTexturesReady(VideoYuvTexturesReady::planes(video_id, tex_y, tex_u, tex_v)));
                 }
                 CxOsOp::BeginVideoPlayback(video_id) => {
                     if self.os.camera_players.contains_key(&video_id)
@@ -1256,6 +1592,8 @@ impl Cx {
                         player.set_playback_rate(rate);
                     }
                 }
+                // Track selection is currently implemented on Linux GStreamer only.
+                CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
                 CxOsOp::PrepareAudioPlayback(video_id, source, autoplay, should_loop) => {
                     use crate::texture::TextureId;
                     let player = AppleUnifiedVideoPlayer::new(
@@ -1284,6 +1622,29 @@ impl Cx {
                 CxOsOp::StartDragging(items) => {
                     self.os.internal_drag_items = Some(Arc::new(items));
                 }
+                CxOsOp::StartExternalDragging { .. } => {
+                    crate::error!("external file dragging is not implemented on iOS");
+                    self.call_event_handler(&Event::DragEnd);
+                }
+                CxOsOp::SelectFileDialog(settings) => {
+                    ios_file_dialog::open_select_file_dialog(settings);
+                }
+                CxOsOp::SaveFileDialog(settings) => {
+                    ios_file_dialog::open_save_file_dialog(settings);
+                }
+                CxOsOp::SelectFolderDialog(settings) => {
+                    ios_file_dialog::open_select_folder_dialog(settings);
+                }
+                CxOsOp::SaveFolderDialog(settings) => {
+                    ios_file_dialog::open_save_folder_dialog(settings);
+                }
+                CxOsOp::SetSystemBarDarkIcons(dark_icons) => {
+                    IosApp::set_status_bar_dark_icons(dark_icons);
+                }
+                CxOsOp::DeferSystemGestures(edges) => {
+                    IosApp::set_deferred_system_gesture_edges(ui_rect_edges(edges));
+                }
+                CxOsOp::SetWindowTitle(_, _) => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
@@ -1291,6 +1652,26 @@ impl Cx {
         }
     }
 
+}
+
+/// `UIRectEdge` bits (UIKit: top 1, left 2, bottom 4, right 8) for a
+/// [`ScreenEdges`] set.
+fn ui_rect_edges(edges: ScreenEdges) -> u64 {
+    let mut bits = 0u64;
+    for (edge, bit) in [
+        (ScreenEdges::TOP, 1u64),
+        (ScreenEdges::LEFT, 2),
+        (ScreenEdges::BOTTOM, 4),
+        (ScreenEdges::RIGHT, 8),
+    ] {
+        if edges.contains(edge) {
+            bits |= bit;
+        }
+    }
+    bits
+}
+
+impl Cx {
     /*
     let _ = self.live_file_change_sender.send(vec![LiveFileChange{
         file_name:file_name.to_string(),
@@ -1336,6 +1717,7 @@ impl Cx {
             crate::permission::Permission::SceneAccess => {
                 crate::permission::PermissionStatus::DeniedPermanent
             }
+            crate::permission::Permission::Location => Self::apple_location_permission_status(),
         };
 
         self.call_event_handler(&crate::event::Event::PermissionResult(
@@ -1361,6 +1743,7 @@ impl Cx {
             crate::permission::Permission::SceneAccess => {
                 crate::permission::PermissionStatus::DeniedPermanent
             }
+            crate::permission::Permission::Location => Self::apple_location_permission_status(),
         };
         match status {
             crate::permission::PermissionStatus::NotDetermined => match permission {
@@ -1372,6 +1755,9 @@ impl Cx {
                 }
                 crate::permission::Permission::HeadsetCamera => {}
                 crate::permission::Permission::SceneAccess => {}
+                crate::permission::Permission::Location => {
+                    self.apple_request_location_permission(request_id);
+                }
             },
             _ => {
                 self.call_event_handler(&crate::event::Event::PermissionResult(
@@ -1524,13 +1910,6 @@ impl CxOsApi for Cx {
         self.apple_bundle_load_dependencies();
     }
 
-    fn spawn_thread<F>(&mut self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        std::thread::spawn(f);
-    }
-
     fn seconds_since_app_start(&self) -> f64 {
         Instant::now()
             .duration_since(self.os.start_time.unwrap())
@@ -1538,6 +1917,7 @@ impl CxOsApi for Cx {
     }
 
     fn open_url(&mut self, _url: &str, _in_place: OpenUrlInPlace) {
+        if self.script_data.std.host_io_only() { return; }
         crate::error!("open_url not implemented on this platform");
     }
 

@@ -1,6 +1,58 @@
-use crate::{task, ScriptStd};
+use crate::task;
 use makepad_script::*;
 use std::any::Any;
+use std::cell::Cell;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe, Location};
+
+thread_local! {
+    /// Source location of the `with_vm`/`eval` entry that currently holds the
+    /// script VM (`None` when the VM is available). Set when the VM is taken and
+    /// restored when it's released, so a re-entrant entry can name the holder.
+    /// Only read on the panic path, so the bookkeeping is off the hot path's
+    /// critical observation.
+    static VM_HELD_AT: Cell<Option<&'static Location<'static>>> = const { Cell::new(None) };
+}
+
+/// RAII guard, created by the `Cx::with_vm` family right before they take the
+/// VM, that (a) turns a re-entrant entry into an actionable panic naming both
+/// the current holder and the re-entrant caller (readable even when the native
+/// backtrace is unsymbolicated, e.g. iOS release builds), and (b) records this
+/// entry as the new holder for the duration of the call.
+///
+/// The canonical re-entrancy bug is holding a raw `vm.cx_mut()` borrow (which
+/// leaves `Cx::script_vm` swapped off) and then reaching `cx.with_vm`; the fix
+/// is `vm.with_cx_mut(|cx| ...)`, which parks the VM back onto `Cx` first.
+pub struct VmHolderGuard {
+    prev: Option<&'static Location<'static>>,
+}
+
+impl VmHolderGuard {
+    /// `vm_available` is `Cx::script_vm.is_some()` evaluated at the call site.
+    /// When it's `false` the VM is already held (re-entrancy) and we panic with
+    /// a diagnostic instead of letting the later `take().expect(...)` abort with
+    /// the opaque "swapped off" message.
+    #[track_caller]
+    pub fn enter(vm_available: bool, caller: &'static Location<'static>) -> VmHolderGuard {
+        if !vm_available {
+            let held = VM_HELD_AT.with(|c| c.get());
+            panic!(
+                "re-entrant script VM access at {caller}: the VM is already held by \
+                 {} (it's `take()`n for the whole duration of a `with_vm`/`eval` closure). \
+                 You're most likely inside a raw `vm.cx_mut()` borrow or another `with_vm`; \
+                 use `vm.with_cx_mut(|cx| ...)` so the VM is parked back onto `Cx` first.",
+                held.map(|l| l.to_string()).unwrap_or_else(|| "<unknown>".to_string()),
+            );
+        }
+        let prev = VM_HELD_AT.with(|c| c.replace(Some(caller)));
+        VmHolderGuard { prev }
+    }
+}
+
+impl Drop for VmHolderGuard {
+    fn drop(&mut self) {
+        VM_HELD_AT.with(|c| c.set(self.prev));
+    }
+}
 
 pub trait ScriptVmStdExt {
     fn std_ref<T: Any>(&mut self) -> &T;
@@ -9,92 +61,101 @@ pub trait ScriptVmStdExt {
 
 impl<'a> ScriptVmStdExt for ScriptVm<'a> {
     fn std_ref<T: Any>(&mut self) -> &T {
-        self.std.downcast_ref().unwrap()
+        self.host.script_std().downcast_ref().unwrap()
     }
 
     fn std_mut<T: Any>(&mut self) -> &mut T {
-        self.std.downcast_mut().unwrap()
+        self.host.script_std().downcast_mut().unwrap()
     }
 }
 
-impl ScriptVmStdExt for &mut dyn Any {
-    fn std_ref<T: Any>(&mut self) -> &T {
-        self.downcast_ref().unwrap()
-    }
+const TAKEN_MSG: &str = "re-entrant script VM access: the VM is already `take()`n (swapped off) by an \
+             enclosing `with_vm`/`eval`. You're most likely inside a raw `vm.cx_mut()` borrow; \
+             use `vm.with_cx_mut(|cx| ...)` so the VM is parked back onto `Cx` first.";
 
-    fn std_mut<T: Any>(&mut self) -> &mut T {
-        self.downcast_mut().unwrap()
+/// Run `f` on `bx` as the host's VM and put `bx` back on the host whether
+/// `f` returns or unwinds.
+///
+/// A drop guard cannot do this: the `ScriptVm` owns the host borrow AND
+/// the base for the whole call, so nothing else can hold either to restore
+/// them. The unwind is caught instead, the VM parked, and the panic resumed
+/// as it was (`resume_unwind` runs no hook a second time). A catcher higher
+/// up — a platform's event catcher, a host isolating a guest — then finds
+/// the host exactly as it was before the call, where letting the frame go
+/// dropped the whole heap and left every later entry re-entrant.
+///
+/// The slot is never overwritten on the way out of a panic: `with_cx_mut`
+/// parks the real VM on the host itself while its closure runs, and the
+/// `ScriptVm` then holds a placeholder — if that closure is where the
+/// unwind began and the placeholder came back here, the slot already has
+/// the VM and the placeholder is dropped.
+fn run_parked<R>(host: &mut dyn ScriptHost, bx: Box<ScriptVmBase>, f: impl FnOnce(&mut ScriptVm) -> R) -> R {
+    let mut vm = ScriptVm { host, bx };
+    let out = catch_unwind(AssertUnwindSafe(|| f(&mut vm)));
+    let ScriptVm { host, bx } = vm;
+    match out {
+        Ok(out) => {
+            *host.script_vm_slot() = Some(bx);
+            out
+        }
+        Err(payload) => {
+            let slot = host.script_vm_slot();
+            if slot.is_none() {
+                *slot = Some(bx);
+            }
+            resume_unwind(payload)
+        }
     }
 }
 
-pub fn with_vm_and_async<H: Any, F: FnOnce(&mut ScriptVm) -> R, R>(
-    host: &mut H,
-    std: &mut ScriptStd,
-    script_vm: &mut Option<Box<ScriptVmBase>>,
+pub fn with_vm_and_async<F: FnOnce(&mut ScriptVm) -> R, R>(
+    host: &mut dyn ScriptHost,
     f: F,
 ) -> R {
-    let mut bx = script_vm
-        .take()
-        .expect("Script VM swapped off, make sure to call with_vm if you want this to work");
+    let mut bx = host.script_vm_slot().take().expect(TAKEN_MSG);
     bx.threads.set_current_to_first_unpaused_thread();
-
-    let (out, bx) = {
-        let mut vm = ScriptVm { host, std, bx };
-        let out = f(&mut vm);
-        (out, vm.bx)
-    };
-    *script_vm = Some(bx);
-    task::handle_script_tasks(host, std, script_vm);
+    let out = run_parked(host, bx, f);
+    task::handle_script_tasks(host);
     out
 }
 
-pub fn with_vm<H: Any, F: FnOnce(&mut ScriptVm) -> R, R>(
-    host: &mut H,
-    std: &mut ScriptStd,
-    script_vm: &mut Option<Box<ScriptVmBase>>,
-    f: F,
-) -> R {
-    let mut bx = script_vm
-        .take()
-        .expect("Script VM swapped off, make sure to call with_vm if you want this to work");
+pub fn with_vm<F: FnOnce(&mut ScriptVm) -> R, R>(host: &mut dyn ScriptHost, f: F) -> R {
+    let mut bx = host.script_vm_slot().take().expect(TAKEN_MSG);
     bx.threads.set_current_to_first_unpaused_thread();
-
-    let (out, bx) = {
-        let mut vm = ScriptVm { host, std, bx };
-        let out = f(&mut vm);
+    run_parked(host, bx, |vm| {
+        let out = f(vm);
         vm.drain_errors();
-        (out, vm.bx)
-    };
-    *script_vm = Some(bx);
-    out
+        out
+    })
 }
 
-pub fn with_vm_thread<H: Any, F: FnOnce(&mut ScriptVm) -> R, R>(
-    host: &mut H,
-    std: &mut ScriptStd,
-    script_vm: &mut Option<Box<ScriptVmBase>>,
+/// Like [`with_vm`], but returns `None` instead of panicking when the VM is
+/// already held (swapped off) by an enclosing `with_vm`/`eval`. Use this for
+/// call sites that can correctly degrade — e.g. defer to a later frame — when
+/// invoked re-entrantly, rather than aborting.
+pub fn try_with_vm<F: FnOnce(&mut ScriptVm) -> R, R>(
+    host: &mut dyn ScriptHost,
+    f: F,
+) -> Option<R> {
+    let mut bx = host.script_vm_slot().take()?;
+    bx.threads.set_current_to_first_unpaused_thread();
+    Some(run_parked(host, bx, |vm| {
+        let out = f(vm);
+        vm.drain_errors();
+        out
+    }))
+}
+
+pub fn with_vm_thread<F: FnOnce(&mut ScriptVm) -> R, R>(
+    host: &mut dyn ScriptHost,
     thread_id: ScriptThreadId,
     f: F,
 ) -> R {
-    let mut bx = script_vm
-        .take()
-        .expect("Script VM swapped off, make sure to call with_vm if you want this to work");
+    let mut bx = host.script_vm_slot().take().expect(TAKEN_MSG);
     bx.threads.set_current_thread_id(thread_id);
-
-    let (out, bx) = {
-        let mut vm = ScriptVm { host, std, bx };
-        let out = f(&mut vm);
-        (out, vm.bx)
-    };
-    *script_vm = Some(bx);
-    out
+    run_parked(host, bx, f)
 }
 
-pub fn eval<H: Any>(
-    host: &mut H,
-    std: &mut ScriptStd,
-    script_vm: &mut Option<Box<ScriptVmBase>>,
-    script_mod: ScriptMod,
-) -> ScriptValue {
-    with_vm_and_async(host, std, script_vm, |vm| vm.eval(script_mod))
+pub fn eval(host: &mut dyn ScriptHost, script_mod: ScriptMod) -> ScriptValue {
+    with_vm_and_async(host, |vm| vm.eval(script_mod))
 }

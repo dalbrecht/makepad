@@ -4,12 +4,14 @@ use {
         cx_api::CxOsOp,
         draw_pass::CxDrawPassParent,
         event::Event,
-        event::WindowGeom,
+        event::{WindowGeom},
         makepad_math::*,
         makepad_micro_serde::*,
         os::{
             d3d11::D3d11Cx,
-            shared_framebuf::{PresentableDraw, PresentableImageId, SWAPCHAIN_IMAGE_COUNT},
+            shared_framebuf::{
+                PollTimer, PresentableDraw, PresentableImageId, SWAPCHAIN_IMAGE_COUNT,
+            },
             win32_app::Win32Time,
         },
         texture::{Texture, TextureFormat},
@@ -22,6 +24,9 @@ use {
     makepad_studio_protocol::{AppToStudio, GCSample, StudioToApp, StudioToAppVec},
     std::ffi::c_void,
 };
+
+static WINDIAG_REPAINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WINDIAG_FLIP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct LocalPresentableImage {
     id: PresentableImageId,
@@ -55,32 +60,48 @@ impl Cx {
         self.repaint_id += 1;
         let time_now = time.time_now();
         for &draw_pass_id in &passes_todo {
-            self.passes[draw_pass_id].set_time(time_now as f32);
+            let uniforms_gen = self.next_uniform_gen();
+            self.passes[draw_pass_id].set_time(time_now as f32, uniforms_gen);
             match self.passes[draw_pass_id].parent.clone() {
                 CxDrawPassParent::Xr => {}
                 CxDrawPassParent::Window(window_id) => {
                     // only render to swapchain if swapchain exists
-                    let window = &mut windows[window_id.id()];
+                    let Some(window) = windows.get_mut(window_id.id()) else {
+                        continue;
+                    };
                     if let Some(swapchain) = &window.swapchain {
                         // and if GPU is not already rendering something else
                         if window.new_frame_being_rendered.is_none() {
                             let current_image = &swapchain.presentable_images[window.present_index];
+                            let img_tex = current_image.image.clone();
+                            let img_id = current_image.id;
 
                             window.present_index =
                                 (window.present_index + 1) % swapchain.presentable_images.len();
 
-                            // render to swapchain
+                            // Bracket the render into the shared texture with the keyed
+                            // mutex: Acquire before queuing draws, Release after. This makes
+                            // the studio host's later Acquire (consumer side) wait for these
+                            // draws on the GPU timeline and see coherent pixels — plain
+                            // D3D11_RESOURCE_MISC_SHARED gave no cross-device coherence, so
+                            // the host was sampling the never-updated (black) surface.
+                            if WINDIAG_REPAINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                                crate::log!("WINCHILD: repaint -> swapchain target={:?}", img_id);
+                            }
+                            self.shared_texture_keyed_acquire(&img_tex);
                             self.draw_pass_to_texture(
                                 draw_pass_id,
                                 d3d11_cx,
-                                Some(current_image.image.texture_id()),
+                                Some(img_tex.texture_id()),
                             );
+                            self.shared_texture_keyed_release(&img_tex);
 
                             let dpi_factor = self.passes[draw_pass_id].dpi_factor.unwrap();
                             let pass_rect = self.get_pass_rect(draw_pass_id, dpi_factor).unwrap();
                             let future_presentable_draw = PresentableDraw {
+                                sequence: 0,
                                 window_id: window_id.id(),
-                                target_id: current_image.id,
+                                target_id: img_id,
                                 width: (pass_rect.size.x * dpi_factor) as u32,
                                 height: (pass_rect.size.y * dpi_factor) as u32,
                             };
@@ -109,8 +130,11 @@ impl Cx {
 
         let mut stdin_windows: Vec<StdinWindow> = Vec::new();
         let time = Win32Time::new();
+        self.set_physical_keyboard_state(true);
         self.call_event_handler(&Event::Startup);
         Self::stdin_send_to_host(AppToStudio::AfterStartup);
+        // What this child's pointer input understands (see HostedPointerCaps).
+        Self::stdin_send_to_host(AppToStudio::Custom(crate::ime::HostedPointerCaps::current().to_json()));
 
         loop {
             if !Self::has_studio_web_socket() {
@@ -121,11 +145,18 @@ impl Cx {
                 Some(incoming) => incoming,
                 None => break,
             };
+            crate::memory_watchdog::note_stdin_host_message();
 
             match incoming {
                 WebSocketMessage::Binary(data) => match StudioToAppVec::deserialize_bin(&data) {
                     Ok(msgs) => {
-                        for msg in msgs.0 {
+                        // The whole queued backlog at once, collapsed to one
+                        // Tick and the latest pointer position, so a slow
+                        // frame never pays for the ticks it missed.
+                        let mut batch = msgs.0;
+                        let closed = self.stdin_drain_host_batches(&mut batch);
+                        Self::stdin_coalesce_host_batch(&mut batch);
+                        for msg in batch {
                             if self.stdin_handle_host_to_stdin(
                                 msg,
                                 d3d11_cx,
@@ -136,6 +167,9 @@ impl Cx {
                             }
                         }
                         self.handle_actions();
+                        if closed {
+                            break;
+                        }
                     }
                     Err(err) => {
                         crate::error!(
@@ -205,7 +239,7 @@ impl Cx {
                 };
                 self.call_event_handler(&Event::TweakRay(tweak_ray));
             }
-            StudioToApp::MouseUp(ref e) => {
+            StudioToApp::MouseUp(ref e) | StudioToApp::MouseCancel(ref e) => {
                 let (window_id, pos) = if let Some((_, window_id)) = self.fingers.first_mouse_button
                 {
                     (window_id, self.windows[window_id].window_geom.position)
@@ -227,16 +261,30 @@ impl Cx {
                 height,
                 window_id,
             } => {
-                self.windows[CxWindowPool::from_usize(window_id)].window_geom = WindowGeom {
-                    dpi_factor,
-                    position: dvec2(0.0, 0.0),
-                    inner_size: dvec2(width, height),
-                    ..Default::default()
-                };
-                self.redraw_all();
+                let window_id = CxWindowPool::from_usize(window_id);
+                if self.windows.is_valid(window_id) {
+                    let re = self.windows.stdin_apply_native_geom(
+                        window_id,
+                        WindowGeom {
+                            position: dvec2(0.0, 0.0),
+                            dpi_factor,
+                            inner_size: dvec2(width, height),
+                            ..Default::default()
+                        },
+                    );
+                    if re.old_geom.dpi_factor != re.new_geom.dpi_factor
+                        || re.old_geom.inner_size != re.new_geom.inner_size
+                    {
+                        if let Some(main_pass_id) = self.windows[re.window_id].main_pass_id {
+                            self.redraw_pass_and_child_passes(main_pass_id);
+                        }
+                    }
+                    self.call_event_handler(&Event::WindowGeomChange(re));
+                }
             }
             StudioToApp::Swapchain(new_swapchain) => {
                 let window_id = new_swapchain.window_id;
+                crate::log!("WINCHILD: Swapchain msg window_id={} stdin_windows.len={} alloc={}x{}", window_id, stdin_windows.len(), new_swapchain.alloc_width, new_swapchain.alloc_height);
                 let local_swapchain = LocalSwapchain {
                     presentable_images: new_swapchain.presentable_images.map(|pi| {
                         let handle = HANDLE(pi.handle as usize as *mut c_void);
@@ -264,15 +312,26 @@ impl Cx {
             }
             StudioToApp::RunViewFrameRequest(_) => {}
             StudioToApp::Tick => {
-                if SignalToUI::check_and_clear_ui_signal() {
+                let internal_signal = SignalToUI::check_and_clear_internal_signal();
+                let ui_signal = SignalToUI::check_and_clear_ui_signal();
+                if internal_signal || ui_signal {
+                    self.handle_termination_signal();
                     self.handle_media_signals();
                     self.handle_script_signals();
+                }
+                if ui_signal {
                     self.call_event_handler(&Event::Signal);
                 }
                 if SignalToUI::check_and_clear_action_signal() {
                     self.handle_action_receiver();
                 }
                 self.poll_control_channel();
+
+                let events = self.os.stdin_timers.get_dispatch();
+                for event in events {
+                    self.handle_script_timer(&event);
+                    self.call_event_handler(&Event::Timer(event));
+                }
 
                 self.handle_networking_events();
                 self.stdin_handle_platform_ops(stdin_windows);
@@ -282,6 +341,7 @@ impl Cx {
                     self.call_next_frame_event(time_now);
                 }
 
+                self.hlsl_adopt_shaders(d3d11_cx);
                 if self.need_redrawing() {
                     self.call_draw_event(time_now);
                     self.hlsl_compile_shaders(d3d11_cx);
@@ -313,12 +373,25 @@ impl Cx {
                 if has_pending_draws && d3d11_cx.is_gpu_done() {
                     for window in stdin_windows.iter_mut() {
                         if let Some(presentable_draw) = window.new_frame_being_rendered.take() {
+                            if WINDIAG_FLIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                                crate::log!("WINCHILD: DrawCompleteAndFlip target={:?} {}x{}", presentable_draw.target_id, presentable_draw.width, presentable_draw.height);
+                            }
                             Self::stdin_send_to_host(AppToStudio::DrawCompleteAndFlip(
                                 presentable_draw,
                             ));
                         }
                     }
                 }
+
+                if !self.new_next_frames.is_empty()
+                    || self.need_redrawing()
+                    || !self.os.stdin_timers.timers.is_empty()
+                {
+                    Self::stdin_send_to_host(AppToStudio::RequestAnimationFrame);
+                }
+                // One Tick consumed: the host sends the next one on this,
+                // never ahead of it (run_view.rs tick pacing).
+                Self::stdin_send_to_host(AppToStudio::TickDone);
             }
             // All other variants (Key*, Text*, Screenshot, WidgetTreeDump,
             // Kill, KeepAlive, LiveChange, None) handled by shared dispatch.
@@ -330,7 +403,7 @@ impl Cx {
     }
 
     fn stdin_handle_platform_ops(&mut self, stdin_windows: &mut Vec<StdinWindow>) {
-        while let Some(op) = self.platform_ops.pop() {
+        while let Some(op) = self.platform_ops.pop_front() {
             match op {
                 CxOsOp::CreateWindow(window_id) => {
                     while window_id.id() >= stdin_windows.len() {
@@ -363,8 +436,36 @@ impl Cx {
                 CxOsOp::SetCursor(cursor) => {
                     Self::stdin_send_to_host(AppToStudio::SetCursor(cursor.into()));
                 }
+                CxOsOp::StartTimer {
+                    timer_id,
+                    interval,
+                    repeats,
+                } => {
+                    self.os
+                        .stdin_timers
+                        .timers
+                        .insert(timer_id, PollTimer::new(interval, repeats));
+                }
+                CxOsOp::StopTimer(timer_id) => {
+                    self.os.stdin_timers.timers.remove(&timer_id);
+                }
+                CxOsOp::HttpRequest {
+                    request_id,
+                    request,
+                } => {
+                    let _ = self.net.http_start(request_id, request);
+                }
+                CxOsOp::CancelHttpRequest { request_id } => {
+                    let _ = self.net.http_cancel(request_id);
+                }
                 CxOsOp::CopyToClipboard(content) => {
                     Self::stdin_send_to_host(AppToStudio::SetClipboard(content));
+                }
+                CxOsOp::StartExternalDragging { .. } => {
+                    crate::error!(
+                        "external file dragging is not available in the Studio stdin runtime"
+                    );
+                    self.call_event_handler(&Event::DragEnd);
                 }
                 _ => (), /*
                          CxOsOp::CloseWindow(_window_id) => {},

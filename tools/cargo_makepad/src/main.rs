@@ -10,11 +10,13 @@ mod check;
 #[cfg(not(target_arch = "wasm32"))]
 mod desktop;
 #[cfg(not(target_arch = "wasm32"))]
+mod desktop_bundle;
+#[cfg(not(target_arch = "wasm32"))]
+mod font_assets;
+#[cfg(not(target_arch = "wasm32"))]
 mod open_harmony;
 #[cfg(not(target_arch = "wasm32"))]
 mod server_manager;
-#[cfg(not(target_arch = "wasm32"))]
-mod studio;
 #[cfg(not(target_arch = "wasm32"))]
 mod tunnel;
 #[cfg(not(target_arch = "wasm32"))]
@@ -41,8 +43,6 @@ pub use makepad_shell;
 pub use makepad_wasm_strip;
 #[cfg(not(target_arch = "wasm32"))]
 use open_harmony::*;
-#[cfg(not(target_arch = "wasm32"))]
-use studio::*;
 #[cfg(not(target_arch = "wasm32"))]
 use tunnel::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -72,13 +72,28 @@ fn show_help() {
     println!("       --port=8010                               The port to run the wasm webserver");
     println!("       --lan                                     Bind the webserver to your lan ip");
     println!(
+        "       --production                              Release profile, strip, Brotli, optional Binaryen -Oz"
+    );
+    println!(
+        "       --lto                                     With --production, opt into the small profile (fat LTO)"
+    );
+    println!(
         "       --strip                                   Shipping-size wasm optimization pass (implies custom-section stripping)"
     );
     println!(
         "       --strip-custom-sections                   Legacy mode: only strip custom wasm sections"
     );
     println!(
-        "       --wasm-opt                                Run Binaryen wasm-opt -Os for IR-level optimization (optional; requires binaryen)"
+        "       --wasm-opt                                Run Binaryen wasm-opt -Oz when a compatible version is on PATH"
+    );
+    println!(
+        "       --no-location-detail                      Omit panic file/line/column detail (nightly production diagnostic tradeoff)"
+    );
+    println!(
+        "       --size-report                             Print exact wasm section and split-artifact sizes"
+    );
+    println!(
+        "       --keep-names                              Keep <app>.names.wasm beside the packaged wasm"
     );
     println!(
         "       --split[=200]                             Split wasm payloads; bare --split uses a cold-first automatic split policy"
@@ -143,10 +158,16 @@ fn show_help() {
         "       --device=<DEVICE_NAME>                    The device name to use for signing/provisioning"
     );
     println!();
+    println!("    [package.metadata.makepad.ios] (or .tvos) in Cargo.toml:");
+    println!("       info_plist = \"packaging/ios/Info.plist\"");
+    println!("       Optional XML/binary plist dictionary, relative to the package directory.");
+    println!("       Its top-level keys replace generated defaults before icons and signing.");
+    println!("       CFBundleIdentifier and CFBundleExecutable must match the generated values.");
+    println!();
     println!("Android commands:");
     println!();
     println!(
-        "    android [options] install-toolchain          Download and install the android sdk and rust toolchains"
+        "    android [options] install-toolchain          Download the Android SDK and add selected Rust targets"
     );
     println!(
         "    android [options] run <cargo args>           Run an android project on a connected android device via adb"
@@ -170,6 +191,9 @@ fn show_help() {
         "       --sdk-path=./android_33_sdk               The path to read/write the android SDK"
     );
     println!(
+        "                                                 (defaults to ~/.makepad/android_33_<host-os>)"
+    );
+    println!(
         "       --full-ndk                                Install the full NDK prebuilts for the selected Host OS (default is a minimal subset)."
     );
     println!(
@@ -183,7 +207,7 @@ fn show_help() {
         "                                                 Host OS is autodetected but can be overridden here"
     );
     println!("    [Android install-toolchain separated steps]");
-    println!("    android [options] rustup-install-toolchain");
+    println!("    android [options] rustup-install-toolchain   Add selected Android Rust targets with rustup");
     println!("    android [options] download-sdk");
     println!("    android [options] expand-sdk");
     println!("    android [options] remove-sdk-sources");
@@ -222,13 +246,45 @@ fn show_help() {
     println!("Desktop commands:");
     println!();
     println!(
-        "    desktop build <cargo args>                   Run cargo build with Makepad icon env autodetection"
+        "    desktop build [sign opts] <cargo args>       Run cargo build with Makepad icon env autodetection"
     );
     println!(
         "    desktop run <cargo args>                     Run cargo run with Makepad icon env autodetection"
     );
     println!(
         "    desktop check <cargo args>                   Run cargo check with Makepad icon env autodetection"
+    );
+    println!(
+        "    desktop sign [sign opts] <cargo args>        Sign a built macOS desktop artifact"
+    );
+    println!(
+        "    desktop bundle [bundle opts] -p <crate>      Build a self-contained, signed macOS .app (see [package.metadata.makepad.desktop])"
+    );
+    println!("    [bundle opts]:");
+    println!(
+        "       --install[=DIR]                            Also install it into DIR (default ~/.makepad/apps), outside target/"
+    );
+    println!(
+        "       --cert='<IDENTITY>' | --adhoc                Signing identity; defaults to the Apple Development identity (or MAKEPAD_CODESIGN_IDENTITY)"
+    );
+    println!("    [sign opts]:");
+    println!(
+        "       --sign                                     Enable post-build signing for `desktop build`"
+    );
+    println!(
+        "       --cert='<IDENTITY>'                        codesign identity; defaults to a single Apple Development identity if unambiguous"
+    );
+    println!(
+        "       --entitlements='<PATH>'                    Use an explicit entitlements plist"
+    );
+    println!(
+        "       --debugger                                 Generate com.apple.security.cs.debugger entitlement"
+    );
+    println!(
+        "       --get-task-allow                           Generate com.apple.security.get-task-allow entitlement"
+    );
+    println!(
+        "       --runtime                                  Sign with hardened runtime (--options runtime)"
     );
     println!();
     println!("Linux commands:");
@@ -247,21 +303,25 @@ fn show_help() {
         "    tunnel <ip:port> shell <command...>          Run remote shell command (requires --all on server)"
     );
     println!();
-    println!("Studio commands:");
-    println!();
-    println!(
-        "    studio [options]                              Start filtered newline-JSON studio remote websocket"
-    );
-    println!("    [options]:");
-    println!("       --studio=127.0.0.1:8001                   Studio server ip:port");
-    println!("                                                 (or set STUDIO=127.0.0.1:8001)");
-    println!();
-    println!();
+
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), Cow<'static, str>> {
     let args: Vec<String> = std::env::args().collect();
+
+    // `RUSTC_WRAPPER` mode for the Android super-app pack: cargo runs the
+    // `makepad-dyn-rustc` link to this binary as `makepad-dyn-rustc <rustc>
+    // <args…>`. Both the name and the env var must say so: a bare inherited
+    // env var never diverts an ordinary `cargo makepad` command.
+    let invoked_as_wrapper = args
+        .first()
+        .and_then(|a| std::path::Path::new(a).file_stem())
+        .map(|stem| stem == "makepad-dyn-rustc")
+        .unwrap_or(false);
+    if invoked_as_wrapper && std::env::var_os("MAKEPAD_DYN_RUSTC_WRAPPER").is_some() && args.len() > 1 {
+        android_rustc_wrapper(&args[1..]);
+    }
 
     // Skip the first argument if it's the binary path or 'cargo'
     let args = if args.len() > 1
@@ -283,6 +343,16 @@ fn main() -> Result<(), Cow<'static, str>> {
         show_help();
         return Err("not enough arguments; expected at least one command.".into());
     }
+    // The workspace's release profile is incremental for fast agent
+    // rebuilds; packaged builds are shipped, so they are built whole
+    // (every cargo this process spawns inherits the override). An explicit
+    // CARGO_PROFILE_RELEASE_INCREMENTAL in the environment still wins.
+    let packaging = matches!(args[0].as_str(), "android" | "apple" | "wasm" | "ohos")
+        || (args[0] == "desktop" && args.get(1).map(String::as_str) == Some("build"));
+    if packaging && std::env::var_os("CARGO_PROFILE_RELEASE_INCREMENTAL").is_none() {
+        std::env::set_var("CARGO_PROFILE_RELEASE_INCREMENTAL", "false");
+    }
+
     let result = match args[0].as_ref() {
         "android" => handle_android(&args[1..]),
         "desktop" => handle_desktop(&args[1..]),
@@ -291,7 +361,6 @@ fn main() -> Result<(), Cow<'static, str>> {
         "ohos" => handle_open_harmony(&args[1..]),
         "check" => handle_check(&args[1..]),
         "tunnel" => handle_tunnel(&args[1..]),
-        "studio" => handle_studio(&args[1..]),
         unsupported => {
             show_help();
             Err(format!("unsupported command: '{unsupported}'").into())

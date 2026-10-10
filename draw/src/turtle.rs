@@ -1,4 +1,8 @@
-use crate::{cx_2d::Cx2d, makepad_platform::*};
+use crate::{
+    cx_2d::Cx2d,
+    makepad_platform::*,
+    size_expr::{SizeExprContext, SizeExprId, SizeExprSimple, SizeExprStore, SizeExprUnit},
+};
 
 script_mod! {
     mod.turtle = {
@@ -7,13 +11,16 @@ script_mod! {
         Size: mod.std.set_type_default() do #(Size::script_api(vm)),
         ..me.Size,
         Metrics: mod.std.set_type_default() do #(Metrics::script_api(vm))
+        Baseline: mod.std.set_type_default() do #(Baseline::script_api(vm))
         RowAlign: mod.std.set_type_default() do #(RowAlign::script_api(vm))
-        Base: mod.std.set_type_default() do #(Base::script_api(vm))
+        Distribute: mod.std.set_type_default() do #(Distribute::script_api(vm))
         Flow: mod.std.set_type_default() do #(Flow::script_api(vm)),
         ..me.Flow,
         Align: mod.std.set_type_default() do #(Align::script_api(vm))
         Inset: mod.std.set_type_default() do #(Inset::script_api(vm))
         Layout: mod.std.set_type_default() do #(Layout::script_api(vm))
+        CellAlign: mod.std.set_type_default() do #(CellAlign::script_api(vm))
+        CellPlacement: mod.std.set_type_default() do #(CellPlacement::script_api(vm))
         Walk: mod.std.set_type_default() do #(Walk::script_api(vm)),
         TopLeft: me.Align{x:0., y:0.}
         Center: me.Align{x:0.5, y:0.5}
@@ -22,11 +29,47 @@ script_mod! {
     }
 }
 
+/// Alignment of a grid child within one cell axis.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Script, ScriptHook)]
+pub enum CellAlign {
+    #[default]
+    #[pick]
+    Stretch,
+    Start,
+    Center,
+    End,
+}
+
+/// Optional grid placement carried by every widget's flattened `Walk`.
+/// Rows and columns are one-based; zero selects automatic placement.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Script, ScriptHook)]
+pub struct CellPlacement {
+    #[live]
+    pub col: u32,
+    #[live]
+    pub row: u32,
+    #[live]
+    pub col_span: u32,
+    #[live]
+    pub row_span: u32,
+    #[live]
+    pub area: LiveId,
+    #[live]
+    pub align_self: Option<CellAlign>,
+    #[live]
+    pub justify_self: Option<CellAlign>,
+}
+
 #[derive(Clone, Debug)]
 struct DeferredFill {
-    weight: f64,
+    grow: f64,
+    shrink: f64,
+    unclamped_basis: f64,
+    basis: f64,
     max: Option<f64>,
     min: Option<f64>,
+    delta: f64,
+    frozen: bool,
 }
 
 #[derive(Debug)]
@@ -64,19 +107,75 @@ pub struct Walk {
     #[live]
     pub height: Size,
 
+    /// Content-box constraints. These are independent of the historical
+    /// margin-box bounds carried by `Size::Fit` and `Size::Fill`.
+    #[live]
+    pub min_width: Option<FitBound>,
+    #[live]
+    pub max_width: Option<FitBound>,
+    #[live]
+    pub min_height: Option<FitBound>,
+    #[live]
+    pub max_height: Option<FitBound>,
+
+    /// Preferred content-box width divided by height.
+    #[live]
+    pub aspect: Option<f64>,
+
+    /// Definite-grid placement. Other turtle flows ignore this metadata.
+    #[live]
+    pub cell: Option<CellPlacement>,
+
     #[live]
     pub metrics: Metrics,
+
+    /// Where this walk's text baseline sits, for `RowAlign::Baseline` rows.
+    #[live]
+    pub baseline: Baseline,
+
+    /// True only for an internally-materialized deferred walk. This keeps
+    /// absolute placement internal to the flex pass distinguishable from a
+    /// user-authored `abs_pos` without exposing layout provenance to script.
+    #[doc(hidden)]
+    #[rust]
+    pub deferred: bool,
+
+    #[doc(hidden)]
+    #[rust]
+    pub flow_index: u32,
 }
 
 impl Walk {
+    #[inline]
+    fn needs_resolve(self) -> bool {
+        let size_needs_resolve = |size| {
+            matches!(size, Size::Rel { .. } | Size::Expr(_))
+                || matches!(
+                    size,
+                    Size::Fill {
+                        basis,
+                        min,
+                        max,
+                        ..
+                    } if !matches!(basis, FitBound::Abs(_)) || min.is_some() || max.is_some()
+                )
+                || matches!(size, Size::Fit { min, max } if min.is_some() || max.is_some())
+        };
+        size_needs_resolve(self.width)
+            || size_needs_resolve(self.height)
+            || self.min_width.is_some()
+            || self.max_width.is_some()
+            || self.min_height.is_some()
+            || self.max_height.is_some()
+            || self.aspect.is_some()
+    }
+
     /// Returns a `Walk` with `width` and `height` set to the given value, and no margin.
     pub fn new(width: Size, height: Size) -> Self {
         Self {
-            abs_pos: None,
-            margin: Inset::default(),
             width,
             height,
-            metrics: Metrics::default(),
+            ..Self::default()
         }
     }
 
@@ -88,33 +187,27 @@ impl Walk {
     /// Returns a `Walk` with both `width` and `height` set to `Size::fill()`, and no margin.
     pub fn fill() -> Self {
         Self {
-            abs_pos: None,
-            margin: Inset::default(),
             width: Size::fill(),
             height: Size::fill(),
-            metrics: Metrics::default(),
+            ..Self::default()
         }
     }
 
     /// Returns a `Walk` with `width` and `height` set to the given fixed values, and no margin.
     pub fn fixed(width: f64, height: f64) -> Self {
         Self {
-            abs_pos: None,
-            margin: Inset::default(),
             width: Size::Fixed(width),
             height: Size::Fixed(height),
-            metrics: Metrics::default(),
+            ..Self::default()
         }
     }
 
     /// Returns a `Walk` with both `width` and `height` set to `Size::fit()`, and no margin.
     pub fn fit() -> Self {
         Self {
-            abs_pos: None,
-            margin: Inset::default(),
             width: Size::fit(),
             height: Size::fit(),
-            metrics: Metrics::default(),
+            ..Self::default()
         }
     }
 
@@ -122,11 +215,9 @@ impl Walk {
     /// margin.
     pub fn fill_fit() -> Self {
         Self {
-            abs_pos: None,
-            margin: Inset::default(),
             width: Size::fill(),
             height: Size::fit(),
-            metrics: Metrics::default(),
+            ..Self::default()
         }
     }
 
@@ -197,19 +288,38 @@ impl Default for Metrics {
         }
     }
 }
+
+/// Where a walk's text baseline sits, in lpxs down from the top of its rectangle
+/// (inside the margin). `Auto` is what the walk draws or what its children report;
+/// `At` is an f32 so `Walk` stays inside its size gate.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Script, ScriptHook)]
+pub enum Baseline {
+    #[pick]
+    #[default]
+    Auto,
+    /// Has none and never reports one: a baseline row seats this walk's bottom edge.
+    None,
+    #[live(0.0)]
+    At(f32),
+}
+
 /// Specifies the desired width/height of a walk's rectangle.
 ///
 /// See `Turtle::next_walk_width` and `Turtle::next_walk_height` for details on how the actual
 /// width/height is computed based on the desired width/height.
-#[derive(Copy, Clone, Debug, Script)]
+#[derive(Copy, Clone, Debug, PartialEq, Script)]
 pub enum Size {
     #[pick {
         weight: 100.0,
+        basis: FitBound::Abs(0.0),
+        shrink: 0.0,
         min: None,
         max: None,
     }]
     Fill {
         weight: f64,
+        basis: FitBound,
+        shrink: f64,
         min: Option<f64>,
         max: Option<f64>,
     },
@@ -223,6 +333,13 @@ pub enum Size {
         min: Option<FitBound>,
         max: Option<FitBound>,
     },
+    #[live {
+        base: Base::Parent,
+        factor: 1.0
+    }]
+    Rel { base: Base, factor: f64 },
+    #[live(SizeExprId(u32::MAX))]
+    Expr(SizeExprId),
 }
 
 impl Size {
@@ -231,6 +348,8 @@ impl Size {
     pub fn fill() -> Self {
         Self::Fill {
             weight: 100.0,
+            basis: FitBound::Abs(0.0),
+            shrink: 0.0,
             min: None,
             max: None,
         }
@@ -259,6 +378,13 @@ impl Size {
         matches!(self, Self::Fit { .. })
     }
 
+    /// Returns whether this declaration denotes a definite size rather than
+    /// content- or distribution-dependent sizing. A contextual declaration
+    /// can still fail to resolve when its required context is unknown.
+    pub fn is_definite(self) -> bool {
+        matches!(self, Self::Fixed(_) | Self::Rel { .. } | Self::Expr(_))
+    }
+
     /// Returns the fixed size if this is a `Size::Fixed`, or `None` otherwise.
     pub fn to_fixed(self) -> Option<f64> {
         match self {
@@ -276,12 +402,12 @@ impl Default for Size {
 
 impl ScriptHook for Size {
     fn on_type_check(_heap: &ScriptHeap, value: ScriptValue) -> bool {
-        value.as_f64().is_some() || value.as_number().is_some()
+        value.as_f64().is_some() || value.as_number().is_some() || value.is_string_like()
     }
 
     fn on_custom_apply(
         &mut self,
-        _vm: &mut ScriptVm,
+        vm: &mut ScriptVm,
         _apply: &Apply,
         _scope: &mut Scope,
         value: ScriptValue,
@@ -295,12 +421,35 @@ impl ScriptHook for Size {
             *self = Size::Fixed(v);
             return true;
         }
+        if let Some(source) = script_string(vm, value) {
+            match intern_size_expression(vm, &source) {
+                Ok(SizeExprSimple::Abs(value)) => *self = Size::Fixed(value),
+                Ok(SizeExprSimple::Rel { unit, factor }) => {
+                    *self = Size::Rel {
+                        base: unit.into(),
+                        factor,
+                    }
+                }
+                Ok(SizeExprSimple::Compound(id)) => *self = Size::Expr(id),
+                Err(error) => {
+                    error!("invalid Size expression {:?}: {}", source, error);
+                }
+            }
+            return true;
+        }
         // Return false to let the generated code handle normal enum objects
         false
     }
+
+    fn on_custom_to_value(&self, vm: &mut ScriptVm) -> Option<ScriptValue> {
+        let Self::Expr(id) = self else {
+            return None;
+        };
+        size_expr_source_to_value(vm, *id)
+    }
 }
 
-#[derive(Clone, Copy, Debug, Script, ScriptHook)]
+#[derive(Clone, Copy, Debug, PartialEq, Script)]
 pub enum FitBound {
     #[pick(100.0)]
     Abs(f64),
@@ -309,27 +458,60 @@ pub enum FitBound {
         factor: 1.0
     }]
     Rel { base: Base, factor: f64 },
+    #[live(SizeExprId(u32::MAX))]
+    Expr(SizeExprId),
+}
+
+impl ScriptHook for FitBound {
+    fn on_type_check(_heap: &ScriptHeap, value: ScriptValue) -> bool {
+        value.as_number().is_some() || value.is_string_like()
+    }
+
+    fn on_custom_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        _apply: &Apply,
+        _scope: &mut Scope,
+        value: ScriptValue,
+    ) -> bool {
+        if let Some(value) = value.as_number() {
+            *self = Self::Abs(value);
+            return true;
+        }
+        if let Some(source) = script_string(vm, value) {
+            match intern_size_expression(vm, &source) {
+                Ok(SizeExprSimple::Abs(value)) => *self = Self::Abs(value),
+                Ok(SizeExprSimple::Rel { unit, factor }) => {
+                    *self = Self::Rel {
+                        base: unit.into(),
+                        factor,
+                    }
+                }
+                Ok(SizeExprSimple::Compound(id)) => *self = Self::Expr(id),
+                Err(error) => error!("invalid FitBound expression {:?}: {}", source, error),
+            }
+            return true;
+        }
+        false
+    }
+
+    fn on_custom_to_value(&self, vm: &mut ScriptVm) -> Option<ScriptValue> {
+        let Self::Expr(id) = self else {
+            return None;
+        };
+        size_expr_source_to_value(vm, *id)
+    }
 }
 
 impl FitBound {
     pub fn eval_width(self, cx: &Cx2d<'_, '_>) -> Option<f64> {
-        match self {
-            FitBound::Abs(abs) => Some(abs),
-            FitBound::Rel { base, factor } => {
-                let base = cx.find_base_width(base)?;
-                Some(base * factor)
-            }
-        }
+        let turtle_index = cx.turtles.len().checked_sub(1)?;
+        cx.eval_fit_bound_for_turtle(self, Axis::Width, turtle_index)
     }
 
     pub fn eval_height(self, cx: &Cx2d<'_, '_>) -> Option<f64> {
-        match self {
-            FitBound::Abs(abs) => Some(abs),
-            FitBound::Rel { base, factor } => {
-                let base = cx.find_base_height(base)?;
-                Some(base * factor)
-            }
-        }
+        let turtle_index = cx.turtles.len().checked_sub(1)?;
+        cx.eval_fit_bound_for_turtle(self, Axis::Height, turtle_index)
     }
 }
 /*
@@ -353,11 +535,2137 @@ impl LiveHook for FitBound {
     }
 }*/
 
-#[derive(Clone, Copy, Debug, Script, ScriptHook)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cx_draw::CxDraw;
+
+    fn with_turtle(size: Vec2d, layout: Layout, test: impl FnOnce(&mut Cx2d)) {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let event = DrawEvent::default();
+        let mut draw = CxDraw::new(&mut cx, &event);
+        let mut cx = Cx2d::new(&mut draw);
+        cx.begin_root_turtle(size, layout);
+        test(&mut cx);
+        while !cx.turtles.is_empty() {
+            cx.end_turtle();
+        }
+    }
+
+    fn with_window_child_pass(test: impl FnOnce(&mut Cx2d)) {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let window = WindowHandle::new(&mut cx);
+        let window_id = window.window_id();
+        cx.windows[window_id].is_created = true;
+        cx.windows[window_id].window_geom.inner_size = dvec2(1000.0, 800.0);
+        let root_pass = DrawPass::new(&mut cx);
+        window.set_pass(&mut cx, &root_pass);
+        let child_pass = DrawPass::new(&mut cx);
+        child_pass.set_pass_parent(&mut cx, &root_pass);
+        child_pass.set_size(&mut cx, dvec2(64.0, 48.0));
+
+        let event = DrawEvent::default();
+        let mut draw = CxDraw::new(&mut cx, &event);
+        draw.begin_pass(&child_pass, None);
+        {
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_root_turtle(dvec2(64.0, 48.0), Layout::default());
+            test(&mut cx);
+            while !cx.turtles.is_empty() {
+                cx.end_turtle();
+            }
+        }
+        draw.end_pass(&child_pass);
+    }
+
+    #[test]
+    fn legacy_fixed_fit_fill_flows_remain_stable() {
+        with_turtle(dvec2(100.0, 80.0), Layout::flow_right(), |cx| {
+            let a = cx.walk_turtle(Walk::fixed(20.0, 10.0));
+            let b = cx.walk_turtle(Walk::new(Size::fill(), Size::Fixed(10.0)));
+            assert_eq!(a.pos, dvec2(0.0, 0.0));
+            assert_eq!(b.pos, dvec2(20.0, 0.0));
+            assert_eq!(b.size.x, 80.0);
+        });
+        with_turtle(dvec2(50.0, 80.0), Layout::flow_right_wrap(), |cx| {
+            let _ = cx.walk_turtle(Walk::fixed(30.0, 10.0));
+            let wrapped = cx.walk_turtle(Walk::fixed(30.0, 12.0));
+            assert_eq!(wrapped.pos, dvec2(0.0, 10.0));
+        });
+        with_turtle(dvec2(100.0, 80.0), Layout::flow_down(), |cx| {
+            let _ = cx.walk_turtle(Walk::fixed(20.0, 10.0));
+            let next = cx.walk_turtle(Walk::fixed(20.0, 15.0));
+            assert_eq!(next.pos, dvec2(0.0, 10.0));
+        });
+        with_turtle(dvec2(100.0, 80.0), Layout::flow_overlay(), |cx| {
+            let a = cx.walk_turtle(Walk::fixed(20.0, 10.0));
+            let b = cx.walk_turtle(Walk::fixed(30.0, 15.0));
+            assert_eq!(a.pos, b.pos);
+        });
+        with_turtle(dvec2(100.0, 80.0), Layout::flow_right(), |cx| {
+            cx.begin_turtle(Walk::fit(), Layout::default());
+            cx.walk_turtle(Walk::fixed(23.0, 17.0));
+            let fitted = cx.end_turtle();
+            assert_eq!(fitted.size, dvec2(23.0, 17.0));
+        });
+    }
+
+    #[test]
+    fn parent_resolution_is_strict_and_phase_correct() {
+        with_turtle(
+            dvec2(300.0, 200.0),
+            Layout::default().with_padding_all(10.0),
+            |cx| {
+                let relative = Walk::new(
+                    Size::Rel {
+                        base: Base::Parent,
+                        factor: 0.5,
+                    },
+                    Size::Fixed(10.0),
+                );
+                let before = cx.resolve_walk(relative, ResolveAt::BeforeBegin);
+                assert_eq!(before.width.to_fixed(), Some(140.0));
+                cx.begin_turtle(Walk::fixed(50.0, 50.0), Layout::default());
+                let at_close = cx.resolve_walk(relative, ResolveAt::AtClose);
+                assert_eq!(at_close.width.to_fixed(), Some(140.0));
+                assert_eq!(cx.resolve_walk(at_close, ResolveAt::AtClose).width.to_fixed(), Some(140.0));
+                cx.end_turtle();
+
+                cx.begin_turtle(Walk::new(Size::fit(), Size::Fixed(20.0)), Layout::default());
+                let unresolved = cx.resolve_walk(relative, ResolveAt::BeforeBegin);
+                assert!(unresolved.width.is_fit(), "Parent must not skip an unknown immediate parent");
+                cx.end_turtle();
+            },
+        );
+    }
+
+    #[test]
+    fn close_time_bounds_remain_declarative_until_the_turtle_closes() {
+        let line = FitBound::Rel {
+            base: Base::Line,
+            factor: 1.0,
+        };
+        let unused = FitBound::Rel {
+            base: Base::Unused,
+            factor: 1.0,
+        };
+
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            cx.walk_turtle(Walk::fixed(40.0, 10.0));
+            let declaration = Walk {
+                width: Size::Fit {
+                    min: Some(unused),
+                    max: Some(line),
+                },
+                height: Size::fit(),
+                max_width: Some(unused),
+                ..Default::default()
+            };
+            let before = cx.resolve_walk(declaration, ResolveAt::BeforeBegin);
+            assert_eq!(before.width, declaration.width);
+            assert_eq!(before.max_width, declaration.max_width);
+
+            let full = cx.resolve_walk(
+                Walk {
+                    width: Size::Fit {
+                        min: None,
+                        max: Some(FitBound::Rel {
+                            base: Base::Full,
+                            factor: 0.5,
+                        }),
+                    },
+                    height: Size::fit(),
+                    ..Default::default()
+                },
+                ResolveAt::BeforeBegin,
+            );
+            assert_eq!(
+                full.width,
+                Size::Fit {
+                    min: None,
+                    max: Some(FitBound::Abs(100.0))
+                }
+            );
+
+            for base in [Base::Line, Base::Unused] {
+                let contextual_size = Size::Rel { base, factor: 0.5 };
+                assert!(cx
+                    .resolve_walk(
+                        Walk::new(contextual_size, Size::Fixed(1.0)),
+                        ResolveAt::BeforeBegin,
+                    )
+                    .width
+                    .is_fit());
+            }
+        });
+
+        for bound in [line, unused] {
+            with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+                cx.walk_turtle(Walk::fixed(40.0, 10.0));
+                cx.begin_turtle(
+                    Walk {
+                        width: Size::Fit {
+                            min: None,
+                            max: Some(bound),
+                        },
+                        height: Size::fit(),
+                        ..Default::default()
+                    },
+                    Layout::default(),
+                );
+                assert_eq!(
+                    cx.turtle().walk().width,
+                    Size::Fit {
+                        min: None,
+                        max: Some(bound)
+                    }
+                );
+                cx.walk_turtle(Walk::fixed(400.0, 10.0));
+                assert_eq!(cx.end_turtle().size.x, 160.0);
+            });
+        }
+
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            cx.begin_turtle(Walk::fit(), Layout::default());
+            for base in [Base::Line, Base::Unused] {
+                assert!(cx
+                    .resolve_walk(
+                        Walk::new(Size::Rel { base, factor: 1.0 }, Size::Fixed(1.0)),
+                        ResolveAt::AtClose,
+                    )
+                    .width
+                    .is_fit());
+            }
+            cx.end_turtle();
+        });
+    }
+
+    #[test]
+    fn viewport_and_container_context_follow_the_reviewed_fallbacks() {
+        with_window_child_pass(|cx| {
+            let viewport_walk = Walk::new(
+                Size::Rel { base: Base::Vw, factor: 0.5 },
+                Size::Rel { base: Base::Vh, factor: 0.25 },
+            );
+            let resolved = cx.resolve_walk(viewport_walk, ResolveAt::BeforeBegin);
+            assert_eq!(resolved.width.to_fixed(), Some(500.0));
+            assert_eq!(resolved.height.to_fixed(), Some(200.0));
+
+            let outer_id = LiveId(11);
+            let inner_id = LiveId(22);
+            cx.begin_turtle(
+                Walk::fixed(400.0, 300.0),
+                Layout { container_id: outer_id, ..Default::default() },
+            );
+            cx.begin_turtle(
+                Walk::fixed(200.0, 100.0),
+                Layout { container_id: inner_id, ..Default::default() },
+            );
+            let nearest = cx.resolve_walk(
+                Walk::new(Size::Rel { base: Base::Cqw, factor: 0.5 }, Size::Fixed(1.0)),
+                ResolveAt::BeforeBegin,
+            );
+            assert_eq!(nearest.width.to_fixed(), Some(100.0));
+            let named = cx.resolve_walk(
+                Walk::new(Size::Rel { base: Base::Named(outer_id), factor: 0.5 }, Size::Fixed(1.0)),
+                ResolveAt::BeforeBegin,
+            );
+            assert_eq!(named.width.to_fixed(), Some(200.0));
+            let missing = cx.resolve_walk(
+                Walk::new(Size::Rel { base: Base::Named(LiveId(99)), factor: 0.5 }, Size::Fixed(1.0)),
+                ResolveAt::BeforeBegin,
+            );
+            assert_eq!(missing.width.to_fixed(), Some(500.0));
+            cx.end_turtle();
+            cx.end_turtle();
+
+            cx.begin_turtle(
+                Walk::new(Size::fit(), Size::Fixed(20.0)),
+                Layout { container_id: inner_id, ..Default::default() },
+            );
+            let unknown = cx.resolve_walk(
+                Walk::new(Size::Rel { base: Base::Cqw, factor: 0.5 }, Size::Fixed(1.0)),
+                ResolveAt::BeforeBegin,
+            );
+            assert!(unknown.width.is_fit());
+            cx.end_turtle();
+        });
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let root_pass = DrawPass::new(&mut cx);
+        root_pass.set_size(&mut cx, dvec2(500.0, 400.0));
+        let child_pass = DrawPass::new(&mut cx);
+        child_pass.set_pass_parent(&mut cx, &root_pass);
+        child_pass.set_size(&mut cx, dvec2(64.0, 48.0));
+        let event = DrawEvent::default();
+        let mut draw = CxDraw::new(&mut cx, &event);
+        draw.begin_pass(&child_pass, None);
+        {
+            let mut cx = Cx2d::new(&mut draw);
+            cx.begin_root_turtle(dvec2(64.0, 48.0), Layout::default());
+            let resolved = cx.resolve_walk(
+                Walk::new(
+                    Size::Rel {
+                        base: Base::Vw,
+                        factor: 0.5,
+                    },
+                    Size::Rel {
+                        base: Base::Vh,
+                        factor: 0.25,
+                    },
+                ),
+                ResolveAt::BeforeBegin,
+            );
+            assert_eq!(resolved.width.to_fixed(), Some(250.0));
+            assert_eq!(resolved.height.to_fixed(), Some(100.0));
+            cx.end_turtle();
+        }
+        draw.end_pass(&child_pass);
+    }
+
+    #[test]
+    fn constraints_keep_size_margin_box_and_walk_content_box_semantics() {
+        with_turtle(dvec2(200.0, 200.0), Layout::default(), |cx| {
+            let margin = Inset { left: 10.0, right: 10.0, top: 5.0, bottom: 5.0 };
+            let size_bound = cx.walk_turtle(Walk {
+                abs_pos: Some(dvec2(0.0, 0.0)),
+                margin,
+                width: Size::Fill {
+                    weight: 100.0,
+                    basis: FitBound::Abs(0.0),
+                    shrink: 0.0,
+                    min: None,
+                    max: Some(100.0),
+                },
+                height: Size::Fixed(10.0),
+                ..Default::default()
+            });
+            assert_eq!(size_bound.size.x, 80.0);
+
+            let walk_bound = cx.walk_turtle(Walk {
+                abs_pos: Some(dvec2(0.0, 30.0)),
+                margin,
+                width: Size::Fill {
+                    weight: 100.0,
+                    basis: FitBound::Abs(0.0),
+                    shrink: 0.0,
+                    min: None,
+                    max: None,
+                },
+                height: Size::Fixed(10.0),
+                max_width: Some(FitBound::Abs(100.0)),
+                ..Default::default()
+            });
+            assert_eq!(walk_bound.size.x, 100.0);
+
+            let inverted = cx.peek_walk_turtle(Walk {
+                width: Size::Fixed(70.0),
+                height: Size::Fixed(10.0),
+                min_width: Some(FitBound::Abs(120.0)),
+                max_width: Some(FitBound::Abs(80.0)),
+                ..Default::default()
+            });
+            assert_eq!(inverted.size.x, 120.0);
+
+            let relative = cx.peek_walk_turtle(Walk {
+                width: Size::Rel { base: Base::Parent, factor: 0.25 },
+                height: Size::Fixed(10.0),
+                min_width: Some(FitBound::Abs(60.0)),
+                ..Default::default()
+            });
+            assert_eq!(relative.size.x, 60.0);
+
+            let expression = match cx
+                .global::<SizeExprStore>()
+                .intern("50% + 10px")
+                .unwrap()
+            {
+                SizeExprSimple::Compound(id) => id,
+                other => panic!("expected compound expression, got {other:?}"),
+            };
+            let expression = cx.peek_walk_turtle(Walk {
+                width: Size::Expr(expression),
+                height: Size::Fixed(10.0),
+                max_width: Some(FitBound::Abs(90.0)),
+                ..Default::default()
+            });
+            assert_eq!(expression.size.x, 90.0);
+        });
+
+        with_turtle(dvec2(200.0, 200.0), Layout::default(), |cx| {
+            cx.begin_turtle(
+                Walk {
+                    margin: Inset { left: 10.0, right: 10.0, ..Default::default() },
+                    width: Size::Fit { min: None, max: Some(FitBound::Abs(80.0)) },
+                    height: Size::fit(),
+                    ..Default::default()
+                },
+                Layout::default(),
+            );
+            cx.walk_turtle(Walk::fixed(150.0, 10.0));
+            let size_fit = cx.end_turtle();
+            assert_eq!(size_fit.size.x, 60.0);
+
+            cx.begin_turtle(
+                Walk {
+                    abs_pos: Some(dvec2(0.0, 40.0)),
+                    margin: Inset { left: 10.0, right: 10.0, ..Default::default() },
+                    width: Size::fit(),
+                    height: Size::fit(),
+                    max_width: Some(FitBound::Abs(80.0)),
+                    ..Default::default()
+                },
+                Layout::default(),
+            );
+            cx.walk_turtle(Walk::fixed(150.0, 10.0));
+            let walk_fit = cx.end_turtle();
+            assert_eq!(walk_fit.size.x, 80.0);
+        });
+    }
+
+    #[test]
+    fn inverted_size_fill_bounds_normalize_for_immediate_and_deferred_axes() {
+        let horizontal = Walk {
+            margin: Inset {
+                left: 8.0,
+                right: 12.0,
+                ..Default::default()
+            },
+            width: Size::Fill {
+                weight: 1.0,
+                basis: FitBound::Abs(0.0),
+                shrink: 0.0,
+                min: Some(120.0),
+                max: Some(80.0),
+            },
+            height: Size::Fixed(10.0),
+            ..Default::default()
+        };
+        let mut immediate_width = 0.0;
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            immediate_width = cx.walk_turtle(horizontal).size.x;
+        });
+        assert_eq!(immediate_width, 100.0);
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            let mut deferred = cx.defer_walk_turtle(horizontal).unwrap();
+            let materialized = deferred.resolve(cx);
+            assert_eq!(materialized.width, Size::Fixed(immediate_width));
+            assert_eq!(cx.walk_turtle(materialized).size.x, immediate_width);
+        });
+
+        let vertical = Walk {
+            margin: Inset {
+                top: 4.0,
+                bottom: 6.0,
+                ..Default::default()
+            },
+            width: Size::Fixed(10.0),
+            height: Size::Fill {
+                weight: 1.0,
+                basis: FitBound::Abs(0.0),
+                shrink: 0.0,
+                min: Some(90.0),
+                max: Some(40.0),
+            },
+            ..Default::default()
+        };
+        let mut immediate_height = 0.0;
+        with_turtle(dvec2(100.0, 150.0), Layout::flow_down(), |cx| {
+            immediate_height = cx.walk_turtle(vertical).size.y;
+        });
+        assert_eq!(immediate_height, 80.0);
+        with_turtle(dvec2(100.0, 150.0), Layout::flow_down(), |cx| {
+            let mut deferred = cx.defer_walk_turtle(vertical).unwrap();
+            let materialized = deferred.resolve(cx);
+            assert_eq!(materialized.height, Size::Fixed(immediate_height));
+            assert_eq!(cx.walk_turtle(materialized).size.y, immediate_height);
+        });
+    }
+
+    #[test]
+    fn deferred_fill_matches_immediate_margin_box_constraints() {
+        let right_walk = Walk {
+            margin: Inset {
+                left: 10.0,
+                right: 20.0,
+                ..Default::default()
+            },
+            width: Size::Fill {
+                weight: 100.0,
+                basis: FitBound::Abs(0.0),
+                shrink: 0.0,
+                min: Some(80.0),
+                max: Some(120.0),
+            },
+            height: Size::Fixed(10.0),
+            ..Default::default()
+        };
+        for (parent_width, expected_content) in [(200.0, 90.0), (60.0, 50.0)] {
+            let mut immediate_size = Vec2d::default();
+            with_turtle(
+                dvec2(parent_width, 100.0),
+                Layout::flow_right(),
+                |cx| immediate_size = cx.walk_turtle(right_walk).size,
+            );
+            with_turtle(
+                dvec2(parent_width, 100.0),
+                Layout::flow_right(),
+                |cx| {
+                    let mut deferred = cx.defer_walk_turtle(right_walk).unwrap();
+                    let materialized = deferred.resolve(cx);
+                    let deferred_rect = cx.walk_turtle(materialized);
+                    assert_eq!(immediate_size.x, expected_content);
+                    assert_eq!(deferred_rect.size.x, immediate_size.x);
+                },
+            );
+        }
+
+        let down_walk = Walk {
+            margin: Inset {
+                top: 7.0,
+                bottom: 13.0,
+                ..Default::default()
+            },
+            width: Size::Fixed(10.0),
+            height: Size::Fill {
+                weight: 100.0,
+                basis: FitBound::Abs(0.0),
+                shrink: 0.0,
+                min: Some(70.0),
+                max: Some(110.0),
+            },
+            ..Default::default()
+        };
+        for (parent_height, expected_content) in [(200.0, 90.0), (50.0, 50.0)] {
+            let mut immediate_size = Vec2d::default();
+            with_turtle(
+                dvec2(100.0, parent_height),
+                Layout::flow_down(),
+                |cx| immediate_size = cx.walk_turtle(down_walk).size,
+            );
+            with_turtle(
+                dvec2(100.0, parent_height),
+                Layout::flow_down(),
+                |cx| {
+                    let mut deferred = cx.defer_walk_turtle(down_walk).unwrap();
+                    let materialized = deferred.resolve(cx);
+                    let deferred_rect = cx.walk_turtle(materialized);
+                    assert_eq!(immediate_size.y, expected_content);
+                    assert_eq!(deferred_rect.size.y, immediate_size.y);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_main_axis_fill_applies_aspect_after_materialization() {
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            let walk = Walk {
+                margin: Inset {
+                    left: 10.0,
+                    right: 10.0,
+                    ..Default::default()
+                },
+                width: Size::Fill {
+                    weight: 100.0,
+                    basis: FitBound::Abs(0.0),
+                    shrink: 0.0,
+                    min: None,
+                    max: Some(120.0),
+                },
+                height: Size::fit(),
+                aspect: Some(2.0),
+                ..Default::default()
+            };
+            let mut deferred = cx.defer_walk_turtle(walk).unwrap();
+            let materialized = deferred.resolve(cx);
+            assert_eq!(materialized.width.to_fixed(), Some(100.0));
+            assert_eq!(materialized.height.to_fixed(), Some(50.0));
+            assert_eq!(cx.walk_turtle(materialized).size, dvec2(100.0, 50.0));
+        });
+    }
+
+    #[test]
+    fn current_turtle_bounds_combine_legacy_and_walk_limits() {
+        with_turtle(dvec2(300.0, 300.0), Layout::default(), |cx| {
+            cx.begin_turtle(
+                Walk {
+                    margin: Inset {
+                        left: 10.0,
+                        right: 10.0,
+                        top: 5.0,
+                        bottom: 5.0,
+                    },
+                    width: Size::Fit {
+                        min: None,
+                        max: Some(FitBound::Abs(140.0)),
+                    },
+                    height: Size::Fit {
+                        min: None,
+                        max: Some(FitBound::Abs(110.0)),
+                    },
+                    max_width: Some(FitBound::Abs(90.0)),
+                    max_height: Some(FitBound::Abs(80.0)),
+                    ..Default::default()
+                },
+                Layout::default(),
+            );
+            assert_eq!(cx.current_turtle_max_width(), Some(90.0));
+            assert_eq!(cx.current_turtle_max_height(), Some(80.0));
+            cx.end_turtle();
+        });
+    }
+
+    #[test]
+    fn aspect_transfer_clamps_only_the_derived_axis_and_matches_peek_and_absolute() {
+        with_turtle(dvec2(300.0, 200.0), Layout::flow_right(), |cx| {
+            let fixed = Walk { width: Size::Fixed(120.0), height: Size::fit(), aspect: Some(2.0), ..Default::default() };
+            assert_eq!(cx.peek_walk_turtle(fixed).size, dvec2(120.0, 60.0));
+
+            let relative = Walk { width: Size::Rel { base: Base::Parent, factor: 0.5 }, height: Size::fit(), aspect: Some(2.0), ..Default::default() };
+            assert_eq!(cx.peek_walk_turtle(relative).size, dvec2(150.0, 75.0));
+
+            let cross_fill = Walk { width: Size::fit(), height: Size::fill(), aspect: Some(2.0), ..Default::default() };
+            assert_eq!(cx.peek_walk_turtle(cross_fill).size, dvec2(400.0, 200.0));
+
+            let clamped = Walk { width: Size::Fixed(120.0), height: Size::fit(), max_height: Some(FitBound::Abs(40.0)), aspect: Some(2.0), ..Default::default() };
+            assert_eq!(cx.peek_walk_turtle(clamped).size, dvec2(120.0, 40.0));
+
+            let both_definite = Walk { width: Size::Fixed(120.0), height: Size::Fixed(20.0), aspect: Some(2.0), ..Default::default() };
+            assert_eq!(cx.peek_walk_turtle(both_definite).size, dvec2(120.0, 20.0));
+            let both_fit = Walk { width: Size::fit(), height: Size::fit(), aspect: Some(2.0), ..Default::default() };
+            let fit_size = cx.peek_walk_turtle(both_fit).size;
+            assert!(fit_size.x.is_nan() && fit_size.y.is_nan());
+
+            let absolute = fixed.with_abs_pos(dvec2(9.0, 13.0));
+            let peek = cx.peek_walk_turtle(absolute);
+            let walked = cx.walk_turtle(absolute);
+            assert_eq!(peek, walked);
+
+            let main_fill = cx.resolve_walk(
+                Walk { width: Size::fill(), height: Size::fit(), aspect: Some(2.0), ..Default::default() },
+                ResolveAt::BeforeBegin,
+            );
+            assert!(main_fill.width.is_fill() && main_fill.height.is_fit());
+        });
+    }
+
+    #[test]
+    fn ancestor_max_and_adjacent_bug_fixes_are_covered() {
+        let layout = Layout {
+            padding: Inset { left: 3.0, right: 11.0, top: 7.0, bottom: 13.0 },
+            ..Default::default()
+        };
+        with_turtle(dvec2(200.0, 100.0), layout, |cx| {
+            assert_eq!(cx.turtle().rel_pos_padded(), dvec2(0.0, 0.0));
+            let height = cx.turtle().max_height(Walk::new(Size::Fixed(150.0), Size::Fixed(25.0)));
+            assert_eq!(height, Some(25.0));
+            assert_eq!(
+                cx.turtle().max_width(Walk::new(
+                    Size::Rel {
+                        base: Base::Parent,
+                        factor: 0.5,
+                    },
+                    Size::Fixed(1.0),
+                )),
+                None,
+            );
+
+            cx.begin_turtle(
+                Walk { width: Size::fit(), height: Size::fit(), max_height: Some(FitBound::Abs(70.0)), ..Default::default() },
+                Layout::default(),
+            );
+            cx.begin_turtle(Walk::fit(), Layout::default());
+            assert_eq!(cx.compute_max_height_from_ancestors(), 70.0);
+            cx.end_turtle();
+            cx.end_turtle();
+
+            cx.begin_turtle(
+                Walk {
+                    abs_pos: Some(dvec2(0.0, 0.0)),
+                    margin: Inset { top: 8.0, bottom: 8.0, ..Default::default() },
+                    width: Size::fit(),
+                    height: Size::Fit { min: None, max: Some(FitBound::Abs(10.0)) },
+                    ..Default::default()
+                },
+                Layout::default(),
+            );
+            cx.walk_turtle(Walk::fixed(10.0, 20.0));
+            assert_eq!(cx.end_turtle().size.y, 0.0);
+        });
+    }
+
+    #[test]
+    fn script_strings_accept_inline_and_heap_values_and_round_trip_compounds() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
+        cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let mut size = Size::fill();
+            let inline = ScriptValue::from_inline_string("50%").unwrap();
+            size.script_apply(vm, &Apply::New, &mut Scope::empty(), inline);
+            assert!(matches!(size, Size::Rel { base: Base::Parent, factor } if factor == 0.5));
+
+            let heap = vm.bx.heap.new_string_from_str("calc(10px + 25vw)");
+            size.script_apply(vm, &Apply::New, &mut Scope::empty(), heap);
+            let Size::Expr(id) = size else { panic!("heap string did not compile to Expr") };
+            assert_eq!(vm.cx().get_global_ref::<SizeExprStore>().unwrap().source(id), Some("calc(10px + 25vw)"));
+            let emitted = size.script_to_value(vm);
+            let round_trip = vm.bx.heap.string_with(emitted, |_, source| source.to_string());
+            assert_eq!(round_trip.as_deref(), Some("calc(10px + 25vw)"));
+
+            let old = size;
+            let invalid = vm.bx.heap.new_string_from_str("10px + 2");
+            size.script_apply(vm, &Apply::New, &mut Scope::empty(), invalid);
+            assert!(matches!((old, size), (Size::Expr(a), Size::Expr(b)) if a == b));
+
+            let mut bound = FitBound::Abs(1.0);
+            let bound_value = vm.bx.heap.new_string_from_str("max(10px, 5vw)");
+            bound.script_apply(vm, &Apply::New, &mut Scope::empty(), bound_value);
+            assert!(matches!(bound, FitBound::Expr(_)));
+
+            let mut direct = SizeExprId::default();
+            assert!(!SizeExprId::on_type_check(
+                &vm.bx.heap,
+                ScriptValue::from_f64(0.0)
+            ));
+            direct.script_apply(
+                vm,
+                &Apply::New,
+                &mut Scope::empty(),
+                ScriptValue::from_f64(0.0),
+            );
+            assert_eq!(direct, SizeExprId::INVALID);
+
+            let simple = ScriptValue::from_inline_string("50%").unwrap();
+            direct.script_apply(vm, &Apply::New, &mut Scope::empty(), simple);
+            assert_ne!(direct, SizeExprId::INVALID);
+            assert_eq!(
+                vm.cx()
+                    .get_global_ref::<SizeExprStore>()
+                    .unwrap()
+                    .source(direct),
+                Some("50%")
+            );
+            let emitted = direct.script_to_value(vm);
+            let emitted = vm
+                .bx
+                .heap
+                .string_with(emitted, |_, source| source.to_string());
+            assert_eq!(emitted.as_deref(), Some("50%"));
+
+            let pixels = ScriptValue::from_inline_string("10px").unwrap();
+            direct.script_apply(vm, &Apply::New, &mut Scope::empty(), pixels);
+            assert_eq!(
+                vm.cx()
+                    .get_global_ref::<SizeExprStore>()
+                    .unwrap()
+                    .source(direct),
+                Some("10px")
+            );
+
+            let compound = vm.bx.heap.new_string_from_str("10px + 25vw");
+            direct.script_apply(vm, &Apply::New, &mut Scope::empty(), compound);
+            assert_eq!(
+                vm.cx()
+                    .get_global_ref::<SizeExprStore>()
+                    .unwrap()
+                    .source(direct),
+                Some("10px + 25vw")
+            );
+            let old = direct;
+            let invalid = vm.bx.heap.new_string_from_str("10px + 2");
+            direct.script_apply(vm, &Apply::New, &mut Scope::empty(), invalid);
+            assert_eq!(direct, old);
+        });
+    }
+
+    fn flex(grow: f64, basis: f64, shrink: f64) -> Size {
+        Size::Fill {
+            weight: grow,
+            basis: FitBound::Abs(basis),
+            shrink,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn resolve_flex_widths(parent_width: f64, sizes: &[Size]) -> Vec<f64> {
+        let mut result = Vec::new();
+        with_turtle(
+            dvec2(parent_width, 100.0),
+            Layout::flow_right(),
+            |cx| {
+                let mut deferred: Vec<_> = sizes
+                    .iter()
+                    .map(|size| {
+                        cx.defer_walk_turtle(Walk::new(*size, Size::Fixed(10.0)))
+                            .unwrap()
+                    })
+                    .collect();
+                for walk in &mut deferred {
+                    result.push(walk.resolve(cx).width.to_fixed().unwrap());
+                }
+            },
+        );
+        result
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn definite_basis_flex_grows_and_shrinks_with_finite_positive_factors() {
+        let grown = resolve_flex_widths(300.0, &[flex(1.0, 50.0, 0.0), flex(2.0, 50.0, 0.0)]);
+        assert_close(grown[0], 350.0 / 3.0);
+        assert_close(grown[1], 550.0 / 3.0);
+
+        let three = resolve_flex_widths(
+            300.0,
+            &[
+                flex(1.0, 30.0, 0.0),
+                flex(2.0, 30.0, 0.0),
+                flex(0.0, 30.0, 0.0),
+            ],
+        );
+        assert_eq!(three, vec![100.0, 170.0, 30.0]);
+
+        let shrunk = resolve_flex_widths(
+            120.0,
+            &[flex(0.0, 100.0, 1.0), flex(0.0, 100.0, 3.0)],
+        );
+        assert_eq!(shrunk, vec![80.0, 40.0]);
+
+        let three_shrunk = resolve_flex_widths(
+            180.0,
+            &[
+                flex(0.0, 100.0, 1.0),
+                flex(0.0, 100.0, 2.0),
+                flex(0.0, 100.0, 0.0),
+            ],
+        );
+        assert_eq!(three_shrunk, vec![60.0, 20.0, 100.0]);
+
+        let ignored = resolve_flex_widths(
+            120.0,
+            &[
+                flex(f64::NAN, 100.0, f64::INFINITY),
+                flex(-1.0, 100.0, 1.0),
+            ],
+        );
+        assert_eq!(ignored, vec![100.0, 20.0]);
+
+        let no_factors = resolve_flex_widths(
+            120.0,
+            &[flex(0.0, 100.0, 0.0), flex(f64::NAN, 100.0, -1.0)],
+        );
+        assert_eq!(no_factors, vec![100.0, 100.0]);
+
+        let large_finite = resolve_flex_widths(
+            200.0,
+            &[flex(f64::MAX, 0.0, 0.0), flex(f64::MAX, 0.0, 0.0)],
+        );
+        assert_eq!(large_finite, vec![100.0, 100.0]);
+
+        with_turtle(dvec2(100.0, 120.0), Layout::flow_down(), |cx| {
+            let mut a = cx
+                .defer_walk_turtle(Walk::new(
+                    Size::Fixed(10.0),
+                    flex(0.0, 100.0, 1.0),
+                ))
+                .unwrap();
+            let mut b = cx
+                .defer_walk_turtle(Walk::new(
+                    Size::Fixed(10.0),
+                    flex(0.0, 100.0, 3.0),
+                ))
+                .unwrap();
+            assert_eq!(a.resolve(cx).height, Size::Fixed(80.0));
+            assert_eq!(b.resolve(cx).height, Size::Fixed(40.0));
+        });
+
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            let mut contextual = cx
+                .defer_walk_turtle(Walk::new(
+                    Size::Fill {
+                        weight: 0.0,
+                        basis: FitBound::Rel {
+                            base: Base::Parent,
+                            factor: 0.25,
+                        },
+                        shrink: 0.0,
+                        min: None,
+                        max: None,
+                    },
+                    Size::Fixed(10.0),
+                ))
+                .unwrap();
+            assert_eq!(contextual.resolve(cx).width, Size::Fixed(50.0));
+        });
+    }
+
+    #[test]
+    fn flex_accounts_for_fixed_gaps_margins_and_iterative_bounds() {
+        let layout = Layout {
+            spacing: 10.0,
+            padding: Inset {
+                left: 10.0,
+                right: 10.0,
+                ..Default::default()
+            },
+            ..Layout::flow_right()
+        };
+        with_turtle(dvec2(500.0, 100.0), layout, |cx| {
+            cx.walk_turtle(Walk::fixed(50.0, 10.0));
+            let margin = Inset {
+                left: 10.0,
+                right: 10.0,
+                ..Default::default()
+            };
+            let mut a = cx
+                .defer_walk_turtle(Walk {
+                    margin,
+                    width: Size::Fill {
+                        weight: 1.0,
+                        basis: FitBound::Abs(100.0),
+                        shrink: 1.0,
+                        min: None,
+                        max: Some(150.0),
+                    },
+                    height: Size::Fixed(10.0),
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut b = cx
+                .defer_walk_turtle(Walk::new(flex(1.0, 100.0, 1.0), Size::Fixed(10.0)))
+                .unwrap();
+            assert_eq!(a.resolve(cx).width.to_fixed(), Some(130.0));
+            assert_eq!(b.resolve(cx).width.to_fixed(), Some(260.0));
+        });
+
+        let bounded = [
+            Size::Fill {
+                weight: 1.0,
+                basis: FitBound::Abs(100.0),
+                shrink: 1.0,
+                min: None,
+                max: Some(120.0),
+            },
+            Size::Fill {
+                weight: 1.0,
+                basis: FitBound::Abs(100.0),
+                shrink: 1.0,
+                min: None,
+                max: Some(200.0),
+            },
+            flex(1.0, 100.0, 1.0),
+        ];
+        assert_eq!(resolve_flex_widths(540.0, &bounded), vec![120.0, 200.0, 220.0]);
+
+        let floors = [
+            Size::Fill {
+                weight: 0.0,
+                basis: FitBound::Abs(100.0),
+                shrink: 1.0,
+                min: Some(90.0),
+                max: None,
+            },
+            Size::Fill {
+                weight: 0.0,
+                basis: FitBound::Abs(100.0),
+                shrink: 1.0,
+                min: Some(20.0),
+                max: None,
+            },
+        ];
+        assert_eq!(resolve_flex_widths(150.0, &floors), vec![90.0, 60.0]);
+
+        let permuted = [bounded[2], bounded[0], bounded[1]];
+        let mut original = resolve_flex_widths(540.0, &bounded);
+        let mut reordered = resolve_flex_widths(540.0, &permuted);
+        original.sort_by(f64::total_cmp);
+        reordered.sort_by(f64::total_cmp);
+        assert_eq!(original, reordered);
+    }
+
+    #[test]
+    fn indefinite_flex_materializes_clamped_basis_without_nan() {
+        with_turtle(dvec2(f64::NAN, 100.0), Layout::flow_right(), |cx| {
+            let mut deferred = cx
+                .defer_walk_turtle(Walk::new(
+                    Size::Fill {
+                        weight: 1.0,
+                        basis: FitBound::Abs(40.0),
+                        shrink: 1.0,
+                        min: Some(60.0),
+                        max: None,
+                    },
+                    Size::Fixed(10.0),
+                ))
+                .unwrap();
+            let walk = deferred.resolve(cx);
+            assert_eq!(walk.width, Size::Fixed(60.0));
+            assert!(!matches!(walk.width, Size::Fixed(value) if value.is_nan()));
+            assert_eq!(cx.walk_turtle(walk).size.x, 60.0);
+        });
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn late_defer_is_rejected_after_one_shot_resolution() {
+        with_turtle(dvec2(100.0, 100.0), Layout::flow_right(), |cx| {
+            let mut first = cx
+                .defer_walk_turtle(Walk::new(flex(1.0, 0.0, 0.0), Size::Fixed(10.0)))
+                .unwrap();
+            first.resolve(cx);
+            assert!(cx
+                .defer_walk_turtle(Walk::new(flex(1.0, 0.0, 0.0), Size::Fixed(10.0)))
+                .is_none());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "cannot defer another fill after flex resolution")]
+    fn late_defer_debug_asserts_after_one_shot_resolution() {
+        with_turtle(dvec2(100.0, 100.0), Layout::flow_right(), |cx| {
+            let mut first = cx
+                .defer_walk_turtle(Walk::new(flex(1.0, 0.0, 0.0), Size::Fixed(10.0)))
+                .unwrap();
+            first.resolve(cx);
+            let _ = cx.defer_walk_turtle(Walk::new(
+                flex(1.0, 0.0, 0.0),
+                Size::Fixed(10.0),
+            ));
+        });
+    }
+
+    #[test]
+    fn deferred_walk_preserves_metadata_aspect_and_child_round_trip_provenance() {
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            let metrics = Metrics {
+                descender: 3.0,
+                line_gap: 4.0,
+                line_scale: 1.5,
+            };
+            let original = Walk {
+                margin: Inset {
+                    left: 5.0,
+                    right: 7.0,
+                    ..Default::default()
+                },
+                width: flex(0.0, 80.0, 1.0),
+                height: Size::fit(),
+                min_height: Some(FitBound::Abs(20.0)),
+                max_height: Some(FitBound::Abs(50.0)),
+                aspect: Some(2.0),
+                metrics,
+                ..Default::default()
+            };
+            let mut deferred = cx.defer_walk_turtle(original).unwrap();
+            let materialized = deferred.resolve(cx);
+            assert!(materialized.deferred);
+            assert_eq!(materialized.margin.left, original.margin.left);
+            assert_eq!(materialized.margin.right, original.margin.right);
+            assert_eq!(materialized.margin.top, original.margin.top);
+            assert_eq!(materialized.margin.bottom, original.margin.bottom);
+            assert_eq!(materialized.min_height, original.min_height);
+            assert_eq!(materialized.max_height, original.max_height);
+            assert_eq!(materialized.aspect, original.aspect);
+            assert_eq!(materialized.width, Size::Fixed(80.0));
+            assert_eq!(materialized.height, Size::Fixed(40.0));
+
+            cx.begin_turtle(materialized, Layout::default());
+            cx.walk_turtle(Walk::fixed(1.0, 1.0));
+            cx.end_turtle();
+            let finished = cx.finished_walks.last().unwrap();
+            assert!(finished.in_flow);
+            assert_eq!(finished.metrics.descender, metrics.descender);
+            assert_eq!(finished.metrics.line_gap, metrics.line_gap);
+            assert_eq!(finished.metrics.line_scale, metrics.line_scale);
+
+            cx.walk_turtle(Walk::fixed(5.0, 5.0).with_abs_pos(dvec2(2.0, 3.0)));
+            assert!(!cx.finished_walks.last().unwrap().in_flow);
+        });
+    }
+
+    #[test]
+    fn wrapped_fill_uses_current_remainder_or_a_full_fresh_row() {
+        let layout = Layout {
+            spacing: 10.0,
+            ..Layout::flow_right_wrap()
+        };
+        with_turtle(dvec2(100.0, 100.0), layout, |cx| {
+            cx.walk_turtle(Walk::fixed(30.0, 10.0));
+            let fill_walk = Walk::new(flex(1.0, 20.0, 1.0), Size::Fixed(10.0));
+            assert!(cx.defer_walk_turtle(fill_walk).is_none());
+            let fill = cx.walk_turtle(fill_walk);
+            assert_eq!(fill.pos, dvec2(40.0, 0.0));
+            assert_eq!(fill.size.x, 60.0);
+        });
+
+        with_turtle(dvec2(100.0, 100.0), layout, |cx| {
+            cx.walk_turtle(Walk::fixed(30.0, 10.0));
+            let fresh = cx.walk_turtle(Walk {
+                width: Size::Fill {
+                    weight: 1.0,
+                    basis: FitBound::Abs(20.0),
+                    shrink: 1.0,
+                    min: Some(70.0),
+                    max: None,
+                },
+                height: Size::Fixed(10.0),
+                ..Default::default()
+            });
+            assert_eq!(fresh.pos, dvec2(0.0, 10.0));
+            assert_eq!(fresh.size.x, 100.0);
+            assert!(cx.turtle().deferred_fills.is_empty());
+        });
+    }
+
+    #[test]
+    fn wrapped_inverted_fill_bounds_use_the_current_or_one_fresh_row() {
+        let layout = Layout {
+            spacing: 10.0,
+            wrap_spacing: 5.0,
+            ..Layout::flow_right_wrap()
+        };
+        let margin = Inset {
+            left: 4.0,
+            right: 6.0,
+            ..Default::default()
+        };
+
+        with_turtle(dvec2(100.0, 100.0), layout, |cx| {
+            cx.walk_turtle(Walk::fixed(20.0, 10.0));
+            let current = cx.walk_turtle(Walk {
+                margin,
+                width: Size::Fill {
+                    weight: 1.0,
+                    basis: FitBound::Abs(0.0),
+                    shrink: 0.0,
+                    min: Some(70.0),
+                    max: Some(40.0),
+                },
+                height: Size::Fixed(10.0),
+                ..Default::default()
+            });
+            assert_eq!(current.pos, dvec2(34.0, 0.0));
+            assert_eq!(current.size.x, 60.0);
+        });
+
+        with_turtle(dvec2(100.0, 100.0), layout, |cx| {
+            cx.walk_turtle(Walk::fixed(30.0, 10.0));
+            let fresh = cx.walk_turtle(Walk {
+                margin,
+                width: Size::Fill {
+                    weight: 1.0,
+                    basis: FitBound::Abs(0.0),
+                    shrink: 0.0,
+                    min: Some(120.0),
+                    max: Some(80.0),
+                },
+                height: Size::Fixed(10.0),
+                ..Default::default()
+            });
+            assert_eq!(fresh.pos, dvec2(4.0, 15.0));
+            assert_eq!(fresh.size.x, 110.0);
+        });
+    }
+
+    fn tracked_walk(cx: &mut Cx2d, walk: Walk) -> usize {
+        let rect = cx.walk_turtle(walk);
+        let marker = cx.align_list.len();
+        cx.align_list
+            .push(AlignEntry::BeginClip(rect.pos, rect.pos + rect.size));
+        marker
+    }
+
+    fn marker_pos(cx: &Cx2d, marker: usize) -> Vec2d {
+        match cx.align_list[marker] {
+            AlignEntry::BeginClip(pos, _) => pos,
+            ref other => panic!("unexpected marker {other:?}"),
+        }
+    }
+
+    fn nowrap_distribution_positions(mode: Distribute) -> (Vec2d, Vec2d) {
+        let mut positions = (Vec2d::default(), Vec2d::default());
+        with_turtle(
+            dvec2(100.0, 100.0),
+            Layout {
+                distribute: mode,
+                ..Layout::flow_right()
+            },
+            |cx| {
+                let a = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                let b = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                cx.end_turtle();
+                positions = (marker_pos(cx, a), marker_pos(cx, b));
+            },
+        );
+        positions
+    }
+
+    #[test]
+    fn nowrap_right_distribution_modes_and_small_groups_are_defined() {
+        assert_eq!(
+            nowrap_distribution_positions(Distribute::Start),
+            (dvec2(0.0, 0.0), dvec2(10.0, 0.0))
+        );
+        assert_eq!(
+            nowrap_distribution_positions(Distribute::SpaceBetween),
+            (dvec2(0.0, 0.0), dvec2(90.0, 0.0))
+        );
+        let around = nowrap_distribution_positions(Distribute::SpaceAround);
+        assert_close(around.0.x, 20.0);
+        assert_close(around.1.x, 70.0);
+        let evenly = nowrap_distribution_positions(Distribute::SpaceEvenly);
+        assert_close(evenly.0.x, 80.0 / 3.0);
+        assert_close(evenly.1.x, 190.0 / 3.0);
+
+        for mode in [
+            Distribute::Start,
+            Distribute::SpaceBetween,
+            Distribute::SpaceAround,
+            Distribute::SpaceEvenly,
+        ] {
+            with_turtle(
+                dvec2(100.0, 100.0),
+                Layout {
+                    distribute: mode,
+                    ..Layout::flow_right()
+                },
+                |cx| {
+                    if mode != Distribute::Start {
+                        let marker = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                        cx.end_turtle();
+                        let expected = if mode == Distribute::SpaceBetween {
+                            0.0
+                        } else {
+                            45.0
+                        };
+                        assert_close(marker_pos(cx, marker).x, expected);
+                    }
+                },
+            );
+        }
+        with_turtle(
+            dvec2(100.0, 100.0),
+            Layout {
+                distribute: Distribute::SpaceEvenly,
+                ..Layout::flow_right()
+            },
+            |cx| {
+                cx.end_turtle();
+            },
+        );
+    }
+
+    #[test]
+    fn wrapped_rows_and_down_flow_distribute_independently() {
+        with_turtle(
+            dvec2(100.0, 100.0),
+            Layout {
+                distribute: Distribute::SpaceEvenly,
+                ..Layout::flow_right_wrap()
+            },
+            |cx| {
+                let a = tracked_walk(cx, Walk::fixed(40.0, 10.0));
+                let b = tracked_walk(cx, Walk::fixed(40.0, 10.0));
+                let c = tracked_walk(cx, Walk::fixed(40.0, 10.0));
+                cx.end_turtle();
+                assert_close(marker_pos(cx, a).x, 20.0 / 3.0);
+                assert_close(marker_pos(cx, b).x, 160.0 / 3.0);
+                assert_eq!(marker_pos(cx, c), dvec2(30.0, 10.0));
+            },
+        );
+
+        for mode in [
+            Distribute::Start,
+            Distribute::SpaceBetween,
+            Distribute::SpaceAround,
+            Distribute::SpaceEvenly,
+        ] {
+            with_turtle(
+                dvec2(100.0, 100.0),
+                Layout {
+                    distribute: mode,
+                    ..Layout::flow_down()
+                },
+                |cx| {
+                    let a = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                    let b = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                    cx.end_turtle();
+                    let (expected_a, expected_b) = match mode {
+                        Distribute::Start => (0.0, 10.0),
+                        Distribute::SpaceBetween => (0.0, 90.0),
+                        Distribute::SpaceAround => (20.0, 70.0),
+                        Distribute::SpaceEvenly => (80.0 / 3.0, 190.0 / 3.0),
+                    };
+                    assert_close(marker_pos(cx, a).y, expected_a);
+                    assert_close(marker_pos(cx, b).y, expected_b);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_anchor_centers_a_taller_walk_in_place() {
+        let layout = Layout {
+            flow: Flow::Right { wrap: true, row_align: RowAlign::Center },
+            padding: Inset { top: 1.0, ..Default::default() },
+            ..Default::default()
+        };
+        with_turtle(dvec2(200.0, 100.0), layout, |cx| {
+            assert_eq!(cx.row_anchor_drop(18.0, None), 0.0);
+            let pill = tracked_walk(cx, Walk::fixed(20.0, 24.0));
+            // Centering an 18-tall anchor on the 24-tall walk seats it 3 below the row top.
+            let drop = cx.row_anchor_drop(18.0, None);
+            assert_eq!(drop, 3.0);
+
+            // Emit the anchor the way a wrapped text run does: from the row top, padded by the drop.
+            let row_top = cx.turtle().pos();
+            let start = cx.align_list.len();
+            cx.align_list.push(AlignEntry::BeginClip(row_top + dvec2(0.0, drop), row_top));
+            cx.turtle_mut().allocate_width(30.0);
+            cx.turtle_mut().allocate_height(drop + 18.0);
+            let rect = Rect { pos: row_top, size: dvec2(30.0, drop + 18.0) };
+            let align_height = Some(18.0 + 2.0 * drop);
+            cx.emit_turtle_walk_with_role(rect, start, Metrics::default(), align_height, None, RowAlignRole::Anchor);
+            // A second anchor on this row stays on the first one's line.
+            assert_eq!(cx.row_anchor_drop(18.0, None), 0.0);
+            cx.turtle_new_line();
+
+            // The walk stayed where it was drawn, below the padding, and both centers meet.
+            assert_eq!(marker_pos(cx, pill).y, 1.0);
+            assert_eq!(marker_pos(cx, start).y, 4.0);
+            assert_eq!(marker_pos(cx, pill).y + 12.0, marker_pos(cx, start).y + 9.0);
+            // A fresh row holds nothing to center on.
+            assert_eq!(cx.row_anchor_drop(18.0, None), 0.0);
+        });
+    }
+
+    fn baseline_rows() -> Layout {
+        Layout {
+            flow: Flow::Right { wrap: true, row_align: RowAlign::Baseline },
+            ..Default::default()
+        }
+    }
+
+    fn walk_with_baseline(width: f64, height: f64, baseline: f32) -> Walk {
+        Walk { baseline: Baseline::At(baseline), ..Walk::fixed(width, height) }
+    }
+
+    /// Emits an immovable text row the way a wrapped run's first row does: from the row top,
+    /// `drop` of padding above its `height`, its baseline `baseline` below the row top.
+    fn emit_text_anchor(cx: &mut Cx2d, width: f64, height: f64, drop: f64, baseline: f64) -> usize {
+        let row_top = cx.turtle().pos();
+        let start = cx.align_list.len();
+        cx.align_list.push(AlignEntry::BeginClip(row_top + dvec2(0.0, drop), row_top));
+        cx.turtle_mut().allocate_width(width);
+        cx.turtle_mut().allocate_height(drop + height);
+        cx.turtle_mut().move_right(width);
+        let rect = Rect { pos: row_top, size: dvec2(width, drop + height) };
+        cx.emit_turtle_walk_with_role(
+            rect,
+            start,
+            Metrics::default(),
+            Some(height + 2.0 * drop),
+            Some(baseline),
+            RowAlignRole::Anchor,
+        );
+        start
+    }
+
+    fn last_reported_baseline(cx: &Cx2d) -> Option<f64> {
+        cx.finished_walks.last().unwrap().baseline
+    }
+
+    #[test]
+    fn baseline_row_puts_every_baseline_on_the_deepest_one() {
+        with_turtle(dvec2(200.0, 100.0), baseline_rows(), |cx| {
+            let a = tracked_walk(cx, walk_with_baseline(20.0, 20.0, 15.0));
+            let b = tracked_walk(cx, walk_with_baseline(20.0, 10.0, 8.0));
+            cx.turtle_new_line();
+            assert_eq!(marker_pos(cx, a).y, 0.0);
+            assert_eq!(marker_pos(cx, b).y, 7.0);
+            assert_eq!(cx.turtle().used_height(), 20.0);
+            assert_eq!(cx.turtle().pos().y, 20.0);
+        });
+    }
+
+    #[test]
+    fn baseline_row_grows_for_a_box_seated_below_it() {
+        with_turtle(dvec2(200.0, 100.0), baseline_rows(), |cx| {
+            tracked_walk(cx, walk_with_baseline(20.0, 17.6, 13.5));
+            let b = tracked_walk(cx, walk_with_baseline(20.0, 10.0, 2.0));
+            cx.turtle_new_line();
+            // B ends at 21.5, below the 17.6 the row had, so the row grew to keep it.
+            assert_close(marker_pos(cx, b).y, 11.5);
+            assert_close(cx.turtle().used_height(), 21.5);
+            assert_close(cx.turtle().pos().y, 21.5);
+        });
+    }
+
+    #[test]
+    fn baseline_row_seats_a_baseline_less_box_on_the_line() {
+        with_turtle(dvec2(200.0, 100.0), baseline_rows(), |cx| {
+            let text = tracked_walk(cx, walk_with_baseline(20.0, 17.6, 13.5));
+            let image = tracked_walk(cx, Walk::fixed(12.0, 12.0));
+            tracked_walk(cx, Walk::fixed(5.0, 0.0));
+            cx.turtle_new_line();
+            assert_eq!(marker_pos(cx, text).y, 0.0);
+            assert_close(marker_pos(cx, image).y, 1.5);
+            // The zero-height spacer adds nothing above or below the line.
+            assert_close(cx.turtle().used_height(), 17.6);
+        });
+    }
+
+    #[test]
+    fn baseline_anchor_owns_the_line_and_the_up_shift_is_clamped() {
+        let layout = Layout {
+            padding: Inset { top: 1.0, ..Default::default() },
+            ..baseline_rows()
+        };
+        with_turtle(dvec2(200.0, 100.0), layout, |cx| {
+            let anchor = emit_text_anchor(cx, 30.0, 18.0, 0.0, 13.0);
+            let pill = tracked_walk(cx, walk_with_baseline(20.0, 24.0, 17.0));
+            cx.turtle_new_line();
+            // The pill wants to rise 4 onto the anchor's line, but only the 1 of padding fits.
+            assert_eq!(marker_pos(cx, anchor).y, 1.0);
+            assert_eq!(marker_pos(cx, pill).y, 0.0);
+            // That 1 is forgiven below the row, so the next row starts at the pill's bottom.
+            assert_eq!(cx.turtle().pos().y, 24.0);
+        });
+    }
+
+    #[test]
+    fn dropped_anchor_meets_a_deeper_baseline_in_place() {
+        with_turtle(dvec2(200.0, 100.0), baseline_rows(), |cx| {
+            assert_eq!(cx.row_anchor_drop(18.0, Some(13.0)), 0.0);
+            let pill = tracked_walk(cx, walk_with_baseline(20.0, 24.0, 17.0));
+            let drop = cx.row_anchor_drop(18.0, Some(13.0));
+            assert_eq!(drop, 4.0);
+            let anchor = emit_text_anchor(cx, 30.0, 18.0, drop, drop + 13.0);
+            // A second anchor on this row stays on the first one's line.
+            assert_eq!(cx.row_anchor_drop(18.0, Some(13.0)), 0.0);
+            cx.turtle_new_line();
+            assert_eq!(marker_pos(cx, pill).y, 0.0);
+            assert_eq!(marker_pos(cx, anchor).y, 4.0);
+            assert_eq!(cx.turtle().pos().y, 24.0);
+            assert_eq!(cx.row_anchor_drop(18.0, Some(13.0)), 0.0);
+        });
+    }
+
+    #[test]
+    fn row_baseline_descent_is_the_deepest_hang_below_the_line() {
+        with_turtle(dvec2(200.0, 100.0), baseline_rows(), |cx| {
+            assert_eq!(cx.row_baseline_descent(), 0.0);
+            tracked_walk(cx, walk_with_baseline(20.0, 24.0, 17.0));
+            tracked_walk(cx, Walk::fixed(5.0, 0.0));
+            assert_eq!(cx.row_baseline_descent(), 7.0);
+            // A box without a baseline sits on the line, so it hangs nothing below it.
+            tracked_walk(cx, Walk::fixed(10.0, 12.0));
+            assert_eq!(cx.row_baseline_descent(), 7.0);
+        });
+    }
+
+    #[test]
+    fn turtle_reports_its_first_declared_in_flow_baseline() {
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            let inner = Layout {
+                padding: Inset { top: 2.0, ..Default::default() },
+                ..Layout::flow_right()
+            };
+            cx.begin_turtle(Walk::fit(), inner);
+            cx.walk_turtle(Walk {
+                abs_pos: Some(dvec2(0.0, 0.0)),
+                ..walk_with_baseline(10.0, 20.0, 1.0)
+            });
+            let start = cx.align_list.len();
+            let rect = Rect { pos: cx.turtle().pos(), size: dvec2(10.0, 20.0) };
+            cx.emit_turtle_walk_with_role(rect, start, Metrics::default(), None, Some(3.0), RowAlignRole::Fixed);
+            cx.walk_turtle(Walk {
+                margin: Inset { top: 3.0, ..Default::default() },
+                ..walk_with_baseline(10.0, 20.0, 10.0)
+            });
+            cx.walk_turtle(walk_with_baseline(10.0, 20.0, 4.0));
+            cx.end_turtle();
+            // Padding 2 + margin 3 + baseline 10; the out-of-flow and immovable walks before
+            // it were skipped and the shallower walk after it changed nothing.
+            assert_eq!(last_reported_baseline(cx), Some(15.0));
+        });
+    }
+
+    #[test]
+    fn declared_turtle_baseline_wins_over_its_children() {
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            cx.begin_turtle(Walk { baseline: Baseline::None, ..Walk::fit() }, Layout::flow_right());
+            cx.walk_turtle(walk_with_baseline(10.0, 20.0, 10.0));
+            cx.end_turtle();
+            assert_eq!(last_reported_baseline(cx), None);
+
+            cx.begin_turtle(Walk { baseline: Baseline::At(4.0), ..Walk::fit() }, Layout::flow_right());
+            cx.walk_turtle(walk_with_baseline(10.0, 20.0, 10.0));
+            cx.end_turtle();
+            assert_eq!(last_reported_baseline(cx), Some(4.0));
+
+            cx.begin_turtle(Walk::fit(), Layout::flow_right());
+            cx.walk_turtle(Walk::fixed(10.0, 20.0));
+            cx.end_turtle();
+            assert_eq!(last_reported_baseline(cx), None);
+        });
+    }
+
+    #[test]
+    fn turtle_baseline_follows_close_time_shifts() {
+        with_turtle(dvec2(200.0, 400.0), Layout::flow_down(), |cx| {
+            // A centered non-wrapping row: the 10-tall walk drops 10 to center in the box's row.
+            cx.begin_turtle(Walk::fit(), Layout { align: Align { x: 0.0, y: 0.5 }, ..Layout::flow_right() });
+            cx.walk_turtle(Walk::fixed(30.0, 30.0));
+            cx.walk_turtle(walk_with_baseline(10.0, 10.0, 8.0));
+            cx.end_turtle();
+            assert_eq!(last_reported_baseline(cx), Some(18.0));
+
+            // A column centering its content in a fixed height.
+            cx.begin_turtle(Walk::fixed(50.0, 100.0), Layout { align: Align { x: 0.0, y: 0.5 }, ..Layout::flow_down() });
+            cx.walk_turtle(walk_with_baseline(10.0, 10.0, 8.0));
+            cx.end_turtle();
+            assert_eq!(last_reported_baseline(cx), Some(53.0));
+
+            // An overlay aligned to its bottom.
+            cx.begin_turtle(Walk::fixed(50.0, 100.0), Layout { align: Align { x: 0.0, y: 1.0 }, ..Layout::flow_overlay() });
+            cx.walk_turtle(walk_with_baseline(10.0, 10.0, 8.0));
+            cx.end_turtle();
+            assert_eq!(last_reported_baseline(cx), Some(98.0));
+        });
+    }
+
+    #[test]
+    fn turtle_reports_a_baseline_after_a_leading_new_line() {
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_down(), |cx| {
+            cx.begin_turtle(Walk::fit(), Layout::flow_right_wrap());
+            cx.turtle_new_line();
+            cx.walk_turtle(walk_with_baseline(10.0, 20.0, 10.0));
+            cx.end_turtle();
+            assert_eq!(last_reported_baseline(cx), Some(10.0));
+        });
+    }
+
+    #[test]
+    fn deferred_fill_declared_first_is_the_turtle_baseline_source() {
+        with_turtle(dvec2(200.0, 200.0), Layout::flow_down(), |cx| {
+            cx.begin_turtle(Walk::fixed(100.0, 40.0), Layout { align: Align { x: 0.0, y: 0.5 }, ..Layout::flow_right() });
+            let mut deferred = cx
+                .defer_walk_turtle(Walk {
+                    baseline: Baseline::At(6.0),
+                    ..Walk::new(
+                        Size::Fill {
+                            weight: 1.0,
+                            basis: FitBound::Abs(20.0),
+                            shrink: 0.0,
+                            min: None,
+                            max: Some(40.0),
+                        },
+                        Size::Fixed(10.0),
+                    )
+                })
+                .unwrap();
+            tracked_walk(cx, walk_with_baseline(10.0, 20.0, 9.0));
+            let materialized = deferred.resolve(cx);
+            let fill = tracked_walk(cx, materialized);
+            cx.end_turtle();
+            // Declared first, the Fill is the source; its centering (15 down in the 40-tall
+            // row) is counted once.
+            assert_eq!(marker_pos(cx, fill).y, 15.0);
+            assert_eq!(last_reported_baseline(cx), Some(21.0));
+        });
+    }
+
+    /// Draws one wrapping row of a box and a text-like walk under `row_align`, with or
+    /// without baseline data, and returns the marker positions, the used height and the
+    /// baseline the row's turtle reported.
+    fn aligned_row(row_align: RowAlign, with_baselines: bool) -> (Vec2d, Vec2d, f64, Option<f64>) {
+        let mut result = (Vec2d::default(), Vec2d::default(), 0.0, None);
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_down(), |cx| {
+            cx.begin_turtle(Walk::fit(), Layout { flow: Flow::Right { wrap: true, row_align }, ..Default::default() });
+            let box_walk = tracked_walk(cx, Walk::fixed(20.0, 24.0));
+            let text = tracked_walk(cx, Walk {
+                metrics: Metrics { descender: 4.0, ..Metrics::default() },
+                baseline: if with_baselines { Baseline::At(13.5) } else { Baseline::Auto },
+                ..Walk::fixed(20.0, 17.0)
+            });
+            cx.turtle_new_line();
+            let used = cx.turtle().used_height();
+            cx.end_turtle();
+            result = (marker_pos(cx, box_walk), marker_pos(cx, text), used, last_reported_baseline(cx));
+        });
+        result
+    }
+
+    #[test]
+    fn center_and_bottom_rows_ignore_baselines_and_report_the_shifted_one() {
+        let (box_a, text_a, used_a, reported_a) = aligned_row(RowAlign::Center, true);
+        let (box_b, text_b, used_b, reported_b) = aligned_row(RowAlign::Center, false);
+        assert_eq!((box_a, text_a, used_a), (box_b, text_b, used_b));
+        assert_close(text_a.y, 3.5);
+        assert_close(reported_a.unwrap(), 13.5 + 3.5);
+        assert_eq!(reported_b, None);
+
+        let (box_a, text_a, used_a, reported_a) = aligned_row(RowAlign::Bottom, true);
+        let (box_b, text_b, used_b, reported_b) = aligned_row(RowAlign::Bottom, false);
+        assert_eq!((box_a, text_a, used_a), (box_b, text_b, used_b));
+        assert_close(reported_a.unwrap(), 13.5 + text_a.y);
+        assert_eq!(reported_b, None);
+    }
+
+
+    fn assert_near(actual: f64, expected: f64, tol: f64) {
+        assert!((actual - expected).abs() < tol, "expected {expected}, got {actual}");
+    }
+
+    /// Robrix's pill_bg: a Fit turtle with negative vertical padding and align y 0.5, holding a
+    /// baseline-less avatar and a title. The reported baseline must be where the title's really is.
+    #[test]
+    fn negative_padding_turtle_reports_where_its_title_sits() {
+        with_turtle(dvec2(400.0, 100.0), baseline_rows(), |cx| {
+            cx.begin_turtle(
+                Walk::fit(),
+                Layout {
+                    align: Align { x: 0.0, y: 0.5 },
+                    padding: Inset { left: 6.0, right: 4.0, top: -3.0, bottom: -3.0 },
+                    ..Layout::flow_right()
+                },
+            );
+            tracked_walk(cx, Walk { baseline: Baseline::None, ..Walk::fixed(16.0, 16.0) });
+            let title = tracked_walk(cx, walk_with_baseline(50.0, 17.6, 13.5667));
+            let rect = cx.end_turtle();
+            let reported = last_reported_baseline(cx).unwrap();
+            assert_near(rect.pos.y + reported, marker_pos(cx, title).y + 13.5667, 1e-4);
+        });
+    }
+
+    #[test]
+    fn nowrap_baseline_row_grows_its_fit_turtle() {
+        with_turtle(dvec2(400.0, 100.0), Layout::flow_down(), |cx| {
+            cx.begin_turtle(Walk::fit(), Layout { flow: Flow::Right { wrap: false, row_align: RowAlign::Baseline }, ..Default::default() });
+            let image = tracked_walk(cx, Walk::fixed(30.0, 30.0));
+            let text = tracked_walk(cx, walk_with_baseline(50.0, 17.6, 13.5667));
+            let rect = cx.end_turtle();
+            assert_near(marker_pos(cx, image).y, 0.0, 1e-4);
+            assert_near(marker_pos(cx, text).y, 30.0 - 13.5667, 1e-4);
+            assert_near(rect.size.y, 30.0 + 17.6 - 13.5667, 1e-4);
+            assert_near(last_reported_baseline(cx).unwrap(), 30.0, 1e-4);
+        });
+    }
+
+    #[test]
+    fn grown_row_extends_the_turtle_clip() {
+        with_turtle(dvec2(400.0, 200.0), Layout::flow_down(), |cx| {
+            let clip_index = cx.align_list.len();
+            cx.begin_turtle(Walk::fit(), Layout { clip_y: true, ..baseline_rows() });
+            tracked_walk(cx, walk_with_baseline(50.0, 17.6, 13.5667));
+            tracked_walk(cx, Walk::fixed(30.0, 30.0));
+            let rect = cx.end_turtle();
+            assert_near(rect.size.y, 30.0 + 17.6 - 13.5667, 1e-4);
+            let AlignEntry::BeginClip(min, max) = cx.align_list[clip_index] else { panic!() };
+            assert_near(max.y - min.y, rect.size.y, 1e-4);
+        });
+    }
+
+    /// A lone walk never needs to move, even with its baseline above its outer top (negative margin).
+    #[test]
+    fn lone_walk_with_a_baseline_above_its_top_stays_put() {
+        with_turtle(dvec2(400.0, 100.0), baseline_rows(), |cx| {
+            let walk = tracked_walk(cx, Walk { margin: Inset { top: -5.0, ..Default::default() }, ..walk_with_baseline(10.0, 10.0, 2.0) });
+            cx.turtle_new_line();
+            assert_near(marker_pos(cx, walk).y, -5.0, 1e-4);
+        });
+    }
+
+    #[test]
+    fn deferred_fill_joins_the_baseline_row() {
+        with_turtle(dvec2(200.0, 200.0), Layout::flow_down(), |cx| {
+            cx.begin_turtle(Walk::fixed(100.0, 60.0), Layout { flow: Flow::Right { wrap: false, row_align: RowAlign::Baseline }, ..Default::default() });
+            let mut deferred = cx
+                .defer_walk_turtle(Walk {
+                    baseline: Baseline::At(6.0),
+                    ..Walk::new(
+                        Size::Fill { weight: 1.0, basis: FitBound::Abs(20.0), shrink: 0.0, min: None, max: Some(40.0) },
+                        Size::Fixed(10.0),
+                    )
+                })
+                .unwrap();
+            let text = tracked_walk(cx, walk_with_baseline(10.0, 20.0, 15.0));
+            let materialized = deferred.resolve(cx);
+            let fill = tracked_walk(cx, materialized);
+            cx.end_turtle();
+            assert_near(marker_pos(cx, text).y, 0.0, 1e-4);
+            assert_near(marker_pos(cx, fill).y, 9.0, 1e-4);
+        });
+    }
+
+    #[test]
+    fn turtle_reports_first_row_baseline_after_that_row_grew() {
+        with_turtle(dvec2(400.0, 200.0), Layout::flow_down(), |cx| {
+            cx.begin_turtle(Walk::fit(), baseline_rows());
+            let text = tracked_walk(cx, walk_with_baseline(50.0, 17.6, 13.5667));
+            let tall = tracked_walk(cx, walk_with_baseline(13.0, 30.0, 4.0));
+            cx.turtle_new_line();
+            let row2 = tracked_walk(cx, walk_with_baseline(50.0, 17.6, 13.5667));
+            let rect = cx.end_turtle();
+            assert_near(marker_pos(cx, text).y, 0.0, 1e-4);
+            assert_near(marker_pos(cx, tall).y, 13.5667 - 4.0, 1e-4);
+            assert_near(marker_pos(cx, row2).y, 39.5667, 1e-4);
+            assert_near(rect.size.y, 39.5667 + 17.6, 1e-4);
+            assert_near(last_reported_baseline(cx).unwrap(), 13.5667, 1e-4);
+        });
+    }
+
+    #[test]
+    fn child_declared_none_is_skipped_as_source() {
+        with_turtle(dvec2(200.0, 100.0), Layout::flow_right(), |cx| {
+            cx.begin_turtle(Walk::fit(), Layout::flow_right());
+            cx.walk_turtle(Walk { baseline: Baseline::None, ..walk_with_baseline(10.0, 20.0, 3.0) });
+            cx.walk_turtle(walk_with_baseline(10.0, 20.0, 10.0));
+            cx.end_turtle();
+            assert_eq!(last_reported_baseline(cx), Some(10.0));
+        });
+    }
+
+    #[test]
+    fn nested_block_aligns_by_its_first_line() {
+        with_turtle(dvec2(400.0, 200.0), baseline_rows(), |cx| {
+            let text = tracked_walk(cx, walk_with_baseline(50.0, 17.6, 13.5667));
+            cx.begin_turtle(Walk::fit(), Layout { padding: Inset { top: 4.0, ..Default::default() }, ..Layout::flow_down() });
+            let line1 = tracked_walk(cx, walk_with_baseline(50.0, 17.6, 13.5667));
+            let line2 = tracked_walk(cx, walk_with_baseline(50.0, 17.6, 13.5667));
+            cx.end_turtle();
+            cx.turtle_new_line();
+            assert_near(marker_pos(cx, text).y, 4.0, 1e-4);
+            assert_near(marker_pos(cx, line1).y, 4.0, 1e-4);
+            assert_near(marker_pos(cx, line2).y, 21.6, 1e-4);
+            assert_near(cx.turtle().used_height(), 4.0 + 35.2, 1e-4);
+        });
+    }
+
+    #[test]
+    fn baseline_bookkeeping_sizes() {
+        // `Walk` is passed by value everywhere, so its gate is the one that matters.
+        assert!(std::mem::size_of::<Baseline>() <= 8);
+        assert!(std::mem::size_of::<Walk>() <= 384);
+    }
+
+    struct CountingAllocator;
+
+    static ALLOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::alloc::System.alloc(layout)
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            std::alloc::System.dealloc(ptr, layout)
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::alloc::System.realloc(ptr, layout, new_size)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    /// Draws `rows` wrapping rows of eight nested boxes with baselines under `row_align`,
+    /// returning how many heap allocations that took.
+    fn allocations_for_rows(row_align: RowAlign, rows: usize) -> usize {
+        let before = ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+        with_turtle(dvec2(1000.0, 10000.0), Layout::flow_down(), |cx| {
+            cx.begin_turtle(Walk::fit(), Layout { flow: Flow::Right { wrap: true, row_align }, ..Default::default() });
+            for row in 0..rows {
+                for index in 0..8 {
+                    let height = 10.0 + ((row + index) % 5) as f64 * 3.0;
+                    cx.begin_turtle(Walk::fit(), Layout { align: Align { x: 0.0, y: 0.5 }, ..Layout::flow_right() });
+                    cx.walk_turtle(walk_with_baseline(20.0, height, (height * 0.75) as f32));
+                    cx.end_turtle();
+                }
+                cx.turtle_new_line();
+            }
+            cx.end_turtle();
+        });
+        ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed) - before
+    }
+
+    /// Run alone (`-- --ignored --test-threads=1`) so no other test's allocations are counted.
+    /// The counts still wobble by a few from test setup, so only per-row growth would fail it.
+    #[test]
+    #[ignore = "counts this thread's allocations, so it needs --test-threads=1"]
+    fn baseline_rows_allocate_like_center_and_top_rows() {
+        let count = |row_align| (0..3).map(|_| allocations_for_rows(row_align, 50)).min().unwrap();
+        let (top, center, baseline) = (count(RowAlign::Top), count(RowAlign::Center), count(RowAlign::Baseline));
+        println!("allocations for 50 rows x 8 walks: top {top} center {center} baseline {baseline}");
+        assert!(baseline <= center + 8 && baseline <= top + 8);
+    }
+
+    /// Run with `--release -- --ignored --nocapture` for the per-row cost of each alignment.
+    #[test]
+    #[ignore = "timing only"]
+    fn row_alignment_timing() {
+        for row_align in [RowAlign::Top, RowAlign::Center, RowAlign::Baseline] {
+            let rows = 200;
+            let mut best = f64::MAX;
+            for _ in 0..20 {
+                let start = std::time::Instant::now();
+                allocations_for_rows(row_align, rows);
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            println!("{row_align:?}: {:.1} ns per row of 8 nested walks", best * 1e9 / rows as f64);
+        }
+    }
+
+    #[test]
+    fn deferred_prefix_delta_moves_anchor_and_fixed_followers() {
+        with_turtle(dvec2(100.0, 40.0), Layout::flow_right(), |cx| {
+            let mut deferred = cx
+                .defer_walk_turtle(Walk::new(
+                    Size::Fill {
+                        weight: 1.0,
+                        basis: FitBound::Abs(20.0),
+                        shrink: 0.0,
+                        min: None,
+                        max: Some(40.0),
+                    },
+                    Size::Fixed(10.0),
+                ))
+                .unwrap();
+            let following = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+            cx.finished_walks.last_mut().unwrap().align_role = RowAlignRole::Anchor;
+            let materialized = deferred.resolve(cx);
+            let fill = tracked_walk(cx, materialized);
+            cx.end_turtle();
+            assert_eq!(marker_pos(cx, fill), dvec2(0.0, 0.0));
+            assert_eq!(marker_pos(cx, following), dvec2(40.0, 0.0));
+        });
+
+        with_turtle(dvec2(40.0, 100.0), Layout::flow_down(), |cx| {
+            let mut deferred = cx
+                .defer_walk_turtle(Walk::new(
+                    Size::Fixed(10.0),
+                    Size::Fill {
+                        weight: 1.0,
+                        basis: FitBound::Abs(20.0),
+                        shrink: 0.0,
+                        min: None,
+                        max: Some(40.0),
+                    },
+                ))
+                .unwrap();
+            let following = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+            cx.finished_walks.last_mut().unwrap().align_role = RowAlignRole::Fixed;
+            let materialized = deferred.resolve(cx);
+            let fill = tracked_walk(cx, materialized);
+            cx.end_turtle();
+            assert_eq!(marker_pos(cx, fill), dvec2(0.0, 0.0));
+            assert_eq!(marker_pos(cx, following), dvec2(0.0, 40.0));
+        });
+    }
+
+    #[test]
+    fn mixed_roles_keep_start_main_and_cross_axis_alignment() {
+        with_turtle(
+            dvec2(100.0, 40.0),
+            Layout {
+                align: Align { x: 0.5, y: 1.0 },
+                ..Layout::flow_right()
+            },
+            |cx| {
+                let anchor = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                let normal = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                cx.finished_walks[0].align_role = RowAlignRole::Anchor;
+                cx.end_turtle();
+                assert_eq!(marker_pos(cx, anchor), dvec2(40.0, 30.0));
+                assert_eq!(marker_pos(cx, normal), dvec2(50.0, 30.0));
+            },
+        );
+
+        with_turtle(
+            dvec2(40.0, 100.0),
+            Layout {
+                align: Align { x: 1.0, y: 0.5 },
+                ..Layout::flow_down()
+            },
+            |cx| {
+                let fixed = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                let normal = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                cx.finished_walks[0].align_role = RowAlignRole::Fixed;
+                cx.end_turtle();
+                assert_eq!(marker_pos(cx, fixed), dvec2(30.0, 40.0));
+                assert_eq!(marker_pos(cx, normal), dvec2(30.0, 50.0));
+            },
+        );
+    }
+
+    #[test]
+    fn space_distribution_falls_back_for_the_whole_mixed_role_group() {
+        for flow in [Flow::right(), Flow::right_wrap()] {
+            let expected_y = if matches!(flow, Flow::Right { wrap: true, .. }) {
+                0.0
+            } else {
+                30.0
+            };
+            with_turtle(
+                dvec2(100.0, 40.0),
+                Layout {
+                    flow,
+                    align: Align { x: 0.5, y: 1.0 },
+                    distribute: Distribute::SpaceBetween,
+                    ..Default::default()
+                },
+                |cx| {
+                    let anchor = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                    let normal = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                    cx.finished_walks[0].align_role = RowAlignRole::Anchor;
+                    cx.end_turtle();
+                    assert_eq!(marker_pos(cx, anchor), dvec2(40.0, expected_y));
+                    assert_eq!(marker_pos(cx, normal), dvec2(50.0, expected_y));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_ignores_space_distribution() {
+        with_turtle(
+            dvec2(100.0, 100.0),
+            Layout {
+                align: Align { x: 0.5, y: 0.5 },
+                distribute: Distribute::SpaceEvenly,
+                ..Layout::flow_overlay()
+            },
+            |cx| {
+                let small = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                let large = tracked_walk(cx, Walk::fixed(20.0, 20.0));
+                cx.end_turtle();
+                assert_eq!(marker_pos(cx, small), dvec2(45.0, 45.0));
+                assert_eq!(marker_pos(cx, large), dvec2(40.0, 40.0));
+            },
+        );
+    }
+
+    #[test]
+    fn distribution_handles_constrained_fill_absolute_and_immovable_walks() {
+        with_turtle(
+            dvec2(100.0, 100.0),
+            Layout {
+                distribute: Distribute::SpaceEvenly,
+                ..Layout::flow_right()
+            },
+            |cx| {
+                let mut deferred = cx
+                    .defer_walk_turtle(Walk::new(
+                        Size::Fill {
+                            weight: 1.0,
+                            basis: FitBound::Abs(0.0),
+                            shrink: 0.0,
+                            min: None,
+                            max: Some(40.0),
+                        },
+                        Size::Fixed(10.0),
+                    ))
+                    .unwrap();
+                let walk = deferred.resolve(cx);
+                assert_eq!(walk.width, Size::Fixed(40.0));
+                let fill = tracked_walk(cx, walk);
+                cx.end_turtle();
+                assert_eq!(marker_pos(cx, fill), dvec2(30.0, 0.0));
+            },
+        );
+
+        // A following normal walk receives the deferred fill's signed delta
+        // and its own distribution offset in one close-time range move.
+        with_turtle(
+            dvec2(100.0, 100.0),
+            Layout {
+                distribute: Distribute::SpaceEvenly,
+                ..Layout::flow_right()
+            },
+            |cx| {
+                let mut deferred = cx
+                    .defer_walk_turtle(Walk::new(
+                        Size::Fill {
+                            weight: 1.0,
+                            basis: FitBound::Abs(20.0),
+                            shrink: 0.0,
+                            min: None,
+                            max: Some(40.0),
+                        },
+                        Size::Fixed(10.0),
+                    ))
+                    .unwrap();
+                let following = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                let materialized = deferred.resolve(cx);
+                let fill = tracked_walk(cx, materialized);
+                cx.end_turtle();
+                assert_close(marker_pos(cx, fill).x, 50.0 / 3.0);
+                assert_close(marker_pos(cx, following).x, 220.0 / 3.0);
+            },
+        );
+
+        with_turtle(
+            dvec2(100.0, 100.0),
+            Layout {
+                distribute: Distribute::SpaceBetween,
+                ..Layout::flow_right()
+            },
+            |cx| {
+                let absolute = tracked_walk(
+                    cx,
+                    Walk::fixed(80.0, 10.0).with_abs_pos(dvec2(5.0, 20.0)),
+                );
+                let a = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                let b = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                cx.end_turtle();
+                assert_eq!(marker_pos(cx, absolute), dvec2(5.0, 20.0));
+                assert_eq!(marker_pos(cx, a), dvec2(0.0, 0.0));
+                assert_eq!(marker_pos(cx, b), dvec2(90.0, 0.0));
+            },
+        );
+
+        with_turtle(
+            dvec2(100.0, 100.0),
+            Layout {
+                distribute: Distribute::SpaceBetween,
+                ..Layout::flow_right()
+            },
+            |cx| {
+                let a = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                let b = tracked_walk(cx, Walk::fixed(10.0, 10.0));
+                cx.finished_walks[0].align_role = RowAlignRole::Anchor;
+                cx.end_turtle();
+                assert_eq!(marker_pos(cx, a), dvec2(0.0, 0.0));
+                assert_eq!(marker_pos(cx, b), dvec2(10.0, 0.0));
+            },
+        );
+    }
+
+    #[test]
+    fn new_defaults_preserve_legacy_fill_behavior() {
+        assert_eq!(
+            Size::fill(),
+            Size::Fill {
+                weight: 100.0,
+                basis: FitBound::Abs(0.0),
+                shrink: 0.0,
+                min: None,
+                max: None,
+            }
+        );
+        assert_eq!(Layout::default().distribute, Distribute::Start);
+        assert!(!Walk::default().deferred);
+    }
+
+    #[test]
+    fn walk_and_layout_size_gates() {
+        assert!(std::mem::size_of::<Walk>() <= 384);
+        // Layout was 96 bytes before the one-word container id. Keep the
+        // reviewed foundation within the measured 112-byte baseline.
+        assert!(std::mem::size_of::<Layout>() <= 112);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Script, ScriptHook)]
 pub enum Base {
     #[pick]
     Full,
+    Parent,
+    Vw,
+    Vh,
+    Cqw,
+    Cqh,
+    #[live(LiveId(0))]
+    Named(LiveId),
     Unused,
+    /// The width available on the enclosing line for inline content,
+    /// accounting for the enclosing widget's own leading geometry and
+    /// trailing insets; see [`Cx2d::find_line_available_width`]. Widths
+    /// only: as a height base this resolves to nothing.
+    Line,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveAt {
+    /// The walk has not been pushed; the top turtle is its immediate parent.
+    BeforeBegin,
+    /// The walk owns the top turtle; its immediate parent is one slot below.
+    AtClose,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Axis {
+    Width,
+    Height,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ContentBounds {
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+impl ContentBounds {
+    fn from_fill(min: Option<f64>, max: Option<f64>, margin: f64) -> Self {
+        let mut bounds = Self::default();
+        bounds.add_min(min.map(|value| (value - margin).max(0.0)));
+        bounds.add_max(max.map(|value| (value - margin).max(0.0)));
+        bounds.normalize();
+        bounds
+    }
+
+    fn add_min(&mut self, value: Option<f64>) {
+        if let Some(value) = value.filter(|value| value.is_finite()) {
+            self.min = Some(self.min.map_or(value, |old| old.max(value)));
+        }
+    }
+
+    fn add_max(&mut self, value: Option<f64>) {
+        if let Some(value) = value.filter(|value| value.is_finite()) {
+            self.max = Some(self.max.map_or(value, |old| old.min(value)));
+        }
+    }
+
+    fn normalize(&mut self) {
+        if let (Some(min), Some(max)) = (self.min, self.max) {
+            if min > max {
+                self.max = Some(min);
+            }
+        }
+    }
+
+    fn clamp(self, value: f64) -> f64 {
+        let mut value = value;
+        if let Some(max) = self.max {
+            value = value.min(max);
+        }
+        if let Some(min) = self.min {
+            value = value.max(min);
+        }
+        value.max(0.0)
+    }
+
+    fn clamp_available(self, value: f64) -> f64 {
+        if value.is_nan() && self.min.is_none() && self.max.is_none() {
+            value
+        } else {
+            self.clamp(value)
+        }
+    }
 }
 
 /// Specifies how walks should be laid out with respect to each other.
@@ -378,6 +2686,10 @@ pub struct Layout {
     #[live]
     pub spacing: f64,
 
+    /// The vertical spacing between rows when wrapping in a `Flow::Right { wrap: true }` layout.
+    #[live]
+    pub wrap_spacing: f64,
+
     /// The padding around the inner rectangle of each walk.
     #[live]
     pub padding: Inset,
@@ -385,6 +2697,15 @@ pub struct Layout {
     /// The alignment of each walk with respect to their turtle's rectangle.
     #[live]
     pub align: Align,
+
+    /// Distribution of positive slack along the main axis.
+    #[live]
+    pub distribute: Distribute,
+
+    /// Nonzero ids make this turtle a query container for cqw/cqh and
+    /// `Base::Named` resolution.
+    #[live]
+    pub container_id: LiveId,
 }
 
 impl Layout {
@@ -470,9 +2791,86 @@ impl Default for Layout {
             clip_y: true,
             padding: Inset::default(),
             align: Align::default(),
+            distribute: Distribute::default(),
             flow: Flow::default(),
             spacing: 0.0,
+            wrap_spacing: 0.0,
+            container_id: LiveId(0),
         }
+    }
+}
+
+impl From<SizeExprUnit> for Base {
+    fn from(unit: SizeExprUnit) -> Self {
+        match unit {
+            SizeExprUnit::Parent => Base::Parent,
+            SizeExprUnit::Vw => Base::Vw,
+            SizeExprUnit::Vh => Base::Vh,
+            SizeExprUnit::Cqw => Base::Cqw,
+            SizeExprUnit::Cqh => Base::Cqh,
+        }
+    }
+}
+
+fn script_string(vm: &mut ScriptVm, value: ScriptValue) -> Option<String> {
+    vm.bx
+        .heap
+        .string_with(value, |_, source| source.to_string())
+}
+
+fn intern_size_expression(
+    vm: &mut ScriptVm,
+    source: &str,
+) -> Result<SizeExprSimple, String> {
+    vm.cx_mut().global::<SizeExprStore>().intern(source)
+}
+
+fn size_expr_source_to_value(vm: &mut ScriptVm, id: SizeExprId) -> Option<ScriptValue> {
+    let source = vm
+        .cx()
+        .get_global_ref::<SizeExprStore>()?
+        .source(id)?
+        .to_string();
+    Some(vm.bx.heap.new_string_from_str(&source))
+}
+
+impl ScriptHook for SizeExprId {
+    fn on_type_check(_heap: &ScriptHeap, value: ScriptValue) -> bool {
+        value.is_string_like()
+    }
+}
+
+impl ScriptNew for SizeExprId {
+    fn script_new(_vm: &mut ScriptVm) -> Self {
+        Self::default()
+    }
+}
+
+impl ScriptApply for SizeExprId {
+    fn script_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        _apply: &Apply,
+        _scope: &mut Scope,
+        value: ScriptValue,
+    ) {
+        if let Some(source) = script_string(vm, value) {
+            match vm.cx_mut().global::<SizeExprStore>().intern_id(&source) {
+                Ok(id) => *self = id,
+                Err(error) => error!("invalid SizeExprId expression {:?}: {}", source, error),
+            }
+        } else {
+            error!("SizeExprId requires a string expression");
+        }
+    }
+
+    fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
+        let source = vm
+            .cx()
+            .get_global_ref::<SizeExprStore>()
+            .and_then(|store| store.source(*self))
+            .map(str::to_string);
+        source.map_or(NIL, |source| vm.bx.heap.new_string_from_str(&source))
     }
 }
 
@@ -539,11 +2937,51 @@ impl Default for Flow {
     }
 }
 
+/// How each walk in a `Flow::Right` row is vertically aligned relative to the
+/// row's other walks (a non-wrapping flow is one row).
+///
+/// All alignment is performed at row-finish time (i.e., when the row wraps
+/// or when the turtle ends) by shifting the already-rendered items in the
+/// turtle's align list. `Top` (the default) is a no-op.
 #[derive(Copy, Clone, PartialEq, Debug, Script, ScriptHook)]
 pub enum RowAlign {
+    /// Each walk is placed at the top of the row (no post-adjustment). This
+    /// is the default and matches the historical layout behavior.
     #[pick]
     Top,
+    /// Each walk is shifted down so its bottom sits on the row baseline,
+    /// using `Walk::metrics.descender` to separate baseline from bottom.
+    /// Useful for text-heavy rows with mixed font sizes.
     Bottom,
+    /// Each walk is shifted down so its vertical center aligns with the row's
+    /// vertical center. Useful for mixing inline block widgets (e.g. pills)
+    /// with surrounding text: the block stays put (it's the tallest item on
+    /// the row), and the text slides down to the row's center so that the
+    /// block's internal content visually aligns with the surrounding text.
+    Center,
+    /// Each walk is shifted so its baseline sits on the row's: the deepest
+    /// baseline on the row, or an immovable text row's own. A walk with no
+    /// baseline seats its bottom edge there, the way an inline image does in HTML.
+    /// Text runs report their line's baseline, so a widget inside a sub/superscript
+    /// sits on the line, not the raised text. An `abs_pos` walk, or a cached View
+    /// that draws nothing, reports no baseline. Leave `align.y` at 0 on such rows:
+    /// it is applied per walk afterwards and would undo the alignment.
+    Baseline,
+}
+
+/// How positive slack is distributed between in-flow walks on the main axis.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Script, ScriptHook)]
+pub enum Distribute {
+    /// Keep walks at the main-axis start. This is the historical behavior.
+    #[pick]
+    #[default]
+    Start,
+    /// Put all positive slack between adjacent walks.
+    SpaceBetween,
+    /// Give each walk an equal share of slack on both sides.
+    SpaceAround,
+    /// Give every edge and every inter-walk boundary equal slack.
+    SpaceEvenly,
 }
 
 /// The turtle is the main layout primitive in Makepad.
@@ -583,7 +3021,12 @@ pub struct Turtle {
     finished_rows_start: usize,
     finished_walks_start: usize,
     deferred_fills: Vec<DeferredFill>,
-    resolved_fills: Vec<f64>,
+    flex_resolved: bool,
+    next_flow_index: u32,
+    /// The finished walk whose baseline this turtle reports, and that baseline below
+    /// the turtle's rectangle top, kept current through row-finish and close-time shifts.
+    baseline_walk: Option<usize>,
+    baseline_y: f64,
     pos: Vec2d,
     origin: Vec2d,
     guard: Area,
@@ -626,6 +3069,30 @@ impl Turtle {
     /// after measuring the actual width of the bullet/marker text.
     pub fn set_padding_left(&mut self, left: f64) {
         self.layout.padding.left = left;
+    }
+
+    /// Sets the right padding of this turtle's layout.
+    ///
+    /// Useful for temporarily reserving space at the right edge of an
+    /// in-flow turtle (e.g. so wrapping text leaves room for trailing
+    /// decoration drawn after the layout call). Save the previous value
+    /// via [`Turtle::padding`] and restore it when done.
+    pub fn set_padding_right(&mut self, right: f64) {
+        self.layout.padding.right = right;
+    }
+
+    /// Sets whether this turtle's `Flow::Right` layout wraps onto a new row,
+    /// leaving any other flow untouched.
+    ///
+    /// Turning wrapping off confines the following walks to the current row,
+    /// which is how a caller that has run out of rows to give keeps an
+    /// oversized walk from opening one anyway. Such a walk overruns the row's
+    /// width instead, exactly as unwrappable text does. Save the previous
+    /// setting via [`Turtle::layout`] and restore it when done.
+    pub fn set_flow_wrap(&mut self, wrap: bool) {
+        if let Flow::Right { wrap: flow_wrap, .. } = &mut self.layout.flow {
+            *flow_wrap = wrap;
+        }
     }
 
     /// Returns the alignment of each walk of this turtle with respect to it's rectangle.
@@ -767,20 +3234,6 @@ impl Turtle {
         dvec2(self.width(), self.height())
     }
 
-    pub fn base_width(&self, base: Base) -> f64 {
-        match base {
-            Base::Full => self.width(),
-            Base::Unused => self.unused_width(),
-        }
-    }
-
-    pub fn base_height(&self, base: Base) -> f64 {
-        match base {
-            Base::Full => self.height(),
-            Base::Unused => self.unused_height(),
-        }
-    }
-
     /// Returns the width of this turtle's rectangle.
     ///
     /// If the width is unknown, then NaN is returned.
@@ -799,7 +3252,6 @@ impl Turtle {
     pub fn set_width(&mut self, width: f64) {
         self.width = width;
     }
-
 
     /// Sets the height of this turtle's rectangle.
     pub fn set_height(&mut self, height: f64) {
@@ -1005,21 +3457,17 @@ impl Turtle {
     pub fn next_walk_width(&self, width: Size, margin: Inset) -> f64 {
         match width {
             Size::Fill { min, max, .. } => {
-                let mut outer_width = match self.layout.flow {
+                let outer_width = match self.layout.flow {
                     Flow::Right { wrap: false, .. } => self.unused_inner_width(),
                     Flow::Right { wrap: true, .. } => self.unused_inner_width_for_current_row(),
                     Flow::Down | Flow::Overlay => self.effective_inner_width(),
                 };
-                if let Some(min) = min {
-                    outer_width = outer_width.max(min);
-                }
-                if let Some(max) = max {
-                    outer_width = outer_width.min(max);
-                }
-                outer_width - margin.width()
+                ContentBounds::from_fill(min, max, margin.width())
+                    .clamp_available(outer_width - margin.width())
             }
             Size::Fixed(width) => width.max(0.0),
             Size::Fit { .. } => f64::NAN,
+            Size::Rel { .. } | Size::Expr(_) => f64::NAN,
         }
     }
 
@@ -1049,20 +3497,16 @@ impl Turtle {
     pub fn next_walk_height(&self, height: Size, margin: Inset) -> f64 {
         match height {
             Size::Fill { min, max, .. } => {
-                let mut outer_height = match self.layout.flow {
+                let outer_height = match self.layout.flow {
                     Flow::Right { .. } | Flow::Overlay => self.inner_effective_height(),
                     Flow::Down => self.unused_inner_height(),
                 };
-                if let Some(min) = min {
-                    outer_height = outer_height.max(min);
-                }
-                if let Some(max) = max {
-                    outer_height = outer_height.min(max);
-                }
-                outer_height - margin.height()
+                ContentBounds::from_fill(min, max, margin.height())
+                    .clamp_available(outer_height - margin.height())
             }
             Size::Fixed(height) => height.max(0.0),
             Size::Fit { .. } => f64::NAN,
+            Size::Rel { .. } | Size::Expr(_) => f64::NAN,
         }
     }
 
@@ -1114,58 +3558,121 @@ impl Turtle {
         self.deferred_fills.len()
     }
 
-    fn resolved_fill_count(&self) -> usize {
-        self.resolved_fills.len()
-    }
-
-    fn total_deferred_weight_from(&self, index: usize) -> f64 {
-        self.deferred_fills[index..]
+    fn total_resolved_delta_to(&self, index: usize) -> f64 {
+        self.deferred_fills[..index]
             .iter()
-            .map(|deferred_fill| deferred_fill.weight)
+            .map(|fill| fill.delta)
             .sum()
     }
 
-    fn total_resolved_length_to(&self, index: usize) -> f64 {
-        self.resolved_fills[..index].iter().sum()
-    }
-
-    fn inner_unused_length(&self) -> f64 {
+    fn inner_free_length(&self) -> f64 {
         match self.layout.flow {
-            Flow::Right { wrap: false, .. } => self.unused_inner_width(),
-            Flow::Down => self.unused_inner_height(),
+            Flow::Right { wrap: false, .. } => self.inner_width() - self.inner_used_width(),
+            Flow::Down => self.inner_height() - self.inner_used_height(),
             _ => panic!(),
         }
     }
 
-    fn unresolved_length_from(&self, index: usize) -> f64 {
-        self.inner_unused_length() - self.total_resolved_length_to(index)
-    }
-
     fn resolve_fill(&mut self, index: usize) -> f64 {
-        let mut count = self.resolved_fill_count();
-        while count <= index {
-            let unresolved_length = self.unresolved_length_from(count);
-            let deferred_fill = &self.deferred_fills[count];
-            let total_deferred_weight = self.total_deferred_weight_from(count);
-            let mut length = unresolved_length * deferred_fill.weight / total_deferred_weight;
-            if let Some(min) = deferred_fill.min {
-                length = length.max(min);
-            }
-            if let Some(max) = deferred_fill.max {
-                length = length.min(max);
-            }
-            self.push_resolved_fill(length);
-            count += 1;
+        if !self.flex_resolved {
+            self.solve_fills();
         }
-        self.resolved_fills[index]
+        self.deferred_fills[index].basis + self.deferred_fills[index].delta
     }
 
-    fn push_deferred_fill(&mut self, weight: f64, min: Option<f64>, max: Option<f64>) {
-        self.deferred_fills.push(DeferredFill { weight, min, max });
+    fn solve_fills(&mut self) {
+        debug_assert!(!self.flex_resolved, "flex solver must run exactly once");
+        self.flex_resolved = true;
+
+        let mut free = self.inner_free_length();
+        if !free.is_finite() || free == 0.0 {
+            return;
+        }
+        let growing = free > 0.0;
+
+        for _ in 0..self.deferred_fills.len() {
+            let factor_scale = self
+                .deferred_fills
+                .iter()
+                .filter(|fill| !fill.frozen)
+                .map(|fill| fill.flex_factor(growing))
+                .fold(0.0_f64, f64::max);
+            if factor_scale <= 0.0 {
+                break;
+            }
+            let factor_sum: f64 = self
+                .deferred_fills
+                .iter()
+                .filter(|fill| !fill.frozen)
+                .map(|fill| fill.flex_factor(growing) / factor_scale)
+                .sum();
+
+            let mut froze_any = false;
+            for fill in &mut self.deferred_fills {
+                if fill.frozen {
+                    continue;
+                }
+                let factor = fill.flex_factor(growing) / factor_scale;
+                let proposal = fill.basis + free * (factor / factor_sum);
+                let resolved = fill.clamp(proposal);
+                let blocked = if growing {
+                    resolved < proposal
+                } else {
+                    resolved > proposal
+                };
+                fill.delta = resolved - fill.basis;
+                if blocked {
+                    fill.frozen = true;
+                    froze_any = true;
+                }
+            }
+
+            if !froze_any {
+                break;
+            }
+
+            free = self.inner_free_length()
+                - self
+                    .deferred_fills
+                    .iter()
+                    .filter(|fill| fill.frozen)
+                    .map(|fill| fill.delta)
+                    .sum::<f64>();
+        }
     }
 
-    fn push_resolved_fill(&mut self, length: f64) {
-        self.resolved_fills.push(length);
+    fn push_deferred_fill(&mut self, fill: DeferredFill) {
+        debug_assert!(
+            !self.flex_resolved,
+            "cannot defer another fill after flex resolution"
+        );
+        self.deferred_fills.push(fill);
+    }
+}
+
+impl DeferredFill {
+    fn clamp(&self, value: f64) -> f64 {
+        let mut value = value;
+        if let Some(max) = self.max {
+            value = value.min(max);
+        }
+        if let Some(min) = self.min {
+            value = value.max(min);
+        }
+        value.max(0.0)
+    }
+
+    fn flex_factor(&self, growing: bool) -> f64 {
+        let factor = if growing {
+            self.grow
+        } else {
+            self.shrink * self.unclamped_basis.max(0.0)
+        };
+        if factor.is_finite() && factor > 0.0 {
+            factor
+        } else {
+            0.0
+        }
     }
 }
 
@@ -1179,8 +3686,7 @@ pub enum DeferredWalk {
     Unresolved {
         index: usize,
         pos: Vec2d,
-        margin: Inset,
-        other_axis: Size,
+        walk: Walk,
     },
     /// A resolved deferred walk.
     Resolved(Walk),
@@ -1192,28 +3698,32 @@ impl DeferredWalk {
             Self::Unresolved {
                 index,
                 pos,
-                margin,
-                other_axis,
+                mut walk,
             } => {
-                let turtle = cx.turtles.last_mut().unwrap();
-
-                let walk = match turtle.flow() {
-                    Flow::Right { wrap: false, .. } => Walk {
-                        abs_pos: Some(pos + dvec2(turtle.total_resolved_length_to(index), 0.0)),
-                        margin,
-                        width: Size::Fixed(turtle.resolve_fill(index)),
-                        height: other_axis,
-                        metrics: Metrics::default(),
-                    },
-                    Flow::Down => Walk {
-                        abs_pos: Some(pos + dvec2(0.0, turtle.total_resolved_length_to(index))),
-                        margin,
-                        height: Size::Fixed(turtle.resolve_fill(index)),
-                        width: other_axis,
-                        metrics: Metrics::default(),
-                    },
-                    _ => panic!(),
-                };
+                {
+                    let turtle = cx.turtles.last_mut().unwrap();
+                    match turtle.flow() {
+                        Flow::Right { wrap: false, .. } => {
+                            let length = turtle.resolve_fill(index);
+                            walk.abs_pos = Some(
+                                pos + dvec2(turtle.total_resolved_delta_to(index), 0.0),
+                            );
+                            walk.width = Size::Fixed(length);
+                        }
+                        Flow::Down => {
+                            let length = turtle.resolve_fill(index);
+                            walk.abs_pos = Some(
+                                pos + dvec2(0.0, turtle.total_resolved_delta_to(index)),
+                            );
+                            walk.height = Size::Fixed(length);
+                        }
+                        _ => panic!(),
+                    }
+                }
+                // Main-axis Fill is now definite, so the ordinary resolver can
+                // transfer `aspect` to a Fit cross axis and apply its bounds.
+                walk.deferred = true;
+                walk = cx.resolve_walk(walk, ResolveAt::BeforeBegin);
                 *self = DeferredWalk::Resolved(walk);
                 walk
             }
@@ -1238,7 +3748,160 @@ pub struct FinishedWalk {
     /// The size of the outer rectangle of this finished walk.
     outer_size: Vec2d,
 
+    /// Whether this walk participates in normal flow and distribution.
+    in_flow: bool,
+
+    /// Declaration order within the owning turtle.
+    flow_index: u32,
+
     metrics: Metrics,
+
+    /// How row alignment may treat this walk (see [`RowAlignRole`]).
+    align_role: RowAlignRole,
+
+    /// Height to center by under `RowAlign::Center` instead of `outer_size.y`.
+    /// Text runs pass their line's height here so mixed-font runs on a row all
+    /// get the same shift and keep their relative baselines.
+    align_height: Option<f64>,
+
+    /// The walk's text baseline below its outer top (margin included), when it has one.
+    baseline: Option<f64>,
+}
+
+impl FinishedWalk {
+    /// The baseline a `RowAlign::Baseline` row aligns: a walk without one sits on its bottom edge.
+    fn effective_baseline(&self) -> f64 {
+        self.baseline.unwrap_or(self.outer_size.y)
+    }
+}
+
+/// How row alignment may treat a finished walk.
+///
+/// A multi-row text run draws all of its glyphs in one instance batch, so no
+/// individual row of it can ever be repositioned; the run's per-row walks are
+/// therefore immovable and declare one of the non-`Shiftable` roles.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum RowAlignRole {
+    /// Row alignment may shift this walk's align range.
+    #[default]
+    Shiftable,
+    /// Immovable, and under `RowAlign::Center` the row's center line anchors
+    /// to this walk's own center instead of the tallest walk's, so every
+    /// shiftable walk on the row — including a taller one, which then shifts
+    /// UP — centers on it. Declared by a wrapped run's rows that hold visible
+    /// text.
+    Anchor,
+    /// Immovable and inert: neither shifted nor an anchor. Declared by a
+    /// wrapped run's first-row walk when that row holds no glyphs (the run
+    /// wrapped immediately), so a row of other content is not anchored to an
+    /// invisible line.
+    Fixed,
+}
+
+/// The horizontal shift that centers a `Flow::Right` row's actually-drawn content
+/// within its inner width, per `align.x`.
+///
+/// Deferred fills are given all the slack up front, so the normal align path skips
+/// align.x when any exist. But a fill that draws narrower than its slot (an image
+/// that aspect-fits, say) leaves genuine slack, and this reclaims it. Returns 0 when
+/// the content fills the row or the inner width is unknown.
+fn row_align_x_shift(
+    align_x: f64,
+    inner_width: f64,
+    spacing: f64,
+    walks: &[FinishedWalk],
+) -> f64 {
+    if align_x == 0.0 || walks.is_empty() || inner_width.is_nan() {
+        return 0.0;
+    }
+    let gaps = spacing * walks.len().saturating_sub(1) as f64;
+    let used: f64 = walks.iter().map(|w| w.outer_size.x).sum::<f64>() + gaps;
+    align_x * (inner_width - used).max(0.0)
+}
+
+/// The vertical counterpart of [`row_align_x_shift`] for a `Flow::Down` column.
+///
+/// A `height: Fill` child that draws shorter than its slot leaves genuine slack;
+/// this reclaims it for `align.y`. Returns 0 when the column fills, `align.y` is 0,
+/// or the inner height is unknown.
+fn col_align_y_shift(
+    align_y: f64,
+    inner_height: f64,
+    spacing: f64,
+    walks: &[FinishedWalk],
+) -> f64 {
+    if align_y == 0.0 || walks.is_empty() || inner_height.is_nan() {
+        return 0.0;
+    }
+    let gaps = spacing * walks.len().saturating_sub(1) as f64;
+    let used: f64 = walks.iter().map(|w| w.outer_size.y).sum::<f64>() + gaps;
+    align_y * (inner_height - used).max(0.0)
+}
+
+#[derive(Clone, Copy)]
+struct DistributionGroup {
+    count: usize,
+    slack: f64,
+}
+
+impl DistributionGroup {
+    fn for_walks(
+        inner: f64,
+        spacing: f64,
+        walks: &[FinishedWalk],
+        axis: Axis,
+    ) -> Option<Self> {
+        let mut count: usize = 0;
+        let mut used = 0.0;
+        let mut immovable = false;
+        for walk in walks.iter().filter(|walk| walk.in_flow) {
+            count += 1;
+            used += match axis {
+                Axis::Width => walk.outer_size.x,
+                Axis::Height => walk.outer_size.y,
+            };
+            immovable |= walk.align_role != RowAlignRole::Shiftable;
+        }
+        if immovable {
+            #[cfg(debug_assertions)]
+            log!("main-axis distribution skipped for a group containing immovable text");
+            return None;
+        }
+        if count == 0 {
+            return None;
+        }
+        used += spacing * count.saturating_sub(1) as f64;
+        let slack = inner - used;
+        Some(Self {
+            count,
+            slack: if slack.is_finite() && slack > 0.0 {
+                slack
+            } else {
+                0.0
+            },
+        })
+    }
+
+    fn offset(self, mode: Distribute, rank: usize) -> f64 {
+        match mode {
+            Distribute::Start => 0.0,
+            Distribute::SpaceBetween if self.count <= 1 => 0.0,
+            Distribute::SpaceBetween => self.slack * rank as f64 / (self.count - 1) as f64,
+            Distribute::SpaceAround => {
+                self.slack * (rank as f64 + 0.5) / self.count as f64
+            }
+            Distribute::SpaceEvenly => {
+                self.slack * (rank + 1) as f64 / (self.count + 1) as f64
+            }
+        }
+    }
+}
+
+fn distribution_rank(walks: &[FinishedWalk], flow_index: u32) -> usize {
+    walks
+        .iter()
+        .filter(|walk| walk.in_flow && walk.flow_index < flow_index)
+        .count()
 }
 
 impl<'a, 'b> Cx2d<'a, 'b> {
@@ -1247,14 +3910,51 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         self.turtles.last().unwrap()
     }
 
+    /// Where the turtles around the current one clip what is drawn in it,
+    /// as far as this draw knows yet: every open ancestor's clip laid over
+    /// the others, the current turtle's own clip left out. The pair is the
+    /// least and the greatest corner, the form [`Rect::clip`] takes. An axis
+    /// no ancestor clips on, or clips on with an extent it does not know yet
+    /// (a Fit), is open to infinity.
+    ///
+    /// Read mid-draw, like [`Turtle::rect`], and so before any alignment an
+    /// ancestor applies when it ends. An overlay drawn on a root turtle,
+    /// which none of these turtles clip, reads it to stop where the view its
+    /// anchor sits in stops, on the same draw that scrolled the anchor there:
+    /// the clip an area reports is only known once the draw has ended.
+    pub fn turtle_ancestor_clip(&self) -> (Vec2d, Vec2d) {
+        let mut min = dvec2(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut max = dvec2(f64::INFINITY, f64::INFINITY);
+        let ancestors = self.turtles.len().saturating_sub(1);
+        for turtle in &self.turtles[..ancestors] {
+            let Some(AlignEntry::BeginClip(lo, hi)) = self.align_list.get(turtle.align_start) else {
+                continue;
+            };
+            if lo.x.is_finite() && hi.x.is_finite() {
+                min.x = min.x.max(lo.x);
+                max.x = max.x.min(hi.x);
+            }
+            if lo.y.is_finite() && hi.y.is_finite() {
+                min.y = min.y.max(lo.y);
+                max.y = max.y.min(hi.y);
+            }
+        }
+        (min, max)
+    }
+
     pub fn turtle_is_at_first_row(&self) -> bool {
         self.turtle().finished_rows_start == self.finished_rows.len()
     }
 
     /// Returns true if the current turtle's next walk would be it's first.
     pub fn turtle_next_walk_is_first(&self) -> bool {
-        self.turtle().finished_walks_start == self.finished_walks.len()
-            && self.turtle().deferred_fills.is_empty()
+        self.turtle().next_flow_index == 0
+    }
+
+    fn turtle_current_row_has_in_flow_walks(&self) -> bool {
+        self.finished_walks[self.current_row_walks_start()..]
+            .iter()
+            .any(|walk| walk.in_flow)
     }
 
     /// Returns the offset to the current turtle's next walk.
@@ -1262,7 +3962,11 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     /// This is either zero if the current turtle's next walk would be its first, or the current
     /// turtle's spacing in the direction of it's flow otherwise.
     pub fn turtle_next_walk_offset(&self) -> Vec2d {
-        if self.turtle_next_walk_is_first() {
+        let first_on_wrapped_row = matches!(
+            self.turtle().layout.flow,
+            Flow::Right { wrap: true, .. }
+        ) && !self.turtle_current_row_has_in_flow_walks();
+        if self.turtle_next_walk_is_first() || first_on_wrapped_row {
             dvec2(0.0, 0.0)
         } else {
             match self.turtle().layout.flow {
@@ -1278,22 +3982,525 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         self.turtles.last_mut().unwrap()
     }
 
+    /// Resolves contextual sizes, content-box constraints, and generic aspect
+    /// sizing for the requested layout phase. Calling this repeatedly is safe.
+    pub fn resolve_walk(&self, walk: Walk, at: ResolveAt) -> Walk {
+        if !walk.needs_resolve() {
+            return walk;
+        }
+
+        let mut walk = walk;
+        walk.width = self.resolve_size(walk.width, Axis::Width, at);
+        walk.height = self.resolve_size(walk.height, Axis::Height, at);
+        walk.width = self.resolve_size_bounds(walk.width, Axis::Width, at);
+        walk.height = self.resolve_size_bounds(walk.height, Axis::Height, at);
+        walk.min_width = self.resolve_bound_declaration(walk.min_width, Axis::Width, at);
+        walk.max_width = self.resolve_bound_declaration(walk.max_width, Axis::Width, at);
+        walk.min_height = self.resolve_bound_declaration(walk.min_height, Axis::Height, at);
+        walk.max_height = self.resolve_bound_declaration(walk.max_height, Axis::Height, at);
+
+        let width_bounds = self.content_bounds(&walk, Axis::Width, at);
+        let height_bounds = self.content_bounds(&walk, Axis::Height, at);
+        walk.width = self.apply_before_bounds(walk.width, width_bounds, walk.margin.width());
+        walk.height = self.apply_before_bounds(walk.height, height_bounds, walk.margin.height());
+
+        if let Some(aspect) = walk.aspect.filter(|aspect| aspect.is_finite() && *aspect > 0.0) {
+            match (walk.width, walk.height) {
+                (Size::Fit { .. }, Size::Fixed(height)) => {
+                    walk.width = Size::Fixed(width_bounds.clamp(height * aspect));
+                }
+                (Size::Fixed(width), Size::Fit { .. }) => {
+                    walk.height = Size::Fixed(height_bounds.clamp(width / aspect));
+                }
+                (Size::Fit { .. }, Size::Fill { .. })
+                    if self.fill_is_immediate_cross_axis(Axis::Height, at) =>
+                {
+                    if let Some(height) = self.materialize_fill(walk.height, Axis::Height, walk.margin, at) {
+                        walk.height = Size::Fixed(height_bounds.clamp(height));
+                        walk.width = Size::Fixed(width_bounds.clamp(height * aspect));
+                    }
+                }
+                (Size::Fill { .. }, Size::Fit { .. })
+                    if self.fill_is_immediate_cross_axis(Axis::Width, at) =>
+                {
+                    if let Some(width) = self.materialize_fill(walk.width, Axis::Width, walk.margin, at) {
+                        walk.width = Size::Fixed(width_bounds.clamp(width));
+                        walk.height = Size::Fixed(height_bounds.clamp(width / aspect));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Size::Fixed(width) = walk.width {
+            walk.width = Size::Fixed(width_bounds.clamp(width));
+        }
+        if let Size::Fixed(height) = walk.height {
+            walk.height = Size::Fixed(height_bounds.clamp(height));
+        }
+        walk
+    }
+
+    fn resolve_size(&self, size: Size, axis: Axis, at: ResolveAt) -> Size {
+        match size {
+            // These bases describe close-time layout state and are supported
+            // for Fit bounds only. A Size object must never sample the moving
+            // pen, at either phase.
+            Size::Rel {
+                base: Base::Line | Base::Unused,
+                ..
+            } => Size::fit(),
+            Size::Rel { base, factor } => self
+                .resolve_base(base, axis, at)
+                .filter(|value| value.is_finite())
+                .map_or_else(Size::fit, |value| Size::Fixed(value * factor)),
+            Size::Expr(id) => self
+                .eval_size_expr(id, axis, at)
+                .filter(|value| value.is_finite())
+                .map_or_else(Size::fit, Size::Fixed),
+            other => other,
+        }
+    }
+
+    fn resolve_size_bounds(&self, size: Size, axis: Axis, at: ResolveAt) -> Size {
+        match size {
+            Size::Fill {
+                weight,
+                basis,
+                shrink,
+                min,
+                max,
+            } => Size::Fill {
+                weight,
+                basis: self
+                    .resolve_bound_declaration(Some(basis), axis, at)
+                    .unwrap_or(basis),
+                shrink,
+                min,
+                max,
+            },
+            Size::Fit { min, max } => Size::Fit {
+                min: self.resolve_bound_declaration(min, axis, at),
+                max: self.resolve_bound_declaration(max, axis, at),
+            },
+            other => other,
+        }
+    }
+
+    fn resolve_bound_declaration(
+        &self,
+        bound: Option<FitBound>,
+        axis: Axis,
+        at: ResolveAt,
+    ) -> Option<FitBound> {
+        bound.map(|bound| {
+            self.eval_fit_bound(bound, axis, at)
+                .filter(|value| value.is_finite())
+                .map_or(bound, FitBound::Abs)
+        })
+    }
+
+    fn content_bounds(&self, walk: &Walk, axis: Axis, at: ResolveAt) -> ContentBounds {
+        self.content_bounds_with_parent(
+            walk,
+            axis,
+            self.parent_index(at),
+            at == ResolveAt::AtClose,
+        )
+    }
+
+    fn content_bounds_with_parent(
+        &self,
+        walk: &Walk,
+        axis: Axis,
+        parent_index: Option<usize>,
+        allow_close_bases: bool,
+    ) -> ContentBounds {
+        let (size, walk_min, walk_max, margin) = match axis {
+            Axis::Width => (walk.width, walk.min_width, walk.max_width, walk.margin.width()),
+            Axis::Height => (walk.height, walk.min_height, walk.max_height, walk.margin.height()),
+        };
+        let mut bounds = ContentBounds::default();
+        match size {
+            Size::Fill { min, max, .. } => {
+                bounds = ContentBounds::from_fill(min, max, margin);
+            }
+            Size::Fit { min, max } => {
+                bounds.add_min(
+                    min.and_then(|bound| {
+                        self.eval_fit_bound_with_parent(
+                            bound,
+                            axis,
+                            parent_index,
+                            allow_close_bases,
+                        )
+                    })
+                        .map(|value| (value - margin).max(0.0)),
+                );
+                bounds.add_max(
+                    max.and_then(|bound| {
+                        self.eval_fit_bound_with_parent(
+                            bound,
+                            axis,
+                            parent_index,
+                            allow_close_bases,
+                        )
+                    })
+                        .map(|value| (value - margin).max(0.0)),
+                );
+            }
+            _ => {}
+        }
+        bounds.add_min(walk_min.and_then(|bound| {
+            self.eval_fit_bound_with_parent(bound, axis, parent_index, allow_close_bases)
+        }));
+        bounds.add_max(walk_max.and_then(|bound| {
+            self.eval_fit_bound_with_parent(bound, axis, parent_index, allow_close_bases)
+        }));
+        bounds.normalize();
+        bounds
+    }
+
+    pub fn walk_max_width(&self, walk: Walk) -> Option<f64> {
+        self.content_bounds(&walk, Axis::Width, ResolveAt::BeforeBegin).max
+    }
+
+    pub fn walk_max_height(&self, walk: Walk) -> Option<f64> {
+        self.content_bounds(&walk, Axis::Height, ResolveAt::BeforeBegin).max
+    }
+
+    pub fn current_turtle_max_width(&self) -> Option<f64> {
+        let index = self.turtles.len().checked_sub(1)?;
+        self.content_bounds_for_turtle(&self.turtles[index].walk, Axis::Width, index)
+            .max
+    }
+
+    pub fn current_turtle_max_height(&self) -> Option<f64> {
+        let index = self.turtles.len().checked_sub(1)?;
+        self.content_bounds_for_turtle(&self.turtles[index].walk, Axis::Height, index)
+            .max
+    }
+
+    fn content_bounds_for_turtle(
+        &self,
+        walk: &Walk,
+        axis: Axis,
+        turtle_index: usize,
+    ) -> ContentBounds {
+        self.content_bounds_with_parent(walk, axis, turtle_index.checked_sub(1), true)
+    }
+
+    fn apply_before_bounds(&self, size: Size, bounds: ContentBounds, margin: f64) -> Size {
+        match size {
+            Size::Fixed(value) => Size::Fixed(bounds.clamp(value)),
+            Size::Fill {
+                weight,
+                basis,
+                shrink,
+                ..
+            } => Size::Fill {
+                weight,
+                basis,
+                shrink,
+                min: bounds.min.map(|value| value + margin),
+                max: bounds.max.map(|value| value + margin),
+            },
+            other => other,
+        }
+    }
+
+    fn fill_is_immediate_cross_axis(&self, axis: Axis, at: ResolveAt) -> bool {
+        let Some(parent_index) = self.parent_index(at) else {
+            return false;
+        };
+        match (self.turtles[parent_index].flow(), axis) {
+            (Flow::Right { .. }, Axis::Height)
+            | (Flow::Down, Axis::Width)
+            | (Flow::Overlay, _) => true,
+            _ => false,
+        }
+    }
+
+    fn materialize_fill(
+        &self,
+        size: Size,
+        axis: Axis,
+        margin: Inset,
+        at: ResolveAt,
+    ) -> Option<f64> {
+        let parent = &self.turtles[self.parent_index(at)?];
+        let value = match axis {
+            Axis::Width => parent.next_walk_width(size, margin),
+            Axis::Height => parent.next_walk_height(size, margin),
+        };
+        value.is_finite().then_some(value)
+    }
+
+    fn parent_index(&self, at: ResolveAt) -> Option<usize> {
+        self.turtles.len().checked_sub(match at {
+            ResolveAt::BeforeBegin => 1,
+            ResolveAt::AtClose => 2,
+        })
+    }
+
+    fn resolve_base(&self, base: Base, axis: Axis, at: ResolveAt) -> Option<f64> {
+        self.resolve_base_from_parent(base, axis, self.parent_index(at))
+    }
+
+    fn resolve_base_from_parent(
+        &self,
+        base: Base,
+        axis: Axis,
+        parent_index: Option<usize>,
+    ) -> Option<f64> {
+        let dimension = |turtle: &Turtle, axis| match axis {
+            Axis::Width => turtle.inner_width(),
+            Axis::Height => turtle.inner_height(),
+        };
+        match base {
+            Base::Parent => {
+                let value = dimension(self.turtles.get(parent_index?)?, axis);
+                value.is_finite().then_some(value)
+            }
+            Base::Vw => self.viewport_size().x.is_finite().then_some(self.viewport_size().x),
+            Base::Vh => self.viewport_size().y.is_finite().then_some(self.viewport_size().y),
+            Base::Cqw => self.resolve_container_dimension(None, Axis::Width, parent_index),
+            Base::Cqh => self.resolve_container_dimension(None, Axis::Height, parent_index),
+            Base::Named(id) => self.resolve_container_dimension(Some(id), axis, parent_index),
+            Base::Line => {
+                if axis == Axis::Width {
+                    let turtle_index = parent_index.map_or(0, |index| index + 1);
+                    self.find_line_available_width_for_turtle(turtle_index)
+                } else {
+                    None
+                }
+            }
+            Base::Full | Base::Unused => {
+                let mut index = parent_index?;
+                loop {
+                    let turtle = &self.turtles[index];
+                    let value = match (base, axis) {
+                        (Base::Full, Axis::Width) => turtle.width(),
+                        (Base::Full, Axis::Height) => turtle.height(),
+                        (Base::Unused, Axis::Width) => turtle.unused_width(),
+                        (Base::Unused, Axis::Height) => turtle.unused_height(),
+                        _ => unreachable!(),
+                    };
+                    if value.is_finite() {
+                        return Some(value);
+                    }
+                    let Some(next) = index.checked_sub(1) else {
+                        return None;
+                    };
+                    index = next;
+                }
+            }
+        }
+    }
+
+    fn resolve_container_dimension(
+        &self,
+        named: Option<LiveId>,
+        axis: Axis,
+        parent_index: Option<usize>,
+    ) -> Option<f64> {
+        let mut index = parent_index;
+        while let Some(current) = index {
+            let turtle = &self.turtles[current];
+            let id = turtle.layout.container_id;
+            let matches = named.map_or(id != LiveId(0), |wanted| id == wanted && id != LiveId(0));
+            if matches {
+                let value = match axis {
+                    Axis::Width => turtle.inner_width(),
+                    Axis::Height => turtle.inner_height(),
+                };
+                // A matching-but-unknown container is intentionally terminal:
+                // do not skip outward or use viewport fallback.
+                return value.is_finite().then_some(value);
+            }
+            index = current.checked_sub(1);
+        }
+        let viewport = self.viewport_size();
+        let value = match axis {
+            Axis::Width => viewport.x,
+            Axis::Height => viewport.y,
+        };
+        value.is_finite().then_some(value)
+    }
+
+    fn viewport_size(&self) -> Vec2d {
+        self.owning_window_or_root_pass_size()
+    }
+
+    pub(crate) fn eval_size_expr(
+        &self,
+        id: SizeExprId,
+        axis: Axis,
+        at: ResolveAt,
+    ) -> Option<f64> {
+        self.eval_size_expr_with_parent(id, axis, self.parent_index(at))
+    }
+
+    /// Evaluates a stored size expression against the current turtle's inner
+    /// axis. This is the shared contextual-size seam used by definite Grid
+    /// tracks; `horizontal == false` selects the vertical axis.
+    pub fn eval_size_expr_in_current_turtle(
+        &self,
+        id: SizeExprId,
+        horizontal: bool,
+    ) -> Option<f64> {
+        self.eval_size_expr(
+            id,
+            if horizontal { Axis::Width } else { Axis::Height },
+            ResolveAt::BeforeBegin,
+        )
+    }
+
+    /// Whether an expression can be resolved without a parent/container base.
+    pub fn size_expr_is_content_independent(&self, id: SizeExprId) -> bool {
+        self.get_global_ref::<SizeExprStore>()
+            .is_some_and(|store| !store.requires_parent_or_container(id))
+    }
+
+    fn size_expr_context(
+        &self,
+        axis: Axis,
+        parent_index: Option<usize>,
+    ) -> SizeExprContext {
+        let viewport = self.viewport_size();
+        SizeExprContext {
+            parent: self
+                .resolve_base_from_parent(Base::Parent, axis, parent_index)
+                .unwrap_or(f64::NAN),
+            viewport_width: viewport.x,
+            viewport_height: viewport.y,
+            container_width: self
+                .resolve_container_dimension(None, Axis::Width, parent_index)
+                .unwrap_or(f64::NAN),
+            container_height: self
+                .resolve_container_dimension(None, Axis::Height, parent_index)
+                .unwrap_or(f64::NAN),
+        }
+    }
+
+    fn eval_size_expr_with_parent(
+        &self,
+        id: SizeExprId,
+        axis: Axis,
+        parent_index: Option<usize>,
+    ) -> Option<f64> {
+        let value = self
+            .get_global_ref::<SizeExprStore>()?
+            .eval(id, self.size_expr_context(axis, parent_index));
+        value.is_finite().then_some(value)
+    }
+
+    fn eval_fit_bound(&self, bound: FitBound, axis: Axis, at: ResolveAt) -> Option<f64> {
+        self.eval_fit_bound_with_parent(
+            bound,
+            axis,
+            self.parent_index(at),
+            at == ResolveAt::AtClose,
+        )
+    }
+
+    fn eval_fit_bound_with_parent(
+        &self,
+        bound: FitBound,
+        axis: Axis,
+        parent_index: Option<usize>,
+        allow_close_bases: bool,
+    ) -> Option<f64> {
+        match bound {
+            FitBound::Abs(value) => Some(value),
+            FitBound::Rel {
+                base: Base::Line | Base::Unused,
+                ..
+            } if !allow_close_bases => None,
+            FitBound::Rel { base, factor } => {
+                Some(self.resolve_base_from_parent(base, axis, parent_index)? * factor)
+            }
+            FitBound::Expr(id) => self.eval_size_expr_with_parent(id, axis, parent_index),
+        }
+    }
+
+    fn eval_fit_bound_for_turtle(
+        &self,
+        bound: FitBound,
+        axis: Axis,
+        turtle_index: usize,
+    ) -> Option<f64> {
+        self.eval_fit_bound_with_parent(bound, axis, turtle_index.checked_sub(1), true)
+    }
+
     pub fn find_base_width(&self, base: Base) -> Option<f64> {
-        self.turtles
-            .iter()
-            .rev()
-            .skip(1)
-            .map(|turtle| turtle.base_width(base))
-            .find(|width| !width.is_nan())
+        self.resolve_base(base, Axis::Width, ResolveAt::AtClose)
     }
 
     pub fn find_base_height(&self, base: Base) -> Option<f64> {
-        self.turtles
-            .iter()
-            .rev()
-            .skip(1)
-            .map(|turtle| turtle.base_height(base))
-            .find(|height| !height.is_nan())
+        self.resolve_base(base, Axis::Height, ResolveAt::AtClose)
+    }
+
+    /// Returns the width available on the enclosing line for the current
+    /// turtle's content, for a [`Base::Line`] bound.
+    ///
+    /// The line is the nearest enclosing turtle with a known width; the
+    /// unresolved `Fit` turtles between it and the current one (an inline
+    /// widget's nesting levels) contribute their leading geometry and
+    /// trailing insets. The line's flow selects between two measurements,
+    /// each of which is final at the moment it is taken:
+    ///
+    /// - A wrapping line can relocate the inline widget whole onto a fresh
+    ///   row, so the bound is what a fresh row offers: the line's inner
+    ///   width minus the widget-internal lead-in before this turtle and
+    ///   the trailing insets after it. Content sized to this bound either
+    ///   fits where it is, or fits the row the widget is relocated to.
+    /// - A non-wrapping line (including one held non-wrapping by an
+    ///   inline-content clamp on the last permitted row) keeps the widget
+    ///   where it is, so the bound is the remnant: the distance from the
+    ///   pen to the line's inner right edge, minus the trailing insets.
+    ///
+    /// The current turtle's own trailing margin is left for the consumer,
+    /// which resolves a `Fit` max bound against the walk's margin box. Its
+    /// leading margin is part of the measured lead-in (the turtle's origin
+    /// lies past it), so a consumer that subtracts the full margin width
+    /// counts the leading side twice — a deliberately conservative overlap
+    /// of a few pixels that keeps a remnant-fitted walk safely inside the
+    /// line's overrun tolerance.
+    pub fn find_line_available_width(&self) -> Option<f64> {
+        let turtle_index = self.turtles.len().checked_sub(1)?;
+        self.find_line_available_width_for_turtle(turtle_index)
+    }
+
+    fn find_line_available_width_for_turtle(&self, turtle_index: usize) -> Option<f64> {
+        let current = self.turtles.get(turtle_index)?;
+        let outer_turtles = &self.turtles[..turtle_index];
+        // Measure from the closing turtle's content origin, not its moving pen.
+        let start_x = current.origin().x + current.padding().left;
+        let mut trailing = current.padding().right;
+        // The outermost unresolved turtle inside the line so far: the
+        // inline widget's root, whose origin marks where its lead-in
+        // (icons, padding, spacing before this content) begins.
+        let mut widget_origin_x = current.origin().x;
+        let mut widget_margin_left = 0.0;
+        for turtle in outer_turtles.iter().rev() {
+            if !turtle.width().is_nan() {
+                let inner = turtle.inner_rect();
+                let available = match turtle.layout().flow {
+                    Flow::Right { wrap: false, .. } => {
+                        inner.pos.x + inner.size.x - start_x - trailing
+                    }
+                    Flow::Right { wrap: true, .. } | Flow::Down | Flow::Overlay => {
+                        inner.size.x - widget_margin_left - (start_x - widget_origin_x) - trailing
+                    }
+                };
+                return Some(available.max(0.0));
+            }
+            trailing += turtle.padding().right + turtle.walk().margin.right;
+            widget_origin_x = turtle.origin().x;
+            widget_margin_left = turtle.walk().margin.left;
+        }
+        None
     }
 
     /// Starts a root turtle.
@@ -1308,12 +4515,15 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             finished_rows_start: self.finished_rows.len(),
             finished_walks_start: self.finished_walks.len(),
             deferred_fills: Vec::new(),
-            resolved_fills: Vec::new(),
+            flex_resolved: false,
+            next_flow_index: 0,
+            baseline_walk: None,
+            baseline_y: 0.0,
             pos: Vec2d {
                 x: layout.padding.left,
                 y: layout.padding.top,
             },
-            wrap_spacing: 0.0,
+            wrap_spacing: layout.wrap_spacing,
             origin: dvec2(0.0, 0.0),
             width: size.x,
             height: size.y,
@@ -1368,6 +4578,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     ///
     /// See [`begin_turtle`] for more information.
     pub fn begin_turtle_with_guard(&mut self, walk: Walk, layout: Layout, guard: Area) {
+        let walk = self.resolve_walk(walk, ResolveAt::BeforeBegin);
         let parent = self.turtle();
 
         let outer_origin = if let Some(outer_origin) = walk.abs_pos {
@@ -1409,8 +4620,11 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             finished_rows_start: self.finished_rows.len(),
             finished_walks_start: self.finished_walks.len(),
             deferred_fills: Vec::new(),
-            resolved_fills: Vec::new(),
-            wrap_spacing: 0.0,
+            flex_resolved: false,
+            next_flow_index: 0,
+            baseline_walk: None,
+            baseline_y: 0.0,
+            wrap_spacing: layout.wrap_spacing,
             pos: Vec2d {
                 x: origin.x + layout.padding.left,
                 y: origin.y + layout.padding.top,
@@ -1437,168 +4651,285 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     ///
     /// The current turtle should be finished with the same guard area that was used to start it.
     pub fn end_turtle_with_guard(&mut self, guard: Area) -> Rect {
-        self.finish_row(self.align_list.len());
+        // The final row's bottom forgiveness is deliberately discarded: the
+        // turtle's used height keeps that row's full physical extent, so
+        // up-centered walks on a last row stay inside the reported rect and
+        // its clip bottom.
+        let _ = self.finish_row(self.align_list.len());
         self.compute_final_size();
 
-        let mut turtle = self.turtles.last_mut().unwrap();
-        if guard != turtle.guard {
-            panic!(
-                "End turtle guard area misaligned!, begin/end pair not matched begin {:?} end {:?}",
-                turtle.guard, guard
+        let (
+            turtle_align_start,
+            turtle_walks_start,
+            turtle_rows_start,
+            scope_rect,
+            flow,
+            align,
+            distribute,
+            has_deferred,
+            inner_width,
+            inner_height,
+            inner_effective_width,
+            inner_effective_height,
+            unused_inner_width,
+            unused_inner_height,
+            spacing,
+        ) = {
+            let turtle = self.turtles.last().unwrap();
+            if guard != turtle.guard {
+                panic!(
+                    "End turtle guard area misaligned!, begin/end pair not matched begin {:?} end {:?}",
+                    turtle.guard, guard
+                )
+            }
+            (
+                turtle.align_start,
+                turtle.finished_walks_start,
+                turtle.finished_rows_start,
+                turtle.rect(),
+                turtle.flow(),
+                turtle.align(),
+                turtle.layout.distribute,
+                !turtle.deferred_fills.is_empty(),
+                turtle.inner_width(),
+                turtle.inner_height(),
+                turtle.effective_inner_width(),
+                turtle.inner_effective_height(),
+                turtle.unused_inner_width(),
+                turtle.unused_inner_height(),
+                turtle.spacing(),
             )
-        }
+        };
 
-        let turtle_align_start = turtle.align_start;
-        let turtle_walks_start = turtle.finished_walks_start;
+        // The walk this turtle's baseline comes from moves too, so its shift is kept.
+        let baseline_walk = self.turtle().baseline_walk;
+        let mut baseline_dy = 0.0;
 
-        // Now that the current turtle's rectangle is known, we can align its finished walks.
-        match turtle.flow() {
+        // Close-time placement is one normalized pass. Every align-list range
+        // moves at most once, combining a preceding flex delta with either the
+        // historical Start alignment or its distribution offset.
+        match flow {
             Flow::Right { wrap: false, .. } => {
-                if turtle.deferred_fills.is_empty() {
-                    // If walks are laid out from left to right, and there are no deferred walks,
-                    // then the horizontal alignment is applied to all walks as a whole, while
-                    // the vertical alignment is applied to each walk individually.
-                    if turtle.align().x != 0.0 || turtle.align().y != 0.0 {
-                        let inner_unused_width = turtle.unused_inner_width();
-                        let inner_effective_height = turtle.inner_effective_height();
-
-                        for finished_walk_index in
-                            turtle.finished_walks_start..self.finished_walks.len()
-                        {
-                            let finished_walk = &self.finished_walks[finished_walk_index];
-
-                            let inner_unused_height = (inner_effective_height
-                                - finished_walk.outer_size.y)
-                                .max(0.0);
-
-                            let dx = turtle.align().x * inner_unused_width;
-                            let dy = turtle.align().y * inner_unused_height;
-
-                            let align_list_start = finished_walk.align_list_start;
-                            let align_list_end =
-                                self.finished_walk_align_list_end(finished_walk_index);
-                            self.move_align_list(align_list_start, align_list_end, dx, dy, false);
-
-                            turtle = self.turtles.last_mut().unwrap();
-                        }
+                let walks_end = self.finished_walks.len();
+                let group = (distribute != Distribute::Start)
+                    .then(|| {
+                        DistributionGroup::for_walks(
+                            inner_width,
+                            spacing,
+                            &self.finished_walks[turtle_walks_start..walks_end],
+                            Axis::Width,
+                        )
+                    })
+                    .flatten();
+                let use_start = distribute == Distribute::Start
+                    || (group.is_none()
+                        && self.finished_walks[turtle_walks_start..walks_end]
+                            .iter()
+                            .any(|walk| walk.in_flow));
+                let start_dx = if use_start {
+                    if has_deferred {
+                        row_align_x_shift(
+                            align.x,
+                            inner_width,
+                            spacing,
+                            &self.finished_walks[turtle_walks_start..walks_end],
+                        )
+                    } else {
+                        align.x * unused_inner_width
                     }
                 } else {
-                    // If walks are laid out from left to right, and there are deferred walks, then
-                    // the unused inner width is distributed over the deferred walks, while the
-                    // vertical alignment is applied to each walk individually.
-                    let inner_effective_height = turtle.inner_effective_height();
+                    0.0
+                };
 
-                    for finished_walk_index in turtle_walks_start..self.finished_walks.len() {
-                        let finished_walk = &self.finished_walks[finished_walk_index];
-
-                        let inner_unused_height = (inner_effective_height
-                            - finished_walk.outer_size.y)
-                            .max(0.0);
-
-                        let dx =
-                            turtle.total_resolved_length_to(finished_walk.deferred_before_count);
-                        let dy = turtle.align().y * inner_unused_height;
-
-                        let align_list_start = finished_walk.align_list_start;
-                        let align_list_end = self.finished_walk_align_list_end(finished_walk_index);
-                        self.move_align_list(align_list_start, align_list_end, dx, dy, false);
-
-                        turtle = self.turtles.last_mut().unwrap();
+                for index in turtle_walks_start..walks_end {
+                    let (range_start, outer_height, in_flow, flow_index, role, delta) = {
+                        let walk = &self.finished_walks[index];
+                        (
+                            walk.align_list_start,
+                            walk.outer_size.y,
+                            walk.in_flow,
+                            walk.flow_index,
+                            walk.align_role,
+                            self.turtle()
+                                .total_resolved_delta_to(walk.deferred_before_count),
+                        )
+                    };
+                    let rank = distribution_rank(
+                        &self.finished_walks[turtle_walks_start..walks_end],
+                        flow_index,
+                    );
+                    let distributed = if in_flow {
+                        group.map_or(0.0, |group| group.offset(distribute, rank))
+                    } else {
+                        0.0
+                    };
+                    let main = delta
+                        + if use_start {
+                            start_dx
+                        } else if role == RowAlignRole::Shiftable {
+                            distributed
+                        } else {
+                            0.0
+                        };
+                    let cross = align.y * (inner_effective_height - outer_height).max(0.0);
+                    if Some(index) == baseline_walk {
+                        baseline_dy = cross;
                     }
+                    let range_end = self.finished_walk_align_list_end(index);
+                    self.move_align_list(range_start, range_end, main, cross, false);
                 }
             }
             Flow::Right { wrap: true, .. } => {
-                if turtle.deferred_fills.is_empty() {
-                    // TODO
-                } else {
-                    panic!()
+                debug_assert!(!has_deferred);
+                let mut row_start = turtle_walks_start;
+                for row_index in turtle_rows_start..self.finished_rows.len() {
+                    let row_end = self.finished_rows[row_index];
+                    let group = (distribute != Distribute::Start)
+                        .then(|| {
+                            DistributionGroup::for_walks(
+                                inner_width,
+                                spacing,
+                                &self.finished_walks[row_start..row_end],
+                                Axis::Width,
+                            )
+                        })
+                        .flatten();
+                    let use_start = distribute == Distribute::Start
+                        || (group.is_none()
+                            && self.finished_walks[row_start..row_end]
+                                .iter()
+                                .any(|walk| walk.in_flow));
+                    let start_dx = if use_start {
+                        row_align_x_shift(
+                            align.x,
+                            inner_width,
+                            spacing,
+                            &self.finished_walks[row_start..row_end],
+                        )
+                    } else {
+                        0.0
+                    };
+                    for index in row_start..row_end {
+                        let (range_start, in_flow, flow_index, role) = {
+                            let walk = &self.finished_walks[index];
+                            (
+                                walk.align_list_start,
+                                walk.in_flow,
+                                walk.flow_index,
+                                walk.align_role,
+                            )
+                        };
+                        let rank = distribution_rank(
+                            &self.finished_walks[row_start..row_end],
+                            flow_index,
+                        );
+                        let dx = if use_start {
+                            start_dx
+                        } else if in_flow && role == RowAlignRole::Shiftable {
+                            group.map_or(0.0, |group| group.offset(distribute, rank))
+                        } else {
+                            0.0
+                        };
+                        let range_end = self.finished_walk_align_list_end(index);
+                        self.move_align_list(range_start, range_end, dx, 0.0, false);
+                    }
+                    row_start = row_end;
                 }
             }
             Flow::Down => {
-                // If walks are laid out from top to bottom, and there are no deferred walks, then
-                // the horizontal alignment is applied each walk individually, while the vertical
-                // alignment is applied to all walks as a whole.
-                if turtle.deferred_fills.is_empty() {
-                    if turtle.align().x != 0.0 || turtle.align().y != 0.0 {
-                        let inner_effective_width = turtle.effective_inner_width();
-                        let inner_unused_height = turtle.unused_inner_height();
-
-                        for finished_walk_index in turtle_walks_start..self.finished_walks.len() {
-                            let finished_walk = &self.finished_walks[finished_walk_index];
-
-                            let inner_unused_width = (inner_effective_width
-                                - finished_walk.outer_size.x)
-                                .max(0.0);
-
-                            let dx = turtle.align().x * inner_unused_width;
-                            let dy = turtle.align().y * inner_unused_height;
-
-                            let align_list_start = finished_walk.align_list_start;
-                            let align_list_end =
-                                self.finished_walk_align_list_end(finished_walk_index);
-                            self.move_align_list(align_list_start, align_list_end, dx, dy, false);
-
-                            turtle = self.turtles.last_mut().unwrap();
-                        }
+                let walks_end = self.finished_walks.len();
+                let group = (distribute != Distribute::Start)
+                    .then(|| {
+                        DistributionGroup::for_walks(
+                            inner_height,
+                            spacing,
+                            &self.finished_walks[turtle_walks_start..walks_end],
+                            Axis::Height,
+                        )
+                    })
+                    .flatten();
+                let use_start = distribute == Distribute::Start
+                    || (group.is_none()
+                        && self.finished_walks[turtle_walks_start..walks_end]
+                            .iter()
+                            .any(|walk| walk.in_flow));
+                let start_dy = if use_start {
+                    if has_deferred {
+                        col_align_y_shift(
+                            align.y,
+                            inner_height,
+                            spacing,
+                            &self.finished_walks[turtle_walks_start..walks_end],
+                        )
+                    } else {
+                        align.y * unused_inner_height
                     }
                 } else {
-                    // If walks are laid out from top to bottom, and there are deferred walks, then
-                    // the horizontal alignment is applied each walk individually, while the inner
-                    // unused height is distributed over the deferred walks.
-                    let inner_effective_width = turtle.effective_inner_width();
+                    0.0
+                };
 
-                    for finished_walk_index in turtle_walks_start..self.finished_walks.len() {
-                        let finished_walk = &self.finished_walks[finished_walk_index];
-
-                        let inner_unused_width = (inner_effective_width
-                            - finished_walk.outer_size.x)
-                            .max(0.0);
-
-                        let dx = turtle.align().x * inner_unused_width;
-                        let dy =
-                            turtle.total_resolved_length_to(finished_walk.deferred_before_count);
-
-                        let align_list_start = finished_walk.align_list_start;
-                        let align_list_end = self.finished_walk_align_list_end(finished_walk_index);
-                        self.move_align_list(align_list_start, align_list_end, dx, dy, false);
-
-                        turtle = self.turtles.last_mut().unwrap();
+                for index in turtle_walks_start..walks_end {
+                    let (range_start, outer_width, in_flow, flow_index, role, delta) = {
+                        let walk = &self.finished_walks[index];
+                        (
+                            walk.align_list_start,
+                            walk.outer_size.x,
+                            walk.in_flow,
+                            walk.flow_index,
+                            walk.align_role,
+                            self.turtle()
+                                .total_resolved_delta_to(walk.deferred_before_count),
+                        )
+                    };
+                    let rank = distribution_rank(
+                        &self.finished_walks[turtle_walks_start..walks_end],
+                        flow_index,
+                    );
+                    let distributed = if in_flow {
+                        group.map_or(0.0, |group| group.offset(distribute, rank))
+                    } else {
+                        0.0
+                    };
+                    let main = delta
+                        + if use_start {
+                            start_dy
+                        } else if role == RowAlignRole::Shiftable {
+                            distributed
+                        } else {
+                            0.0
+                        };
+                    let cross = align.x * (inner_effective_width - outer_width).max(0.0);
+                    if Some(index) == baseline_walk {
+                        baseline_dy = main;
                     }
+                    let range_end = self.finished_walk_align_list_end(index);
+                    self.move_align_list(range_start, range_end, cross, main, false);
                 }
             }
             Flow::Overlay => {
-                // If walks are laid out on top of each other, then both the horizontal and vertical
-                // alignment are applied to each walk individually.
-                if turtle.align().x != 0.0 || turtle.align().y != 0.0 {
-                    let inner_effective_width = turtle.effective_inner_width();
-                    let inner_effective_height = turtle.inner_effective_height();
-
-                    for finished_walk_index in turtle_walks_start..self.finished_walks.len() {
-                        let finished_walk = &self.finished_walks[finished_walk_index];
-
-                        let inner_unused_width = (inner_effective_width
-                            - finished_walk.outer_size.x)
-                            .max(0.0);
-                        let inner_unused_height = (inner_effective_height
-                            - finished_walk.outer_size.y)
-                            .max(0.0);
-
-                        let dx = turtle.align().x * inner_unused_width;
-                        let dy = turtle.align().y * inner_unused_height;
-
-                        let align_list_start = finished_walk.align_list_start;
-                        let align_list_end = self.finished_walk_align_list_end(finished_walk_index);
-                        self.move_align_list(align_list_start, align_list_end, dx, dy, false);
-
-                        turtle = self.turtles.last_mut().unwrap();
+                for index in turtle_walks_start..self.finished_walks.len() {
+                    let walk = &self.finished_walks[index];
+                    let dx = align.x * (inner_effective_width - walk.outer_size.x).max(0.0);
+                    let dy = align.y * (inner_effective_height - walk.outer_size.y).max(0.0);
+                    if Some(index) == baseline_walk {
+                        baseline_dy = dy;
                     }
+                    let range_start = walk.align_list_start;
+                    let range_end = self.finished_walk_align_list_end(index);
+                    self.move_align_list(range_start, range_end, dx, dy, false);
                 }
             }
         }
 
+        // Exploded z-layer view: give this scope a visible frame. Emitted here
+        // — after the scope's own contents are aligned, before the parent's
+        // pass — so it sits inside this turtle's align range and rides every
+        // shift the parent later applies to the whole walk.
+        self.draw_sploded_hairline(scope_rect);
+
         self.align_list.push(AlignEntry::EndClip);
-        self.finished_rows.truncate(turtle.finished_rows_start);
-        self.finished_walks.truncate(turtle.finished_walks_start);
+        self.finished_rows.truncate(turtle_rows_start);
+        self.finished_walks.truncate(turtle_walks_start);
         let turtle = self.turtles.pop().unwrap();
 
         if self.turtles.is_empty() {
@@ -1607,13 +4938,21 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 size: turtle.size(),
             }
         } else {
+            // A turtle reports the first in-flow child baseline it saw (its first line, like a
+            // table cell in CSS), unless its walk declares one.
+            let baseline = match turtle.walk().baseline {
+                Baseline::Auto if turtle.baseline_walk.is_some() => {
+                    Baseline::At((turtle.baseline_y + baseline_dy) as f32)
+                }
+                declared => declared,
+            };
             self.walk_turtle_internal(
                 Walk {
                     abs_pos: turtle.walk().abs_pos,
-                    margin: turtle.margin(),
                     width: Size::Fixed(turtle.width()),
                     height: Size::Fixed(turtle.height()),
-                    metrics: turtle.walk().metrics,
+                    baseline,
+                    ..turtle.walk()
                 },
                 turtle_align_start,
             )
@@ -1621,59 +4960,40 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     }
 
     pub fn compute_final_size(&mut self) {
-        let mut turtle = self.turtles.last_mut().unwrap();
+        let walk = self.turtles.last().unwrap().walk;
+        let width_bounds = self.content_bounds(&walk, Axis::Width, ResolveAt::AtClose);
+        let height_bounds = self.content_bounds(&walk, Axis::Height, ResolveAt::AtClose);
 
-        // If the current turtle's width is not yet known, we can now compute it based on the used width.
-        if turtle.width.is_nan() {
-            turtle.width = turtle.used_width() + turtle.padding().right;
-            if let Size::Fit { min, max } = turtle.walk.width {
-                if let Some(min) = min {
-                    let min = min.eval_width(self);
-                    turtle = self.turtles.last_mut().unwrap();
-                    if let Some(min) = min {
-                        turtle.width = turtle.width.max(min);
-                    }
-                }
-                if let Some(max) = max {
-                    let max = max.eval_width(self);
-                    turtle = self.turtles.last_mut().unwrap();
-                    if let Some(max) = max {
-                        turtle.width = turtle.width.min(max);
-                    }
-                }
-            }
+        if self.turtles.last().unwrap().width.is_nan() {
+            let natural = {
+                let turtle = self.turtles.last().unwrap();
+                turtle.used_width() + turtle.padding().right
+            };
+            let turtle = self.turtles.last_mut().unwrap();
+            turtle.width = width_bounds.clamp(natural);
             if let AlignEntry::BeginClip(clip_min, clip_max) =
                 &mut self.align_list[turtle.align_start]
             {
                 clip_max.x = clip_min.x + turtle.width();
             }
-        };
+        }
 
-        // If the current turtle's height is not yet known, we can now compute it based on the used height.
-        if turtle.height.is_nan() {
-            turtle.height = turtle.used_height() + turtle.padding().bottom;
-            if let Size::Fit { min, max } = turtle.walk.height {
-                if let Some(min) = min {
-                    let min = min.eval_height(self);
-                    turtle = self.turtles.last_mut().unwrap();
-                    if let Some(min) = min {
-                        turtle.height = turtle.height.max(min);
-                    }
-                }
-                if let Some(max) = max {
-                    let max = max.eval_height(self);
-                    turtle = self.turtles.last_mut().unwrap();
-                    if let Some(max) = max {
-                        turtle.height = turtle.height.min(max);
-                    }
-                }
-            }
+        if self.turtles.last().unwrap().height.is_nan() {
+            let natural = {
+                let turtle = self.turtles.last().unwrap();
+                turtle.used_height() + turtle.padding().bottom
+            };
+            let turtle = self.turtles.last_mut().unwrap();
+            // `ContentBounds::clamp` also floors at zero. This deliberately
+            // fixes the historical negative-height path when a margin-box max
+            // is smaller than the vertical margins.
+            turtle.height = height_bounds.clamp(natural);
             if let AlignEntry::BeginClip(clip_min, clip_max) =
                 &mut self.align_list[turtle.align_start]
             {
                 clip_max.y = clip_min.y + turtle.height();
             }
-        };
+        }
     }
 
     /// Computes the maximum available height for the current turtle by walking up
@@ -1694,21 +5014,21 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         let mut consumed_padding = current.padding().height();
 
         // Walk ancestors (skip self)
-        for ancestor in self.turtles.iter().rev().skip(1) {
-            if let Size::Fit { max: Some(max), .. } = ancestor.walk.height {
-                if let Some(ancestor_max) = max.eval_height(self) {
-                    // The available height for the current turtle is the ancestor's
-                    // max minus the padding/spacing consumed between the ancestor
-                    // and the current turtle.
-                    let available = ancestor_max - consumed_padding;
-                    max_height = max_height.min(available);
-                }
+        for ancestor_index in (0..self.turtles.len().saturating_sub(1)).rev() {
+            let ancestor = &self.turtles[ancestor_index];
+            if let Some(ancestor_max) = self
+                .content_bounds_for_turtle(&ancestor.walk, Axis::Height, ancestor_index)
+                .max
+            {
+                let available = ancestor_max - consumed_padding;
+                max_height = max_height.min(available);
             }
 
             // If this ancestor has a known (non-NaN) height, it already constrains
             // children via layout, so we don't need to look further up.
             if !ancestor.height().is_nan() {
-                let available = ancestor.inner_height() - consumed_padding + current.padding().height();
+                let available =
+                    ancestor.inner_height() - consumed_padding + current.padding().height();
                 max_height = max_height.min(available);
                 break;
             }
@@ -1726,23 +5046,23 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     /// horizontal scrolling, even when their own walk width is unbounded `Fit`.
     pub fn compute_max_width_from_ancestors(&self) -> f64 {
         let mut max_width = f64::MAX;
-        let current = match self.turtles.last() {
-            Some(t) => t,
-            None => return f64::MAX,
-        };
+        let current = self.turtles.last().unwrap();
         let mut consumed_padding = current.padding().width();
 
         // Walk ancestors (skip self)
-        for ancestor in self.turtles.iter().rev().skip(1) {
-            if let Size::Fit { max: Some(max), .. } = ancestor.walk.width {
-                if let Some(ancestor_max) = max.eval_width(self) {
-                    let available = ancestor_max - consumed_padding;
-                    max_width = max_width.min(available);
-                }
+        for ancestor_index in (0..self.turtles.len().saturating_sub(1)).rev() {
+            let ancestor = &self.turtles[ancestor_index];
+            if let Some(ancestor_max) = self
+                .content_bounds_for_turtle(&ancestor.walk, Axis::Width, ancestor_index)
+                .max
+            {
+                let available = ancestor_max - consumed_padding;
+                max_width = max_width.min(available);
             }
 
             if !ancestor.width().is_nan() {
-                let available = ancestor.inner_width() - consumed_padding + current.padding().width();
+                let available =
+                    ancestor.inner_width() - consumed_padding + current.padding().width();
                 max_width = max_width.min(available);
                 break;
             }
@@ -1751,7 +5071,6 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         }
         max_width
     }
-
 
     /// Pushes a clip rect entry and returns the index of that entry in the align list.
     /// The clip can later be modified via [`update_clip_rect_at`].
@@ -1787,10 +5106,58 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     }
 
     fn walk_turtle_internal(&mut self, walk: Walk, align_list_start: usize) -> Rect {
+        let mut walk = self.resolve_walk(walk, ResolveAt::BeforeBegin);
+
+        // A wrapping Fill is intentionally a one-pass row fill, not part of
+        // the multi-item flex solver. Keep it on the current row when its
+        // minimum outer width fits; otherwise start fresh and use that row's
+        // full available width.
+        if matches!(self.turtle().flow(), Flow::Right { wrap: true, .. })
+            && walk.abs_pos.is_none()
+        {
+            if let Size::Fill { min, max, .. } = walk.width {
+                let bounds = ContentBounds::from_fill(min, max, walk.margin.width());
+                let spacing = self.turtle_next_walk_offset().x;
+                let remaining = self.turtle().unused_inner_width_for_current_row() - spacing;
+                let minimum_outer = bounds
+                    .min
+                    .map_or(walk.margin.width(), |min| min + walk.margin.width());
+                if self.turtle_current_row_has_in_flow_walks() && minimum_outer > remaining {
+                    self.wrap_turtle(align_list_start);
+                }
+
+                let spacing = self.turtle_next_walk_offset().x;
+                let mut outer = self.turtle().unused_inner_width_for_current_row() - spacing;
+                if !outer.is_finite() {
+                    outer = minimum_outer;
+                }
+                walk.width = Size::Fixed(bounds.clamp(outer - walk.margin.width()));
+                // Main-axis Fill is definite now, so transfer aspect to a Fit
+                // cross axis through the ordinary foundation resolver.
+                walk = self.resolve_walk(walk, ResolveAt::BeforeBegin);
+            }
+        }
+        let flow_spacing = self.turtle_next_walk_offset();
+        let in_flow = walk.abs_pos.is_none() || walk.deferred;
+        let flow_index = if walk.deferred {
+            walk.flow_index
+        } else if in_flow {
+            let turtle = self.turtles.last_mut().unwrap();
+            let index = turtle.next_flow_index;
+            turtle.next_flow_index = turtle.next_flow_index.wrapping_add(1);
+            index
+        } else {
+            u32::MAX
+        };
+        let current_row_has_in_flow_walks = self.turtle_current_row_has_in_flow_walks();
         let turtle = self.turtles.last_mut().unwrap();
 
         let size = turtle.next_walk_size(walk.width, walk.height, walk.margin);
         let outer_size = size + walk.margin.size();
+        let baseline = match walk.baseline {
+            Baseline::At(baseline) => Some(walk.margin.top + baseline as f64),
+            _ => None,
+        };
 
         if let Some(outer_origin) = walk.abs_pos {
             let old_pos = turtle.pos();
@@ -1809,18 +5176,25 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 align_list_start,
                 deferred_before_count: 0,
                 outer_size: size + walk.margin.size(),
+                in_flow,
+                flow_index,
                 metrics: walk.metrics,
+                align_role: RowAlignRole::Shiftable,
+                align_height: None,
+                baseline,
             });
+            self.note_turtle_baseline(in_flow, RowAlignRole::Shiftable, outer_origin.y, baseline, flow_index);
 
             let origin = outer_origin + walk.margin.left_top();
             Rect { pos: origin, size }
         } else {
-            let spacing = self.turtle_next_walk_offset();
+            let spacing = flow_spacing;
             let turtle = self.turtles.last_mut().unwrap();
 
             let outer_origin = match turtle.flow() {
                 Flow::Right { wrap: true, .. }
-                    if outer_size.x > turtle.unused_inner_width_for_current_row() =>
+                    if current_row_has_in_flow_walks
+                        && spacing.x + outer_size.x > turtle.unused_inner_width_for_current_row() =>
                 {
                     self.wrap_turtle(align_list_start);
                     let turtle = self.turtles.last_mut().unwrap();
@@ -1852,6 +5226,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 }
             };
 
+
             let defer_index = self.turtle().deferred_fills.len();
             self.turtle_mut().current_row_metrics =
                 self.turtle().current_row_metrics.max(walk.metrics);
@@ -1859,8 +5234,14 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 align_list_start,
                 deferred_before_count: defer_index,
                 outer_size,
+                in_flow: true,
+                flow_index,
                 metrics: walk.metrics,
+                align_role: RowAlignRole::Shiftable,
+                align_height: None,
+                baseline,
             });
+            self.note_turtle_baseline(true, RowAlignRole::Shiftable, outer_origin.y, baseline, flow_index);
 
             let origin = outer_origin + walk.margin.left_top();
             Rect { pos: origin, size }
@@ -1869,23 +5250,46 @@ impl<'a, 'b> Cx2d<'a, 'b> {
 
     /// Defers walking the turtle with the given `Walk`.
     pub fn defer_walk_turtle(&mut self, walk: Walk) -> Option<DeferredWalk> {
+        let mut walk = self.resolve_walk(walk, ResolveAt::BeforeBegin);
         if walk.abs_pos.is_some() {
             return None;
         }
 
-        let turtle = self.turtles.last_mut().unwrap();
-
-        match turtle.flow() {
+        match self.turtle().flow() {
             Flow::Right { wrap: false, .. } => {
-                let Size::Fill { weight, min, max } = walk.width else {
+                let Size::Fill {
+                    weight,
+                    basis,
+                    shrink,
+                    ..
+                } = walk.width
+                else {
                     return None;
                 };
 
-                let old_pos = turtle.pos();
+                debug_assert!(
+                    !self.turtle().flex_resolved,
+                    "cannot defer another fill after flex resolution"
+                );
+                if self.turtle().flex_resolved {
+                    return None;
+                }
 
                 let spacing = self.turtle_next_walk_offset();
+                walk.flow_index = self.turtle().next_flow_index;
+                self.turtle_mut().next_flow_index = walk.flow_index.wrapping_add(1);
+
+                let bounds = self.content_bounds(&walk, Axis::Width, ResolveAt::BeforeBegin);
+                let unclamped_basis = self
+                    .eval_fit_bound(basis, Axis::Width, ResolveAt::BeforeBegin)
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(0.0);
+                let basis = bounds.clamp(unclamped_basis);
+
+                let old_pos = self.turtle().pos();
+
                 let turtle = self.turtles.last_mut().unwrap();
-                let size = dvec2(0.0, turtle.next_walk_height(walk.height, walk.margin));
+                let size = dvec2(basis, turtle.next_walk_height(walk.height, walk.margin));
                 let outer_size = size + walk.margin.size();
 
                 turtle.move_right(spacing.x);
@@ -1893,25 +5297,57 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 turtle.move_right(outer_size.x);
 
                 let index = turtle.deferred_fills.len();
-                turtle.push_deferred_fill(weight, min, max);
+                turtle.push_deferred_fill(DeferredFill {
+                    grow: weight,
+                    shrink,
+                    unclamped_basis,
+                    basis,
+                    min: bounds.min,
+                    max: bounds.max,
+                    delta: 0.0,
+                    frozen: false,
+                });
 
                 Some(DeferredWalk::Unresolved {
                     index,
                     pos: old_pos + spacing,
-                    margin: walk.margin,
-                    other_axis: walk.height,
+                    walk,
                 })
             }
             Flow::Down => {
-                let Size::Fill { weight, min, max } = walk.height else {
+                let Size::Fill {
+                    weight,
+                    basis,
+                    shrink,
+                    ..
+                } = walk.height
+                else {
                     return None;
                 };
 
-                let old_pos = turtle.pos();
+                debug_assert!(
+                    !self.turtle().flex_resolved,
+                    "cannot defer another fill after flex resolution"
+                );
+                if self.turtle().flex_resolved {
+                    return None;
+                }
 
                 let spacing = self.turtle_next_walk_offset();
+                walk.flow_index = self.turtle().next_flow_index;
+                self.turtle_mut().next_flow_index = walk.flow_index.wrapping_add(1);
+
+                let bounds = self.content_bounds(&walk, Axis::Height, ResolveAt::BeforeBegin);
+                let unclamped_basis = self
+                    .eval_fit_bound(basis, Axis::Height, ResolveAt::BeforeBegin)
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(0.0);
+                let basis = bounds.clamp(unclamped_basis);
+
+                let old_pos = self.turtle().pos();
+
                 let turtle = self.turtles.last_mut().unwrap();
-                let size = dvec2(turtle.next_walk_width(walk.width, walk.margin), 0.0);
+                let size = dvec2(turtle.next_walk_width(walk.width, walk.margin), basis);
                 let outer_size = size + walk.margin.size();
 
                 turtle.move_down(spacing.y);
@@ -1919,17 +5355,24 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 turtle.move_down(outer_size.y);
 
                 let index = turtle.deferred_fills.len();
-                turtle.push_deferred_fill(weight, min, max);
+                turtle.push_deferred_fill(DeferredFill {
+                    grow: weight,
+                    shrink,
+                    unclamped_basis,
+                    basis,
+                    min: bounds.min,
+                    max: bounds.max,
+                    delta: 0.0,
+                    frozen: false,
+                });
 
                 Some(DeferredWalk::Unresolved {
                     index,
-                    margin: walk.margin,
-                    other_axis: walk.width,
                     pos: old_pos + spacing,
+                    walk,
                 })
             }
             Flow::Right { wrap: true, .. } if walk.width.is_fill() => {
-                error!("flow: Right {{ wrap: true }} does not support width: Fill");
                 None
             }
             _ => None,
@@ -2005,6 +5448,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     }
 
     pub fn peek_walk_pos(&self, walk: Walk) -> Vec2d {
+        let walk = self.resolve_walk(walk, ResolveAt::BeforeBegin);
         if let Some(pos) = walk.abs_pos {
             pos + walk.margin.left_top()
         } else {
@@ -2013,20 +5457,111 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         }
     }
 
-    pub fn emit_turtle_walk(&mut self, rect: Rect) {
-        let turtle = self.turtles.last().unwrap();
+    /// Returns the current length of the turtle's align list. Call this
+    /// BEFORE drawing something you later intend to register with
+    /// [`emit_turtle_walk`], and pass the captured value as that call's
+    /// `align_list_start` argument.
+    pub fn align_list_len(&self) -> usize {
+        self.align_list.len()
+    }
+
+    /// Records that the current turtle has emitted a `Rect`-shaped walk.
+    ///
+    /// `align_list_start` must be the value of [`Cx2d::align_list_len`]
+    /// captured BEFORE the caller added any align entries for this walk. This
+    /// mirrors how `walk_turtle_internal` records `align_list_start`, and lets
+    /// `finish_row`'s row-alignment passes (e.g., `RowAlign::Center`) correctly
+    /// identify and shift the walk's own align entries.
+    pub fn emit_turtle_walk(&mut self, rect: Rect, align_list_start: usize) {
+        self.emit_turtle_walk_with_metrics(rect, align_list_start, Metrics::default())
+    }
+
+    /// Like [`emit_turtle_walk`] but lets the caller specify the walk's
+    /// `Metrics` (descender/line_gap/line_scale) for baseline-aware row
+    /// alignment (`RowAlign::Bottom`).
+    pub fn emit_turtle_walk_with_metrics(
+        &mut self,
+        rect: Rect,
+        align_list_start: usize,
+        metrics: Metrics,
+    ) {
+        self.emit_turtle_walk_with_align_height(rect, align_list_start, metrics, None)
+    }
+
+    /// Like [`emit_turtle_walk_with_metrics`] but also sets the walk's
+    /// centering height for `RowAlign::Center` (see `FinishedWalk::align_height`).
+    pub fn emit_turtle_walk_with_align_height(
+        &mut self,
+        rect: Rect,
+        align_list_start: usize,
+        metrics: Metrics,
+        align_height: Option<f64>,
+    ) {
+        self.emit_turtle_walk_with_role(rect, align_list_start, metrics, align_height, None, RowAlignRole::Shiftable)
+    }
+
+    /// Like [`emit_turtle_walk_with_align_height`] but with the walk's text
+    /// baseline below `rect`'s top (for `RowAlign::Baseline`) and an explicit
+    /// [`RowAlignRole`].
+    pub fn emit_turtle_walk_with_role(
+        &mut self,
+        rect: Rect,
+        align_list_start: usize,
+        metrics: Metrics,
+        align_height: Option<f64>,
+        baseline: Option<f64>,
+        align_role: RowAlignRole,
+    ) {
+        let turtle = self.turtles.last_mut().unwrap();
+        let flow_index = turtle.next_flow_index;
+        turtle.next_flow_index = turtle.next_flow_index.wrapping_add(1);
         self.finished_walks.push(FinishedWalk {
-            align_list_start: self.align_list.len(),
+            align_list_start,
             deferred_before_count: turtle.deferred_fills.len(),
             outer_size: rect.size,
-            metrics: Metrics::default(),
+            in_flow: true,
+            flow_index,
+            metrics,
+            align_role,
+            align_height,
+            baseline,
         });
+        self.note_turtle_baseline(true, align_role, rect.pos.y, baseline, flow_index);
+    }
+
+    /// Remembers the first declared in-flow walk with a baseline as the one this
+    /// turtle reports. A deferred Fill is pushed after its siblings but keeps its
+    /// declaration index, so it can still take over.
+    fn note_turtle_baseline(
+        &mut self,
+        in_flow: bool,
+        align_role: RowAlignRole,
+        outer_top: f64,
+        baseline: Option<f64>,
+        flow_index: u32,
+    ) {
+        let Some(baseline) = baseline else { return };
+        if !in_flow || align_role == RowAlignRole::Fixed {
+            return;
+        }
+        let index = self.finished_walks.len() - 1;
+        let replace = match self.turtle().baseline_walk {
+            None => true,
+            Some(current) => flow_index < self.finished_walks[current].flow_index,
+        };
+        if replace {
+            let baseline_y = outer_top - self.turtle().origin().y + baseline;
+            let turtle = self.turtle_mut();
+            turtle.baseline_walk = Some(index);
+            turtle.baseline_y = baseline_y;
+        }
     }
 
     fn walk_turtle_peek(&self, walk: Walk) -> Rect {
         if self.turtles.is_empty() {
             return Rect::default();
         }
+        let walk = self.resolve_walk(walk, ResolveAt::BeforeBegin);
         let turtle = self.turtles.last().unwrap();
         let size = dvec2(
             turtle.next_walk_width(walk.width, walk.margin),
@@ -2049,7 +5584,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     }
 
     fn wrap_turtle(&mut self, align_list_start: usize) {
-        let old_pos = self.turtle().pos() - self.turtle_next_walk_offset();
+        let old_pos = self.turtle().pos() + self.turtle_next_walk_offset();
         self.turtle_new_line_internal(self.turtle().wrap_spacing, align_list_start);
         let new_pos = self.turtle().pos();
         let shift = new_pos - old_pos;
@@ -2071,7 +5606,20 @@ impl<'a, 'b> Cx2d<'a, 'b> {
     }
 
     pub fn turtle_new_line_internal(&mut self, spacing: f64, align_list_start: usize) {
-        self.finish_row(align_list_start);
+        let row_bottom_forgiveness = self.finish_row(align_list_start);
+        if row_bottom_forgiveness > 0.0 {
+            // An anchored row's up-centered walks overhang the row's anchor
+            // symmetrically, and the top overhang already intrudes into the
+            // gap above the row; forgiving the same amount below it keeps the
+            // gaps on both sides of the row equal. The reduction happens only
+            // on the new-line path — a turtle's final row is finished by
+            // `end_turtle_with_guard`, which discards the forgiveness — so a
+            // turtle's reported height always covers its last row's full
+            // physical extent.
+            let used_width = self.turtle().used_width();
+            let reduced_used_height = self.turtle().used_height() - row_bottom_forgiveness;
+            self.turtle_mut().set_used(used_width, reduced_used_height);
+        }
         let new_pos = dvec2(
             self.turtle().origin.x + self.turtle().padding().left,
             self.turtle().origin.y + self.turtle().used_height() + spacing,
@@ -2080,85 +5628,396 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         self.turtle_mut().allocate_height(0.0);
     }
 
-    fn finish_row(&mut self, align_list_start: usize) {
-        if let Flow::Right {
-            row_align: RowAlign::Bottom,
-            ..
-        } = self.turtle().flow()
-        {
-            let current_row_height = self.turtle().row_height();
-            let current_row_metrics = self.turtle().current_row_metrics;
+    /// Finishes the current row: applies its row alignment and rolls the row
+    /// bookkeeping forward.
+    ///
+    /// Returns the row's bottom forgiveness (see [`Cx2d::finish_row_center`] and
+    /// [`Cx2d::finish_row_baseline`]); rows under `RowAlign::Top` and
+    /// `RowAlign::Bottom` always return zero.
+    fn finish_row(&mut self, align_list_start: usize) -> f64 {
+        let row_align = if let Flow::Right { row_align, .. } = self.turtle().flow() {
+            row_align
+        } else {
+            RowAlign::Top
+        };
 
-            // We're going to push down each finished walk for the current row so that their
-            // baseline aligns with the bottom of the current row. Therefore, the height of the
-            // ascender of the current row will be the height of the current row, minus the height
-            // of the descender of the current row.
-            let current_row_ascender = current_row_height - current_row_metrics.descender;
-
-            // If the current row is not the first row, compute the amount by which we have to shift
-            // each finished walk for the current row so that the actual spacing between the
-            // baseline of the previous and the current row is equal to the desired spacing.
-            let line_spacing_shift = if self.turtle_is_at_first_row() {
+        let row_bottom_forgiveness = match row_align {
+            RowAlign::Top => {
+                // No per-walk shifts needed — items stay at the row top.
                 0.0
-            } else {
-                // After we've pushed down each finished walk for the current row so that their
-                // baseline aligns with the bottom of the current row, the actual spacing
-                // between the baseline of the previous and current row will be the height of
-                // the descender of the previous row, plus the height of the current row.
-                let prev_row_metrics = self.turtle().prev_row_metrics;
-                let actual_line_spacing = prev_row_metrics.descender + current_row_height;
-
-                // The desired spacing between the baseline of the previous and current row is
-                // the sum of the height of the descender and line gap of the previous row, and
-                // the ascender of the current row, scaled up by the line scale of the current
-                // row.
-                let desired_line_spacing =
-                    (prev_row_metrics.descender + prev_row_metrics.line_gap + current_row_ascender)
-                        * current_row_metrics.line_scale;
-
-                // The amount by which we have to shift each finished walk is the difference between
-                // the desired and the actual spacing.
-                desired_line_spacing - actual_line_spacing
-            };
-
-            // Update the height of the row to account for the shifts we're about to do.
-            self.turtle_mut().used_height += current_row_metrics.descender + line_spacing_shift;
-
-            let finished_walks_start =
-                if self.turtle().finished_rows_start == self.finished_rows.len() {
-                    self.turtle().finished_walks_start
-                } else {
-                    self.finished_rows[self.turtle().finished_rows_start]
-                };
-            let finished_walks_end = self.finished_walks.len();
-            for finished_walk_index in finished_walks_start..finished_walks_end {
-                let finished_walk_height = self.finished_walks[finished_walk_index].outer_size.y;
-                let finished_walk_metrics = self.finished_walks[finished_walk_index].metrics;
-
-                // The amount by which we have to shift the current finished walk so that its
-                // descender aligns with the bottom of the current row.
-                let descender_shift = current_row_height - finished_walk_height;
-
-                // The amount by which we have to shift the current finished walk so that its
-                // baseline aligns with the bottom of the current row.
-                let baseline_shift = finished_walk_metrics.descender;
-
-                // The total amount by which we have to shift the current finished walk.
-                let shift = descender_shift + baseline_shift + line_spacing_shift;
-
-                let start = self.finished_walks[finished_walk_index].align_list_start;
-                let end = if finished_walk_index + 1 < self.finished_walks.len() {
-                    self.finished_walks[finished_walk_index + 1].align_list_start
-                } else {
-                    align_list_start
-                };
-                self.move_align_list(start, end, 0.0, shift, false);
             }
-        }
+            RowAlign::Bottom => {
+                self.finish_row_bottom(align_list_start);
+                0.0
+            }
+            RowAlign::Center => self.finish_row_center(align_list_start),
+            RowAlign::Baseline => self.finish_row_baseline(align_list_start),
+        };
 
         self.turtle_mut().prev_row_metrics = self.turtle().current_row_metrics;
         self.turtle_mut().current_row_metrics = Metrics::default();
         self.finished_rows.push(self.finished_walks.len());
+        row_bottom_forgiveness
+    }
+
+    /// Baseline-aligns every finished walk in the current row so that its
+    /// descender sits on the row's baseline. Requires each walk's
+    /// `metrics.descender` to describe the distance from its bottom to its
+    /// internal baseline.
+    fn finish_row_bottom(&mut self, align_list_start: usize) {
+        let current_row_height = self.turtle().row_height();
+        let current_row_metrics = self.turtle().current_row_metrics;
+
+        // We're going to push down each finished walk for the current row so that their
+        // baseline aligns with the bottom of the current row. Therefore, the height of the
+        // ascender of the current row will be the height of the current row, minus the height
+        // of the descender of the current row.
+        let current_row_ascender = current_row_height - current_row_metrics.descender;
+
+        // If the current row is not the first row, compute the amount by which we have to shift
+        // each finished walk for the current row so that the actual spacing between the
+        // baseline of the previous and the current row is equal to the desired spacing.
+        let line_spacing_shift = if self.turtle_is_at_first_row() {
+            0.0
+        } else {
+            // After we've pushed down each finished walk for the current row so that their
+            // baseline aligns with the bottom of the current row, the actual spacing
+            // between the baseline of the previous and current row will be the height of
+            // the descender of the previous row, plus the height of the current row.
+            let prev_row_metrics = self.turtle().prev_row_metrics;
+            let actual_line_spacing = prev_row_metrics.descender + current_row_height;
+
+            // The desired spacing between the baseline of the previous and current row is
+            // the sum of the height of the descender and line gap of the previous row, and
+            // the ascender of the current row, scaled up by the line scale of the current
+            // row.
+            let desired_line_spacing =
+                (prev_row_metrics.descender + prev_row_metrics.line_gap + current_row_ascender)
+                    * current_row_metrics.line_scale;
+
+            // The amount by which we have to shift each finished walk is the difference between
+            // the desired and the actual spacing.
+            desired_line_spacing - actual_line_spacing
+        };
+
+        // Update the height of the row to account for the shifts we're about to do.
+        self.turtle_mut().used_height += current_row_metrics.descender + line_spacing_shift;
+
+        let finished_walks_start = self.current_row_walks_start();
+        let finished_walks_end = self.finished_walks.len();
+        for finished_walk_index in finished_walks_start..finished_walks_end {
+            // Immovable walks (a wrapped run's rows — their glyphs live in one
+            // shared batch) cannot be baseline-shifted either.
+            if self.finished_walks[finished_walk_index].align_role != RowAlignRole::Shiftable {
+                continue;
+            }
+            let finished_walk_height = self.finished_walks[finished_walk_index].outer_size.y;
+            let finished_walk_metrics = self.finished_walks[finished_walk_index].metrics;
+
+            // The amount by which we have to shift the current finished walk so that its
+            // descender aligns with the bottom of the current row.
+            let descender_shift = current_row_height - finished_walk_height;
+
+            // The amount by which we have to shift the current finished walk so that its
+            // baseline aligns with the bottom of the current row.
+            let baseline_shift = finished_walk_metrics.descender;
+
+            // The total amount by which we have to shift the current finished walk.
+            let shift = descender_shift + baseline_shift + line_spacing_shift;
+
+
+            let start = self.finished_walks[finished_walk_index].align_list_start;
+            let end = if finished_walk_index + 1 < self.finished_walks.len() {
+                self.finished_walks[finished_walk_index + 1].align_list_start
+            } else {
+                align_list_start
+            };
+            if Some(finished_walk_index) == self.turtle().baseline_walk {
+                self.turtle_mut().baseline_y += shift;
+            }
+            self.move_align_list(start, end, 0.0, shift, false);
+        }
+    }
+
+    /// Returns the `finished_walks` index where the current (unfinished) row's
+    /// walks begin for the current turtle.
+    ///
+    /// * If this turtle has no finished rows yet, the current row's walks start
+    ///   at `turtle.finished_walks_start`.
+    /// * Otherwise, they start just after the last finished row of this turtle.
+    ///   `finished_rows` holds cumulative `finished_walks.len()` snapshots at
+    ///   each row boundary; nested turtles truncate their own entries when they
+    ///   end, so `finished_rows.last()` is always the current turtle's most
+    ///   recent row end (as long as this turtle has any).
+    fn current_row_walks_start(&self) -> usize {
+        if self.turtle().finished_rows_start == self.finished_rows.len() {
+            self.turtle().finished_walks_start
+        } else {
+            // Safe: finished_rows.len() > finished_rows_start, so at least one
+            // entry exists for this turtle and it's at the end of the vec.
+            *self.finished_rows.last().unwrap()
+        }
+    }
+
+    /// Vertically centers every finished walk in the current row on the row's
+    /// vertical center line.
+    ///
+    /// Without an anchor walk, the row centers on its tallest walk: shifts are
+    /// downward only and every walk stays entirely within the row's bounds, so
+    /// `used_height` is untouched. With an anchor walk (an immovable wrapped-run
+    /// row), every shiftable walk centers on the anchor's center line instead,
+    /// so a walk taller than the anchor shifts UP and overhangs the anchor's
+    /// box symmetrically — by equal amounts above and below it.
+    ///
+    /// An up-shift is clamped so that no walk's top rises above the turtle's
+    /// own rectangle top: that edge is also the turtle's clip top, and content
+    /// shifted above it renders with its top edge cut off. The clamp can only
+    /// restrict an up-shift; it never turns one into a downward shift.
+    ///
+    /// Returns the row's bottom forgiveness: how far the row's allocated
+    /// bottom extent hangs below the bottom of its anchor-centered content,
+    /// capped at twice the largest up-shift actually applied. The new-line
+    /// path subtracts this from the advance to the next row, so a centered
+    /// walk's symmetric overhang intrudes equally into the row gaps above and
+    /// below it instead of pushing the next row further down. Anchorless rows
+    /// return zero, which leaves the advance untouched.
+    fn finish_row_center(&mut self, align_list_start: usize) -> f64 {
+        let current_row_height = self.turtle().row_height();
+
+        let finished_walks_start = self.current_row_walks_start();
+        let finished_walks_end = self.finished_walks.len();
+
+        // An anchor walk stands for content that cannot be shifted, so the
+        // row's center line is anchored to its center rather than the tallest
+        // walk's. Shiftable walks then move toward that line in either
+        // direction: a taller item (an inline pill beside a wrapped run's
+        // text row) moves UP to center on the text. Without an anchor, the
+        // row centers on its tallest walk and shifts are downward only.
+        let mut anchor_center: Option<f64> = None;
+        for finished_walk_index in finished_walks_start..finished_walks_end {
+            let finished_walk = &self.finished_walks[finished_walk_index];
+            if finished_walk.align_role == RowAlignRole::Anchor {
+                let center = finished_walk
+                    .align_height
+                    .unwrap_or(finished_walk.outer_size.y)
+                    * 0.5;
+                anchor_center = Some(anchor_center.map_or(center, |c: f64| c.max(center)));
+            }
+        }
+
+
+        // The largest post-shift "effective bottom" of any walk on this row,
+        // relative to the row top: the walk's own box displaced by the shift
+        // that was actually applied to it. An up-shifted walk's bottom rises
+        // by exactly its shift, so the row's visual extent ends that much
+        // above its allocation, and only that surplus may be forgiven.
+        let mut max_effective_bottom: f64 = 0.0;
+        // The largest upward shift actually applied on this row; it bounds
+        // the returned forgiveness so that allocations no walk accounts for
+        // (pre-allocated text row boxes, vertical margins) are never forgiven.
+        let mut max_up_overhang: f64 = 0.0;
+
+        for finished_walk_index in finished_walks_start..finished_walks_end {
+            let finished_walk = &self.finished_walks[finished_walk_index];
+            if finished_walk.align_role != RowAlignRole::Shiftable {
+                max_effective_bottom = max_effective_bottom.max(finished_walk.outer_size.y);
+                continue;
+            }
+            let finished_walk_height = finished_walk
+                .align_height
+                .unwrap_or(finished_walk.outer_size.y);
+            let shift = match anchor_center {
+                Some(center) => {
+                    // The row top is the turtle's position while the row
+                    // finishes; the walk's top after shifting is the row top
+                    // plus the shift. A negative bound keeps the walk's top at
+                    // or below the turtle's own rectangle top (its clip top);
+                    // the `min(0.0)` keeps the bound from ever forcing a
+                    // downward shift.
+                    let min_shift =
+                        (self.turtle().origin().y - self.turtle().pos().y).min(0.0);
+                    (center - finished_walk_height * 0.5).max(min_shift)
+                }
+                None => (current_row_height - finished_walk_height) * 0.5,
+            };
+
+            let applied = !((anchor_center.is_none() && shift <= 0.0) || shift == 0.0);
+            let applied_shift = if applied { shift } else { 0.0 };
+            max_up_overhang = max_up_overhang.max((-applied_shift).max(0.0));
+            max_effective_bottom =
+                max_effective_bottom.max(finished_walk.outer_size.y + applied_shift);
+
+
+            if !applied {
+                continue;
+            }
+
+            let start = self.finished_walks[finished_walk_index].align_list_start;
+            let end = if finished_walk_index + 1 < self.finished_walks.len() {
+                self.finished_walks[finished_walk_index + 1].align_list_start
+            } else {
+                align_list_start
+            };
+            if Some(finished_walk_index) == self.turtle().baseline_walk {
+                self.turtle_mut().baseline_y += shift;
+            }
+            self.move_align_list(start, end, 0.0, shift, false);
+        }
+
+        if anchor_center.is_none() {
+            return 0.0;
+        }
+        let row_bottom_forgiveness = (current_row_height - max_effective_bottom.max(0.0))
+            .clamp(0.0, max_up_overhang);
+        row_bottom_forgiveness
+    }
+
+    /// Puts the current row's walks on one baseline (the deepest, or an immovable text row's
+    /// own; a walk without one sits on its bottom edge). The row grows when a seated box
+    /// reaches below it; up-shifts toward an anchor are clamped and forgiven like Center's.
+    fn finish_row_baseline(&mut self, align_list_start: usize) -> f64 {
+        let current_row_height = self.turtle().row_height();
+
+        let finished_walks_start = self.current_row_walks_start();
+        let finished_walks_end = self.finished_walks.len();
+
+        let mut anchor_baseline: Option<f64> = None;
+        let mut deepest_baseline: Option<f64> = None;
+        for finished_walk in &self.finished_walks[finished_walks_start..finished_walks_end] {
+            if !finished_walk.in_flow {
+                continue;
+            }
+            let baseline = finished_walk.effective_baseline();
+            match finished_walk.align_role {
+                RowAlignRole::Anchor => {
+                    anchor_baseline =
+                        Some(anchor_baseline.map_or(baseline, |b: f64| b.max(baseline)));
+                }
+                RowAlignRole::Shiftable => {
+                    deepest_baseline =
+                        Some(deepest_baseline.map_or(baseline, |b: f64| b.max(baseline)));
+                }
+                RowAlignRole::Fixed => {}
+            }
+        }
+        // A negative margin can put a baseline above the row top, so no zero floor here.
+        let row_baseline = anchor_baseline.or(deepest_baseline).unwrap_or(0.0);
+        let min_shift = (self.turtle().origin().y - self.turtle().pos().y).min(0.0);
+        let baseline_walk = self.turtle().baseline_walk;
+
+        let mut max_effective_bottom: f64 = 0.0;
+        let mut max_up_overhang: f64 = 0.0;
+
+        for finished_walk_index in finished_walks_start..finished_walks_end {
+            let finished_walk = &self.finished_walks[finished_walk_index];
+            if !finished_walk.in_flow {
+                continue;
+            }
+            if finished_walk.align_role != RowAlignRole::Shiftable {
+                max_effective_bottom = max_effective_bottom.max(finished_walk.outer_size.y);
+                continue;
+            }
+            let mut shift = row_baseline - finished_walk.effective_baseline();
+            if anchor_baseline.is_some() {
+                shift = shift.max(min_shift);
+            }
+
+            let applied = shift != 0.0;
+            let applied_shift = if applied { shift } else { 0.0 };
+            max_up_overhang = max_up_overhang.max((-applied_shift).max(0.0));
+            max_effective_bottom =
+                max_effective_bottom.max(finished_walk.outer_size.y + applied_shift);
+
+            if !applied {
+                continue;
+            }
+
+            let start = self.finished_walks[finished_walk_index].align_list_start;
+            let end = if finished_walk_index + 1 < self.finished_walks.len() {
+                self.finished_walks[finished_walk_index + 1].align_list_start
+            } else {
+                align_list_start
+            };
+            if Some(finished_walk_index) == baseline_walk {
+                self.turtle_mut().baseline_y += shift;
+            }
+            self.move_align_list(start, end, 0.0, shift, false);
+        }
+
+        // A box seated on the line can reach below the row; the row grows to keep it.
+        let grow = max_effective_bottom - current_row_height;
+        if grow > 0.0 {
+            self.turtle_mut().used_height += grow;
+        }
+
+        if anchor_baseline.is_none() {
+            return 0.0;
+        }
+        (current_row_height - max_effective_bottom.max(0.0)).clamp(0.0, max_up_overhang)
+    }
+
+    /// How far below the current row's top an anchor must sit so the row's other walks meet
+    /// it without moving up: an `anchor_height`-tall one under Center, one whose baseline is
+    /// `anchor_baseline` below its top under Baseline. A row that already holds an anchor: 0.
+    pub fn row_anchor_drop(&self, anchor_height: f64, anchor_baseline: Option<f64>) -> f64 {
+        let Flow::Right { row_align, .. } = self.turtle().flow() else {
+            return 0.0;
+        };
+        let walks = &self.finished_walks[self.current_row_walks_start()..];
+        match row_align {
+            RowAlign::Center => {
+                let mut tallest: f64 = 0.0;
+                for walk in walks {
+                    match walk.align_role {
+                        RowAlignRole::Anchor => return 0.0,
+                        RowAlignRole::Shiftable => {
+                            tallest = tallest.max(walk.align_height.unwrap_or(walk.outer_size.y))
+                        }
+                        RowAlignRole::Fixed => {}
+                    }
+                }
+                ((tallest - anchor_height) * 0.5).max(0.0)
+            }
+            RowAlign::Baseline => {
+                let Some(anchor_baseline) = anchor_baseline else {
+                    return 0.0;
+                };
+                let mut deepest: f64 = 0.0;
+                for walk in walks {
+                    match walk.align_role {
+                        RowAlignRole::Anchor => return 0.0,
+                        RowAlignRole::Shiftable if walk.in_flow => {
+                            deepest = deepest.max(walk.effective_baseline())
+                        }
+                        _ => {}
+                    }
+                }
+                (deepest - anchor_baseline).max(0.0)
+            }
+            RowAlign::Top | RowAlign::Bottom => 0.0,
+        }
+    }
+
+    /// How far the current row's walks reach below their baselines, once a
+    /// `RowAlign::Baseline` row has put them on one line.
+    pub fn row_baseline_descent(&self) -> f64 {
+        let mut descent: f64 = 0.0;
+        for walk in &self.finished_walks[self.current_row_walks_start()..] {
+            if walk.in_flow {
+                descent = descent.max(walk.outer_size.y - walk.effective_baseline());
+            }
+        }
+        descent
+    }
+
+    /// Shifts the rendered content in the align list range `[start, end)` by
+    /// `(dx, dy)` logical pixels. This moves already-drawn instances and rect
+    /// areas without changing the turtle's allocation.
+    ///
+    /// Use [`Cx2d::align_list_len`] to capture `start` before drawing and
+    /// `end` after drawing, then call this to reposition the drawn content.
+    pub fn shift_align_entries(&mut self, start: usize, end: usize, dx: f64, dy: f64) {
+        self.move_align_list(start, end, dx, dy, false);
     }
 
     fn move_align_list(&mut self, start: usize, end: usize, dx: f64, dy: f64, shift_clip: bool) {
@@ -2207,11 +6066,14 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 }
                 AlignEntry::Area(Area::Rect(ra)) => {
                     let draw_list = &mut self.cx.draw_lists[ra.draw_list_id];
-                    let rect_area = &mut draw_list.rect_areas[ra.rect_id];
-                    rect_area.rect.pos += d;
-                    if shift_clip {
-                        rect_area.draw_clip.0 += d;
-                        rect_area.draw_clip.1 += d;
+                    if draw_list.redraw_id == ra.redraw_id {
+                        if let Some(rect_area) = draw_list.rect_areas.get_mut(ra.rect_id) {
+                            rect_area.rect.pos += d;
+                            if shift_clip {
+                                rect_area.draw_clip.0 += d;
+                                rect_area.draw_clip.1 += d;
+                            }
+                        }
                     }
                 }
                 AlignEntry::BeginClip(clip0, clip1) => {
@@ -2294,9 +6156,12 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                 AlignEntry::Area(Area::Rect(ra)) => {
                     if let Some((clip0, clip1)) = self.turtle_clips.last() {
                         let draw_list = &mut self.cx.draw_lists[ra.draw_list_id];
-                        let rect_area = &mut draw_list.rect_areas[ra.rect_id];
-                        rect_area.draw_clip.0 = *clip0;
-                        rect_area.draw_clip.1 = *clip1;
+                        if draw_list.redraw_id == ra.redraw_id {
+                            if let Some(rect_area) = draw_list.rect_areas.get_mut(ra.rect_id) {
+                                rect_area.draw_clip.0 = *clip0;
+                                rect_area.draw_clip.1 = *clip1;
+                            }
+                        }
                     }
                 }
                 AlignEntry::Unset => {}
@@ -2400,7 +6265,7 @@ impl Turtle {
     pub fn rel_pos_padded(&self) -> Vec2d {
         Vec2d {
             x: self.pos.x - self.origin.x - self.layout.padding.left,
-            y: self.pos.y - self.origin.y - self.layout.padding.right,
+            y: self.pos.y - self.origin.y - self.layout.padding.top,
         }
     }
 
@@ -2416,14 +6281,16 @@ impl Turtle {
         if walk.width.is_fit() {
             return None;
         }
-        Some(self.next_walk_width(walk.width, walk.margin))
+        let width = self.next_walk_width(walk.width, walk.margin);
+        width.is_finite().then_some(width)
     }
 
     pub fn max_height(&self, walk: Walk) -> Option<f64> {
         if walk.height.is_fit() {
             return None;
         }
-        Some(self.next_walk_width(walk.height, walk.margin))
+        let height = self.next_walk_height(walk.height, walk.margin);
+        height.is_finite().then_some(height)
     }
 }
 
@@ -2431,10 +6298,9 @@ impl Walk {
     pub fn abs_rect(rect: Rect) -> Self {
         Self {
             abs_pos: Some(rect.pos),
-            margin: Inset::default(),
             width: Size::Fixed(rect.size.x),
             height: Size::Fixed(rect.size.y),
-            metrics: Metrics::default(),
+            ..Self::default()
         }
     }
 
@@ -2464,6 +6330,11 @@ impl Walk {
 impl Layout {
     pub fn with_scroll(mut self, v: Vec2d) -> Self {
         self.scroll = v;
+        self
+    }
+
+    pub fn with_align(mut self, v: Align) -> Self {
+        self.align = v;
         self
     }
 

@@ -6,6 +6,15 @@ use {
     crate::{cx_2d::Cx2d, makepad_platform::*},
 };
 
+/// The enclosing frame's overlay state, saved by
+/// [`Overlay::begin_nested_for_pass`] and restored by [`Overlay::end_nested`].
+pub struct OverlayScope {
+    overlay_id: Option<DrawListId>,
+    overlay_pass_id: Option<DrawPassId>,
+    overlay_seq: u64,
+    overlay_draw_depth: usize,
+}
+
 #[derive(Debug, Script, ScriptHook)]
 pub struct Overlay {
     // draw info per UI element
@@ -30,11 +39,54 @@ impl Overlay {
     pub fn begin(&self, cx: &mut Cx2d) {
         // mark our overlay_id on cx
         cx.overlay_id = Some(self.draw_list.id());
+        cx.overlay_pass_id = None;
+        cx.overlay_seq = 0;
         // cx.overlay_sweep_lock = Some(self.sweep_lock.clone());
+    }
+
+    pub fn begin_for_pass(&self, cx: &mut Cx2d, pass_id: DrawPassId) {
+        // mark our overlay_id on cx
+        cx.overlay_id = Some(self.draw_list.id());
+        cx.overlay_pass_id = Some(pass_id);
+        cx.overlay_seq = 0;
+        // cx.overlay_sweep_lock = Some(self.sweep_lock.clone());
+    }
+
+    /// Begin this overlay for a pass drawn in the MIDDLE of another frame —
+    /// a host recording an app into a texture of its own. Every list begun
+    /// with `begin_overlay_*` while this scope is open records here and
+    /// composites into `pass_id` (the app's texture), never into the
+    /// enclosing window's overlay; the depth ladder restarts, because the
+    /// app's pass has a depth buffer of its own. [`Overlay::end_nested`]
+    /// composites it and hands the enclosing overlay back.
+    pub fn begin_nested_for_pass(&self, cx: &mut Cx2d, pass_id: DrawPassId) -> OverlayScope {
+        let scope = OverlayScope {
+            overlay_id: cx.overlay_id,
+            overlay_pass_id: cx.overlay_pass_id,
+            overlay_seq: cx.overlay_seq,
+            overlay_draw_depth: cx.overlay_draw_depth,
+        };
+        cx.overlay_id = Some(self.draw_list.id());
+        cx.overlay_pass_id = Some(pass_id);
+        cx.overlay_seq = 0;
+        cx.overlay_draw_depth = 0;
+        scope
+    }
+
+    /// The nested overlay composites into the list being recorded (the
+    /// app's root, so it paints last in the app's pass), and the enclosing
+    /// frame's overlay state is exactly what it was.
+    pub fn end_nested(&self, cx: &mut Cx2d, scope: OverlayScope) {
+        self.end(cx);
+        cx.overlay_id = scope.overlay_id;
+        cx.overlay_pass_id = scope.overlay_pass_id;
+        cx.overlay_seq = scope.overlay_seq;
+        cx.overlay_draw_depth = scope.overlay_draw_depth;
     }
 
     pub fn end(&self, cx: &mut Cx2d) {
         cx.overlay_id = None;
+        cx.overlay_pass_id = None;
         let parent_id = cx.draw_list_stack.last().cloned().unwrap();
         let redraw_id = cx.redraw_id;
         cx.draw_lists[parent_id].append_sub_list(redraw_id, self.draw_list.id());
@@ -43,12 +95,30 @@ impl Overlay {
         // this means it didn't
         for i in 0..cx.draw_lists[self.draw_list.id()].draw_items.len() {
             if let Some(sub_id) = cx.draw_lists[self.draw_list.id()].draw_items[i].sub_list() {
+                // If the sub draw list's owning widget was DROPPED (its slot is in the free pool),
+                // its overlay must be removed — otherwise a glass widget whose chat message was
+                // cleared/recycled stays stuck (it's never drawn again to clear itself, and the
+                // redraw_id heuristic below can't catch a freed-but-not-yet-reused slot). Only
+                // freed lists hit this; live (still-drawn) glass keeps its slot, so no flicker.
+                if cx.draw_lists.is_id_freed(sub_id) {
+                    cx.draw_lists[self.draw_list.id()].clear_sub_list(sub_id);
+                    continue;
+                }
                 // Use checked_index to safely access draw lists that might have been recycled
                 if let Some(sub_draw_list) = cx.draw_lists.checked_index(sub_id) {
                     if let Some(cfp) = sub_draw_list.codeflow_parent_id {
                         // Also check the parent draw list safely
                         if let Some(parent_draw_list) = cx.draw_lists.checked_index(cfp) {
-                            if parent_draw_list.redraw_id != sub_draw_list.redraw_id {
+                            // A parent that did not redraw keeps its glass (a
+                            // cached view); one whose pass is no longer drawn
+                            // (a texture-cached view that went invisible) must
+                            // not: nothing will ever draw it again, and its
+                            // glass would stay on screen where it last was.
+                            if parent_draw_list.redraw_id != sub_draw_list.redraw_id
+                                || parent_draw_list
+                                    .draw_pass_id
+                                    .is_some_and(|pass_id| pass_chain_is_stale(cx, pass_id))
+                            {
                                 cx.draw_lists[self.draw_list.id()].clear_sub_list(sub_id);
                             }
                         } else {
@@ -62,5 +132,50 @@ impl Overlay {
                 }
             }
         }
+
+        // Composite in DRAW order, not slot order.
+        //
+        // A glass surface keeps whichever overlay slot it first claimed
+        // (`store_sub_list` takes the first free one and never moves it), so
+        // slot order is really creation order — a home widget rebuilt after a
+        // layout change, or a panel opened later, lands wherever there happens
+        // to be a hole. That is why glass appeared on top of things drawn after
+        // it. Each sub-list was stamped with its draw position in
+        // `begin_overlay_inner`; ordering by that stamp makes glass obey the
+        // same rule as everything else: later drawn, later painted.
+        let list_id = self.draw_list.id();
+        let len = cx.draw_lists[list_id].draw_items.len();
+        let mut keys: Vec<u64> = Vec::with_capacity(len);
+        for i in 0..len {
+            let sub = cx.draw_lists[list_id].draw_items[i].sub_list();
+            let order = sub
+                .and_then(|sub_id| cx.draw_lists.checked_index(sub_id))
+                .map(|sub_list| sub_list.overlay_order)
+                .unwrap_or(0);
+            keys.push(order);
+        }
+        let mut order: Vec<usize> = (0..len).collect();
+        // Stable, so entries that didn't draw this frame keep their relative
+        // positions instead of shuffling.
+        order.sort_by_key(|&i| keys[i]);
+        cx.draw_lists[list_id].draw_item_reorder = Some(order);
     }
+}
+
+/// True when `pass_id`, or a texture pass it renders into, is no longer
+/// drawn by the list that attached it (`Cx::pass_attachment_is_stale`).
+fn pass_chain_is_stale(cx: &Cx2d, pass_id: DrawPassId) -> bool {
+    let mut pass_id = pass_id;
+    // Parent links of recycled pass slots can form a cycle; a chain longer
+    // than the pool is one.
+    for _ in 0..=cx.passes.id_iter().count() {
+        if cx.pass_attachment_is_stale(pass_id) {
+            return true;
+        }
+        match cx.passes[pass_id].parent {
+            CxDrawPassParent::DrawPass(parent) => pass_id = parent,
+            _ => return false,
+        }
+    }
+    false
 }

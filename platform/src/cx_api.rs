@@ -1,18 +1,19 @@
-use crate::file_dialogs::FileDialog;
+use crate::file_dialogs::{FileDialog, VirtualFileLimits};
 
 use {
     crate::{
         area::Area,
         cursor::MouseCursor,
-        cx::{Cx, CxRef, OsType, XrCapabilities},
+        cx::{Cx, CxRef, GpuBackend, OsType, XrCapabilities},
+        display_context::SystemBarAppearance,
         draw_list::DrawListId,
         draw_pass::{CxDrawPassParent, CxDrawPassRect, DrawPassId},
         dvec2,
         event::keyboard::CharOffset,
         event::xr::XrAnchor,
         event::{
-            video_playback::CameraPreviewMode, DragItem, NextFrame, Timer, Trigger,
-            VideoSource,
+            video_playback::CameraPreviewMode, DragItem, Event, NextFrame, QuitReason,
+            QuitRequestedEvent, Timer, Trigger, VideoSource,
         },
         gpu_info::GpuInfo,
         ime::TextInputConfig,
@@ -24,11 +25,12 @@ use {
         makepad_script::value::ScriptHandle,
         shared_bytes::SharedBytes,
         texture::{Texture, TextureId},
-        window::WindowId,
         window::WindowVisuals,
+        window::{CxWindow, WindowId},
     },
     std::{
         any::{Any, TypeId},
+        collections::VecDeque,
         ops::Range,
         rc::Rc,
     },
@@ -42,6 +44,8 @@ pub enum OpenUrlInPlace {
 pub enum CxThreadPriority {
     #[default]
     Normal,
+    UserInteractive,
+    UserInitiated,
     Utility,
     Background,
     Idle,
@@ -83,7 +87,6 @@ pub struct XrFrameCpuBreakdown {
     pub resize_projection_ms: f64,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SystemBrowserId(pub LiveId);
 
@@ -104,14 +107,15 @@ impl<'a> CxSystemBrowser<'a> {
     }
 
     pub fn spawn(&mut self, url: &str) {
-        self.cx.platform_ops.push(CxOsOp::SpawnSystemBrowser {
+        if self.cx.script_data.std.host_io_only() { return; }
+        self.cx.platform_ops.push_back(CxOsOp::SpawnSystemBrowser {
             browser_id: self.id.0,
             url: url.to_string(),
         });
     }
 
     pub fn update(&mut self, area: Area, visible: bool) {
-        self.cx.platform_ops.push(CxOsOp::UpdateSystemBrowser {
+        self.cx.platform_ops.push_back(CxOsOp::UpdateSystemBrowser {
             browser_id: self.id.0,
             area,
             visible,
@@ -119,13 +123,14 @@ impl<'a> CxSystemBrowser<'a> {
     }
 
     pub fn detach(&mut self) {
-        self.cx.platform_ops.push(CxOsOp::DetachSystemBrowser {
+        self.cx.platform_ops.push_back(CxOsOp::DetachSystemBrowser {
             browser_id: self.id.0,
         });
     }
 
     pub fn set_url(&mut self, url: &str, replace: bool) {
-        self.cx.platform_ops.push(CxOsOp::SetSystemBrowserUrl {
+        if self.cx.script_data.std.host_io_only() { return; }
+        self.cx.platform_ops.push_back(CxOsOp::SetSystemBrowserUrl {
             browser_id: self.id.0,
             url: url.to_string(),
             replace,
@@ -133,25 +138,28 @@ impl<'a> CxSystemBrowser<'a> {
     }
 
     pub fn history_go(&mut self, delta: i32) {
-        self.cx.platform_ops.push(CxOsOp::SystemBrowserHistoryGo {
-            browser_id: self.id.0,
-            delta,
-        });
+        if self.cx.script_data.std.host_io_only() { return; }
+        self.cx
+            .platform_ops
+            .push_back(CxOsOp::SystemBrowserHistoryGo {
+                browser_id: self.id.0,
+                delta,
+            });
     }
 
     pub fn close(&mut self) {
-        self.cx.platform_ops.push(CxOsOp::CloseSystemBrowser {
+        self.cx.platform_ops.push_back(CxOsOp::CloseSystemBrowser {
             browser_id: self.id.0,
         });
     }
 }
 
+/// A system haptic (`Cx::haptic_feedback`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HapticFeedback { Click, VirtualKey, Tick }
+
 pub trait CxOsApi {
     fn init_cx_os(&mut self);
-
-    fn spawn_thread<F>(&mut self, f: F)
-    where
-        F: FnOnce() + Send + 'static;
 
     fn start_stdin_service(&mut self) {}
     fn pre_start() -> bool {
@@ -163,6 +171,14 @@ pub trait CxOsApi {
     fn browser_update_url(&mut self, _url: &str, _replace: bool) {}
 
     fn browser_history_go(&mut self, _delta: i32) {}
+
+    /// Platform hook shared by native and synthetic pointer injection. Cocoa
+    /// uses it to activate the clicked window before the down is dispatched.
+    fn activate_window_on_pointer_down(&mut self, _window_id: WindowId) {}
+
+    /// Re-evaluate any platform pacing override after widget capture state
+    /// may have changed in a pointer callback.
+    fn update_pointer_capture_pacing(&mut self) {}
 
     fn seconds_since_app_start(&self) -> f64;
 
@@ -235,6 +251,31 @@ impl std::fmt::Debug for AccessibilityUpdatePayload {
     }
 }
 
+/// A set of screen edges, for [`Cx::defer_system_gestures`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenEdges(u8);
+
+impl ScreenEdges {
+    pub const NONE: ScreenEdges = ScreenEdges(0);
+    pub const TOP: ScreenEdges = ScreenEdges(1);
+    pub const LEFT: ScreenEdges = ScreenEdges(2);
+    pub const BOTTOM: ScreenEdges = ScreenEdges(4);
+    pub const RIGHT: ScreenEdges = ScreenEdges(8);
+    pub const ALL: ScreenEdges = ScreenEdges(15);
+
+    pub const fn with(self, other: ScreenEdges) -> ScreenEdges {
+        ScreenEdges(self.0 | other.0)
+    }
+
+    pub const fn contains(self, other: ScreenEdges) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 #[derive(PartialEq)]
 pub enum CxOsOp {
     CreateWindow(WindowId),
@@ -259,10 +300,41 @@ pub enum CxOsOp {
     HideWindowButtons(WindowId),
     ShowWindowButtons(WindowId),
     SetTopmost(WindowId, bool),
+    /// `true`: drop the native maximized-state border/titlebar strip a
+    /// backend would otherwise keep (Windows only; other backends ignore
+    /// it) so a maximized window reads as a clean fullscreen picture
+    /// rather than a decorated window pinned to the work area.
+    SetChromelessWhenMaximized(WindowId, bool),
     SetWindowVisuals(WindowId, WindowVisuals),
     ShowInDock(bool),
+    /// FPS-style pointer lock: `true` hides the cursor and freezes it in
+    /// place while mouse deltas keep arriving (as synthesized absolute
+    /// positions, so existing MouseMove consumers work unchanged); `false`
+    /// releases. Backends without support ignore it.
+    LockMousePointer(bool),
+    /// Widget-scoped pointer pin for value scrubbing: cursor stays at its
+    /// press point (hidden) while deltas keep flowing; restored in place
+    /// on release. Engage at the drag threshold, never on the press.
+    PinMousePointer(bool),
+    /// Per-frame lock maintenance, pushed by the captured app every frame:
+    /// re-pins the hardware cursor. Exists because OS-level disassociation
+    /// proves unreliable on some systems (it silently drops on app
+    /// deactivation and other events) — SDL's fallback is the same
+    /// warp-every-frame. No-op when unlocked or unsupported.
+    RepinMousePointer,
+    /// Tints the system bar (status/navigation bar) icons: `true` requests
+    /// dark icons, `false` requests light icons. Honored on Android and iOS
+    /// (iOS only has a status bar).
+    SetSystemBarDarkIcons(bool),
+    /// Asks the OS to defer its own edge gestures (the home-indicator swipe,
+    /// the status-bar and control-centre pulls) on these screen edges, so
+    /// the first swipe from such an edge reaches the app. Honored on iOS.
+    DeferSystemGestures(ScreenEdges),
 
-    ShowTextIME(Area, Vec2d, TextInputConfig),
+    // The `Rect` is the caret/composition line's bounding box (top-left + size,
+    // line height included), so each backend can ask the OS to place the IME
+    // candidate window directly above/below the line instead of over it.
+    ShowTextIME(Area, Rect, TextInputConfig),
     HideTextIME,
     SyncImeState {
         text: String,
@@ -279,6 +351,14 @@ pub enum CxOsOp {
     Quit,
 
     StartDragging(Vec<DragItem>),
+    /// Begin an operating-system drag whose destination may be another
+    /// application. This is deliberately separate from `StartDragging`:
+    /// several Makepad widgets use that operation for the framework's
+    /// immediate, synthetic in-window drag protocol.
+    StartExternalDragging {
+        window_id: WindowId,
+        items: Vec<DragItem>,
+    },
     UpdateMacosMenu(MacosMenu),
     ShowClipboardActions {
         has_selection: bool,
@@ -308,12 +388,24 @@ pub enum CxOsOp {
         request_id: i32,
     },
 
+    StartLocationUpdates,
+    StopLocationUpdates,
+
     HttpRequest {
         request_id: LiveId,
         request: HttpRequest,
     },
     CancelHttpRequest {
         request_id: LiveId,
+    },
+    #[cfg(target_arch = "wasm32")]
+    #[allow(private_interfaces)]
+    StorageRequest(crate::storage::StorageRequest),
+    #[cfg(target_arch = "wasm32")]
+    StorageRequestError {
+        request_id: crate::storage::StorageRequestId,
+        op: crate::storage::StorageOp,
+        error: crate::storage::StorageError,
     },
 
     PrepareVideoPlayback(
@@ -371,6 +463,8 @@ pub enum CxOsOp {
     SeekVideoPlayback(LiveId, u64),
     SetVideoVolume(LiveId, f64),
     SetVideoPlaybackRate(LiveId, f64),
+    SelectVideoTrack(LiveId, usize),
+    SelectAudioTrack(LiveId, usize),
     UpdateVideoSurfaceTexture(LiveId),
 
     CreateWebView {
@@ -417,8 +511,14 @@ impl std::fmt::Debug for CxOsOp {
             Self::HideWindowButtons(..) => write!(f, "HideWindowButtons"),
             Self::ShowWindowButtons(..) => write!(f, "ShowWindowButtons"),
             Self::SetTopmost(..) => write!(f, "SetTopmost"),
+            Self::SetChromelessWhenMaximized(..) => write!(f, "SetChromelessWhenMaximized"),
             Self::SetWindowVisuals(..) => write!(f, "SetWindowVisuals"),
             Self::ShowInDock(..) => write!(f, "ShowInDock"),
+            Self::LockMousePointer(..) => write!(f, "LockMousePointer"),
+            Self::PinMousePointer(..) => write!(f, "PinMousePointer"),
+            Self::RepinMousePointer => write!(f, "RepinMousePointer"),
+            Self::SetSystemBarDarkIcons(..) => write!(f, "SetSystemBarDarkIcons"),
+            Self::DeferSystemGestures(..) => write!(f, "DeferSystemGestures"),
 
             Self::ShowTextIME(..) => write!(f, "ShowTextIME"),
             Self::HideTextIME => write!(f, "HideTextIME"),
@@ -429,6 +529,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::Quit => write!(f, "Quit"),
 
             Self::StartDragging(..) => write!(f, "StartDragging"),
+            Self::StartExternalDragging { .. } => write!(f, "StartExternalDragging"),
             Self::UpdateMacosMenu(..) => write!(f, "UpdateMacosMenu"),
             Self::ShowClipboardActions { .. } => write!(f, "ShowClipboardActions"),
             Self::HideClipboardActions => write!(f, "HideClipboardActions"),
@@ -441,9 +542,15 @@ impl std::fmt::Debug for CxOsOp {
 
             Self::CheckPermission { .. } => write!(f, "CheckPermission"),
             Self::RequestPermission { .. } => write!(f, "RequestPermission"),
+            Self::StartLocationUpdates => write!(f, "StartLocationUpdates"),
+            Self::StopLocationUpdates => write!(f, "StopLocationUpdates"),
 
             Self::HttpRequest { .. } => write!(f, "HttpRequest"),
             Self::CancelHttpRequest { .. } => write!(f, "CancelHttpRequest"),
+            #[cfg(target_arch = "wasm32")]
+            Self::StorageRequest(..) => write!(f, "StorageRequest"),
+            #[cfg(target_arch = "wasm32")]
+            Self::StorageRequestError { .. } => write!(f, "StorageRequestError"),
 
             Self::PrepareVideoPlayback(..) => write!(f, "PrepareVideoPlayback"),
             Self::AttachCameraNativePreview { .. } => write!(f, "AttachCameraNativePreview"),
@@ -465,6 +572,8 @@ impl std::fmt::Debug for CxOsOp {
             Self::SeekVideoPlayback(..) => write!(f, "SeekVideoPlayback"),
             Self::SetVideoVolume(..) => write!(f, "SetVideoVolume"),
             Self::SetVideoPlaybackRate(..) => write!(f, "SetVideoPlaybackRate"),
+            Self::SelectVideoTrack(..) => write!(f, "SelectVideoTrack"),
+            Self::SelectAudioTrack(..) => write!(f, "SelectAudioTrack"),
             Self::UpdateVideoSurfaceTexture(..) => write!(f, "UpdateVideoSurfaceTexture"),
             Self::CreateWebView { .. } => write!(f, "CreateWebView"),
             Self::UpdateWebView { .. } => write!(f, "UpdateWebView"),
@@ -486,19 +595,132 @@ impl std::fmt::Debug for CxOsOp {
         }
     }
 }
+
+/// Requeue an OS op that cannot run yet. FIFO: append so remaining already-queued
+/// ops still run first. Returns `true` if the drain should continue (`len() > 1`);
+/// `false` if this is the only op left — break and retry on the next event.
+#[allow(dead_code)] // only drivers that defer ops call this (macos, windows today)
+pub(crate) fn defer_platform_op(platform_ops: &mut VecDeque<CxOsOp>, op: CxOsOp) -> bool {
+    platform_ops.push_back(op);
+    platform_ops.len() > 1
+}
+
+impl Cx {
+    /// Update a named dynamic uniform on one retained draw item without
+    /// invalidating its immutable instance publication.
+    pub fn set_draw_item_uniform(
+        &mut self,
+        list: DrawListId,
+        item: usize,
+        name: LiveId,
+        value: &[f32],
+    ) -> bool {
+        // A stale (list, item) after eviction or re-recording is a no-op,
+        // never a UI-thread panic.
+        let draw_items = &self.draw_lists[list].draw_items;
+        let Some(shader) = (item < draw_items.len())
+            .then(|| draw_items[item].draw_call())
+            .flatten()
+            .map(|call| call.draw_shader_id)
+        else {
+            return false;
+        };
+        let Some(input) = self.draw_shaders[shader.index]
+            .mapping
+            .dyn_uniforms
+            .inputs
+            .iter()
+            .find(|input| input.id == name)
+        else {
+            return false;
+        };
+        let offset = input.offset;
+        let len = input.slots.min(value.len());
+        let draw_list = &mut self.draw_lists[list];
+        let changed = draw_list.draw_items.set_dyn_uniform(
+            item,
+            shader,
+            offset,
+            &value[..len],
+            &mut self.uniform_gen,
+        );
+        if changed {
+            if let Some(pass) = draw_list.draw_pass_id {
+                self.passes[pass].paint_dirty = true;
+            }
+        }
+        changed
+    }
+}
+
 impl Cx {
     pub fn in_draw_event(&self) -> bool {
         self.in_draw_event
     }
 
-    /// Updates the `mod.widgets.SAFE_INSET_PAD_*` values on the script heap
-    /// so that Splash code can reference them in widget definitions.
-    /// Requests a deferred re-application of all script/Splash widget definitions,
-    /// causing widgets to pick up updated values from the script heap.
-    /// The re-apply happens on the next event loop iteration (not synchronously),
-    /// to avoid re-entrancy issues when called from within an event handler.
+    /// Requests a deferred `Event::ScriptReapply` on the next event-loop
+    /// iteration. The captured app value is re-applied with
+    /// `Apply::ScriptReapply` — no `script_mod` re-run, so runtime
+    /// `script_eval!` overrides on the heap are preserved. Widgets that
+    /// reference shared heap objects (e.g. `mod.widgets.IMG_MSG_FIT`) pick
+    /// up in-place mutations on this re-apply walk.
+    ///
+    /// Use this when the change you made is a runtime mutation of a shared
+    /// heap object — typically a `script_eval!` override.
     pub fn request_script_reapply(&mut self) {
         self.pending_script_reapply = true;
+    }
+
+    /// Re-evaluate application Splash with a new stylesheet, preserving text and
+    /// other imperative state through `Apply::ScriptReapply`.
+    pub fn request_style_reload(&mut self) {
+        self.pending_style_reload = true;
+        self.pending_live_edit_request = true;
+    }
+
+    /// Requests a deferred `Event::LiveEdit` on the next event-loop iteration.
+    /// The handler re-runs `script_mod` (re-evaluating any expressions that
+    /// reference primitive heap values like `mod.widgets.SAFE_INSET_PAD_TOP`)
+    /// and then re-applies the widget tree with `Apply::Rebake`, which
+    /// preserves imperative runtime state since the DSL itself is unchanged.
+    ///
+    /// Use this only when a primitive heap value has changed and that value
+    /// is consumed by `script_mod!` block expressions — those expressions are
+    /// not re-evaluated by `Apply::ScriptReapply`. The re-run is still a full
+    /// tree walk, so prefer `request_script_reapply` when the change can be
+    /// modeled as a shared-heap-object mutation instead.
+    pub fn request_live_edit(&mut self) {
+        self.pending_live_edit_request = true;
+    }
+
+    /// The `Apply` variant the currently dispatching `Event::LiveEdit` should
+    /// be re-applied with — `Reload` for a file-change hot reload, `Rebake`
+    /// for a `request_live_edit()` re-bake. `app_main!` reads this; app code
+    /// has no reason to.
+    pub fn live_edit_apply(&self) -> crate::makepad_script::Apply {
+        self.live_edit_apply.clone()
+    }
+
+    /// Remap an absolute coordinate from the OS-reported logical-point space
+    /// into the layout's logical-point space when a `dpi_override` is active
+    /// on the given window. No-op if no override is set or `os_dpi_factor`
+    /// hasn't been recorded yet.
+    ///
+    /// Platform-specific event handlers call this on every `abs` field of
+    /// pointer/touch/scroll events so input still hits the right widget when
+    /// zoom is active. Android/OpenHarmony don't need it because they divide
+    /// raw pixels by the override-aware `dpi_factor` at the source — so this
+    /// helper is dead code on those builds, hence the `allow(dead_code)`.
+    #[allow(dead_code)]
+    pub(crate) fn dpi_override_scale(&self, pos: &mut Vec2d, window_id: WindowId) {
+        // Native window callbacks can be delivered after a window has been
+        // destroyed.  In that case their Cocoa back-pointer no longer names a
+        // live Cx window.  Pointer events are best-effort, so never let a stale
+        // callback index the generational pool (and abort the whole app).
+        if !self.windows.is_valid(window_id) || !self.windows[window_id].is_created {
+            return;
+        }
+        *pos = self.windows[window_id].remap_dpi_override(*pos);
     }
 
     pub fn update_safe_inset_script_values(&mut self, insets: crate::event::SafeAreaInsets) {
@@ -597,13 +819,106 @@ impl Cx {
         self.textures.0.live_count()
     }
 
-
-    pub fn set_thread_priority(priority: CxThreadPriority) {
-        #[cfg(target_os = "android")]
-        crate::os::linux::android::android::set_current_thread_priority(priority);
-
-        #[cfg(not(target_os = "android"))]
-        let _ = priority;
+    /// Apply to the calling thread and read the OS setting back. `Applied`
+    /// confirms the requested class/nice value, not a scheduling guarantee.
+    pub fn set_thread_priority(priority: CxThreadPriority) -> crate::thread::PriorityStatus {
+        use crate::thread::PriorityStatus;
+        #[cfg(target_vendor = "apple")]
+        {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32;
+                fn pthread_self() -> *mut std::ffi::c_void;
+                fn pthread_get_qos_class_np(
+                    thread: *mut std::ffi::c_void,
+                    class: *mut u32,
+                    relative: *mut i32,
+                ) -> i32;
+            }
+            let (class, relative) = match priority {
+                CxThreadPriority::UserInteractive => (0x21, 0),
+                CxThreadPriority::UserInitiated => (0x19, 0),
+                CxThreadPriority::Normal => (0x15, 0),
+                CxThreadPriority::Utility => (0x11, 0),
+                CxThreadPriority::Background => (0x09, 0),
+                CxThreadPriority::Idle => (0x09, -15),
+            };
+            let mut actual_class = 0;
+            let mut actual_relative = 0;
+            let applied = unsafe {
+                pthread_set_qos_class_self_np(class, relative) == 0
+                    && pthread_get_qos_class_np(
+                        pthread_self(),
+                        &mut actual_class,
+                        &mut actual_relative,
+                    ) == 0
+                    && actual_class == class
+                    && actual_relative == relative
+            };
+            if applied {
+                PriorityStatus::Applied
+            } else {
+                PriorityStatus::Failed
+            }
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            unsafe extern "C" {
+                fn setpriority(which: i32, who: u32, priority: i32) -> i32;
+                fn getpriority(which: i32, who: u32) -> i32;
+            }
+            // Linux PRIO_PROCESS, who=0 addresses the current task/thread,
+            // not the whole process. Keep SCHED_OTHER; no realtime privilege.
+            // Interactive uses nice 0 (unprivileged), light 1 and utility 5.
+            let nice = match priority {
+                CxThreadPriority::Normal | CxThreadPriority::UserInteractive => 0,
+                CxThreadPriority::UserInitiated => 1,
+                CxThreadPriority::Utility => 5,
+                CxThreadPriority::Background => 10,
+                CxThreadPriority::Idle => 15,
+            };
+            let applied = unsafe { setpriority(0, 0, nice) == 0 && getpriority(0, 0) == nice };
+            if applied {
+                PriorityStatus::Applied
+            } else {
+                PriorityStatus::Failed
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetCurrentThread() -> *mut std::ffi::c_void;
+                fn SetThreadPriority(thread: *mut std::ffi::c_void, priority: i32) -> i32;
+                fn GetThreadPriority(thread: *mut std::ffi::c_void) -> i32;
+            }
+            let value = match priority {
+                CxThreadPriority::UserInteractive => 2, // HIGHEST, not realtime
+                CxThreadPriority::UserInitiated => 1,   // ABOVE_NORMAL
+                CxThreadPriority::Normal => 0,
+                CxThreadPriority::Utility => -1,
+                CxThreadPriority::Background => -2,
+                CxThreadPriority::Idle => -15,
+            };
+            let applied = unsafe {
+                let thread = GetCurrentThread();
+                SetThreadPriority(thread, value) != 0 && GetThreadPriority(thread) == value
+            };
+            if applied {
+                PriorityStatus::Applied
+            } else {
+                PriorityStatus::Failed
+            }
+        }
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "windows"
+        )))]
+        {
+            let _ = priority;
+            PriorityStatus::BestEffortUnsupported
+        }
     }
 
     pub fn get_ref(&self) -> CxRef {
@@ -676,9 +991,10 @@ impl Cx {
         Err(format!("Dependency not loaded {}", path))
     }
 
-    /// Get loaded resource data by ScriptHandle
-    pub fn get_resource(&self, handle: ScriptHandle) -> Option<Rc<Vec<u8>>> {
-        if let Some(data) = self.script_data.resources.get_data(handle) {
+    /// Get loaded resource data by the handle's owning heap and value
+    /// (`ScriptHandleRef::heap_key` / `as_handle`).
+    pub fn get_resource(&self, heap_key: usize, handle: ScriptHandle) -> Option<Rc<Vec<u8>>> {
+        if let Some(data) = self.script_data.resources.get_data(heap_key, handle) {
             return Some(data);
         }
 
@@ -687,7 +1003,7 @@ impl Cx {
         // Loaded yet, allow direct dependency lookup as a synchronous fallback.
         if self.os_type().is_web() {
             let resources = self.script_data.resources.resources.borrow();
-            if let Some(res) = resources.iter().find(|res| res.handle == handle) {
+            if let Some(res) = resources.iter().find(|res| res.has_handle(heap_key, handle)) {
                 if let Some(dep_path) = res.dependency_path.as_deref() {
                     if let Ok(data) = self.get_dependency(dep_path) {
                         return Some(data);
@@ -699,12 +1015,13 @@ impl Cx {
         None
     }
 
-    /// Get the absolute path registered for a script resource handle.
-    pub fn get_resource_abs_path(&self, handle: ScriptHandle) -> Option<String> {
+    /// Get the absolute path registered for a script resource handle of
+    /// the given heap.
+    pub fn get_resource_abs_path(&self, heap_key: usize, handle: ScriptHandle) -> Option<String> {
         let resources = self.script_data.resources.resources.borrow();
         resources
             .iter()
-            .find(|res| res.handle == handle)
+            .find(|res| res.has_handle(heap_key, handle))
             .map(|res| res.abs_path.clone())
     }
 
@@ -712,22 +1029,42 @@ impl Cx {
     ///
     /// This reads local file-backed resources directly, then falls back to
     /// already-loaded resource bytes (required for wasm/network-backed assets).
-    pub fn get_resource_font_bytes(&mut self, handle: ScriptHandle) -> Option<SharedBytes> {
-        let resource_path = {
-            let resources = self.script_data.resources.resources.borrow();
-            resources
-                .iter()
-                .find(|res| res.handle == handle)
-                .map(|res| res.abs_path.clone())
-        };
+    pub fn get_resource_font_bytes(&mut self, heap_key: usize, handle: ScriptHandle) -> Option<SharedBytes> {
+        let path = self.get_resource_abs_path(heap_key, handle)?;
+        self.get_resource_font_bytes_by_path(&path)
+    }
 
-        if let Some(path) = resource_path {
-            if let Ok(bytes) = SharedBytes::from_file_mmap_or_read(&path) {
-                return Some(bytes);
-            }
+    /// Font identity captured in its owning script heap. A local handle alone
+    /// cannot identify a resource once a draw object leaves that heap.
+    pub fn get_resource_font_bytes_by_path(&self, path: &str) -> Option<SharedBytes> {
+        if let Ok(bytes) = SharedBytes::from_file_mmap_or_read(path) {
+            return Some(bytes);
         }
+        let resources = self.script_data.resources.resources.borrow();
+        let res = resources.iter().find(|res| res.abs_path == path)?;
+        if let crate::script::res::CxScriptResourceData::Loaded(data) = &res.data {
+            return Some(SharedBytes::from_owned(data.clone()));
+        }
+        res.dependency_path
+            .as_deref()
+            .and_then(|path| self.get_dependency(path).ok())
+            .map(SharedBytes::from_owned)
+    }
 
-        self.get_resource(handle).map(SharedBytes::from_owned)
+    /// The script resource at `path` can never be read in this process: no
+    /// resource is registered under it, or its load already failed (a font
+    /// left out of the build's font set, an asset missing from the package).
+    /// A resource still loading, or not yet loaded, is not unavailable.
+    pub fn script_resource_generation(&self) -> u64 {
+        self.script_data.resources.generation.get()
+    }
+
+    pub fn script_resource_unavailable(&self, path: &str) -> bool {
+        let resources = self.script_data.resources.resources.borrow();
+        match resources.iter().find(|res| res.abs_path == path) {
+            None => true,
+            Some(res) => matches!(res.data, crate::script::res::CxScriptResourceData::Error(_)),
+        }
     }
 
     pub fn null_texture(&self) -> Texture {
@@ -742,6 +1079,61 @@ impl Cx {
 
     pub fn os_type(&self) -> &OsType {
         &self.os_type
+    }
+
+    /// The GPU API this binary renders with (see [`GpuBackend`]). Desktop Linux
+    /// picks between Vulkan and OpenGL ES at startup (a Vulkan-capable build
+    /// falls back to OpenGL when no usable hardware device answers); once the
+    /// event loop has chosen, this reports that choice (recorded on the
+    /// Linux platform state, `CxOs::gpu_backend`). Before that, and on every
+    /// other platform, it is the API compiled into the binary.
+    pub fn gpu_backend(&self) -> GpuBackend {
+        #[cfg(all(
+            target_os = "linux",
+            not(any(gpusim, linux_direct, target_env = "ohos"))
+        ))]
+        if let Some(active) = self.os.gpu_backend {
+            return active;
+        }
+        #[cfg(all(target_os = "android", use_vulkan))]
+        if self.os.gl_fallback {
+            return GpuBackend::OpenGl;
+        }
+        #[cfg(gpusim)]
+        {
+            GpuBackend::Gpusim
+        }
+        #[cfg(not(gpusim))]
+        {
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            {
+                GpuBackend::Metal
+            }
+            #[cfg(target_os = "windows")]
+            {
+                GpuBackend::Direct3d11
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                GpuBackend::WebGl
+            }
+            #[cfg(all(
+                not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "windows")),
+                not(target_arch = "wasm32"),
+                use_vulkan
+            ))]
+            {
+                GpuBackend::Vulkan
+            }
+            #[cfg(all(
+                not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "windows")),
+                not(target_arch = "wasm32"),
+                not(use_vulkan)
+            ))]
+            {
+                GpuBackend::OpenGl
+            }
+        }
     }
 
     /// Returns the app's writable data directory path.
@@ -767,43 +1159,92 @@ impl Cx {
         &self.gpu_info
     }
 
+    /// GL maps clip-space z/w from [-1, 1] to window depth [0, 1].
+    /// Metal, Vulkan and D3D use [0, 1] clip depth directly.
+    pub fn clip_depth_scale_bias(&self) -> (f32, f32) {
+        // Desktop Linux decides its API at startup (a Vulkan-capable build can
+        // render with OpenGL ES), so it asks the running backend; every other
+        // target's API is fixed at build time.
+        let gl_clip = if cfg!(gpusim) {
+            false
+        } else if cfg!(any(target_arch = "wasm32", target_os = "android", target_env = "ohos")) {
+            cfg!(not(use_vulkan))
+        } else if cfg!(target_os = "linux") {
+            matches!(self.gpu_backend(), GpuBackend::OpenGl)
+        } else {
+            false
+        };
+        if gl_clip {
+            (0.5, 0.5)
+        } else {
+            (1.0, 0.0)
+        }
+    }
+
     pub fn update_macos_menu(&mut self, menu: MacosMenu) {
-        self.platform_ops.push(CxOsOp::UpdateMacosMenu(menu));
+        if self.script_data.std.host_io_only() { return; }
+        self.platform_ops.push_back(CxOsOp::UpdateMacosMenu(menu));
     }
 
     pub fn xr_start_presenting(&mut self) {
-        self.platform_ops.push(CxOsOp::XrStartPresenting);
+        self.platform_ops.push_back(CxOsOp::XrStartPresenting);
     }
 
     pub fn xr_set_render_scale(&mut self, scale: f32) {
-        self.platform_ops.push(CxOsOp::XrSetRenderScale(scale));
+        self.platform_ops.push_back(CxOsOp::XrSetRenderScale(scale));
     }
 
     pub fn xr_advertise_anchor(&mut self, anchor: XrAnchor) {
-        self.platform_ops.push(CxOsOp::XrAdvertiseAnchor(anchor));
+        self.platform_ops
+            .push_back(CxOsOp::XrAdvertiseAnchor(anchor));
     }
 
     pub fn xr_set_local_anchor(&mut self, anchor: XrAnchor) {
-        self.platform_ops.push(CxOsOp::XrSetLocalAnchor(anchor));
+        self.platform_ops
+            .push_back(CxOsOp::XrSetLocalAnchor(anchor));
     }
 
     pub fn xr_set_local_floor(&mut self, floor_y: f32) {
-        self.platform_ops.push(CxOsOp::XrSetLocalFloor(floor_y));
+        self.platform_ops
+            .push_back(CxOsOp::XrSetLocalFloor(floor_y));
     }
 
     pub fn xr_discover_anchor(&mut self, id: u8) {
-        self.platform_ops.push(CxOsOp::XrDiscoverAnchor(id));
+        self.platform_ops.push_back(CxOsOp::XrDiscoverAnchor(id));
     }
 
     pub fn quit(&mut self) {
-        self.platform_ops.push(CxOsOp::Quit);
+        self.platform_ops.push_back(CxOsOp::Quit);
+    }
+
+    pub fn request_quit(&mut self, reason: QuitReason) -> bool {
+        let event = Event::QuitRequested(QuitRequestedEvent::new(reason));
+        self.call_event_handler(&event);
+
+        let was_handled = match &event {
+            Event::QuitRequested(e) => e.handled.get(),
+            _ => false,
+        };
+        if !was_handled {
+            self.quit();
+        }
+        was_handled
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    pub(crate) fn handle_termination_signal(&mut self) {
+        if crate::os::termination_signal::take_requested() {
+            self.request_quit(QuitReason::Signal);
+        }
     }
 
     pub fn browser_update_url(&mut self, url: &str, replace: bool) {
+        if self.script_data.std.host_io_only() { return; }
         <Self as CxOsApi>::browser_update_url(self, url, replace);
     }
 
     pub fn browser_history_go(&mut self, delta: i32) {
+        if self.script_data.std.host_io_only() { return; }
         <Self as CxOsApi>::browser_history_go(self, delta);
     }
 
@@ -816,28 +1257,140 @@ impl Cx {
 
     // Determines whether to show your application in the dock when it runs. The default value is true.
     // You can remove the dock icon by setting this value to false.
-    pub fn show_in_dock(&mut self, show: bool) {
-        self.platform_ops.push(CxOsOp::ShowInDock(show));
+    /// FPS mouse capture: lock hides and freezes the hardware cursor while
+    /// deltas keep flowing as MouseMove events; unlock restores the cursor.
+    /// Convention: lock on the game's own click, RELEASE ON ESCAPE.
+    pub fn lock_mouse_pointer(&mut self, lock: bool) {
+        self.platform_ops.push_back(CxOsOp::LockMousePointer(lock));
     }
+
+    /// Call once per frame while holding the lock — keeps the hardware
+    /// cursor pinned even when the OS quietly drops the disassociation.
+    pub fn repin_mouse_pointer(&mut self) {
+        self.platform_ops.push_back(CxOsOp::RepinMousePointer);
+    }
+
+    /// Pin the CURRENT mouse capture for value scrubbing: the hardware
+    /// cursor hides AT its position and detaches so deltas keep flowing
+    /// with infinite range; the drag owner keeps receiving FingerMove
+    /// through its ordinary capture, and nothing else in the window sees
+    /// the pointer (no hover, no new captures). Engage only when the drag
+    /// actually starts (the 3px threshold crossing), never on the initial
+    /// press. Release is AUTOMATIC: the pin rides on the capture, and the
+    /// hardware button-up releases both (plus focus-loss and the platform
+    /// layer's own unconditional release) — the cursor restores at the
+    /// press point. Call `unpin_pointer_capture` only to cancel EARLY
+    /// (Escape / right-click) while the button is still held.
+    pub fn pin_pointer_capture(&mut self) {
+        if self.fingers.pin_mouse_capture() {
+            self.platform_ops.push_back(CxOsOp::PinMousePointer(true));
+        }
+    }
+
+    /// Cancel a scrub pin while the button is still held (Escape /
+    /// right-click cancel): clears the capture's pin flag and restores the
+    /// cursor at the press point.
+    /// The repaint counter: one step per presented frame. Two reads apart
+    /// in time say whether the app paints on its own.
+    pub fn repaint_id(&self) -> u64 {
+        self.repaint_id
+    }
+
+    pub fn unpin_pointer_capture(&mut self) {
+        if self.fingers.unpin_captures() {
+            self.platform_ops.push_back(CxOsOp::PinMousePointer(false));
+        }
+    }
+
+    pub fn show_in_dock(&mut self, show: bool) {
+        self.platform_ops.push_back(CxOsOp::ShowInDock(show));
+    }
+    /// Controls how the system bars (status bar and navigation bar) icons and
+    /// text are tinted, on platforms that support it (currently Android only).
+    ///
+    /// The default is [`SystemBarAppearance::Auto`], which picks dark or light
+    /// system-bar icons automatically from the luminance of the window's
+    /// background color (`clear_color`): a light background gets dark icons, a
+    /// dark background gets light icons. Pass [`SystemBarAppearance::DarkIcons`]
+    /// or [`SystemBarAppearance::LightIcons`] to override that automatic choice.
+    ///
+    /// The request is resolved and applied by the `Window` widget on its next
+    /// event cycle.
+    pub fn set_system_bar_appearance(&mut self, appearance: SystemBarAppearance) {
+        self.display_context.system_bar_appearance = appearance;
+    }
+
+    /// Ask the OS to defer its own gestures on these screen edges, so the
+    /// FIRST swipe from such an edge reaches the app (an app-owned home
+    /// gesture, an edge-dragged drawer); the OS then shows its indicator and
+    /// takes the next one — the immersive/game behaviour. [`ScreenEdges::NONE`]
+    /// gives the edges back. One call on every platform: honored on iOS
+    /// (`preferredScreenEdgesDeferringSystemGestures`), nothing where the OS
+    /// has no such gesture.
+    pub fn defer_system_gestures(&mut self, edges: ScreenEdges) {
+        if !matches!(self.os_type(), OsType::Ios(_)) {
+            return;
+        }
+        self.platform_ops
+            .retain(|op| !matches!(op, CxOsOp::DeferSystemGestures(_)));
+        self.platform_ops.push_back(CxOsOp::DeferSystemGestures(edges));
+    }
+
     pub fn set_window_title(&mut self, window_id: WindowId, title: &str) {
         self.push_unique_platform_op(CxOsOp::SetWindowTitle(window_id, title.to_string()));
     }
 
     pub fn push_unique_platform_op(&mut self, op: CxOsOp) {
         if self.platform_ops.iter().find(|o| **o == op).is_none() {
-            self.platform_ops.push(op);
+            self.platform_ops.push_back(op);
         }
     }
 
-    pub fn show_text_ime(&mut self, area: Area, pos: Vec2d) {
-        self.show_text_ime_with_config(area, pos, TextInputConfig::default());
+    /// Requeue an OS op that cannot run yet (typical case: `SetTopmost` before
+    /// any native window exists). FIFO: append so remaining already-queued ops
+    /// still run first in this drain. Returns `true` if the drain should
+    /// continue (`len() > 1`); `false` if this is the only op left — break and
+    /// retry on the next event instead of spinning.
+    #[allow(dead_code)] // only drivers that defer ops call this (macos, windows today)
+    pub(crate) fn defer_platform_op(&mut self, op: CxOsOp) -> bool {
+        defer_platform_op(&mut self.platform_ops, op)
     }
 
-    pub fn show_text_ime_with_config(&mut self, area: Area, pos: Vec2d, config: TextInputConfig) {
+    pub fn show_text_ime(&mut self, area: Area, pos: Vec2d) {
+        // No line metrics from this entry point: a zero-height rect anchors the
+        // IME at the bare point (same behavior as before the rect change).
+        self.show_text_ime_with_config(
+            area,
+            Rect {
+                pos,
+                size: Vec2d::default(),
+            },
+            TextInputConfig::default(),
+        );
+    }
+
+    pub fn show_text_ime_with_config(
+        &mut self,
+        area: Area,
+        cursor_rect: Rect,
+        config: TextInputConfig,
+    ) {
         if !self.keyboard.text_ime_dismissed {
             self.ime_area = area;
+            let rect = area.rect(self);
+            self.publish_hosted_ime(crate::ime::HostedImeState {
+                visible: !config.is_read_only
+                    && config.soft_keyboard.input_mode != crate::ime::InputMode::None,
+                input_mode: config.soft_keyboard.input_mode,
+                return_key: config.soft_keyboard.return_key_type,
+                multiline: config.is_multiline,
+                x: rect.pos.x,
+                y: rect.pos.y,
+                width: rect.size.x,
+                height: rect.size.y,
+            });
             self.platform_ops
-                .push(CxOsOp::ShowTextIME(area, pos, config));
+                .push_back(CxOsOp::ShowTextIME(area, cursor_rect, config));
         }
     }
 
@@ -847,7 +1400,7 @@ impl Cx {
         selection: Range<CharOffset>,
         composition: Option<Range<CharOffset>>,
     ) {
-        self.platform_ops.push(CxOsOp::SyncImeState {
+        self.platform_ops.push_back(CxOsOp::SyncImeState {
             text,
             selection,
             composition,
@@ -855,13 +1408,86 @@ impl Cx {
     }
 
     pub fn hide_text_ime(&mut self) {
+        self.publish_hosted_ime(crate::ime::HostedImeState::default());
         self.keyboard.reset_text_ime_dismissed();
-        self.platform_ops.push(CxOsOp::HideTextIME);
+        self.platform_ops.push_back(CxOsOp::HideTextIME);
+    }
+
+    /// Whether keys go to a text field now: the widget with the key focus
+    /// is the one that raised the text IME (every text input does on
+    /// focus). An app's bare-key shortcuts (Space, arrows, letters) stand
+    /// down while it is true.
+    pub fn text_input_has_focus(&self) -> bool {
+        let focus = self.key_focus();
+        !focus.is_empty() && focus == self.ime_area
     }
 
     pub fn text_ime_was_dismissed(&mut self) {
+        self.publish_hosted_ime(crate::ime::HostedImeState::default());
         self.keyboard.set_text_ime_dismissed();
-        self.platform_ops.push(CxOsOp::HideTextIME);
+        // A focused TextInput re-pushes ShowTextIME on every draw, so a show op
+        // queued by a frame drawn just before this dismissal landed can still be
+        // in platform_ops. If it drains after the backend forgets its last-shown
+        // config (e.g. Android's ResizeTextIME-closed clearing last_ime_config),
+        // it re-opens the keyboard the user just closed. Drop the stale shows.
+        self.platform_ops
+            .retain(|op| !matches!(op, CxOsOp::ShowTextIME(..)));
+        self.platform_ops.push_back(CxOsOp::HideTextIME);
+    }
+
+    pub fn hosted_ime_state(&self) -> crate::ime::HostedImeState {
+        self.get_global_ref::<crate::ime::HostedImeState>()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn publish_hosted_ime(&mut self, state: crate::ime::HostedImeState) {
+        if self.get_global_ref::<crate::ime::HostedImeState>() == Some(&state) {
+            return;
+        }
+        if self.in_makepad_studio {
+            Self::send_studio_message(crate::studio::AppToStudio::Custom(state.to_json()));
+        }
+        *self.global::<crate::ime::HostedImeState>() = state;
+    }
+
+    /// Set or clear a window's `dpi_override` at runtime.
+    ///
+    /// This rewrites the stored `WindowGeom` from the previous effective DPI to
+    /// the new effective DPI, including every in-window metric that must remain
+    /// physically fixed: inner/outer size, safe-area insets, and native chrome
+    /// button bounds. The resulting synthetic `WindowGeomChange` is queued so
+    /// this can be called from inside normal event/action handlers.
+    pub fn set_window_dpi_override(&mut self, window_id: WindowId, dpi_override: Option<f64>) {
+        let dpi_override = dpi_override.and_then(CxWindow::valid_dpi_factor);
+        let window = &mut self.windows[window_id];
+        let current_dpi = window.effective_dpi_factor();
+        let target_dpi = dpi_override.unwrap_or_else(|| window.native_dpi_factor());
+
+        if (target_dpi - current_dpi).abs() < f64::EPSILON {
+            window.dpi_override = dpi_override;
+            window.window_geom.dpi_factor = target_dpi;
+            return;
+        }
+
+        let old_geom = window.window_geom.clone();
+        let scale = current_dpi / target_dpi;
+        window.dpi_override = dpi_override;
+        window.window_geom.inner_size *= scale;
+        window.window_geom.outer_size *= scale;
+        window.window_geom.safe_area_insets = window.window_geom.safe_area_insets.scale(scale);
+        window.window_geom.window_chrome_buttons =
+            CxWindow::scale_rect(window.window_geom.window_chrome_buttons, scale);
+        window.window_geom.dpi_factor = target_dpi;
+        let new_geom = window.window_geom.clone();
+
+        self.pending_window_geom_changes
+            .push(crate::event::WindowGeomChangeEvent {
+                window_id,
+                old_geom,
+                new_geom,
+            });
+        self.redraw_all();
     }
 
     /// Shows the native clipboard actions menu (Copy/Paste/Cut/Select All).
@@ -874,8 +1500,8 @@ impl Cx {
     ///
     /// # Parameters
     /// * `has_selection` - Whether text is currently selected (enables Copy/Cut actions)
-    /// * `rect` - Selection bounding box in logical pixels (for menu positioning)
-    /// * `keyboard_shift` - Vertical offset caused by virtual keyboard (in logical pixels)
+    /// * `rect` - Selection bounding box in Makepad layout points (for menu positioning)
+    /// * `keyboard_shift` - Vertical offset caused by virtual keyboard (in Makepad layout points)
     ///
     /// # Platform Support
     /// - Android: Uses ActionMode with floating toolbar
@@ -887,7 +1513,7 @@ impl Cx {
     /// the text selection from Rust directly. The `has_selection` parameter is only
     /// used to determine which menu items to show, not for the operations themselves.
     pub fn show_clipboard_actions(&mut self, has_selection: bool, rect: Rect, keyboard_shift: f64) {
-        self.platform_ops.push(CxOsOp::ShowClipboardActions {
+        self.platform_ops.push_back(CxOsOp::ShowClipboardActions {
             has_selection,
             rect,
             keyboard_shift,
@@ -896,22 +1522,35 @@ impl Cx {
 
     /// Hides the clipboard actions menu
     pub fn hide_clipboard_actions(&mut self) {
-        self.platform_ops.push(CxOsOp::HideClipboardActions);
+        self.platform_ops.push_back(CxOsOp::HideClipboardActions);
     }
 
     /// Copies the given string to the clipboard.
     ///
     /// Due to lack of platform clipboard support, it does not work on Web or tvOS.
+    /// A system haptic (Android: the window's `performHapticFeedback`;
+    /// a no-op elsewhere and in hosted children, which have no window).
+    pub fn haptic_feedback(&mut self, kind: HapticFeedback) {
+        #[cfg(all(target_os = "android", not(linux_direct)))]
+        if !crate::os::linux::android::android_hosted::is_hosted() {
+            let kind = match kind { HapticFeedback::Click => 0, HapticFeedback::VirtualKey => 1, HapticFeedback::Tick => 2 };
+            unsafe { crate::os::linux::android::android_jni::to_java_haptic(kind) };
+        }
+        let _ = kind;
+    }
+
     pub fn copy_to_clipboard(&mut self, content: &str) {
+        if self.script_data.std.host_io_only() { return; }
         self.platform_ops
-            .push(CxOsOp::CopyToClipboard(content.to_owned()));
+            .push_back(CxOsOp::CopyToClipboard(content.to_owned()));
     }
 
     /// Sets the primary selection (Linux middle-click paste).
     /// No-op on non-Linux platforms.
     pub fn set_primary_selection(&mut self, content: &str) {
+        if self.script_data.std.host_io_only() { return; }
         self.platform_ops
-            .push(CxOsOp::SetPrimarySelection(content.to_owned()));
+            .push_back(CxOsOp::SetPrimarySelection(content.to_owned()));
     }
 
     /// Forward an accessibility tree update to the platform adapter.
@@ -920,7 +1559,7 @@ impl Cx {
     /// downcast it when an accessibility adapter is active.
     pub fn update_accessibility_tree(&mut self, update: Box<dyn std::any::Any + Send>) {
         self.platform_ops
-            .push(CxOsOp::AccessibilityUpdate(AccessibilityUpdatePayload(
+            .push_back(CxOsOp::AccessibilityUpdate(AccessibilityUpdatePayload(
                 update,
             )));
     }
@@ -928,30 +1567,59 @@ impl Cx {
     /// Show native selection handles at the given start and end positions (mobile).
     pub fn show_selection_handles(&mut self, start: Vec2d, end: Vec2d) {
         self.platform_ops
-            .push(CxOsOp::ShowSelectionHandles { start, end });
+            .push_back(CxOsOp::ShowSelectionHandles { start, end });
     }
 
     /// Update positions of visible selection handles (mobile).
     pub fn update_selection_handles(&mut self, start: Vec2d, end: Vec2d) {
         self.platform_ops
-            .push(CxOsOp::UpdateSelectionHandles { start, end });
+            .push_back(CxOsOp::UpdateSelectionHandles { start, end });
     }
 
     /// Hide selection handles (mobile).
     pub fn hide_selection_handles(&mut self) {
-        self.platform_ops.push(CxOsOp::HideSelectionHandles);
+        self.platform_ops.push_back(CxOsOp::HideSelectionHandles);
     }
 
     pub fn start_dragging(&mut self, items: Vec<DragItem>) {
-        self.platform_ops.iter().for_each(|p| {
-            if let CxOsOp::StartDragging { .. } = p {
-                panic!("start drag twice");
+        if self.script_data.std.host_io_only() { return; }
+        #[cfg(any(target_arch = "wasm32", target_os = "linux", test))]
+        {
+            self.drag_drop.start_internal_drag(items);
+        }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "linux", test)))]
+        {
+            self.platform_ops.iter().for_each(|p| {
+                if let CxOsOp::StartDragging { .. } = p {
+                    panic!("start drag twice");
+                }
+            });
+            self.platform_ops.push_back(CxOsOp::StartDragging(items));
+        }
+    }
+
+    /// Starts a native drag-and-drop session that can leave the Makepad app.
+    ///
+    /// `FilePath` items must contain absolute paths to existing regular files
+    /// and must not carry an `internal_id`. The source window is explicit so
+    /// a multi-window application never starts the session from a stale Cocoa
+    /// event or the wrong native surface. Unsupported item/platform
+    /// combinations are rejected by the platform adapter. Every accepted or
+    /// rejected request completes with `Event::DragEnd`, allowing callers to
+    /// release gesture state without platform-specific timeouts.
+    pub fn start_external_dragging(&mut self, window_id: WindowId, items: Vec<DragItem>) {
+        if self.script_data.std.host_io_only() { return; }
+        self.platform_ops.iter().for_each(|op| {
+            if matches!(op, CxOsOp::StartExternalDragging { .. }) {
+                panic!("start external drag twice");
             }
         });
-        self.platform_ops.push(CxOsOp::StartDragging(items));
+        self.platform_ops
+            .push_back(CxOsOp::StartExternalDragging { window_id, items });
     }
 
     pub fn set_cursor(&mut self, cursor: MouseCursor) {
+        self.mouse_cursor = cursor;
         // down cursor overrides the hover cursor
         if let Some(p) = self.platform_ops.iter_mut().find(|p| match p {
             CxOsOp::SetCursor(_) => true,
@@ -959,16 +1627,61 @@ impl Cx {
         }) {
             *p = CxOsOp::SetCursor(cursor)
         } else {
-            self.platform_ops.push(CxOsOp::SetCursor(cursor))
+            self.platform_ops.push_back(CxOsOp::SetCursor(cursor))
         }
+    }
+
+    pub fn mouse_cursor(&self) -> MouseCursor {
+        self.mouse_cursor
     }
 
     pub fn sweep_lock(&mut self, value: Area) {
         self.fingers.sweep_lock(value);
     }
 
+    /// Takes a scoped sweep lock above existing owners, unless this area already owns one.
+    pub fn acquire_sweep_lock(&mut self, value: Area) -> Option<crate::event::SweepLock> {
+        self.fingers.acquire_sweep_lock(value)
+    }
+
+    /// Hand the finger currently captured by `from` over to `to` (with sweep area
+    /// `to_sweep`), so a drag begun on one widget can continue on another — e.g. a
+    /// long-pressed drawer app handing its touch to the home pager for placement.
+    /// Returns true if a live capture on `from` was found and handed over; false if
+    /// the finger was already released, so callers can avoid starting a dead drag.
+    pub fn switch_finger_capture(&mut self, from: Area, to: Area, to_sweep: Area) -> bool {
+        self.fingers.switch_capture_area(from, to, to_sweep)
+    }
+
+    /// Hand a finger grabbed by an interactive child up to `over`, a container
+    /// that already co-captures it via `capture_overload` — so `over` (e.g. the
+    /// home pager) can drive a pan/drag even when the press started on a button
+    /// inside one of its children. Returns true if a child capture was dropped.
+    pub fn promote_finger_capture_over(&mut self, over: Area) -> bool {
+        self.fingers.promote_capture_over(over)
+    }
+
+    /// `area` takes the gesture of the finger `digit_id` (a scroller that
+    /// starts scrolling): it becomes the finger's one owner and every other
+    /// capture of it is cancelled. False when the gesture is not `area`'s
+    /// to take (see `CxFingers::claim_gesture`) — then it must stand down.
+    /// On success the owner dispatches `Event::FingerCancel` to its
+    /// children so the presses it took end at once.
+    pub fn claim_finger_gesture(&mut self, digit_id: crate::event::DigitId, area: Area) -> bool {
+        self.fingers.claim_gesture(digit_id, area)
+    }
+
     pub fn sweep_unlock(&mut self, value: Area) {
         self.fingers.sweep_unlock(value);
+    }
+
+    /// The area holding the sweep lock right now, if any.
+    ///
+    /// A popover that takes the pointer while it is open (a drop-down, a
+    /// radial menu, a drawer) reads this to tell its own grab from one an
+    /// overlay above it took, so it releases only what it locked itself.
+    pub fn sweep_lock_area(&self) -> Option<Area> {
+        self.fingers.sweep_lock_area()
     }
 
     /// Returns whether scrolling is currently allowed within the given `area`.
@@ -981,6 +1694,10 @@ impl Cx {
 
     /// Blocks scrolling events/hits in the app *EXCEPT* for within the given `scrollable_area`.
     ///
+    /// Blocks nest: a second owner (a modal over a modal) takes over until it
+    /// releases its own block, and the first owner's block then applies again.
+    /// The same owner may call this every draw and keeps its single entry.
+    ///
     /// ***NOTE***: this must be re-invoked every time the area changes, which is upon every draw pass.
     ///
     /// If you want to block scrolling everywhere, pass in `Area::Empty`.
@@ -989,17 +1706,29 @@ impl Cx {
             .block_scrolling_within_area(Some(scrollable_area));
     }
 
-    /// Fully unblocks scrolling, allowing scrolling to occur anywhere across the entire app.
-    ///
-    /// This effectively restores the default behavior, e.g., after a previous call to
-    /// [`Cx::block_scrolling_except_within()`].
+    /// Releases the innermost scroll block — the most recent
+    /// [`Cx::block_scrolling_except_within()`] whose owner has not released
+    /// it. With a single owner this restores the default, scrolling anywhere.
+    /// An owner that knows its area should call
+    /// [`Cx::unblock_scrolling_within_area()`] instead, so it never pops a
+    /// block another owner pushed over it.
     pub fn unblock_scrolling(&mut self) {
         self.fingers.block_scrolling_within_area(None);
     }
 
+    /// Releases the scroll block owned by `scrollable_area`; a block held by
+    /// another owner is left alone.
+    ///
+    /// The owner-scoped counterpart of [`Cx::unblock_scrolling()`], for a
+    /// panel that closes without knowing whether something else has since
+    /// blocked scrolling over it.
+    pub fn unblock_scrolling_within_area(&mut self, scrollable_area: Area) {
+        self.fingers.unblock_scrolling_within_area(scrollable_area);
+    }
+
     pub fn start_timeout(&mut self, delay: f64) -> Timer {
         self.timer_id += 1;
-        self.platform_ops.push(CxOsOp::StartTimer {
+        self.platform_ops.push_back(CxOsOp::StartTimer {
             timer_id: self.timer_id,
             interval: delay,
             repeats: false,
@@ -1009,7 +1738,7 @@ impl Cx {
 
     pub fn start_interval(&mut self, interval: f64) -> Timer {
         self.timer_id += 1;
-        self.platform_ops.push(CxOsOp::StartTimer {
+        self.platform_ops.push_back(CxOsOp::StartTimer {
             timer_id: self.timer_id,
             interval,
             repeats: true,
@@ -1019,13 +1748,13 @@ impl Cx {
 
     pub fn stop_timer(&mut self, timer: Timer) {
         if timer.0 != 0 {
-            self.platform_ops.push(CxOsOp::StopTimer(timer.0));
+            self.platform_ops.push_back(CxOsOp::StopTimer(timer.0));
         }
     }
 
     pub fn request_permission(&mut self, permission: crate::permission::Permission) -> i32 {
         self.permissions_request_id += 1;
-        self.platform_ops.push(CxOsOp::RequestPermission {
+        self.platform_ops.push_back(CxOsOp::RequestPermission {
             request_id: self.permissions_request_id,
             permission,
         });
@@ -1034,11 +1763,26 @@ impl Cx {
 
     pub fn check_permission(&mut self, permission: crate::permission::Permission) -> i32 {
         self.permissions_request_id += 1;
-        self.platform_ops.push(CxOsOp::CheckPermission {
+        self.platform_ops.push_back(CxOsOp::CheckPermission {
             request_id: self.permissions_request_id,
             permission,
         });
         self.permissions_request_id
+    }
+
+    /// Start streaming position fixes from the platform location service
+    /// (CoreLocation on macOS/iOS, LocationManager on Android,
+    /// `navigator.geolocation` on web). Fixes arrive as
+    /// [`Event::LocationUpdate`]; permission prompts are handled by the
+    /// platform, failures arrive as [`Event::LocationError`]. Platforms
+    /// without a location service log an error and stay silent.
+    pub fn start_location_updates(&mut self) {
+        self.platform_ops.push_back(CxOsOp::StartLocationUpdates);
+    }
+
+    /// Stop streaming position fixes.
+    pub fn stop_location_updates(&mut self) {
+        self.platform_ops.push_back(CxOsOp::StopLocationUpdates);
     }
 
     pub fn get_dpi_factor_of(&mut self, area: &Area) -> f64 {
@@ -1047,6 +1791,12 @@ impl Cx {
             return self.get_delegated_dpi_factor(draw_pass_id);
         }
         return 1.0;
+    }
+
+    pub fn get_window_id_of(&self, area: &Area) -> Option<WindowId> {
+        let draw_list_id = area.draw_list_id()?;
+        let draw_pass_id = self.draw_lists[draw_list_id].draw_pass_id?;
+        self.get_pass_window_id(draw_pass_id)
     }
 
     pub fn get_pass_window_id(&self, draw_pass_id: DrawPassId) -> Option<WindowId> {
@@ -1134,6 +1884,27 @@ impl Cx {
         }
     }
 
+    /// What one texel of a BGRA8 render target costs on this backend: the
+    /// GPU backends allocate 4 bytes, the gpusim raster keeps float colour
+    /// (16 bytes). Caches that budget render targets charge this.
+    pub fn render_target_bytes_per_texel(&self) -> usize {
+        if cfg!(gpusim) { 16 } else { 4 }
+    }
+
+    /// What one texel of a `DepthD32` attachment costs (4 bytes everywhere).
+    pub fn depth_target_bytes_per_texel(&self) -> usize {
+        4
+    }
+
+    /// Whether a pass's depth attachment lives in its colour target's
+    /// storage: the gpusim raster keeps a depth plane per framebuffer, so
+    /// a retained render target painted with depth holds it for good; the
+    /// GPU backends keep one `TextureSize::Auto` depth texture per handle,
+    /// sized to the largest pass it served.
+    pub fn depth_target_rides_with_render_target(&self) -> bool {
+        cfg!(gpusim)
+    }
+
     pub fn get_pass_name(&self, draw_pass_id: DrawPassId) -> &str {
         &self.passes[draw_pass_id].debug_name
     }
@@ -1141,6 +1912,55 @@ impl Cx {
     pub fn repaint_pass(&mut self, draw_pass_id: DrawPassId) {
         let cxpass = &mut self.passes[draw_pass_id];
         cxpass.paint_dirty = true;
+        cxpass.repaint_requested = true;
+    }
+
+    /// An external grab/input-frame request is work even for an idle, hidden
+    /// window. Repaint its pass tree without invalidating tweaked draw buffers.
+    /// Standalone macOS first records any already-pending Draw, then submits
+    /// this window before later input, without advancing NextFrame. Other
+    /// backends service this work on their ordinary next-render path.
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_env = "ohos")))]
+    pub(crate) fn request_remote_window_present(&mut self, window_id: WindowId) {
+        if let Some(pass) = self.windows[window_id].main_pass_id {
+            self.repaint_pass_and_child_passes(pass);
+        }
+    }
+
+    /// Parent `child` under `parent` for painting order on behalf of
+    /// `attached_by`: the draw list being recorded, whose draw calls consume
+    /// the child's output. That list is remembered with its current redraw
+    /// id; when it is recorded again without calling this, the child is
+    /// orphaned and no longer painted. `None` (no list open) parents without
+    /// a record, like `DrawPass::set_pass_parent`.
+    pub fn attach_child_pass(
+        &mut self,
+        child: DrawPassId,
+        parent: DrawPassId,
+        attached_by: Option<DrawListId>,
+    ) {
+        let attached_by = attached_by.map(|list_id| (list_id, self.draw_lists[list_id].redraw_id));
+        let cxpass = &mut self.passes[child];
+        cxpass.parent = CxDrawPassParent::DrawPass(parent);
+        cxpass.attached_by = attached_by;
+    }
+
+    /// True when the draw list that attached `draw_pass_id` has been recorded
+    /// again since without re-attaching it, or was freed: nothing samples the
+    /// pass any more. Its own draw list is frozen at the frame that last began
+    /// it, and the geometries and textures those draw calls name may since
+    /// have been freed and their slots reused — painting it would draw
+    /// whatever now sits in them (the gauss scene pass after the window stopped
+    /// capturing was re-encoded every pan frame with the map's evicted tile
+    /// geometries under other tiles' meshes: tens of millions of triangles into
+    /// a texture nobody read).
+    pub fn pass_attachment_is_stale(&self, draw_pass_id: DrawPassId) -> bool {
+        let Some((list_id, redraw_id)) = self.passes[draw_pass_id].attached_by else {
+            return false;
+        };
+        // A dropped list (its widget is gone) keeps its slot and generation
+        // until reuse; that orphans the pass just the same.
+        self.draw_lists.is_id_freed(list_id) || self.draw_lists[list_id].redraw_id != redraw_id
     }
 
     pub fn repaint_pass_and_child_passes(&mut self, draw_pass_id: DrawPassId) {
@@ -1273,6 +2093,15 @@ impl Cx {
         res
     }
 
+    /// The frame `next_frame` asked for has not been sent yet. Once it has,
+    /// this is false whether or not the asker heard it: a container that
+    /// stops passing events on (a closed modal) swallows it, and a widget
+    /// running an animation on a frame chain can tell that way that its
+    /// chain was cut and re-arm instead of stalling.
+    pub fn next_frame_is_pending(&self, next_frame: NextFrame) -> bool {
+        self.new_next_frames.contains(&next_frame)
+    }
+
     pub fn send_trigger(&mut self, area: Area, trigger: Trigger) {
         if let Some(triggers) = self.triggers.get_mut(&area) {
             triggers.push(trigger);
@@ -1298,6 +2127,17 @@ impl Cx {
         item.1.downcast_mut().unwrap()
     }
 
+    /// Returns an immutable reference to a previously installed Cx-global.
+    ///
+    /// Unlike [`Cx::get_global`], this accessor does not require mutable access and
+    /// does not panic when the requested global has not been installed.
+    pub fn get_global_ref<T: 'static + Any>(&self) -> Option<&T> {
+        self.globals
+            .iter()
+            .find(|item| item.0 == TypeId::of::<T>())
+            .and_then(|item| item.1.downcast_ref())
+    }
+
     pub fn has_global<T: 'static + Any>(&mut self) -> bool {
         self.globals
             .iter_mut()
@@ -1317,6 +2157,7 @@ impl Cx {
     }
 
     pub fn http_request(&mut self, request_id: LiveId, request: HttpRequest) {
+        if self.script_data.std.host_io_only() { return; }
         if let Err(err) = self.net.http_start(request_id, request) {
             crate::error!("http_request failed for {}: {}", request_id.0, err);
         }
@@ -1329,14 +2170,14 @@ impl Cx {
     }
     /*
         pub fn web_socket_open(&mut self, request_id: LiveId, request: HttpRequest) {
-            self.platform_ops.push(CxOsOp::WebSocketOpen{
+            self.platform_ops.push_back(CxOsOp::WebSocketOpen{
                 request,
                 request_id,
             });
         }
 
         pub fn web_socket_send_binary(&mut self, request_id: LiveId, data: Vec<u8>) {
-            self.platform_ops.push(CxOsOp::WebSocketSendBinary{
+            self.platform_ops.push_back(CxOsOp::WebSocketSendBinary{
                 request_id,
                 data,
             });
@@ -1397,6 +2238,7 @@ impl Cx {
         should_loop: bool,
         permission: crate::permission::Permission,
     ) {
+        if self.script_data.std.host_io_only() { return; }
         if let VideoSource::Camera(..) = &source {
             self.pending_camera_playbacks
                 .push(crate::cx::PendingCameraPlayback {
@@ -1412,7 +2254,7 @@ impl Cx {
             let _request_id = self.request_permission(permission);
             return;
         }
-        self.platform_ops.push(CxOsOp::PrepareVideoPlayback(
+        self.platform_ops.push_back(CxOsOp::PrepareVideoPlayback(
             video_id,
             source,
             camera_preview_mode,
@@ -1441,7 +2283,7 @@ impl Cx {
             }
             match result.status {
                 crate::permission::PermissionStatus::Granted => {
-                    self.platform_ops.push(CxOsOp::PrepareVideoPlayback(
+                    self.platform_ops.push_back(CxOsOp::PrepareVideoPlayback(
                         p.video_id,
                         p.source,
                         p.camera_preview_mode,
@@ -1470,47 +2312,75 @@ impl Cx {
 
     pub fn attach_camera_native_preview(&mut self, video_id: LiveId, area: Area) {
         self.platform_ops
-            .push(CxOsOp::AttachCameraNativePreview { video_id, area });
+            .push_back(CxOsOp::AttachCameraNativePreview { video_id, area });
     }
 
     pub fn update_camera_native_preview(&mut self, video_id: LiveId, area: Area, visible: bool) {
-        self.platform_ops.push(CxOsOp::UpdateCameraNativePreview {
-            video_id,
-            area,
-            visible,
-        });
+        self.platform_ops
+            .push_back(CxOsOp::UpdateCameraNativePreview {
+                video_id,
+                area,
+                visible,
+            });
     }
 
     pub fn detach_camera_native_preview(&mut self, video_id: LiveId) {
         self.platform_ops
-            .push(CxOsOp::DetachCameraNativePreview { video_id });
+            .push_back(CxOsOp::DetachCameraNativePreview { video_id });
     }
 
     pub fn begin_video_playback(&mut self, video_id: LiveId) {
-        self.platform_ops.push(CxOsOp::BeginVideoPlayback(video_id));
+        self.drop_pending_video_transport(video_id);
+        self.platform_ops
+            .push_back(CxOsOp::BeginVideoPlayback(video_id));
     }
 
     pub fn pause_video_playback(&mut self, video_id: LiveId) {
-        self.platform_ops.push(CxOsOp::PauseVideoPlayback(video_id));
+        // Last-wins coalescing: one frame should apply a single play/pause
+        // intent even though the queue is FIFO.
+        self.drop_pending_video_transport(video_id);
+        self.platform_ops
+            .push_back(CxOsOp::PauseVideoPlayback(video_id));
     }
 
     pub fn resume_video_playback(&mut self, video_id: LiveId) {
+        self.drop_pending_video_transport(video_id);
         self.platform_ops
-            .push(CxOsOp::ResumeVideoPlayback(video_id));
+            .push_back(CxOsOp::ResumeVideoPlayback(video_id));
     }
 
     pub fn mute_video_playback(&mut self, video_id: LiveId) {
-        self.platform_ops.push(CxOsOp::MuteVideoPlayback(video_id));
+        self.drop_pending_video_mute(video_id);
+        self.platform_ops
+            .push_back(CxOsOp::MuteVideoPlayback(video_id));
     }
 
     pub fn unmute_video_playback(&mut self, video_id: LiveId) {
+        self.drop_pending_video_mute(video_id);
         self.platform_ops
-            .push(CxOsOp::UnmuteVideoPlayback(video_id));
+            .push_back(CxOsOp::UnmuteVideoPlayback(video_id));
+    }
+
+    /// Keep only the latest play/pause/begin intent for `video_id`.
+    fn drop_pending_video_transport(&mut self, video_id: LiveId) {
+        self.platform_ops.retain(|op| match op {
+            CxOsOp::BeginVideoPlayback(id)
+            | CxOsOp::PauseVideoPlayback(id)
+            | CxOsOp::ResumeVideoPlayback(id) => *id != video_id,
+            _ => true,
+        });
+    }
+
+    fn drop_pending_video_mute(&mut self, video_id: LiveId) {
+        self.platform_ops.retain(|op| match op {
+            CxOsOp::MuteVideoPlayback(id) | CxOsOp::UnmuteVideoPlayback(id) => *id != video_id,
+            _ => true,
+        });
     }
 
     pub fn cleanup_video_playback_resources(&mut self, video_id: LiveId) {
         self.platform_ops
-            .push(CxOsOp::CleanupVideoPlaybackResources(video_id));
+            .push_back(CxOsOp::CleanupVideoPlaybackResources(video_id));
     }
 
     pub fn cancel_pending_camera_playback(&mut self, video_id: LiveId) {
@@ -1520,17 +2390,27 @@ impl Cx {
 
     pub fn seek_video_playback(&mut self, video_id: LiveId, position_ms: u64) {
         self.platform_ops
-            .push(CxOsOp::SeekVideoPlayback(video_id, position_ms));
+            .push_back(CxOsOp::SeekVideoPlayback(video_id, position_ms));
     }
 
     pub fn set_video_volume(&mut self, video_id: LiveId, volume: f64) {
         self.platform_ops
-            .push(CxOsOp::SetVideoVolume(video_id, volume));
+            .push_back(CxOsOp::SetVideoVolume(video_id, volume));
     }
 
     pub fn set_video_playback_rate(&mut self, video_id: LiveId, rate: f64) {
         self.platform_ops
-            .push(CxOsOp::SetVideoPlaybackRate(video_id, rate));
+            .push_back(CxOsOp::SetVideoPlaybackRate(video_id, rate));
+    }
+
+    pub fn select_video_track(&mut self, video_id: LiveId, index: usize) {
+        self.platform_ops
+            .push_back(CxOsOp::SelectVideoTrack(video_id, index));
+    }
+
+    pub fn select_audio_track(&mut self, video_id: LiveId, index: usize) {
+        self.platform_ops
+            .push_back(CxOsOp::SelectAudioTrack(video_id, index));
     }
 
     pub fn prepare_audio_playback(
@@ -1540,7 +2420,8 @@ impl Cx {
         autoplay: bool,
         should_loop: bool,
     ) {
-        self.platform_ops.push(CxOsOp::PrepareAudioPlayback(
+        if self.script_data.std.host_io_only() { return; }
+        self.platform_ops.push_back(CxOsOp::PrepareAudioPlayback(
             video_id,
             source,
             autoplay,
@@ -1553,23 +2434,76 @@ impl Cx {
     }
 
     pub fn open_system_savefile_dialog(&mut self) {
+        if self.script_data.std.host_io_only() { return; }
         self.platform_ops
-            .push(CxOsOp::SaveFileDialog(FileDialog::new()));
+            .push_back(CxOsOp::SaveFileDialog(FileDialog::new()));
     }
 
     pub fn open_system_openfile_dialog(&mut self) {
+        self.open_select_file_dialog(FileDialog::new());
+    }
+
+    /// Open the platform file picker, configured (title, start
+    /// location, type filters, multi-select, id) by `dialog`. The answer
+    /// arrives later as a [`crate::file_dialogs::FileDialogAction`] in the
+    /// actions pass. Native dialogs return `FileSelected` paths by default;
+    /// `want_bytes(true)` and every web dialog return `FileLoaded` instead.
+    /// On web this should be called directly from a user input handler:
+    /// browsers may reject a picker requested after that activation expires.
+    pub fn open_select_file_dialog(&mut self, dialog: FileDialog) {
+        if self.script_data.std.host_io_only() { return; }
+        self.file_dialogs.begin(&dialog);
         self.platform_ops
-            .push(CxOsOp::SelectFileDialog(FileDialog::new()));
+            .push_back(CxOsOp::SelectFileDialog(dialog));
+    }
+
+    /// Set the maximum bytes accepted for one virtual file and for one
+    /// multi-file selection/drop. Both limits default to 512 MiB.
+    pub fn set_virtual_file_limits(&mut self, max_file_size: u64, max_total_size: u64) {
+        let limits = VirtualFileLimits {
+            max_file_size,
+            max_total_size,
+        };
+        self.file_dialogs.set_limits(limits);
+        #[cfg(target_arch = "wasm32")]
+        self.os
+            .from_wasm(crate::os::web::from_wasm::FromWasmSetVirtualFileLimits {
+                max_file_size: max_file_size as f64,
+                max_total_size: max_total_size as f64,
+            });
+    }
+
+    pub fn virtual_file_limits(&self) -> VirtualFileLimits {
+        self.file_dialogs.limits()
+    }
+
+    /// Open the platform's native save panel. The OS asks about
+    /// overwriting before answering `SaveFileSelected`.
+    pub fn open_save_file_dialog(&mut self, dialog: FileDialog) {
+        if self.script_data.std.host_io_only() { return; }
+        self.platform_ops.push_back(CxOsOp::SaveFileDialog(dialog));
     }
 
     pub fn open_system_savefolder_dialog(&mut self) {
+        if self.script_data.std.host_io_only() { return; }
         self.platform_ops
-            .push(CxOsOp::SaveFolderDialog(FileDialog::new()));
+            .push_back(CxOsOp::SaveFolderDialog(FileDialog::new()));
     }
 
     pub fn open_system_openfolder_dialog(&mut self) {
+        if self.script_data.std.host_io_only() { return; }
         self.platform_ops
-            .push(CxOsOp::SelectFolderDialog(FileDialog::new()));
+            .push_back(CxOsOp::SelectFolderDialog(FileDialog::new()));
+    }
+
+    /// Open the platform's native folder picker, configured (title, start
+    /// location) by `dialog`. The answer arrives later as a
+    /// [`crate::file_dialogs::FileDialogAction`] in the actions pass —
+    /// `FolderSelected` with the chosen path, or `FolderCancelled`.
+    pub fn open_select_folder_dialog(&mut self, dialog: FileDialog) {
+        if self.script_data.std.host_io_only() { return; }
+        self.platform_ops
+            .push_back(CxOsOp::SelectFolderDialog(dialog));
     }
 
     pub fn event_id(&self) -> u64 {
@@ -1583,7 +2517,83 @@ pub fn can_play_type(mime: &str) -> &'static str {
     can_play_type_impl(mime)
 }
 
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(test)]
+mod stale_window_tests {
+    use super::*;
+    use crate::window::WindowHandle;
+
+    #[test]
+    fn immutable_global_accessor_is_optional_and_preserves_the_value() {
+        let mut cx = Cx::new(Box::new(|_cx: &mut Cx, _event: &Event| {}));
+        assert_eq!(cx.get_global_ref::<u64>(), None);
+        cx.set_global(41_u64);
+        assert_eq!(cx.get_global_ref::<u64>(), Some(&41));
+    }
+
+    /// A hosted window (the host reports 930×848 points at dpi 2) whose app
+    /// shrank its own dpi to 1.6: it lays out 1.25× larger, and a host
+    /// pointer at (100, 100) must land at (125, 125) in its points.
+    #[test]
+    fn a_hosted_window_with_a_dpi_override_lays_out_larger_and_remaps_the_host_pointer() {
+        let mut cx = Cx::new(Box::new(|_cx: &mut Cx, _event: &Event| {}));
+        let window = WindowHandle::new(&mut cx);
+        let window_id = window.window_id();
+        cx.windows[window_id].is_created = true;
+        let native = crate::event::WindowGeom {
+            dpi_factor: 2.0,
+            inner_size: dvec2(930.0, 848.0),
+            ..Default::default()
+        };
+        let first = cx
+            .windows
+            .stdin_apply_native_geom(window_id, native.clone());
+        assert_eq!(first.new_geom.inner_size, dvec2(930.0, 848.0));
+        cx.windows[window_id].dpi_override = Some(1.6);
+        let again = cx.windows.stdin_apply_native_geom(window_id, native);
+        assert!(
+            (again.new_geom.inner_size.x - 1162.5).abs() < 1e-9,
+            "{:?}",
+            again.new_geom.inner_size
+        );
+        assert!((again.new_geom.inner_size.y - 1060.0).abs() < 1e-9);
+        assert_eq!(again.new_geom.dpi_factor, 1.6);
+        let mut pos = dvec2(100.0, 100.0);
+        cx.dpi_override_scale(&mut pos, window_id);
+        assert!(
+            (pos.x - 125.0).abs() < 1e-9 && (pos.y - 125.0).abs() < 1e-9,
+            "{pos:?}"
+        );
+        // The host's point (900, 800) is still inside the window: containment is in host points.
+        let (hit, origin) = cx.windows.window_id_contains(dvec2(900.0, 800.0));
+        assert_eq!(hit, window_id);
+        assert_eq!(origin, dvec2(0.0, 0.0));
+    }
+
+    #[test]
+    fn dpi_override_ignores_closed_and_out_of_range_windows() {
+        let mut cx = Cx::new(Box::new(|_cx: &mut Cx, _event: &Event| {}));
+        let window = WindowHandle::new(&mut cx);
+        let window_id = window.window_id();
+        cx.windows[window_id].is_created = true;
+        cx.windows[window_id].os_dpi_factor = Some(2.0);
+        cx.windows[window_id].dpi_override = Some(1.0);
+
+        let mut live_pos = dvec2(12.0, 8.0);
+        cx.dpi_override_scale(&mut live_pos, window_id);
+        assert_eq!(live_pos, dvec2(24.0, 16.0));
+
+        cx.windows[window_id].is_created = false;
+        let mut closed_pos = dvec2(12.0, 8.0);
+        cx.dpi_override_scale(&mut closed_pos, window_id);
+        assert_eq!(closed_pos, dvec2(12.0, 8.0));
+
+        let mut stale_pos = dvec2(12.0, 8.0);
+        cx.dpi_override_scale(&mut stale_pos, WindowId(usize::MAX, u64::MAX));
+        assert_eq!(stale_pos, dvec2(12.0, 8.0));
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_os = "android"), not(gpusim)))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::linux::linux_video_playback::can_play_type(mime)
 }
@@ -1595,15 +2605,15 @@ fn can_play_type_impl(mime: &str) -> &'static str {
 
 #[cfg(all(
     any(target_os = "macos", target_os = "ios", target_os = "tvos"),
-    not(headless)
+    not(gpusim)
 ))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::apple::apple_video_playback::can_play_type(mime)
 }
 
 #[cfg(all(
-    any(target_os = "macos", target_os = "ios", target_os = "tvos"),
-    headless
+    any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "linux"),
+    gpusim
 ))]
 fn can_play_type_impl(_mime: &str) -> &'static str {
     ""
@@ -1662,4 +2672,256 @@ macro_rules! register_component_factory {
                 ),
             );
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn defer_platform_op_breaks_when_requeued_op_is_alone() {
+        let window_id = WindowId(0, 0);
+        let mut platform_ops = VecDeque::new();
+
+        assert!(!defer_platform_op(
+            &mut platform_ops,
+            CxOsOp::SetTopmost(window_id, true),
+        ));
+        assert_eq!(platform_ops, vec![CxOsOp::SetTopmost(window_id, true)]);
+    }
+
+    #[test]
+    fn defer_platform_op_appends_so_pending_ops_still_run_first() {
+        let window_id = WindowId(0, 0);
+        let mut platform_ops = VecDeque::from(vec![CxOsOp::CreateWindow(window_id)]);
+
+        assert!(defer_platform_op(
+            &mut platform_ops,
+            CxOsOp::SetTopmost(window_id, true),
+        ));
+        assert_eq!(
+            platform_ops,
+            vec![
+                CxOsOp::CreateWindow(window_id),
+                CxOsOp::SetTopmost(window_id, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn platform_ops_drain_fifo_create_window_then_set_topmost() {
+        let window_id = WindowId(0, 0);
+        let mut platform_ops = VecDeque::new();
+        platform_ops.push_back(CxOsOp::CreateWindow(window_id));
+        platform_ops.push_back(CxOsOp::SetTopmost(window_id, true));
+
+        let first = platform_ops.pop_front().unwrap();
+        let second = platform_ops.pop_front().unwrap();
+        assert!(matches!(first, CxOsOp::CreateWindow(_)));
+        assert!(matches!(second, CxOsOp::SetTopmost(_, true)));
+        assert!(platform_ops.is_empty());
+    }
+}
+
+impl Cx {
+    /// Drain completed tickets without waiting. Call on Event::Signal, also
+    /// when no pass needs repainting. Returned Arc payloads belong to the
+    /// caller and are no longer charged to the platform's result budget.
+    pub fn try_take_texture_readbacks(&mut self) -> Vec<crate::texture::TextureReadback> {
+        self.take_texture_readback_results(false)
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect()
+    }
+
+    pub(crate) fn take_texture_readback_results(
+        &mut self,
+        legacy: bool,
+    ) -> Vec<(TextureId, crate::texture::TextureReadback)> {
+        use crate::texture::ReadbackError;
+        if self.textures.1.readbacks.slots.is_empty() {
+            return Vec::new();
+        }
+        self.validate_pending_readbacks();
+        self.poll_texture_readbacks();
+        let state = &mut self.textures.1.readbacks;
+        let mut results = Vec::new();
+        let mut index = 0;
+        while index < state.slots.len() {
+            let slot = &mut state.slots[index];
+            if slot.legacy != legacy {
+                index += 1;
+                continue;
+            }
+            if let Some(receive) = &slot.receive {
+                match receive.try_recv() {
+                    Ok(result) => {
+                        slot.result.data = result;
+                        slot.receive = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        slot.result.data = Err(ReadbackError::DeviceLost);
+                        slot.receive = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if !slot.pending && slot.receive.is_none() {
+                let mut slot = state.slots.remove(index);
+                state.reserved_bytes -= slot.reserved_bytes;
+                if slot.cancelled {
+                    slot.result.data = Err(ReadbackError::Cancelled);
+                }
+                results.push((slot.texture.texture_id(), slot.result));
+            } else {
+                index += 1;
+            }
+        }
+        results
+    }
+
+    /// Cancel publication. An in-flight allocation stays pinned until its
+    /// copy/lease finishes; the ticket then yields Cancelled instead of bytes.
+    pub fn cancel_texture_readback(&mut self, ticket: crate::texture::ReadbackTicket) -> bool {
+        let Some(slot) = self
+            .textures
+            .1
+            .readbacks
+            .slots
+            .iter_mut()
+            .find(|slot| slot.result.ticket == ticket)
+        else {
+            return false;
+        };
+        slot.cancelled = true;
+        if slot.pending {
+            slot.pending = false;
+        }
+        crate::thread::SignalToUI::set_ui_signal();
+        true
+    }
+
+    pub fn texture_readback_usage(&self) -> crate::texture::TextureReadbackUsage {
+        crate::texture::TextureReadbackUsage {
+            requests: self.textures.1.readbacks.slots.len(),
+            reserved_bytes: self.textures.1.readbacks.reserved_bytes,
+        }
+    }
+
+    /// Last submitted renderer serial. Recording a Draw event does not advance
+    /// this value. See `Texture` for backend units and ordering guarantees.
+    pub fn frame_submission_serial(&self) -> u64 {
+        self.textures
+            .1
+            .serials
+            .submitted
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Publish an immutable block of instance data (stride `slots`) as a
+    /// shared publication. The block is charged against the device envelope
+    /// and refused with `PublishError::NoRoom` when it does not fit; the
+    /// receipt starts `Pending` and the backend marks it ready once the
+    /// backing copy landed. Draw items reference `(block, first, count)`.
+    pub fn publish_instances(
+        &self,
+        slots: usize,
+        data: std::sync::Arc<[f32]>,
+        hints: crate::shared_instances::PublishHints,
+    ) -> Result<crate::shared_instances::SharedInstances, crate::shared_instances::PublishError> {
+        self.publications.publish(slots, data, hints)
+    }
+
+    /// The context's publication totals: charged, pending retirement, the
+    /// derived envelope and the live count.
+    pub fn publication_accounting(&self) -> crate::shared_instances::PublicationAccounting {
+        self.publications.accounting()
+    }
+
+    /// The producer's pacing input for this frame: room under the envelope
+    /// plus the backend's last copy observation (recorded by the backend
+    /// through `Publications::record_observation`), against the time the
+    /// caller still has in the frame.
+    pub fn publish_backpressure(
+        &self,
+        frame_remaining_ns: u64,
+    ) -> crate::shared_instances::PublishBackpressure {
+        self.publications.backpressure(frame_remaining_ns)
+    }
+
+    /// Set the publication envelope from the machine's numbers
+    /// (`retained_instances::retained_device_envelope`), once the backend
+    /// knows them. Zero (unknown) refuses nothing.
+    pub fn set_publication_envelope(&self, bytes: usize) {
+        self.publications.set_envelope(bytes);
+    }
+
+    /// Last observed completed prefix, without polling the backend. Progress
+    /// timers use `frame_completion_serial` to refresh this nonblocking snapshot.
+    pub fn frame_completed_serial(&self) -> u64 {
+        self.textures.1.serials.completed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Poll without waiting, collect finished texture retirements, and return
+    /// the greatest serial whose entire prefix has completed. Call again while
+    /// pending, even when the application does not need to repaint.
+    pub fn frame_completion_serial(&mut self) -> u64 {
+        self.poll_texture_lifetimes();
+        self.textures
+            .1
+            .serials
+            .completed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Allocated texture bytes, including free pool slots and pending releases.
+    /// Unknown externally owned allocations are omitted. This is an on-demand
+    /// O(pool size) measurement; ordinary rendering does not scan the pool.
+    pub fn texture_pool_bytes(&self) -> u64 {
+        self.textures.0.pool.iter().enumerate().fold(
+            self.textures.1.retired.iter().fold(0u64, |sum, retired| {
+                sum.saturating_add(retired.os.allocated_bytes(self).unwrap_or(retired.bytes))
+            }),
+            |sum, (index, slot)| {
+                sum.saturating_add(
+                    self.texture_allocation_bytes(TextureId::from_pool_slot(
+                        index,
+                        slot.generation,
+                    ))
+                    .unwrap_or(0),
+                )
+                .saturating_add(
+                    slot.item
+                        .previous_platform_resource
+                        .as_ref()
+                        .and_then(|os| os.allocated_bytes(self))
+                        .unwrap_or(0),
+                )
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod host_io_tests {
+    use super::*;
+
+    #[test]
+    fn host_io_native_widget_paths_do_not_enqueue_external_operations() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.script_data.std.restrict_to_host_io();
+        let before = cx.platform_ops.len();
+        cx.copy_to_clipboard("private");
+        cx.set_primary_selection("private");
+        cx.open_system_savefile_dialog();
+        cx.open_system_openfile_dialog();
+        cx.open_system_openfolder_dialog();
+        cx.open_system_savefolder_dialog();
+        cx.system_browser(LiveId::unique()).spawn("https://example.invalid/private");
+        cx.system_browser(LiveId::unique()).set_url("https://example.invalid/private", false);
+        cx.prepare_audio_playback(LiveId::unique(), VideoSource::Network("https://example.invalid/private".into()), false, false);
+        cx.prepare_audio_playback(LiveId::unique(), VideoSource::Filesystem("/etc/passwd".into()), false, false);
+        assert_eq!(cx.platform_ops.len(), before);
+    }
 }

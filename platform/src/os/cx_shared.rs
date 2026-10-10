@@ -5,8 +5,8 @@ use {
         cx_api::CxOsApi,
         draw_pass::{CxDrawPassParent, DrawPassId},
         event::{
-            DrawEvent, Event, KeyFocusEvent, NextFrameEvent, TextClipboardEvent, TimerEvent,
-            TriggerEvent,
+            DrawEvent, Event, KeyFocusEvent, NextFrameEvent, TextClipboardEvent,
+            TimerEvent, TriggerEvent,
         },
         makepad_live_id::{live_id, LiveId},
         makepad_network::NetworkResponse,
@@ -20,6 +20,33 @@ use {
     std::collections::{HashMap, HashSet},
     std::rc::Rc,
 };
+
+struct EventDispatchGuard {
+    active: Rc<Cell<bool>>,
+    event_depth: Option<Rc<Cell<u32>>>,
+}
+
+impl Drop for EventDispatchGuard {
+    fn drop(&mut self) {
+        self.active.set(false);
+        if let Some(depth) = &self.event_depth {
+            depth.set(depth.get().saturating_sub(1));
+        }
+    }
+}
+
+/// File sinks for in-app frame captures (`Cx::capture_next_frame_to_file`).
+/// A static mutex rather than Cx state because the metal completion handler
+/// that produces the PNG runs off the main thread.
+static SCREENSHOT_FILE_SINKS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<u64, std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+static SCREENSHOT_FILE_NEXT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1 << 63);
+
+fn screenshot_file_sinks() -> &'static std::sync::Mutex<HashMap<u64, std::path::PathBuf>> {
+    SCREENSHOT_FILE_SINKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
 
 impl Cx {
     #[allow(dead_code)]
@@ -44,18 +71,124 @@ impl Cx {
         false
     }
 
+    /// The window a pass ultimately presents into (through any chain of
+    /// offscreen parents); None for Xr/parentless passes.
+    ///
+    /// Shared by the per-window paced backends — the macOS display link and the
+    /// Windows DXGI frame-latency beat — to decide which passes belong to the
+    /// window whose flip is currently being serviced. The 64-step cap is a
+    /// cycle guard: a malformed parent chain must not hang the paint loop.
+    #[allow(dead_code)]
+    pub(crate) fn pass_root_window(&self, pass_id: DrawPassId) -> Option<crate::window::WindowId> {
+        let mut id = pass_id;
+        for _ in 0..64 {
+            match self.passes[id].parent.clone() {
+                CxDrawPassParent::Window(window_id) => return Some(window_id),
+                CxDrawPassParent::DrawPass(parent) => id = parent,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Whether the time repaint (`demo_time_repaint`: some shader read
+    /// `draw_pass.time`, so repaint every frame) may re-dirty this pass.
+    ///
+    /// It used to re-dirty EVERY pass with a main draw list — including
+    /// passes their owner did not begin again on the latest redraw, which
+    /// still hold a stale draw list, parent and target. Re-running one of
+    /// those overwrites the fresh output of the pass that took its place:
+    /// the VJ's warp-only beat re-ran the previous beat's whole tween chain
+    /// and its stale warp stage (same depth, higher pool id) clobbered
+    /// `warp_out` with the old t (audit hazard (a); 999/2000 beats in the
+    /// timed alternation probe).
+    ///
+    /// "Begun on the latest redraw" is read off the draw lists: a pass's main
+    /// draw list is rebuilt (`clear_draw_items(redraw_id)`) every time the
+    /// pass is begun, so its `redraw_id` is the draw cycle that last began
+    /// the pass. The reference is the pass's root window's own main list —
+    /// not the global cycle — so a window that did not redraw this cycle
+    /// keeps its time-animated child passes alive (multi-window), while a
+    /// child left behind by a window that DID redraw is stale. Window passes
+    /// are always live; parentless passes compare against the current cycle.
+    /// Explicit `repaint_pass` users are untouched: this gates only the time
+    /// repaint, and dirty propagation to parents is unchanged.
+    fn pass_live_for_time_repaint(&self, pass_id: DrawPassId) -> bool {
+        let pass = &self.passes[pass_id];
+        let Some(list_id) = pass.main_draw_list_id else {
+            return false;
+        };
+        if matches!(pass.parent, CxDrawPassParent::Window(_)) {
+            return true;
+        }
+        let reference = match self.pass_root_window(pass_id) {
+            Some(window_id) if self.windows.is_valid(window_id) => self.windows[window_id]
+                .main_pass_id
+                .and_then(|main_pass_id| self.passes[main_pass_id].main_draw_list_id)
+                .map(|main_list_id| self.draw_lists[main_list_id].redraw_id)
+                .unwrap_or(self.redraw_id),
+            _ => self.redraw_id,
+        };
+        self.draw_lists[list_id].redraw_id >= reference
+    }
+
     pub(crate) fn compute_pass_repaint_order(&mut self, passes_todo: &mut Vec<DrawPassId>) {
         passes_todo.clear();
+
+        // Resolve attachment liveness through the whole consumer chain before
+        // propagating dirtiness. A descendant's own attachment can still be
+        // current inside an orphaned capture; it must not revive that capture.
+        // Mark a walk inactive while visiting it so recycled parent cycles
+        // cannot keep obsolete passes alive. Each slot is visited once.
+        let slot_cap = self.passes.id_iter().count();
+        let mut live = vec![None; slot_cap];
+        let mut path = Vec::new();
+        for draw_pass_id in self.passes.id_iter() {
+            let mut walk = draw_pass_id;
+            let active = loop {
+                if let Some(active) = live[walk.0] {
+                    break active;
+                }
+                live[walk.0] = Some(false);
+                path.push(walk);
+                if self.pass_attachment_is_stale(walk) {
+                    break false;
+                }
+                match self.passes[walk].parent {
+                    CxDrawPassParent::DrawPass(parent) => walk = parent,
+                    _ => break true,
+                }
+            };
+            for id in path.drain(..) {
+                live[id.0] = Some(active);
+            }
+        }
+
+        // An orphaned child pass — attached by a draw list that has since
+        // been recorded without it (`Cx::pass_attachment_is_stale`) — is not
+        // painted, is neither a source nor a sink of dirtiness below, and has
+        // its flag cleared so an idle app does not keep requesting frames on
+        // its behalf. The one exception is an explicit `repaint_pass`, which
+        // paints it this once.
+        for draw_pass_id in self.passes.id_iter() {
+            let requested = self.passes[draw_pass_id].repaint_requested;
+            if !requested && live[draw_pass_id.0] != Some(true) {
+                self.passes[draw_pass_id].paint_dirty = false;
+            }
+        }
 
         // we need this because we don't mark the entire deptree of passes dirty every small paint
         loop {
             // loop untill we don't propagate anymore
             let mut altered = false;
             for draw_pass_id in self.passes.id_iter() {
-                if self.demo_time_repaint {
-                    if self.passes[draw_pass_id].main_draw_list_id.is_some() {
-                        self.passes[draw_pass_id].paint_dirty = true;
-                    }
+                if live[draw_pass_id.0] != Some(true) {
+                    continue;
+                }
+                if self.demo_time_repaint
+                    && self.pass_live_for_time_repaint(draw_pass_id)
+                {
+                    self.passes[draw_pass_id].paint_dirty = true;
                 }
                 if self.passes[draw_pass_id].paint_dirty {
                     let other = match self.passes[draw_pass_id].parent {
@@ -70,39 +203,70 @@ impl Cx {
                     }
                 }
             }
+            // Liveness runs the OTHER way: a pass that declared itself
+            // live-with-parent re-encodes whenever its consumer repaints.
+            // The gauss chain rides this — realtime glass — while texture
+            // caches, which exist to NOT re-render, never opt in.
+            for draw_pass_id in self.passes.id_iter() {
+                if self.passes[draw_pass_id].live_with_parent
+                    && !self.passes[draw_pass_id].paint_dirty
+                    && live[draw_pass_id.0] == Some(true)
+                {
+                    if let CxDrawPassParent::DrawPass(parent_pass_id) = self.passes[draw_pass_id].parent {
+                        if self.passes[parent_pass_id].paint_dirty {
+                            self.passes[draw_pass_id].paint_dirty = true;
+                            altered = true;
+                        }
+                    }
+                }
+            }
             if !altered {
                 break;
             }
         }
 
+        // EXECUTION ORDER IS THE DEPENDENCY TREE, deepest first. A pass's
+        // parent is its CONSUMER — the pass that samples the texture it
+        // renders — so every dirty pass must execute before its parent.
+        // Distance-to-root gives exactly that: sort deepest first; the
+        // stable sort keeps pool-id order between passes at equal depth
+        // (siblings), which is the order this function always produced for
+        // them. The old scan inserted a child directly before its parent
+        // only when the parent was ALREADY in the list, so with three or
+        // more levels of texture passes and adverse (recycled) pool ids a
+        // grandchild could land AFTER the pass that consumes its output,
+        // which then read a stale texture (the VJ's post/sim pass chains
+        // hit exactly this). Parentless passes keep their old "run first"
+        // contract via the depth bias.
+        const ROOT_NONE_BIAS: u64 = 1 << 32;
         for draw_pass_id in self.passes.id_iter() {
-            if self.passes[draw_pass_id].paint_dirty {
-                let mut inserted = false;
-                match self.passes[draw_pass_id].parent {
-                    CxDrawPassParent::Window(_) | CxDrawPassParent::Xr => {}
-                    CxDrawPassParent::DrawPass(dep_of_pass_id) => {
-                        if draw_pass_id == dep_of_pass_id {
-                            panic!()
-                        }
-                        for insert_before in 0..passes_todo.len() {
-                            if passes_todo[insert_before] == dep_of_pass_id {
-                                passes_todo.insert(insert_before, draw_pass_id);
-                                inserted = true;
-                                break;
-                            }
-                        }
-                    }
-                    CxDrawPassParent::None => {
-                        // we need to be first
-                        passes_todo.insert(0, draw_pass_id);
-                        inserted = true;
-                    }
-                }
-                if !inserted {
-                    passes_todo.push(draw_pass_id);
-                }
+            let requested = std::mem::take(&mut self.passes[draw_pass_id].repaint_requested);
+            if self.passes[draw_pass_id].paint_dirty
+                && (live[draw_pass_id.0] == Some(true) || requested)
+            {
+                passes_todo.push(draw_pass_id);
             }
         }
+        let depth_of = |start: DrawPassId| -> u64 {
+            let mut depth = 0u64;
+            let mut walk = start;
+            loop {
+                match self.passes[walk].parent {
+                    CxDrawPassParent::DrawPass(parent_id) => {
+                        depth += 1;
+                        walk = parent_id;
+                        if depth as usize > slot_cap {
+                            // A cycle in stale parent links (recycled pass
+                            // slots): stop counting rather than hang.
+                            return depth;
+                        }
+                    }
+                    CxDrawPassParent::None => return depth + ROOT_NONE_BIAS,
+                    _ => return depth,
+                }
+            }
+        };
+        passes_todo.sort_by_key(|id| std::cmp::Reverse(depth_of(*id)));
         self.demo_time_repaint = false;
     }
 
@@ -111,11 +275,18 @@ impl Cx {
     }
 
     pub(crate) fn dispatch_network_runtime_events(&mut self) {
+        self.dispatch_storage_responses();
         use crate::makepad_math::dvec2;
         use crate::window::CxWindowPool;
 
         let mut responses = Vec::new();
         while let Some(response) = self.net.try_recv() {
+            if let Some(backlog) = self.studio_backlog.as_mut() {
+                if crate::web_socket::is_studio_socket_response(&response) {
+                    backlog.push_back(response);
+                    continue;
+                }
+            }
             if let Some(msgs) = crate::web_socket::consume_studio_socket_response(&response) {
                 let window_id = CxWindowPool::id_zero();
                 let pos = dvec2(0.0, 0.0);
@@ -145,11 +316,72 @@ impl Cx {
         }
     }
 
+    /// Capture the next presented frame of the main window to a PNG file.
+    /// The readback + write happen on the GPU completion thread after the next
+    /// repaint, so the caller should poll for the file to appear. Piggybacks on
+    /// the studio screenshot pipeline: ids above `SCREENSHOT_FILE_ID_BASE` are
+    /// routed to `SCREENSHOT_FILE_SINKS` instead of the studio connection.
+    /// (Gpusim builds write frames to files on their own; this is for the
+    /// live GPU-rendered app.)
+    /// Returns the capture's request id, so the caller can later
+    /// [`cancel_frame_capture`](Self::cancel_frame_capture) it.
+    pub fn capture_next_frame_to_file(&mut self, path: std::path::PathBuf) -> u64 {
+        let request_id = SCREENSHOT_FILE_NEXT_ID
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        screenshot_file_sinks().lock().unwrap().insert(request_id, path);
+        self.screenshot_requests
+            .push(makepad_studio_protocol::ScreenshotRequest {
+                request_id,
+                kind_id: 0,
+            });
+        self.redraw_all();
+        request_id
+    }
+
+    /// Forget a pending [`capture_next_frame_to_file`]. The GPU readback
+    /// cannot be recalled once its frame presents, so a request that has
+    /// already been drained keeps its sink entry but with an EMPTY path —
+    /// the writer discards those bytes instead of writing a file the
+    /// caller has stopped watching (and never mistakes them for a studio
+    /// response). A request whose frame has not presented yet is dropped
+    /// outright.
+    pub fn cancel_frame_capture(&mut self, request_id: u64) {
+        let queued = self
+            .screenshot_requests
+            .iter()
+            .any(|request| request.request_id == request_id);
+        let mut sinks = screenshot_file_sinks().lock().unwrap();
+        if queued {
+            self.screenshot_requests.retain(|request| request.request_id != request_id);
+            sinks.remove(&request_id);
+        } else if sinks.contains_key(&request_id) {
+            sinks.insert(request_id, std::path::PathBuf::new());
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn take_studio_screenshot_request_ids(&mut self, kind_id: u32) -> Vec<u64> {
+        self.take_studio_screenshot_request_ids_for_window(kind_id, None)
+    }
+
+    /// Drain the pending screenshot requests this pass can answer.
+    ///
+    /// `window_id` is the window the presenting pass belongs to (None for
+    /// offscreen/stdin passes). A `--remote` `/g?w=N` grab only matches its own
+    /// window, so a multi-window app can be captured window by window instead of
+    /// whichever pass happens to present first. Studio and file-sink requests
+    /// are untargeted and match any pass, exactly as before.
+    #[allow(dead_code)]
+    pub(crate) fn take_studio_screenshot_request_ids_for_window(
+        &mut self,
+        kind_id: u32,
+        window_id: Option<usize>,
+    ) -> Vec<u64> {
         let mut request_ids = Vec::new();
         self.screenshot_requests.retain(|request| {
-            if request.kind_id == kind_id {
+            if request.kind_id == kind_id
+                && crate::remote::grab_targets_window(request.request_id, window_id)
+            {
                 request_ids.push(request.request_id);
                 false
             } else {
@@ -169,8 +401,47 @@ impl Cx {
         if request_ids.is_empty() {
             return;
         }
-        Cx::send_studio_message(AppToStudio::Screenshot(ScreenshotResponse {
+        // `--remote` grabs are answered on the requesting HTTP thread.
+        let request_ids = crate::remote::deliver_grabs(
             request_ids,
+            width,
+            height,
+            &png,
+        );
+        if request_ids.is_empty() {
+            return;
+        }
+        // Ids registered by capture_next_frame_to_file get written to disk;
+        // the rest (if any) still go to studio.
+        let mut studio_ids = Vec::new();
+        {
+            let mut sinks = screenshot_file_sinks().lock().unwrap();
+            for id in request_ids {
+                if let Some(path) = sinks.remove(&id) {
+                    if path.as_os_str().is_empty() {
+                        // Cancelled after its frame was drained: discard.
+                        continue;
+                    }
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(err) = std::fs::write(&path, &png) {
+                        crate::error!(
+                            "capture_next_frame_to_file: write {} failed: {}",
+                            path.display(),
+                            err
+                        );
+                    }
+                } else {
+                    studio_ids.push(id);
+                }
+            }
+        }
+        if studio_ids.is_empty() {
+            return;
+        }
+        Cx::send_studio_message(AppToStudio::Screenshot(ScreenshotResponse {
+            request_ids: studio_ids,
             png,
             width,
             height,
@@ -212,7 +483,7 @@ impl Cx {
         }
         self.run_view_frame_encode_in_flight = true;
         let sender = self.run_view_frame_results.sender();
-        self.spawn_thread(move || {
+        if let Ok(task) = self.task_pool().submit_internal(crate::thread::Lane::Heavy, move || {
             let result = Cx::prepare_studio_run_view_rgba(&request, width, height, rgba).and_then(
                 |(width, height, rgba)| {
                     Cx::encode_rgba_as_png(width, height, &rgba).map(|png| RunViewFrameData {
@@ -226,7 +497,9 @@ impl Cx {
                 },
             );
             let _ = sender.send(result);
-        });
+        }) {
+            task.detach();
+        }
     }
 
     fn prepare_studio_run_view_rgba(
@@ -426,10 +699,167 @@ impl Cx {
         }
     }
 
+    /// Hardware-faithful synthetic mouse move (remote `/m?hw=1`): the event
+    /// takes the SAME pointer-lock/pin transform hardware takes
+    /// (`locked_mouse_transform`), so a pinned scrub behaves identically
+    /// under injection. The ordinary injection path bypasses
+    /// send_mouse_move entirely — which is how every bridge verification
+    /// of the pin lied about the physical mouse.
+    pub fn dispatch_hw_mouse_move(
+        &mut self,
+        window_id: crate::window::WindowId,
+        raw: crate::makepad_math::DVec2,
+        delta: crate::makepad_math::DVec2,
+        seed: crate::makepad_math::DVec2,
+        modifiers: crate::event::KeyModifiers,
+        time: f64,
+    ) {
+        // `os::apple` does not exist in a gpusim build (see os/mod.rs), so
+        // the pointer-lock transform has to be gated on the module's own cfg,
+        // not on the target alone.
+        #[cfg(all(target_os = "macos", not(gpusim)))]
+        let (abs, lock_delta) = crate::os::apple::macos::macos_app::with_macos_app(|app| {
+            app.locked_mouse_transform(raw, delta, seed)
+        });
+        #[cfg(not(all(target_os = "macos", not(gpusim))))]
+        let (abs, lock_delta) = {
+            let _ = (delta, seed);
+            (raw, crate::makepad_math::DVec2::default())
+        };
+        self.call_event_handler(&Event::MouseMove(crate::event::MouseMoveEvent {
+            abs,
+            lock_delta,
+            window_id,
+            modifiers,
+            time,
+            handled: Cell::new(Area::Empty),
+        }));
+        self.fingers.cycle_hover_area(live_id!(mouse).into());
+        self.fingers.switch_captures();
+    }
+
+    /// Hardware-faithful synthetic mouse up, part 1: release an active
+    /// scrub pin at the platform layer first — exactly what
+    /// macos_window::send_mouse_up does for a physical up.
+    pub fn dispatch_hw_pin_release(&mut self) {
+        #[cfg(all(target_os = "macos", not(gpusim)))]
+        crate::os::apple::macos::macos_app::with_macos_app(|app| {
+            if app.pointer_pin_mode {
+                app.set_pointer_pin(false);
+            }
+        });
+    }
+
     /// Dispatch a StudioToApp message as an event. Handles input, clipboard,
     /// screenshot, widget dump, and kill. Returns true on Kill (caller should
     /// shut down). Callers handle stdin-specific variants (Swapchain,
     /// WindowGeomChange, Tick) before delegating here.
+    /// A host-forwarded pointer position — host logical points, relative to
+    /// the host's origin — as the app's layout sees it: relative to the
+    /// window, then through the window's dpi override (a native window's
+    /// events take the same remap in the platform callbacks).
+    pub(crate) fn stdin_pointer_abs(
+        &self,
+        host: crate::makepad_math::DVec2,
+        window_pos: crate::makepad_math::DVec2,
+        window_id: crate::window::WindowId,
+    ) -> crate::makepad_math::DVec2 {
+        let mut abs = crate::makepad_math::dvec2(host.x - window_pos.x, host.y - window_pos.y);
+        self.dpi_override_scale(&mut abs, window_id);
+        abs
+    }
+
+    /// A host's `StudioToApp::MouseCancel`: a real cancellation, not a
+    /// release. Every capture of the mouse is cancelled and hears
+    /// `Event::FingerCancel` (which hidden widgets admit too); then the
+    /// button is released without any MouseUp being dispatched.
+    pub(crate) fn dispatch_hosted_mouse_cancel(
+        &mut self,
+        e: &makepad_studio_protocol::RemoteMouseUp,
+        window_id: crate::window::WindowId,
+        pos: crate::makepad_math::DVec2,
+    ) {
+        let digit_id = live_id!(mouse).into();
+        let button = crate::event::MouseButton::from_bits_retain(e.button_raw_bits);
+        self.fingers.cancel_digit(digit_id);
+        self.call_event_handler(&Event::FingerCancel(crate::event::FingerCancelEvent {
+            window_id,
+            digit_id,
+            device: crate::event::DigitDevice::Mouse { button },
+            abs: self.stdin_pointer_abs(crate::makepad_math::dvec2(e.x, e.y), pos, window_id),
+            time: e.time,
+            modifiers: e.modifiers.into_key_modifiers(),
+        }));
+        self.fingers.mouse_up(button);
+        self.fingers.cycle_hover_area(live_id!(mouse).into());
+    }
+
+    /// A hosted child on a touch device (an Android child process): the
+    /// host's pointer is a finger, so its press, moves and release arrive as
+    /// one touch, dispatched the way the Activity build dispatches
+    /// `FromJavaMessage::Touch` — lists and scroll views drag-scroll, and a
+    /// press a scroller takes away is cancelled. As mouse events, a press on
+    /// a row captured the mouse and the list refused to scroll under it.
+    /// `state: None` is the host's cancellation (`MouseCancel`).
+    #[cfg(target_os = "android")]
+    pub(crate) fn dispatch_hosted_touch(
+        &mut self,
+        state: Option<crate::event::finger::TouchState>,
+        at: crate::makepad_math::DVec2,
+        time: f64,
+        window_id: crate::window::WindowId,
+        pos: crate::makepad_math::DVec2,
+    ) {
+        use crate::event::finger::{TouchPoint, TouchState};
+        let abs = self.stdin_pointer_abs(at, pos, window_id);
+        let touch = |state| TouchPoint {
+            state,
+            abs,
+            time,
+            uid: 0,
+            rotation_angle: 0.0,
+            force: 0.0,
+            radius: crate::makepad_math::dvec2(1.0, 1.0),
+            handled: Cell::new(Area::Empty),
+            sweep_lock: Cell::new(Area::Empty),
+        };
+        let Some(state) = state else {
+            let digit_id: crate::event::DigitId = crate::makepad_live_id::live_id_num!(touch, 0).into();
+            self.fingers.cancel_digit(digit_id);
+            self.call_event_handler(&Event::FingerCancel(crate::event::FingerCancelEvent {
+                window_id,
+                digit_id,
+                device: crate::event::DigitDevice::Touch { uid: 0 },
+                abs,
+                time,
+                modifiers: Default::default(),
+            }));
+            self.fingers.process_touch_update_end(&[touch(TouchState::Stop)]);
+            self.update_pointer_capture_pacing();
+            self.send_studio_key_focus_rect_response();
+            return;
+        };
+        if state == TouchState::Start {
+            self.activate_window_on_pointer_down(window_id);
+        }
+        let touches = vec![touch(state)];
+        self.fingers.process_touch_update_start(time, &touches);
+        let e = Event::TouchUpdate(crate::event::TouchUpdateEvent {
+            time,
+            window_id,
+            touches,
+            modifiers: Default::default(),
+        });
+        self.call_event_handler(&e);
+        if let Event::TouchUpdate(e) = e {
+            self.fingers.process_touch_update_end(&e.touches);
+        }
+        self.update_pointer_capture_pacing();
+        if state == TouchState::Stop {
+            self.send_studio_key_focus_rect_response();
+        }
+    }
+
     pub fn dispatch_studio_msg(
         &mut self,
         msg: StudioToApp,
@@ -438,8 +868,12 @@ impl Cx {
     ) -> bool {
         match msg {
             StudioToApp::MouseDown(e) => {
+                // Synthetic input must take the same activation path as a
+                // native click. In particular, an unfocused macOS window
+                // must become key before its drag starts.
+                self.activate_window_on_pointer_down(window_id);
                 let event = crate::event::MouseDownEvent {
-                    abs: crate::makepad_math::dvec2(e.x - pos.x, e.y - pos.y),
+                    abs: self.stdin_pointer_abs(crate::makepad_math::dvec2(e.x, e.y), pos, window_id),
                     button: crate::event::MouseButton::from_bits_retain(e.button_raw_bits),
                     window_id,
                     modifiers: e.modifiers.into_key_modifiers(),
@@ -449,10 +883,12 @@ impl Cx {
                 self.fingers.process_tap_count(event.abs, event.time);
                 self.fingers.mouse_down(event.button, window_id);
                 self.call_event_handler(&Event::MouseDown(event));
+                self.update_pointer_capture_pacing();
             }
             StudioToApp::MouseMove(e) => {
                 self.call_event_handler(&Event::MouseMove(crate::event::MouseMoveEvent {
-                    abs: crate::makepad_math::dvec2(e.x - pos.x, e.y - pos.y),
+                lock_delta: Default::default(),
+                    abs: self.stdin_pointer_abs(crate::makepad_math::dvec2(e.x, e.y), pos, window_id),
                     window_id,
                     modifiers: e.modifiers.into_key_modifiers(),
                     time: e.time,
@@ -461,9 +897,14 @@ impl Cx {
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
                 self.fingers.switch_captures();
             }
+            StudioToApp::MouseCancel(e) => {
+                self.dispatch_hosted_mouse_cancel(&e, window_id, pos);
+                self.update_pointer_capture_pacing();
+                self.send_studio_key_focus_rect_response();
+            }
             StudioToApp::MouseUp(e) => {
                 let event = crate::event::MouseUpEvent {
-                    abs: crate::makepad_math::dvec2(e.x - pos.x, e.y - pos.y),
+                    abs: self.stdin_pointer_abs(crate::makepad_math::dvec2(e.x, e.y), pos, window_id),
                     button: crate::event::MouseButton::from_bits_retain(e.button_raw_bits),
                     window_id,
                     modifiers: e.modifiers.into_key_modifiers(),
@@ -473,11 +914,12 @@ impl Cx {
                 self.call_event_handler(&Event::MouseUp(event));
                 self.fingers.mouse_up(button);
                 self.fingers.cycle_hover_area(live_id!(mouse).into());
+                self.update_pointer_capture_pacing();
                 self.send_studio_key_focus_rect_response();
             }
             StudioToApp::Scroll(e) => {
                 self.call_event_handler(&Event::Scroll(crate::event::ScrollEvent {
-                    abs: crate::makepad_math::dvec2(e.x - pos.x, e.y - pos.y),
+                    abs: self.stdin_pointer_abs(crate::makepad_math::dvec2(e.x, e.y), pos, window_id),
                     scroll: crate::makepad_math::dvec2(e.sx, e.sy),
                     window_id,
                     modifiers: e.modifiers.into_key_modifiers(),
@@ -485,7 +927,23 @@ impl Cx {
                     handled_y: Cell::new(false),
                     is_mouse: e.is_mouse,
                     time: e.time,
+                    phase: crate::event::ScrollPhase::None,
                 }));
+            }
+            StudioToApp::Pinch(e) => {
+                self.call_event_handler(&Event::Pinch(crate::event::PinchEvent {
+                    abs: self.stdin_pointer_abs(crate::makepad_math::dvec2(e.x, e.y), pos, window_id),
+                    window_id,
+                    scale: e.scale,
+                    phase: e.phase,
+                    modifiers: e.modifiers.into_key_modifiers(),
+                    time: e.time,
+                }));
+            }
+            StudioToApp::GameInput(states) => {
+                // Replace wholesale rather than merge: Studio sends the whole
+                // set, so a pad that unplugs disappears by being absent.
+                self.game_input_remote = states.into_iter().map(|s| s.into()).collect();
             }
             StudioToApp::KeyDown(e) => {
                 self.keyboard.process_key_down(e.clone());
@@ -496,6 +954,8 @@ impl Cx {
                 self.call_event_handler(&Event::KeyUp(e));
             }
             StudioToApp::TextInput(e) => {
+                #[cfg(all(target_vendor = "apple", not(gpusim)))]
+                crate::os::apple::metal::note_input_event();
                 self.call_event_handler(&Event::TextInput(e));
             }
             StudioToApp::TextCopy => {
@@ -538,9 +998,30 @@ impl Cx {
                 self.call_event_handler(&Event::Shutdown);
                 return true;
             }
-            StudioToApp::Custom(data) => {
-                self.call_event_handler(&Event::Custom(data));
+            StudioToApp::Gpu(command) => {
+                // Supporting hosted backends intercept this before generic
+                // input dispatch. Other backends must reject the transition
+                // explicitly so a host never waits for a silent no-op.
+                Self::send_studio_message(AppToStudio::Gpu(
+                    makepad_studio_protocol::AppToHostGpu::Failed {
+                        transition: command.transition(),
+                        message: "this backend does not support hosted GPU migration".into(),
+                    },
+                ));
             }
+            StudioToApp::Custom(data) => {
+                if crate::ime::HostedBack::parse(&data).is_some_and(|back| back.handled.is_none()) {
+                    let event = Event::BackPressed { handled: std::cell::Cell::new(false) };
+                    self.call_event_handler(&event);
+                    let Event::BackPressed { handled } = event else { unreachable!() };
+                    Self::send_studio_message(AppToStudio::Custom(crate::ime::HostedBack {
+                        handled: Some(handled.get()),
+                    }.to_json()));
+                } else {
+                    self.call_event_handler(&Event::Custom(data));
+                }
+            }
+            StudioToApp::Relay(relay) => self.handle_host_relay(relay),
             StudioToApp::KeepAlive | StudioToApp::None => {}
             StudioToApp::LiveChange { file_name, content } => {
                 self.script_data
@@ -560,10 +1041,13 @@ impl Cx {
 
     /// Drain the global control channel and dispatch each message as an event.
     /// Must be called from the event loop (not from inside an event handler).
+    /// Also services the `--remote` HTTP control surface, which every backend
+    /// therefore gets by calling this one function.
     pub fn poll_control_channel(&mut self) {
         use crate::makepad_math::dvec2;
         use crate::web_socket::CONTROL_CHANNEL;
         use crate::window::CxWindowPool;
+        crate::remote::poll(self);
         let msgs: Vec<StudioToApp> = {
             let lock = CONTROL_CHANNEL.lock().unwrap();
             if let Some(rx) = lock.as_ref() {
@@ -580,15 +1064,91 @@ impl Cx {
     }
 
     pub(crate) fn run_live_edit_if_needed(&mut self, _backend: &str) {
-        if self.handle_live_edit() {
-            self.draw_shaders.reset_for_live_reload();
-            self.call_event_handler(&Event::LiveEdit);
-            self.redraw_all();
+        // Three independent triggers, fanning out to two events. The
+        // critical distinction between FileChange and Manual is whether
+        // we follow LiveEdit up with an immediate ScriptReapply pass in
+        // the SAME tick — manual triggers (rotation) defer it to the next
+        // tick to keep each tick's work bounded, since rotation can fire
+        // multiple WindowGeomChange events back-to-back during the
+        // animation and each Apply walk over the full widget tree is
+        // non-trivial on mobile hardware.
+        //
+        // 1. `LiveEditTrigger::FileChange` — file watcher delivered a
+        //    hot-reloaded `script_mod!` block (or studio websocket sent
+        //    a `LiveChange`). The DSL itself changed; shader caches may
+        //    be stale, so `reset_for_live_reload` runs. Any preference
+        //    re-broadcast in the LiveEdit handler propagates immediately
+        //    via the same-tick `ScriptReapply` follow-up — file changes
+        //    are a live-coding scenario where the user wants to see the
+        //    update right away.
+        //
+        // 2. `LiveEditTrigger::Manual` — `cx.request_live_edit()` was
+        //    called (canonical case: safe-area insets changed on iOS
+        //    rotation, where `mod.widgets.SAFE_INSET_PAD_*` heap
+        //    primitives need to be re-baked into `script_mod!` block
+        //    expressions). The DSL did NOT change; we skip
+        //    `reset_for_live_reload` (no shader code changed), and we
+        //    skip the immediate ScriptReapply follow-up — if the
+        //    LiveEdit handler set `pending_script_reapply` (e.g. an app
+        //    re-broadcasting preferences), it lands on the next event-
+        //    loop tick. Without this split, rotation incurred a visible
+        //    1-2s lag from doing two full Apply walks per geom change.
+        //
+        // 3. `LiveEditTrigger::None` + `pending_script_reapply` — set by
+        //    `cx.request_script_reapply()` after runtime mutations to a
+        //    *shared* heap *object* (`script_eval!` overriding
+        //    `mod.widgets.IMG_MSG_FIT.max`, etc.). Re-running script_mod
+        //    would clobber those overrides; we fire `Event::ScriptReapply`
+        //    which re-applies the captured `app_value` with
+        //    `Apply::ScriptReapply` — no script_mod re-run, runtime
+        //    overrides preserved, imperative-setter fields early-return.
+        use crate::live_reload::LiveEditTrigger;
+        match self.handle_live_edit() {
+            LiveEditTrigger::FileChange => {
+                self.draw_shaders.reset_for_live_reload();
+                self.pending_script_reapply = false;
+                self.live_edit_apply = crate::makepad_script::Apply::Reload;
+                self.call_event_handler(&Event::LiveEdit);
+                self.redraw_all();
+                if self.pending_script_reapply {
+                    self.pending_script_reapply = false;
+                    self.call_event_handler(&Event::ScriptReapply);
+                    self.redraw_all();
+                }
+            }
+            LiveEditTrigger::Manual => {
+                // A style reload re-evaluates Splash modules under the names
+                // they had, so their bodies' script addresses now hold new
+                // code: the object and function-address shader caches would
+                // hand back the previous shaders (or another template's).
+                // Only the code-keyed cache stays valid.
+                if self.pending_style_reload {
+                    self.draw_shaders.reset_for_live_reload();
+                }
+                // Clear `pending_script_reapply` defensively — LiveEdit's
+                // script_mod re-run clobbers heap overrides anyway, and an
+                // app-level handler that re-broadcasts sets a fresh flag
+                // that lands on the next tick.
+                self.pending_script_reapply = false;
+                // The DSL did not change, so re-apply with `Rebake`: the
+                // re-run only exists to pick up new `SAFE_INSET_PAD_*`
+                // values, and imperative runtime state must survive it.
+                self.live_edit_apply = crate::makepad_script::Apply::Rebake;
+                self.call_event_handler(&Event::LiveEdit);
+                self.redraw_all();
+            }
+            LiveEditTrigger::None => {
+                if self.pending_script_reapply {
+                    self.pending_script_reapply = false;
+                    self.call_event_handler(&Event::ScriptReapply);
+                    self.redraw_all();
+                }
+            }
         }
     }
 
-    // Same logic as headless::raster::encode_png_rgba which is behind
-    // cfg(headless) and unavailable to the windowed backend.
+    // Same logic as gpusim::raster::encode_png_rgba which is behind
+    // cfg(gpusim) and unavailable to the windowed backend.
     #[allow(dead_code)]
     pub fn encode_rgba_as_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
         use makepad_zune_png::{
@@ -612,17 +1172,59 @@ impl Cx {
 
     // event handler wrappers
 
+    fn invoke_event_handler(&mut self, event: &Event) {
+        let event_handler = self.event_handler.clone();
+        // The active flag excludes aliasing, while the Rc keeps this stable
+        // allocation alive even if the handler mutates `Cx`.
+        unsafe {
+            (&mut *event_handler.get())(self, event);
+        }
+    }
+
+    fn event_dispatch_is_reentrant(&self, event: &Event) -> bool {
+        if self.event_handler_dispatch_active.get() {
+            crate::error!(
+                "Rejected synchronous re-entry while dispatching event {}",
+                event.name()
+            );
+            return true;
+        }
+        false
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn reset_event_dispatch_state(&mut self) {
+        self.event_handler_dispatch_active.set(false);
+        self.perf_monitor.event_depth.set(0);
+    }
+
     pub(crate) fn inner_call_event_handler(&mut self, event: &Event) {
+        let _phase = crate::thread::ui_event_phase(event);
+        if self.event_dispatch_is_reentrant(event) {
+            return;
+        }
         self.event_id += 1;
+        // PerfMonitor "event" channel: time only the OUTERMOST dispatch —
+        // Paint recurses into this from the Timer handler on macos.
+        let perf_timing = self.perf_monitor.enabled();
+        if perf_timing {
+            self.perf_monitor
+                .event_depth
+                .set(self.perf_monitor.event_depth.get() + 1);
+        }
+        let dispatch_guard = EventDispatchGuard {
+            active: self.event_handler_dispatch_active.clone(),
+            event_depth: perf_timing.then(|| self.perf_monitor.event_depth.clone()),
+        };
+        self.event_handler_dispatch_active.set(true);
+        let perf_t0 = (perf_timing && self.perf_monitor.event_depth.get() == 1)
+            .then(Cx::monotonic_now);
         if (Cx::has_studio_web_socket()
             && !crate::web_socket::STUDIO_STDOUT_MODE.load(std::sync::atomic::Ordering::SeqCst))
             || Cx::local_profile_capture_enabled()
         {
             let start = self.seconds_since_app_start();
-            if let Some(mut event_handler) = self.event_handler.take() {
-                event_handler(self, event);
-                self.event_handler = Some(event_handler);
-            }
+            self.invoke_event_handler(event);
             let end = self.seconds_since_app_start();
             Cx::send_studio_message(AppToStudio::EventSample(EventSample {
                 event_u32: event.to_u32(),
@@ -635,9 +1237,26 @@ impl Cx {
                 end: end,
             }))
         } else {
-            if let Some(mut event_handler) = self.event_handler.take() {
-                event_handler(self, event);
-                self.event_handler = Some(event_handler);
+            self.invoke_event_handler(event);
+        }
+        drop(dispatch_guard);
+        // A claim during this event cancelled presses that were already
+        // handled earlier in it: each loser gets its terminal cancelled
+        // FingerUp now, before any further input, from a dispatch of its own.
+        let pending = self.fingers.take_pending_cancels(0.0);
+        if !pending.is_empty() {
+            let now = self.seconds_since_app_start();
+            for mut cancel in pending {
+                cancel.time = now;
+                self.inner_call_event_handler(&Event::FingerCancel(cancel));
+            }
+        }
+        if perf_timing {
+            if let Some(t0) = perf_t0 {
+                self.perf_monitor.add(
+                    crate::perf_monitor::PERF_CHANNEL_EVENT,
+                    ((Cx::monotonic_now() - t0).max(0.0) * 1_000_000.0) as u64,
+                );
             }
         }
 
@@ -696,11 +1315,122 @@ impl Cx {
         }
     }
 
+    /// Dispatch any `WindowGeomChange` events queued by code that ran during
+    /// the current event dispatch (typically `Cx::set_window_dpi_override`
+    /// called from a widget handler). Drained the same way as `handle_actions`
+    /// — swap, dispatch each, repeat until quiescent. Each dispatch is a
+    /// fresh `inner_call_event_handler` call after the previous dispatch has
+    /// completed, so it is not rejected as synchronous re-entry.
+    pub fn handle_pending_window_geom_changes(&mut self) {
+        let mut counter = 0;
+        while !self.pending_window_geom_changes.is_empty() {
+            counter += 1;
+            let mut events = Vec::new();
+            std::mem::swap(&mut self.pending_window_geom_changes, &mut events);
+            for event in events {
+                self.inner_call_event_handler(&Event::WindowGeomChange(event));
+                self.inner_key_focus_change();
+            }
+            if counter > 100 {
+                crate::error!("WindowGeomChange feedback loop detected");
+                break;
+            }
+        }
+    }
+
+    /// Clears all widgets' hover/pressed visuals by dispatching one
+    /// `Event::ClearHover` once the current event and its actions finish,
+    /// for when an overlay kept the normal hover-outs from arriving.
+    pub fn clear_all_hovers(&mut self) {
+        self.clear_hover_queued = true;
+    }
+
+    pub(crate) fn handle_pending_clear_hover(&mut self) {
+        if self.clear_hover_queued {
+            self.clear_hover_queued = false;
+            self.inner_call_event_handler(&Event::ClearHover);
+            self.handle_actions();
+        }
+    }
+
     pub(crate) fn call_event_handler(&mut self, event: &Event) {
+        let _phase = crate::thread::ui_event_phase(event);
+        if self.event_dispatch_is_reentrant(event) {
+            return;
+        }
+        crate::remote::note_user_event(self, event);
+        #[cfg(any(target_arch = "wasm32", target_os = "linux", test))]
+        if let Some(drag) = self.drag_drop.internal_drag_event(event) {
+            // The pointer event goes out first and the drag one is appended, the
+            // way every other backend orders it: a widget that ends its gesture on
+            // FingerUp never sees one otherwise, and stays stuck mid-drag.
+            self.drag_drop.suspend_internal_drag();
+            self.call_event_handler(event);
+            self.drag_drop.resume_internal_drag();
+            match drag {
+                crate::event::InternalDragEvent::Drag(event) => {
+                    self.call_event_handler(&Event::Drag(event));
+                    self.drag_drop.cycle_drag();
+                }
+                crate::event::InternalDragEvent::Drop(event) => {
+                    self.call_event_handler(&Event::Drop(event));
+                    self.drag_drop.cycle_drag();
+                    self.call_event_handler(&Event::DragEnd);
+                    self.drag_drop.cycle_drag();
+                }
+            }
+            return;
+        }
+        if matches!(event, Event::Startup) {
+            self.initialize_memory_budget();
+            // The workers boot now, before the app exists, so the first job
+            // never waits for a thread (a Web Worker takes hundreds of ms).
+            self.warm_task_pool();
+        }
+        if !matches!(event, Event::Shutdown) {
+            crate::thread::service_scheduler(self, event);
+        }
+
+        // A scrub pin listens for the button-up ITSELF: release must never
+        // depend on a widget hit path. Schedule the cursor release here,
+        // but do NOT clear the capture's pin flag yet — the flag must
+        // survive THIS dispatch so every suppression gate (hover, new
+        // captures, the tweak pick pass) still stands down while the owner
+        // receives its FingerUp; clearing early let the pick pass eat the
+        // up. The flag dies WITH the capture in fingers.mouse_up, which
+        // every platform calls right after this dispatch.
+        if let Event::MouseUp(e) = event {
+            if e.button.is_primary() && self.fingers.has_pinned_capture() {
+                self.platform_ops
+                    .push_back(crate::cx_api::CxOsOp::PinMousePointer(false));
+            }
+        }
+        // The exploded z-layer view is LIVE: the intercept claims only
+        // its own keys and the orbit drag (on raw screen coordinates), then
+        // the router re-addresses every other pointer event to the plane
+        // its ray lands on so ordinary dispatch — hover, wheel scrolling,
+        // the tweaker's pick — works on the exploded app. (After the pin
+        // hook: leaving mid-drag must never strand a hidden cursor.)
+        let intercepted = self.sploded_intercept(event);
+        // Settle ownership before widget dispatch, including presses consumed by a
+        // platform overlay so their release cannot cancel a second thing underneath.
+        let widget_owner = self.cancel_scopes.resolve_widget_owner(event, intercepted, |lookup| {
+            self.cancel_scope_resolver.and_then(|resolve| resolve(self, lookup))
+        });
+        self.cancel_scopes.handle_event(event, intercepted, widget_owner);
+        if intercepted {
+            return;
+        }
+        let routed = self.sploded_route(event);
+        let event = routed.as_ref().unwrap_or(event);
         if let Event::PermissionResult(result) = event {
             self.handle_camera_permission_result(result);
         }
         self.inner_call_event_handler(event);
+        // Dispatch any synthetic geom changes queued during the original
+        // handler (e.g. runtime dpi_override updates) before triggers and
+        // actions, so layout-dependent reactions see the new geometry.
+        self.handle_pending_window_geom_changes();
         self.inner_key_focus_change();
         self.handle_triggers();
         self.handle_actions();
@@ -708,9 +1438,46 @@ impl Cx {
         // widget->script calls run immediately instead of waiting for tick/timer paths.
         self.handle_script_tasks();
         // Script callbacks can enqueue actions/triggers; flush them in the same cycle.
+        self.handle_pending_window_geom_changes();
         self.inner_key_focus_change();
         self.handle_triggers();
         self.handle_actions();
+        self.handle_pending_clear_hover();
+        if matches!(event, Event::Shutdown) {
+            crate::thread::service_scheduler(self, event);
+            self.close_task_pool();
+            self.thread_spawner.close_runtime();
+        }
+    }
+
+    /// A platform caught a panic that unwound out of an event or draw
+    /// dispatch and goes on. What an unwound frame cannot put back itself
+    /// is put back here: the script VM has parked itself (the `with_vm`
+    /// family catches, parks and resumes) and the draw contexts returned
+    /// their stacks on drop, so what remains is a draw whose redraw list
+    /// went down with the frame — everything is asked to draw again — and
+    /// a check that the VM really did come back.
+    #[allow(dead_code)]
+    pub(crate) fn recover_after_caught_panic(&mut self) {
+        self.in_draw_event = false;
+        if self.script_vm.is_none() {
+            crate::error!(
+                "the script VM did not survive an unwound event handler: every later script entry will be refused as re-entrant"
+            );
+        }
+        self.redraw_all();
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_physical_keyboard_state(&mut self, connected: bool) {
+        self.keyboard.set_physical_keyboard_state(connected);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn update_physical_keyboard_state(&mut self, connected: bool) {
+        if let Some(event) = self.keyboard.update_physical_keyboard_state(connected) {
+            self.call_event_handler(&Event::PhysicalKeyboard(event));
+        }
     }
 
     // helpers
@@ -728,9 +1495,32 @@ impl Cx {
         std::mem::swap(&mut draw_event, &mut self.new_draw_event);
         draw_event.time = time;
         self.in_draw_event = true;
-
-        self.call_event_handler(&Event::Draw(draw_event));
+        // The flag comes down whether the draw returned or unwound: a
+        // platform that catches the panic and goes on must not have every
+        // later `redraw` refused as "already drawing".
+        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.call_event_handler(&Event::Draw(draw_event))
+        }));
         self.in_draw_event = false;
+        if let Err(payload) = drawn {
+            std::panic::resume_unwind(payload);
+        }
+        self.validate_scoped_sweep_locks_after_draw();
+        if let Some(mut hook) = self.post_draw_hook.take() {
+            hook(self);
+            if self.post_draw_hook.is_none() {
+                self.post_draw_hook = Some(hook);
+            }
+        }
+
+        // The frame's recording boundary: every draw list has finished
+        // recording. The geometries dropped since the last redraw are freed
+        // now, except those a live draw call still names (see
+        // `CxGeometryPool`); the scan runs only when something was dropped.
+        if self.geometries.has_unreleased() {
+            let referenced = self.draw_lists.referenced_geometries();
+            self.geometries.release_unreferenced(&referenced);
+        }
 
         if Cx::has_studio_web_socket() {
             self.try_send_studio_widget_tree_dump_responses();
@@ -749,5 +1539,285 @@ impl Cx {
             time: time,
             frame: self.repaint_id,
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{draw_list::DrawList, draw_pass::DrawPass};
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn orphaned_child_pass_is_not_repainted_until_reattached() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let parent = DrawPass::new(&mut cx);
+        let child = DrawPass::new(&mut cx);
+        let list = DrawList::new(&mut cx);
+        let (parent_id, child_id) = (parent.draw_pass_id(), child.draw_pass_id());
+        let mut todo = Vec::new();
+
+        // Recorded at redraw 1, attaching the child: painted, and its
+        // liveness rides on the parent.
+        let recording_gen = cx.next_uniform_gen();
+        let uniforms_gen = cx.next_uniform_gen();
+        cx.draw_lists[list.id()].clear_draw_items(1, recording_gen, uniforms_gen);
+        cx.attach_child_pass(child_id, parent_id, Some(list.id()));
+        cx.passes[child_id].live_with_parent = true;
+        cx.passes[parent_id].paint_dirty = true;
+        cx.compute_pass_repaint_order(&mut todo);
+        assert!(todo.contains(&child_id));
+        assert!(todo.contains(&parent_id));
+
+        // Recorded again at redraw 2 without the child: orphaned. Neither the
+        // parent's repaint nor a direct dirty flag paints it, and the flag is
+        // cleared so nothing keeps the frame loop awake for it.
+        let recording_gen = cx.next_uniform_gen();
+        let uniforms_gen = cx.next_uniform_gen();
+        cx.draw_lists[list.id()].clear_draw_items(2, recording_gen, uniforms_gen);
+        cx.passes[parent_id].paint_dirty = true;
+        cx.passes[child_id].paint_dirty = true;
+        cx.compute_pass_repaint_order(&mut todo);
+        assert!(!todo.contains(&child_id));
+        assert!(todo.contains(&parent_id));
+        assert!(!cx.passes[child_id].paint_dirty);
+
+        // An explicit request paints an orphan this once.
+        cx.repaint_pass(child_id);
+        cx.compute_pass_repaint_order(&mut todo);
+        assert!(todo.contains(&child_id));
+        cx.passes[child_id].paint_dirty = true;
+        cx.compute_pass_repaint_order(&mut todo);
+        assert!(!todo.contains(&child_id));
+
+        // Re-attached by the current recording: live again.
+        cx.attach_child_pass(child_id, parent_id, Some(list.id()));
+        cx.passes[child_id].paint_dirty = true;
+        cx.compute_pass_repaint_order(&mut todo);
+        assert!(todo.contains(&child_id));
+
+        // A freed attaching list orphans too.
+        drop(list);
+        cx.passes[child_id].paint_dirty = true;
+        cx.compute_pass_repaint_order(&mut todo);
+        assert!(!todo.contains(&child_id));
+    }
+
+    #[test]
+    fn platform_monotonic_time_moves_forward() {
+        let wall = Cx::time_now();
+        let start = Cx::monotonic_now();
+        assert!(wall > 0.0);
+        assert!((wall - start).abs() > 1_000_000.0);
+
+        let mut previous = start;
+        let mut later = start;
+        for _ in 0..1_000_000 {
+            std::hint::spin_loop();
+            later = Cx::monotonic_now();
+            assert!(later >= previous);
+            previous = later;
+            if later > start {
+                break;
+            }
+        }
+        assert!(later - start > 0.0);
+    }
+
+    #[test]
+    fn synchronous_event_handler_reentry_is_rejected() {
+        let calls = Rc::new(Cell::new(0));
+        let handler_calls = calls.clone();
+        let mut cx = Cx::new(Box::new(move |cx, _event| {
+            handler_calls.set(handler_calls.get() + 1);
+            cx.call_event_handler(&Event::Signal);
+        }));
+
+        cx.call_event_handler(&Event::Signal);
+        assert_eq!(calls.get(), 1);
+        assert!(!cx.event_handler_dispatch_active.get());
+
+        cx.call_event_handler(&Event::Signal);
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// A host's `StudioToApp::MouseCancel` reaches the child as a real
+    /// cancellation — `Event::FingerCancel`, which hidden widgets admit —
+    /// never as a MouseUp, and the mouse's press is retired afterwards.
+    #[test]
+    fn a_hosted_mouse_cancel_is_a_finger_cancel_not_a_mouse_up() {
+        let seen = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let mut cx = Cx::new(Box::new(move |_cx, event| {
+            log.borrow_mut().push(event.name().to_string());
+        }));
+        let window = crate::window::WindowId(0, 0);
+        cx.fingers.mouse_down(crate::event::MouseButton::PRIMARY, window);
+        cx.fingers.capture_digit(live_id!(mouse).into(), Area::Empty, Area::Empty, 0.0, crate::makepad_math::dvec2(5.0, 5.0));
+        assert!(cx.fingers.any_areas_captured());
+        // The studio arm is exactly this plus the app-only capture pacing.
+        cx.dispatch_hosted_mouse_cancel(
+            &makepad_studio_protocol::RemoteMouseUp {
+                button_raw_bits: crate::event::MouseButton::PRIMARY.bits(),
+                x: 5.0,
+                y: 5.0,
+                ..Default::default()
+            },
+            window,
+            crate::makepad_math::dvec2(0.0, 0.0),
+        );
+        let seen = seen.borrow();
+        assert!(seen.iter().any(|n| n == "FingerCancel"), "no FingerCancel: {seen:?}");
+        assert!(!seen.iter().any(|n| n == "MouseUp"), "the cancel was dispatched as a MouseUp: {seen:?}");
+        assert!(!cx.fingers.any_areas_captured(), "the cancelled press was not retired");
+    }
+
+    #[test]
+    fn panicking_event_handler_is_restored() {
+        let calls = Rc::new(Cell::new(0));
+        let panic_once = Rc::new(Cell::new(true));
+        let handler_calls = calls.clone();
+        let handler_panic_once = panic_once.clone();
+        let mut cx = Cx::new(Box::new(move |_cx, _event| {
+            handler_calls.set(handler_calls.get() + 1);
+            if handler_panic_once.replace(false) {
+                panic!("intentional event-handler panic");
+            }
+        }));
+        cx.perf_monitor.set_enabled(true);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cx.call_event_handler(&Event::Signal);
+        }));
+        assert!(result.is_err());
+        assert!(!cx.event_handler_dispatch_active.get());
+        assert_eq!(cx.perf_monitor.event_depth.get(), 0);
+
+        cx.call_event_handler(&Event::Signal);
+        assert_eq!(calls.get(), 2);
+    }
+}
+
+/// Hosted-child input pacing, shared by every `--stdin-loop` backend.
+impl Cx {
+    /// Collapse one drained host batch before dispatch: every `Tick` but
+    /// the last goes (one draw per drain, however far behind the child
+    /// fell), and a `MouseMove` that another `MouseMove` follows directly
+    /// is replaced by it (a frame can only show the pointer's latest
+    /// position). Everything else keeps its order, so a Down/Up/Scroll
+    /// still sees the move that preceded it.
+    #[cfg(any(
+        gpusim,
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos")),
+    ))]
+    #[cfg(any(not(linux_direct), use_vulkan))]
+    /// Only the Ticks of a batch fold into its last; every pointer sample
+    /// stays (a touch child's velocity tracker needs each one).
+    #[allow(dead_code)]
+    pub(crate) fn stdin_coalesce_host_ticks(msgs: &mut Vec<StudioToApp>) {
+        let ticks = msgs.iter().filter(|msg| matches!(msg, StudioToApp::Tick)).count();
+        if ticks < 2 {
+            return;
+        }
+        let mut seen = 0;
+        msgs.retain(|msg| {
+            if matches!(msg, StudioToApp::Tick) {
+                seen += 1;
+                seen == ticks
+            } else {
+                true
+            }
+        });
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stdin_coalesce_host_batch(msgs: &mut Vec<StudioToApp>) {
+        let ticks = msgs
+            .iter()
+            .filter(|msg| matches!(msg, StudioToApp::Tick))
+            .count();
+        let move_runs = msgs.windows(2).any(|pair| {
+            matches!(
+                (&pair[0], &pair[1]),
+                (StudioToApp::MouseMove(_), StudioToApp::MouseMove(_))
+            )
+        });
+        if ticks < 2 && !move_runs {
+            return;
+        }
+        let mut seen_ticks = 0;
+        let mut out: Vec<StudioToApp> = Vec::with_capacity(msgs.len());
+        for msg in msgs.drain(..) {
+            match msg {
+                StudioToApp::Tick => {
+                    seen_ticks += 1;
+                    if seen_ticks == ticks {
+                        out.push(StudioToApp::Tick);
+                    }
+                }
+                StudioToApp::MouseMove(e) => {
+                    if matches!(out.last(), Some(StudioToApp::MouseMove(_))) {
+                        out.pop();
+                    }
+                    out.push(StudioToApp::MouseMove(e));
+                }
+                other => out.push(other),
+            }
+        }
+        *msgs = out;
+    }
+
+    /// Pull every host batch that is already queued into `into`, so a
+    /// child that fell behind sees its whole backlog at once and can
+    /// coalesce it. Returns true when the socket closed or failed; the
+    /// caller dispatches what it has and then leaves its loop.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos")),
+    ))]
+    #[cfg(all(not(gpusim), any(not(linux_direct), use_vulkan)))]
+    // The direct Vulkan loop drains inline (it also polls its GPU inbox
+    // between batches); every blocking hosted loop uses this.
+    #[cfg(not(all(target_os = "linux", linux_direct, use_vulkan)))]
+    pub(crate) fn stdin_drain_host_batches(&mut self, into: &mut Vec<StudioToApp>) -> bool {
+        use crate::makepad_micro_serde::*;
+        use crate::web_socket::WebSocketMessage;
+        use makepad_studio_protocol::StudioToAppVec;
+        loop {
+            match self.try_recv_studio_websocket_message() {
+                Some(WebSocketMessage::Binary(data)) => {
+                    match StudioToAppVec::deserialize_bin(&data) {
+                        Ok(msgs) => into.extend(msgs.0),
+                        Err(err) => crate::error!(
+                            "Cant parse studio websocket binary payload in --stdin-loop: {:?}",
+                            err
+                        ),
+                    }
+                }
+                Some(WebSocketMessage::String(text)) => match StudioToApp::deserialize_json(&text) {
+                    Ok(msg) => into.push(msg),
+                    Err(_) => {
+                        if !text.trim().is_empty() {
+                            crate::warning!(
+                                "Ignoring unexpected studio websocket text: {}",
+                                text.trim()
+                            );
+                        }
+                    }
+                },
+                Some(WebSocketMessage::Error(err)) => {
+                    crate::error!("Studio websocket error in --stdin-loop: {}", err);
+                    return true;
+                }
+                Some(WebSocketMessage::Closed) => return true,
+                Some(WebSocketMessage::Opened) => {}
+                None => return false,
+            }
+        }
     }
 }
