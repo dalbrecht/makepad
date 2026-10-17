@@ -6,6 +6,25 @@ pub struct QuadVertex {
     pub pos: Vec2f,
 }
 
+/// One vertex of a closed frame ring: a corner of the unit square, plus which
+/// side of the strip it belongs to (0 = outer edge, 1 = inner edge).
+///
+/// Used by the exploded view's container outlines. They are strips, not quads:
+/// a drawless container must submit no full-plane geometry at all — both
+/// because a plane covered in alpha reads as fog over the layers behind it,
+/// and because the mode doubles as an overdraw instrument, where a covered
+/// pixel has to mean the app painted it.
+#[derive(Clone, Script, ScriptHook)]
+pub struct OutlineVertex {
+    #[live]
+    pub pos: Vec2f,
+    #[live]
+    pub inner: f32,
+    /// std140 wants a 16-byte stride; the generator writes this slot too.
+    #[live]
+    pub pad: f32,
+}
+
 #[derive(Clone, Script, ScriptHook)]
 pub struct VectorVertex {
     #[live]
@@ -51,6 +70,128 @@ pub struct VectorVertex {
     pub zbias: f32,
 }
 
+/// Packed VectorVertex: 12 f32 slots carrying the 19 logical fields —
+/// f16 pairs / unorm8x4 bitcast into single slots, unpacked in the vertex
+/// shader (unpack2f16/unpack4u8). Halves vertex fetch bandwidth; the
+/// precision-critical slots (positions, stroke_mult sentinels, param4
+/// icon-floor composite, param5 depth ladder, zbias 1e-6 steps) stay f32.
+#[derive(Clone, Script, ScriptHook)]
+pub struct VectorVertexPacked {
+    #[live]
+    pub x: f32,
+    #[live]
+    pub y: f32,
+    /// f16(u) | f16(v)
+    #[live]
+    pub uv: f32,
+    /// unorm8 r|g|b|a
+    #[live]
+    pub color: f32,
+    #[live]
+    pub stroke_mult: f32,
+    #[live]
+    pub stroke_dist: f32,
+    /// f16(param0) | f16(shape_id)
+    #[live]
+    pub p0s: f32,
+    /// f16(param1) | f16(param2)
+    #[live]
+    pub p12: f32,
+    /// f16(param3) | f16(clip_radius, clamped)
+    #[live]
+    pub p3c: f32,
+    #[live]
+    pub param4: f32,
+    #[live]
+    pub param5: f32,
+    #[live]
+    pub zbias: f32,
+}
+
+/// Typed map-fill vertex. Compact fields are converted to floats by vertex
+/// fetch; `pos` uses `MAP_VERTEX_POSITION_SCALE` fixed-point tile units.
+#[derive(Clone, Copy, Debug, PartialEq, Script, ScriptHook)]
+#[repr(C)]
+pub struct FillVertexTyped {
+    #[live]
+    pub pos: I16x2,
+    #[live]
+    pub color: UNorm8x4,
+    #[live]
+    pub params: F16x2,
+    #[live]
+    pub zbias: U16x2,
+}
+
+/// Typed map-road vertex. The deck remains exact `f32`; vertex fetch expands
+/// every compact field to the same logical float values used by the shader.
+#[derive(Clone, Copy, Debug, PartialEq, Script, ScriptHook)]
+#[repr(C)]
+pub struct RoadVertexTyped {
+    #[live]
+    pub pos: I16x2,
+    #[live]
+    pub off: F16x2,
+    #[live]
+    pub color: UNorm8x4,
+    #[live]
+    pub params: F16x2,
+    #[live]
+    pub deck: f32,
+    #[live]
+    pub depth: F16x2,
+    #[live]
+    pub uv: F16x2,
+}
+
+/// Typed road-union face vertex: the four `RoadVertexTyped` fields a
+/// grounded Boolean face actually varies. The road shader's other inputs
+/// are constants for such a record — zero expansion offset, zero deck, the
+/// tessellator's fill uv (0.5, 1) — and the face shader substitutes them,
+/// so a face record draws exactly as its 28-byte form did.
+#[derive(Clone, Copy, Debug, PartialEq, Script, ScriptHook)]
+#[repr(C)]
+pub struct FaceVertexTyped {
+    #[live]
+    pub pos: I16x2,
+    #[live]
+    pub color: UNorm8x4,
+    #[live]
+    pub params: F16x2,
+    #[live]
+    pub depth: F16x2,
+}
+
+/// Typed roof vertex. Height stays exact so instanced `f32` walls meet roofs.
+#[derive(Clone, Copy, Debug, PartialEq, Script, ScriptHook)]
+#[repr(C)]
+pub struct RoofVertexTyped {
+    #[live]
+    pub pos: I16x2,
+    #[live]
+    pub color: UNorm8x4,
+    #[live]
+    pub height: f32,
+    #[live]
+    pub params: F16x2,
+}
+
+/// Instanced symbol mesh vertex (map POI icons): screen-px offset from the
+/// instance anchor, f16 uv pair, stroke distance. 16 bytes; the anchor,
+/// colour, zoom floor and depth ride the instance instead of every vertex.
+#[derive(Clone, Script, ScriptHook)]
+pub struct IconVertexPacked {
+    #[live]
+    pub x: f32,
+    #[live]
+    pub y: f32,
+    /// f16(u) | f16(v)
+    #[live]
+    pub uv: f32,
+    #[live]
+    pub stroke_dist: f32,
+}
+
 #[derive(Clone, Script, ScriptHook)]
 pub struct PbrVertex {
     #[live]
@@ -61,6 +202,108 @@ pub struct PbrVertex {
     pub color: Vec4f, // rgba
     #[live]
     pub tangent: Vec4f, // tangent xyz + handedness
+}
+
+/// Packed mesh vertex: 6 f32 slots instead of PbrVertex's 16, for streams
+/// where fetch bandwidth matters more than the last bit of precision —
+/// CPU-skinned characters (re-uploaded every frame), terrain, shadow meshes.
+///
+/// Same idea as [`VectorVertexPacked`]: position stays f32 because it is
+/// precision-critical, everything else is an f16 pair or a unorm8 quad
+/// bitcast into one slot and unpacked in the vertex shader
+/// (`unpack2f16` / `unpack4u8`). Normals are octahedral-encoded, which is
+/// what lets a 3-component unit vector fit in two f16 lanes.
+#[derive(Clone, Script, ScriptHook)]
+pub struct GameMeshVertex {
+    // Flat f32 fields, not a Vec3f: std140 pads a vec3 to 16 bytes, which
+    // would not match the Rust repr(C) size. VectorVertexPacked does the
+    // same for the same reason.
+    #[live]
+    pub px: f32,
+    #[live]
+    pub py: f32,
+    #[live]
+    pub pz: f32,
+    /// f16(oct.x) | f16(oct.y) — octahedral unit normal.
+    #[live]
+    pub nrm: f32,
+    /// f16(u) | f16(v)
+    #[live]
+    pub uv: f32,
+    /// unorm8 r|g|b|a
+    #[live]
+    pub color: f32,
+}
+
+/// [`GameMeshVertex`] plus a second uv, into a baked ambient-occlusion atlas.
+///
+/// A separate type rather than a seventh lane on GameMeshVertex, because the
+/// shadow mesh shares that layout and has no use for an AO coordinate — it
+/// would pay four bytes a vertex for nothing. Props opt in; shadows do not.
+#[derive(Clone, Script, ScriptHook)]
+pub struct GameMeshVertexAo {
+    #[live]
+    pub px: f32,
+    #[live]
+    pub py: f32,
+    #[live]
+    pub pz: f32,
+    /// f16(oct.x) | f16(oct.y) — octahedral unit normal.
+    #[live]
+    pub nrm: f32,
+    /// f16(u) | f16(v) — colormap atlas.
+    #[live]
+    pub uv: f32,
+    /// unorm8 r|g|b|a
+    #[live]
+    pub color: f32,
+    /// f16(u) | f16(v) — AO atlas. Per FRAGMENT occlusion: sampling this per
+    /// vertex instead would carry exactly as much information as a vertex
+    /// bake, which is the thing the atlas exists to escape.
+    #[live]
+    pub ao_uv: f32,
+}
+
+/// [`GameMeshVertex`] plus skinning influences, for GPU-skinned characters:
+/// the REST mesh uploads once and the vertex shader blends it against a
+/// joint-matrix texture, so the per-frame cost is a joint palette instead of
+/// a full posed vertex stream.
+///
+/// No colour lane — character rigs carry their colour in the atlas and the
+/// per-instance tint — and no AO lane, because a deforming mesh cannot carry
+/// a baked occlusion atlas (see GameMeshVertexAo).
+#[derive(Clone, Script, ScriptHook)]
+pub struct GameMeshVertexSkin {
+    #[live]
+    pub px: f32,
+    #[live]
+    pub py: f32,
+    #[live]
+    pub pz: f32,
+    /// f16(oct.x) | f16(oct.y) — octahedral unit normal, rest pose.
+    #[live]
+    pub nrm: f32,
+    /// f16(u) | f16(v) — colormap atlas.
+    #[live]
+    pub uv: f32,
+    /// unorm8x4 — four joint indices. u8 addresses 256 joints; the rigs in
+    /// play carry 7-41.
+    #[live]
+    pub joints: f32,
+    /// unorm8x4 — four blend weights, normalized on load.
+    #[live]
+    pub weights: f32,
+    /// unorm16x2 — uv into the rig's rest-pose AO chart atlas (same packing
+    /// as GameMeshVertexAo.ao_uv: f16 spacing near 1.0 is a whole texel).
+    /// Baked once per rig on the rest mesh; the occlusion rides the skinned
+    /// surface through every pose because topology never changes.
+    #[live]
+    pub ao_uv: f32,
+    #[live]
+    pub color: f32,
+    #[live]
+    pub source_vertex: f32,
+
 }
 
 #[derive(Clone, Script, ScriptHook)]
@@ -98,44 +341,81 @@ pub struct DepthMeshVertex {
 }
 
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+    // Each of these standard shader geometries is a single Cx-owned slot shared by
+    // every VM. A VM (main or Splash isolate) only gets a *non-owning* handle to it,
+    // so tearing an isolate down never frees the slot and the Cx-global shader cache
+    // (which bakes in the geometry id) can't be left pointing at a reclaimed slot.
+    fn shared(vm: &mut ScriptVm, key: LiveId, make: impl FnOnce() -> GeometryGen) -> ScriptValue {
+        let id = vm
+            .cx_mut()
+            .shared_geometry(key, |cx| make().into_geometry(cx));
+        Geometry::new_borrowed(id).into_script_handle(vm)
+    }
+
     let geom = vm.new_module(id!(geom));
     // lets make a Quad geometry here
     set_script_value_to_pod!(vm, geom.QuadVertex);
     // now lets also build a quad vertexbuffer
-    let gen = GeometryGen::from_quad_2d(0., 0., 1., 1.)
-        .into_geometry(vm.cx_mut())
-        .into_script_handle(vm);
+    let gen = shared(vm, id!(QuadGeom), || GeometryGen::from_quad_2d(0., 0., 1., 1.));
     set_script_value!(vm, geom.QuadGeom = gen);
+    // Frame-ring strip for the exploded view's container outlines.
+    set_script_value_to_pod!(vm, geom.OutlineVertex);
+    let ogen = shared(vm, id!(OutlineGeom), GeometryGen::from_outline_ring);
+    set_script_value!(vm, geom.OutlineGeom = ogen);
     // Vector geometry: vertex type + placeholder geom (overridden at draw time)
     set_script_value_to_pod!(vm, geom.VectorVertex);
-    let vgen = GeometryGen::from_triangle_2d()
-        .into_geometry(vm.cx_mut())
-        .into_script_handle(vm);
+    let vgen = shared(vm, id!(VectorGeom), GeometryGen::from_triangle_2d);
     set_script_value!(vm, geom.VectorGeom = vgen);
+    set_script_value_to_pod!(vm, geom.VectorVertexPacked);
+    let vpgen = shared(vm, id!(VectorGeomPacked), GeometryGen::from_triangle_2d_packed);
+    set_script_value!(vm, geom.VectorGeomPacked = vpgen);
+    set_script_value_to_pod!(vm, geom.FillVertexTyped);
+    let fpgen = shared(vm, id!(FillGeomTyped), GeometryGen::from_triangle_2d_fill_typed);
+    set_script_value!(vm, geom.FillGeomTyped = fpgen);
+    // Compact map-road geometry: vertex type + placeholder geom.
+    set_script_value_to_pod!(vm, geom.RoadVertexTyped);
+    let rpgen = shared(vm, id!(RoadGeomTyped), GeometryGen::from_triangle_2d_road_typed);
+    set_script_value!(vm, geom.RoadGeomTyped = rpgen);
+    // Road-union faces: the road record minus its constant fields.
+    set_script_value_to_pod!(vm, geom.FaceVertexTyped);
+    let fcgen = shared(vm, id!(FaceGeomTyped), GeometryGen::from_triangle_2d_face_typed);
+    set_script_value!(vm, geom.FaceGeomTyped = fcgen);
+    set_script_value_to_pod!(vm, geom.RoofVertexTyped);
+    let rpgen = shared(vm, id!(RoofGeomTyped), GeometryGen::from_triangle_2d_roof_typed);
+    set_script_value!(vm, geom.RoofGeomTyped = rpgen);
+    // Instanced icon meshes: vertex type + placeholder geom (the mesh is bound at draw time)
+    set_script_value_to_pod!(vm, geom.IconVertexPacked);
+    let ipgen = shared(vm, id!(IconGeomPacked), GeometryGen::from_triangle_2d_icon_packed);
+    set_script_value!(vm, geom.IconGeomPacked = ipgen);
     // PBR geometry: vertex type + placeholder geom (overridden at draw time)
     set_script_value_to_pod!(vm, geom.PbrVertex);
-    let pgen = GeometryGen::from_triangle_pbr()
-        .into_geometry(vm.cx_mut())
-        .into_script_handle(vm);
+    let pgen = shared(vm, id!(PbrGeom), GeometryGen::from_triangle_pbr);
     set_script_value!(vm, geom.PbrGeom = pgen);
+    // Packed game mesh geometry: 6-slot vertex for bandwidth-bound streams.
+    set_script_value_to_pod!(vm, geom.GameMeshVertex);
+    let gmgen = shared(vm, id!(GameMeshGeom), GeometryGen::from_triangle_game_mesh);
+    set_script_value!(vm, geom.GameMeshGeom = gmgen);
+    // Packed game mesh + AO atlas uv, for props that carry baked occlusion.
+    set_script_value_to_pod!(vm, geom.GameMeshVertexAo);
+    let gmaogen = shared(vm, id!(GameMeshAoGeom), GeometryGen::from_triangle_game_mesh_ao);
+    set_script_value!(vm, geom.GameMeshAoGeom = gmaogen);
+    // GPU-skinned mesh: packed rest vertices + joint indices/weights.
+    set_script_value_to_pod!(vm, geom.GameMeshVertexSkin);
+    let gmskin = shared(vm, id!(GameMeshSkinGeom), GeometryGen::from_triangle_game_mesh_skin);
+    set_script_value!(vm, geom.GameMeshSkinGeom = gmskin);
     // Cube geometry: unit cube in the old geom_pos/geom_normal/geom_uv layout.
     set_script_value_to_pod!(vm, geom.CubeVertex);
-    let cgen = GeometryGen::from_cube_3d(1.0, 1.0, 1.0, 1, 1, 1)
-        .into_cube_vertex_pod()
-        .into_geometry(vm.cx_mut())
-        .into_script_handle(vm);
+    let cgen = shared(vm, id!(CubeGeom), || {
+        GeometryGen::from_cube_3d(1.0, 1.0, 1.0, 1, 1, 1).into_cube_vertex_pod()
+    });
     set_script_value!(vm, geom.CubeGeom = cgen);
     // Ico geometry: minimal pos/normal layout for faceted solids.
     set_script_value_to_pod!(vm, geom.IcoVertex);
-    let igen = GeometryGen::from_triangle_ico()
-        .into_geometry(vm.cx_mut())
-        .into_script_handle(vm);
+    let igen = shared(vm, id!(IcoGeom), GeometryGen::from_triangle_ico);
     set_script_value!(vm, geom.IcoGeom = igen);
     // Depth mesh geometry: position plus per-triangle barycentrics.
     set_script_value_to_pod!(vm, geom.DepthMeshVertex);
-    let dgen = GeometryGen::from_triangle_depth_mesh()
-        .into_geometry(vm.cx_mut())
-        .into_script_handle(vm);
+    let dgen = shared(vm, id!(DepthMeshGeom), GeometryGen::from_triangle_depth_mesh);
     set_script_value!(vm, geom.DepthMeshGeom = dgen);
     NIL
 }
@@ -165,6 +445,66 @@ impl GeometryGen {
     }
 
     /// Placeholder single-triangle geometry for vector drawing (overridden at draw time)
+    pub fn from_triangle_2d_packed() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            g.vertices.extend_from_slice(&crate::vector::pack_vector_record(&[
+                0.0, 0.0, 0.5, 1.0,
+                1.0, 1.0, 1.0, 1.0,
+                1e6, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0,
+                0.0,
+            ]));
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+
+    pub fn from_triangle_2d_icon_packed() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            g.vertices.extend_from_slice(&[0.0, 0.0, crate::vector::pack_pair_f16(0.5, 1.0), 0.0]);
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+
+    pub fn from_triangle_2d_fill_typed() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            g.vertices.extend_from_slice(&[0.0; 4]);
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+    pub fn from_triangle_2d_road_typed() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            g.vertices.extend_from_slice(&[0.0; 7]);
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+
+    pub fn from_triangle_2d_face_typed() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            g.vertices.extend_from_slice(&[0.0; 4]);
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+
+    pub fn from_triangle_2d_roof_typed() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            g.vertices.extend_from_slice(&[0.0; 4]);
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+
     pub fn from_triangle_2d() -> GeometryGen {
         let mut g = Self::default();
         // 3 vertices with full VectorVertex stride (23 floats each)
@@ -188,6 +528,32 @@ impl GeometryGen {
         g
     }
 
+    /// A closed frame ring as a triangle strip: four outer corners of the unit
+    /// square paired with four inner ones, eight triangles round the loop.
+    ///
+    /// Vertex layout is `OutlineVertex` — `(corner.x, corner.y, inner)`. The
+    /// shader places the outer ring on the rect's border and pushes the inner
+    /// ring in by the stroke width, so the only geometry submitted is the
+    /// frame itself; the middle of the container is never rasterized.
+    pub fn from_outline_ring() -> GeometryGen {
+        let mut g = Self::default();
+        let corners = [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        for (x, y) in corners {
+            g.vertices.extend_from_slice(&[x, y, 0.0, 0.0]); // outer
+            g.vertices.extend_from_slice(&[x, y, 1.0, 0.0]); // inner
+        }
+        // Two triangles per side, wrapping the last side back to corner 0.
+        for c in 0..4u32 {
+            let a = c * 2; // this corner, outer
+            let b = a + 1; // this corner, inner
+            let n = ((c + 1) % 4) * 2; // next corner, outer
+            let m = n + 1; // next corner, inner
+            g.indices.extend_from_slice(&[a, n, b]);
+            g.indices.extend_from_slice(&[b, n, m]);
+        }
+        g
+    }
+
     /// Placeholder single-triangle geometry for PBR drawing (overridden at draw time)
     pub fn from_triangle_pbr() -> GeometryGen {
         let mut g = Self::default();
@@ -200,6 +566,42 @@ impl GeometryGen {
                 1.0, 1.0, 1.0, 1.0, // color r, g, b, a
                 1.0, 0.0, 0.0, 1.0, // tx, ty, tz, tw
             ]);
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+
+    /// Placeholder single triangle in the packed GameMeshVertex stride.
+    pub fn from_triangle_game_mesh() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            // pos, nrm(oct 0,0 = +y), uv, color(white)
+            g.vertices
+                .extend_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, f32::from_bits(u32::MAX)]);
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+
+    /// Placeholder single triangle in the packed GameMeshVertexAo stride.
+    pub fn from_triangle_game_mesh_ao() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            // pos, nrm, uv, color(white), ao_uv
+            g.vertices
+                .extend_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, f32::from_bits(u32::MAX), 0.0]);
+        }
+        g.indices.extend_from_slice(&[0, 1, 2]);
+        g
+    }
+
+    /// Placeholder single triangle in the packed GameMeshVertexSkin stride.
+    pub fn from_triangle_game_mesh_skin() -> GeometryGen {
+        let mut g = Self::default();
+        for _ in 0..3 {
+            // pos, nrm, uv, joints(0,0,0,0), weights(1,0,0,0), ao_uv(0,0)
+            g.vertices
+                .extend_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, f32::from_bits(0xff), 0.0, f32::from_bits(0xffff_ffff), 0.0]);
         }
         g.indices.extend_from_slice(&[0, 1, 2]);
         g

@@ -10,7 +10,7 @@ use makepad_live_id::*;
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy, PartialEq)]
 pub enum ShaderBackend {
     #[default]
     Metal,
@@ -20,11 +20,206 @@ pub enum ShaderBackend {
     Rust,
 }
 
+#[cfg(test)]
+mod typed_vertex_tests {
+    use super::*;
+    use crate::{
+        pod::{ScriptPodField, ScriptPodTy, ScriptPodTypeInline},
+        shader::{ShaderIo, ShaderIoKind, ShaderOutput},
+        value::NIL,
+        vm::{ScriptVm, ScriptVmBase, ScriptVmHost},
+    };
+
+    fn field(
+        vm: &ScriptVmBase,
+        name: LiveId,
+        ty: ScriptPodType,
+    ) -> ScriptPodField {
+        ScriptPodField {
+            name,
+            default: NIL,
+            ty: ScriptPodTypeInline {
+                self_ref: ty,
+                data: vm.heap.pod_type_ref(ty).clone(),
+            },
+        }
+    }
+
+    #[test]
+    fn metal_emits_distinct_raw_and_logical_compact_structs() {
+        let mut vm = ScriptVmBase::new();
+        let half2 = vm.code.builtins.pod.pod_f16x2;
+        let f32_ty = vm.code.builtins.pod.pod_f32;
+        let fields = vec![field(&vm, id!(off), half2), field(&vm, id!(depth), f32_ty)];
+        let object = vm.heap.new_object();
+        let ty = vm.heap.new_pod_type(
+            object,
+            Some(id!(MixedVertex)),
+            ScriptPodTy::new_struct(fields),
+            NIL,
+        );
+        let roots = BTreeSet::from([ty]);
+        let mut source = String::new();
+        ShaderBackend::Metal.pod_struct_defs_mixed(&vm.heap, &roots, &roots, &mut source);
+
+        let name = ShaderBackend::Metal.map_pod_name(id!(MixedVertex));
+        let raw_half = ShaderBackend::Metal.map_packed_pod_name(id!(f16x2));
+        let logical_vec = ShaderBackend::Metal.map_pod_name(id!(vec2f));
+        let off = ShaderBackend::Metal.map_field_name(id!(off));
+        assert!(source.contains(&format!("struct {name}Raw {{")), "{source}");
+        assert!(source.contains(&format!("{raw_half} {off};")), "{source}");
+        assert!(source.contains(&format!("struct {name} {{")), "{source}");
+        assert!(source.contains(&format!("{logical_vec} {off};")), "{source}");
+
+        let mut packed_only = String::new();
+        ShaderBackend::Metal.pod_struct_defs_packed(&vm.heap, &roots, &mut packed_only);
+        assert!(packed_only.contains(&format!("struct {name} {{")), "{packed_only}");
+        assert!(!packed_only.contains(&format!("struct {name}Raw {{")), "{packed_only}");
+
+        let mut host = ScriptVmHost::new((), ());
+        let vm = ScriptVm {
+            host: &mut host,
+            bx: Box::new(vm),
+        };
+        let geometry_name = id!(geometry).to_string();
+        let output = ShaderOutput {
+            backend: ShaderBackend::Metal,
+            io: vec![ShaderIo {
+                kind: ShaderIoKind::VertexBuffer,
+                name: id!(geometry),
+                ty,
+                buffer_index: None,
+            }],
+            ..Default::default()
+        };
+        let mut fetch_source = String::new();
+        output.metal_create_vertex_buffer_struct(&vm, &mut fetch_source);
+        assert!(
+            fetch_source.contains(&format!("{name}Raw {geometry_name};")),
+            "{fetch_source}"
+        );
+        assert!(
+            fetch_source.contains(&format!("{name} {geometry_name};")),
+            "{fetch_source}"
+        );
+        assert!(
+            fetch_source.contains(&format!(
+                "out_geom.{geometry_name}.{off} = float2(raw.{geometry_name}.{off});"
+            )),
+            "{fetch_source}"
+        );
+    }
+
+    #[test]
+    fn compact_instances_and_nested_aggregates_are_compile_errors() {
+        let mut vm = ScriptVmBase::new();
+        let half2 = vm.code.builtins.pod.pod_f16x2;
+        let mut output = ShaderOutput::default();
+        output.validate_vertex_fetch_io(
+            &vm.heap,
+            &ShaderIoKind::DynInstance,
+            id!(inst),
+            half2,
+        );
+        assert!(output.error_report().contains("instance buffers are f32-backed"));
+
+        let half_inline = ScriptPodTypeInline {
+            self_ref: half2,
+            data: vm.heap.pod_type_ref(half2).clone(),
+        };
+        let array_object = vm.heap.new_object();
+        let array_ty = vm.heap.new_pod_type(
+            array_object,
+            Some(id!(NestedCompactVertex)),
+            ScriptPodTy::FixedArray {
+                align_of: 2,
+                size_of: 8,
+                len: 2,
+                ty: Box::new(half_inline),
+            },
+            NIL,
+        );
+        output.validate_vertex_fetch_io(
+            &vm.heap,
+            &ShaderIoKind::VertexBuffer,
+            id!(geom),
+            array_ty,
+        );
+        assert!(output.error_report().contains("cannot contain nested structs, arrays, matrices"));
+
+        let matrix_ty = vm.code.builtins.pod.pod_mat4x4f;
+        let mut matrix_output = ShaderOutput::default();
+        matrix_output.validate_vertex_fetch_io(
+            &vm.heap,
+            &ShaderIoKind::VertexBuffer,
+            id!(matrix_geom),
+            matrix_ty,
+        );
+        assert!(
+            matrix_output
+                .error_report()
+                .contains("cannot contain nested structs, arrays, matrices")
+        );
+    }
+
+    // `if a { f() } else { g() }` as a statement leaves its phi as a value
+    // nothing uses. WGSL rejects `_phi_1;` (naga: "expected assignment or
+    // increment/decrement"); the other backends accept a bare expression.
+    #[test]
+    fn discarded_values_are_phony_assigned_in_wgsl() {
+        let mut wgsl = String::new();
+        ShaderBackend::Wgsl.write_discarded_expr(&mut wgsl, "_phi_353", false);
+        ShaderBackend::Wgsl.write_discarded_expr(&mut wgsl, "mix(a, b, t)", false);
+        ShaderBackend::Wgsl.write_discarded_expr(&mut wgsl, "Sdf2d_box(&l_sdf, 1.0)", true);
+        ShaderBackend::Wgsl.write_discarded_expr(&mut wgsl, "", false);
+        assert_eq!(wgsl, "_ = _phi_353;\n_ = mix(a, b, t);\nSdf2d_box(&l_sdf, 1.0);\n");
+
+        for backend in [
+            ShaderBackend::Metal,
+            ShaderBackend::Glsl,
+            ShaderBackend::Hlsl,
+            ShaderBackend::Rust,
+        ] {
+            let mut out = String::new();
+            backend.write_discarded_expr(&mut out, "_phi_353", false);
+            assert_eq!(out, "_phi_353;\n", "{backend:?}");
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ShaderIoPrefix {
     Prefix(&'static str),
     Full(&'static str),
     FullOwned(String),
+}
+
+/// Why a shader IO declaration could not be lowered.
+///
+/// Previously eight bare `panic!()`s. A shader that trips one is usually not
+/// exotic — the commonest by far is reading a geometry attribute from the
+/// fragment stage, which every GPU forbids and which the message now says
+/// outright instead of aborting with no text at all.
+#[cold]
+fn unsupported_shader_io(backend: &ShaderBackend, mode: ShaderMode, io_type: ShaderIoType) -> ! {
+    if io_type == SHADER_IO_VERTEX_BUFFER && matches!(mode, ShaderMode::Fragment) {
+        panic!(
+            "shader: a geometry attribute (self.geom.*) was read in `pixel:`, but vertex \
+             attributes only exist in the vertex stage.\n\
+             Pass it through a varying instead:\n\
+             \n\
+             \x20   v_uv: varying(vec2f)\n\
+             \x20   vertex: fn() {{ self.v_uv = self.geom.geom_uv  ... }}\n\
+             \x20   pixel:  fn() {{ ... self.v_uv ... }}\n\
+             \n\
+             (backend {backend:?})"
+        )
+    }
+    panic!(
+        "shader backend {backend:?}: no lowering for io type {io_type:?} in {mode:?} stage.\n\
+         This is a gap in the shader compiler, not in the shader that hit it — a declaration the \
+         language accepts must lower on every backend, or fail with a message that names it."
+    )
 }
 
 impl ShaderBackend {
@@ -60,7 +255,7 @@ impl ShaderBackend {
                         ),
                         SHADER_IO_VERTEX_BUFFER => (
                             ShaderIoKind::VertexBuffer,
-                            ShaderIoPrefix::Prefix("_io.vb[_iov.vid]."),
+                            ShaderIoPrefix::Prefix("_io.g->"),
                         ),
                         SHADER_IO_FRAGMENT_OUTPUT_0 => {
                             (ShaderIoKind::Varying, ShaderIoPrefix::Prefix(""))
@@ -118,7 +313,7 @@ impl ShaderBackend {
                             ShaderIoPrefix::Prefix("_io.su->"),
                         ),
 
-                        _ => panic!(),
+                        _ => unsupported_shader_io(self, mode, io_type),
                     },
                     ShaderMode::Fragment => {
                         // Check for fragment output range first
@@ -205,10 +400,10 @@ impl ShaderBackend {
                                 ShaderIoKind::ScopeUniform,
                                 ShaderIoPrefix::Prefix("_io.su->"),
                             ),
-                            _ => panic!(),
+                            _ => unsupported_shader_io(self, mode, io_type),
                         }
                     }
-                    _ => panic!(),
+                    _ => unsupported_shader_io(self, mode, io_type),
                 }
             }
             Self::Hlsl => {
@@ -301,7 +496,7 @@ impl ShaderBackend {
                             SHADER_IO_SCOPE_UNIFORM => {
                                 (ShaderIoKind::ScopeUniform, ShaderIoPrefix::Prefix("su_"))
                             }
-                            _ => panic!(),
+                            _ => unsupported_shader_io(self, mode, io_type),
                         }
                     }
                     ShaderMode::Fragment => {
@@ -388,10 +583,10 @@ impl ShaderBackend {
                             SHADER_IO_SCOPE_UNIFORM => {
                                 (ShaderIoKind::ScopeUniform, ShaderIoPrefix::Prefix("su_"))
                             }
-                            _ => panic!(),
+                            _ => unsupported_shader_io(self, mode, io_type),
                         }
                     }
-                    _ => panic!(),
+                    _ => unsupported_shader_io(self, mode, io_type),
                 }
             }
             Self::Rust => {
@@ -484,7 +679,7 @@ impl ShaderBackend {
                         ShaderIoKind::ScopeUniform,
                         ShaderIoPrefix::Prefix("rcx.su_"),
                     ),
-                    _ => panic!(),
+                    _ => unsupported_shader_io(self, mode, io_type),
                 }
             }
             Self::Glsl | Self::Wgsl => {
@@ -573,7 +768,7 @@ impl ShaderBackend {
                     SHADER_IO_SCOPE_UNIFORM => {
                         (ShaderIoKind::ScopeUniform, ShaderIoPrefix::Prefix("su_"))
                     }
-                    _ => panic!(),
+                    _ => unsupported_shader_io(self, mode, io_type),
                 }
             }
         }
@@ -632,29 +827,33 @@ impl ShaderBackend {
     }
 
     pub fn map_local_name(&self, id: LiveId, shadow: usize) -> String {
+        let mut out = String::new();
+        self.write_local_name(&mut out, id, shadow);
+        out
+    }
+
+    pub fn write_local_name(&self, out: &mut String, id: LiveId, shadow: usize) {
         match self {
             Self::Hlsl => {
                 if shadow > 0 {
-                    format!("l_{}_{}", id, shadow)
+                    write!(out, "l_{}_{}", id, shadow).ok();
                 } else {
-                    format!("l_{}", id)
+                    write!(out, "l_{}", id).ok();
                 }
             }
             Self::Glsl => {
-                let base = if id == id!(self) {
-                    "_self".to_string()
+                if id == id!(self) {
+                    out.push_str("l__self");
                 } else {
-                    format!("{}", id)
-                };
+                    write!(out, "l_{}", id).ok();
+                }
                 if shadow > 0 {
-                    format!("l_{}_{}", base, shadow)
-                } else {
-                    format!("l_{}", base)
+                    write!(out, "_{}", shadow).ok();
                 }
             }
             Self::Rust => {
-                let base = if id == id!(self) {
-                    "_self".to_string()
+                if id == id!(self) {
+                    out.push_str("_self");
                 } else if id == id!(type)
                     || id == id!(match)
                     || id == id!(fn)
@@ -683,46 +882,56 @@ impl ShaderBackend {
                     || id == id!(super)
                     || id == id!(crate)
                 {
-                    format!("r#{}", id)
+                    write!(out, "r#{}", id).ok();
                 } else {
-                    format!("{}", id)
-                };
+                    write!(out, "{}", id).ok();
+                }
                 if shadow > 0 {
-                    format!("{}_{}", base, shadow)
-                } else {
-                    base
+                    write!(out, "_{}", shadow).ok();
                 }
             }
             _ => {
                 if shadow > 0 {
-                    format!("_s{}{}", shadow, id)
+                    write!(out, "_s{}{}", shadow, id).ok();
                 } else if id == id!(self) {
-                    "_self".to_string()
+                    out.push_str("_self");
                 } else {
-                    format!("{}", id)
+                    // Prefix like Hlsl/Glsl above: a user-declared local emitted verbatim can
+                    // collide with a reserved word in the target language (e.g. `half`, `kernel`,
+                    // `constant`, `thread` in MSL; WGSL reserves even more), which fails shader
+                    // compilation at runtime.
+                    write!(out, "l_{}", id).ok();
                 }
             }
         }
     }
 
     pub fn map_param_name(&self, id: LiveId, shadow: usize) -> String {
+        let mut out = String::new();
+        self.write_param_name(&mut out, id, shadow);
+        out
+    }
+
+    pub fn write_param_name(&self, out: &mut String, id: LiveId, shadow: usize) {
         if id == id!(self) {
             // Rust and WGSL self params are pointers, so dereference for field access.
             if matches!(self, Self::Rust | Self::Wgsl) {
-                return "(*_self)".to_string();
+                out.push_str("(*_self)");
+                return;
             }
-            return "_self".to_string();
+            out.push_str("_self");
+            return;
         }
         match self {
             Self::Hlsl | Self::Glsl => {
                 if shadow > 0 {
-                    format!("p_{}_{}", id, shadow)
+                    write!(out, "p_{}_{}", id, shadow).ok();
                 } else {
-                    format!("p_{}", id)
+                    write!(out, "p_{}", id).ok();
                 }
             }
-            Self::Rust => self.map_local_name(id, shadow),
-            _ => self.map_local_name(id, shadow),
+            Self::Rust => self.write_local_name(out, id, shadow),
+            _ => self.write_local_name(out, id, shadow),
         }
     }
 
@@ -735,38 +944,58 @@ impl ShaderBackend {
     }
 
     pub fn map_io_name(&self, id: LiveId) -> String {
+        let mut out = String::new();
+        self.write_io_name(&mut out, id);
+        out
+    }
+
+    pub fn write_io_name(&self, out: &mut String, id: LiveId) {
         match self {
-            Self::Hlsl => format!("io_{}", id),
-            Self::Rust => format!("{}", id),
-            _ => format!("{}", id),
+            Self::Hlsl => write!(out, "io_{}", id).ok(),
+            Self::Rust => write!(out, "{}", id).ok(),
+            _ => write!(out, "{}", id).ok(),
+        };
+    }
+
+    pub fn write_prefixed_io_name(&self, out: &mut String, prefix: &ShaderIoPrefix, id: LiveId) {
+        match prefix {
+            ShaderIoPrefix::Prefix(prefix) => {
+                out.push_str(prefix);
+                self.write_io_name(out, id);
+            }
+            ShaderIoPrefix::Full(full) => out.push_str(full),
+            ShaderIoPrefix::FullOwned(full) => out.push_str(full),
         }
     }
 
     pub fn map_field_name(&self, id: LiveId) -> String {
-        self.map_field_name_typed(id, true)
+        let mut out = String::new();
+        self.write_field_name_typed(&mut out, id, true);
+        out
     }
 
     /// Map a field name, with `is_vec_type` indicating whether the parent type is a vec
     /// (where swizzle transformations apply).
-    pub fn map_field_name_typed(&self, id: LiveId, is_vec_type: bool) -> String {
+    pub fn write_field_name_typed(&self, out: &mut String, id: LiveId, is_vec_type: bool) {
         match self {
             Self::Hlsl => {
-                let id_str = format!("{}", id);
+                let start = out.len();
+                write!(out, "{}", id).ok();
+                let id_str = &out[start..];
                 let len = id_str.len();
                 let is_swizzle = (1..=4).contains(&len)
                     && id_str.bytes().all(|c| {
                         matches!(c, b'x' | b'y' | b'z' | b'w' | b'r' | b'g' | b'b' | b'a')
                     });
-                if is_swizzle {
-                    id_str
-                } else {
-                    format!("f_{}", id_str)
+                if !is_swizzle {
+                    out.insert_str(start, "f_");
                 }
             }
             Self::Rust => {
                 let id_str = format!("{}", id);
                 if !is_vec_type {
-                    return id_str;
+                    out.push_str(&id_str);
+                    return;
                 }
                 let len = id_str.len();
                 let is_swizzle_char =
@@ -785,21 +1014,23 @@ impl ShaderBackend {
                             other => other,
                         })
                         .collect();
-                    format!("{}()", mapped)
+                    write!(out, "{}()", mapped).ok();
                 } else if all_swizzle && len == 1 {
                     // Single-char field access: map rgba to xyzw
-                    match id_str.as_str() {
-                        "r" => "x".to_string(),
-                        "g" => "y".to_string(),
-                        "b" => "z".to_string(),
-                        "a" => "w".to_string(),
-                        other => other.to_string(),
-                    }
+                    out.push_str(match id_str.as_str() {
+                        "r" => "x",
+                        "g" => "y",
+                        "b" => "z",
+                        "a" => "w",
+                        other => other,
+                    });
                 } else {
-                    id_str
+                    out.push_str(&id_str);
                 }
             }
-            _ => format!("{}", id),
+            _ => {
+                write!(out, "{}", id).ok();
+            }
         }
     }
 
@@ -844,6 +1075,21 @@ impl ShaderBackend {
                 write!(out, "let mut {}: {} = {};\n", var_name, ty_name, zero).ok();
             }
         }
+    }
+
+    /// Writes `expr` as a statement whose value nothing uses. WGSL accepts
+    /// only a call, an assignment or an increment/decrement as a statement,
+    /// so a bare value (`_phi_12;`, `(a + b);`, `mix(a, b, t);` — `mix` is
+    /// `@must_use`) goes through the phony assignment `_ = expr;`. A void call
+    /// cannot be phony-assigned, so `is_void` keeps it bare everywhere.
+    pub fn write_discarded_expr(&self, out: &mut String, expr: &str, is_void: bool) {
+        if expr.is_empty() {
+            return;
+        }
+        match self {
+            Self::Wgsl if !is_void => write!(out, "_ = {};\n", expr).ok(),
+            _ => write!(out, "{};\n", expr).ok(),
+        };
     }
 
     /// Returns the zero literal for a given backend type name.
@@ -1050,6 +1296,10 @@ impl ShaderBackend {
                 id_lut!(packed_half2);
                 id_lut!(packed_half3);
                 id_lut!(packed_half4);
+                id_lut!(packed_short2);
+                id_lut!(packed_ushort2);
+                id_lut!(uchar4);
+                id_lut!(char4);
                 id_lut!(packed_uint2);
                 id_lut!(packed_uint3);
                 id_lut!(packed_uint4);
@@ -1074,6 +1324,8 @@ impl ShaderBackend {
                 id_lut!(ddx);
                 id_lut!(ddy);
                 id_lut!(_mp_inverse);
+                id_lut!(_mp_unpack2f16);
+                id_lut!(_mp_unpack4u8);
                 id_lut!(rsqrt);
                 id_lut!(fmod);
                 id_lut!(frac);
@@ -1105,8 +1357,16 @@ impl ShaderBackend {
                 id_lut!(inverse);
                 id_lut!(inversesqrt);
                 id_lut!(mod);
+                // Packed-attribute unpack wrappers (emitted in the GLSL
+                // preamble). Without lut registration the ids print as
+                // hex hashes — invalid identifiers starting with digits.
+                id_lut!(_mp_unpack2f16);
+                id_lut!(_mp_unpack4u8);
             }
             Self::Wgsl => {
+                id_lut!(_mp_type_shared);
+                id_lut!(_mp_unpack2f16);
+                id_lut!(_mp_unpack4u8);
                 // Builtin function names
                 id_lut!(dpdx);
                 id_lut!(dpdy);
@@ -1128,6 +1388,8 @@ impl ShaderBackend {
                 id!(dFdx) => id!(dfdx),
                 id!(dFdy) => id!(dfdy),
                 id!(inverse) => id!(_mp_inverse),
+                id!(unpack2f16) => id!(_mp_unpack2f16),
+                id!(unpack4u8) => id!(_mp_unpack4u8),
                 id!(inverseSqrt) => id!(rsqrt),
                 id!(modf) => id!(fmod),
                 id!(discard) => id!(discard_fragment),
@@ -1140,6 +1402,8 @@ impl ShaderBackend {
                 id!(modf) => id!(fmod),
                 id!(fract) => id!(frac),
                 id!(mix) => id!(lerp),
+                id!(unpack2f16) => id!(_mp_unpack2f16),
+                id!(unpack4u8) => id!(_mp_unpack4u8),
                 x => x,
             },
             Self::Glsl => {
@@ -1148,6 +1412,8 @@ impl ShaderBackend {
                     id!(inverseSqrt) => id!(inversesqrt),
                     id!(modf) => id!(mod),
                     id!(atan2) => id!(atan),
+                    id!(unpack2f16) => id!(_mp_unpack2f16),
+                    id!(unpack4u8) => id!(_mp_unpack4u8),
                     x => x,
                 }
             }
@@ -1157,6 +1423,11 @@ impl ShaderBackend {
                     id!(dFdx) => id!(dpdx),
                     id!(dFdy) => id!(dpdy),
                     id!(inverseSqrt) => id!(inverseSqrt),
+                    // WGSL helpers to be emitted when the backend lands:
+                    // fn _mp_unpack2f16(x: f32) -> vec2<f32> {
+                    //     return unpack2x16float(bitcast<u32>(x)); }
+                    id!(unpack2f16) => id!(_mp_unpack2f16),
+                    id!(unpack4u8) => id!(_mp_unpack4u8),
                     x => x,
                 }
             }
@@ -1168,6 +1439,8 @@ impl ShaderBackend {
                     id!(dFdx) => id!(dFdx),               // no-op in CPU (returns 0)
                     id!(dFdy) => id!(dFdy),               // no-op in CPU (returns 0)
                     id!(discard) => id!(discard),         // no-op in CPU
+                    id!(unpack2f16) => id!(unpack2f16),   // shader_runtime impl
+                    id!(unpack4u8) => id!(unpack4u8),     // shader_runtime impl
                     x => x,
                 }
             }
@@ -1210,6 +1483,14 @@ impl ShaderBackend {
                     id!(mat4x2f) => id!(float4x2),
                     id!(mat4x3f) => id!(float4x3),
                     id!(mat4x4f) => id!(float4x4),
+                    id!(f16x2) => id!(packed_half2),
+                    id!(f16x4) => id!(packed_half4),
+                    id!(u16x2) => id!(packed_ushort2),
+                    id!(i16x2) => id!(packed_short2),
+                    id!(unorm16x2) => id!(packed_ushort2),
+                    id!(snorm16x2) => id!(packed_short2),
+                    id!(unorm8x4) => id!(uchar4),
+                    id!(snorm8x4) => id!(char4),
                     x => x,
                 }
             }
@@ -1280,7 +1561,13 @@ impl ShaderBackend {
                     x => x,
                 }
             }
-            Self::Wgsl | Self::Rust => name_in,
+            Self::Wgsl => match name_in {
+                // Inline uniform structs can inherit their field's name.
+                // `shared` is legal Splash, but reserved by WGSL.
+                id!(shared) => id!(_mp_type_shared),
+                name => name,
+            },
+            Self::Rust => name_in,
         }
     }
 
@@ -1301,7 +1588,29 @@ impl ShaderBackend {
             let pod_type = heap.pod_type_ref(ty);
             if let ScriptPodTy::Struct { .. } = &pod_type.ty {
                 let mut referenced = BTreeSet::new();
-                self.pod_type_def_impl(heap, ty, &mut referenced, out, false);
+                self.pod_type_def_impl(heap, ty, &mut referenced, out, false, false);
+            }
+        }
+    }
+
+    pub fn pod_struct_defs_packed(
+        &self,
+        heap: &ScriptHeap,
+        root_structs: &BTreeSet<ScriptPodType>,
+        out: &mut String,
+    ) {
+        let mut visited = BTreeSet::new();
+        let mut order = Vec::new();
+
+        for root in root_structs {
+            self.pod_struct_visit(heap, *root, &mut visited, &mut order);
+        }
+
+        for ty in order {
+            let pod_type = heap.pod_type_ref(ty);
+            if let ScriptPodTy::Struct { .. } = &pod_type.ty {
+                let mut referenced = BTreeSet::new();
+                self.pod_type_def_impl(heap, ty, &mut referenced, out, true, false);
             }
         }
     }
@@ -1319,7 +1628,7 @@ impl ShaderBackend {
             self.pod_struct_visit(heap, *root, &mut packed_visited, &mut packed_order);
         }
 
-        let mut plain_visited = packed_visited.clone();
+        let mut plain_visited = BTreeSet::new();
         let mut plain_order = Vec::new();
         for root in plain_root_structs {
             self.pod_struct_visit(heap, *root, &mut plain_visited, &mut plain_order);
@@ -1329,7 +1638,7 @@ impl ShaderBackend {
             let pod_type = heap.pod_type_ref(ty);
             if let ScriptPodTy::Struct { .. } = &pod_type.ty {
                 let mut referenced = BTreeSet::new();
-                self.pod_type_def_impl(heap, ty, &mut referenced, out, true);
+                self.pod_type_def_impl(heap, ty, &mut referenced, out, true, true);
             }
         }
 
@@ -1337,7 +1646,7 @@ impl ShaderBackend {
             let pod_type = heap.pod_type_ref(ty);
             if let ScriptPodTy::Struct { .. } = &pod_type.ty {
                 let mut referenced = BTreeSet::new();
-                self.pod_type_def_impl(heap, ty, &mut referenced, out, false);
+                self.pod_type_def_impl(heap, ty, &mut referenced, out, false, false);
             }
         }
     }
@@ -1385,7 +1694,7 @@ impl ShaderBackend {
         referenced: &mut BTreeSet<ScriptPodType>,
         out: &mut String,
     ) {
-        self.pod_type_def_impl(heap, pod_ty, referenced, out, false)
+        self.pod_type_def_impl(heap, pod_ty, referenced, out, false, false)
     }
 
     fn pod_type_def_impl(
@@ -1395,6 +1704,7 @@ impl ShaderBackend {
         referenced: &mut BTreeSet<ScriptPodType>,
         out: &mut String,
         packed_fields: bool,
+        raw_struct_names: bool,
     ) {
         let pod_type = heap.pod_type_ref(pod_ty);
         if let ScriptPodTy::Struct { fields, .. } = &pod_type.ty {
@@ -1403,7 +1713,12 @@ impl ShaderBackend {
                 writeln!(out, "#[repr(C)]").ok();
             }
             if let Some(name) = pod_type.name {
-                writeln!(out, "struct {} {{", self.map_pod_name(name)).ok();
+                let name = self.map_pod_name(name);
+                if raw_struct_names && matches!(self, Self::Metal) {
+                    writeln!(out, "struct {}Raw {{", name).ok();
+                } else {
+                    writeln!(out, "struct {} {{", name).ok();
+                }
             } else {
                 writeln!(out, "struct S{} {{", pod_ty.index).ok();
             };
@@ -1418,10 +1733,16 @@ impl ShaderBackend {
                                 referenced,
                                 out,
                                 packed_fields,
+                                raw_struct_names,
                             );
                         } else {
                             if packed_fields {
-                                self.pod_type_name_packed_referenced(&field.ty, referenced, out);
+                                self.pod_type_name_packed_referenced(
+                                    &field.ty,
+                                    referenced,
+                                    out,
+                                    raw_struct_names,
+                                );
                             } else {
                                 self.pod_type_name_referenced(&field.ty, referenced, out);
                             }
@@ -1489,6 +1810,7 @@ impl ShaderBackend {
         referenced: &mut BTreeSet<ScriptPodType>,
         out: &mut String,
         packed: bool,
+        raw_struct_names: bool,
     ) {
         let mut dims = String::new();
         let mut curr = ty;
@@ -1502,7 +1824,12 @@ impl ShaderBackend {
             }
         }
         if packed {
-            self.pod_type_name_packed_referenced(curr, referenced, out);
+            self.pod_type_name_packed_referenced(
+                curr,
+                referenced,
+                out,
+                raw_struct_names,
+            );
         } else {
             self.pod_type_name_referenced(curr, referenced, out);
         }
@@ -1542,22 +1869,37 @@ impl ShaderBackend {
         ty: &ScriptPodTypeInline,
         referenced: &mut BTreeSet<ScriptPodType>,
         out: &mut String,
+        raw_struct_names: bool,
     ) {
         match &ty.data.ty {
             ScriptPodTy::Struct { .. } => {
                 referenced.insert(ty.self_ref);
                 let name = ty.data.name.unwrap();
                 let name = self.map_pod_name(name);
-                write!(out, "{}", name).ok();
+                if raw_struct_names && matches!(self, Self::Metal) {
+                    write!(out, "{}Raw", name).ok();
+                } else {
+                    write!(out, "{}", name).ok();
+                }
             }
             ScriptPodTy::FixedArray { ty: inner, len, .. } => {
                 out.push_str("array<");
-                self.pod_type_name_packed_referenced(inner, referenced, out);
+                self.pod_type_name_packed_referenced(
+                    inner,
+                    referenced,
+                    out,
+                    raw_struct_names,
+                );
                 write!(out, ", {}>", len).ok();
             }
             ScriptPodTy::VariableArray { ty: inner, .. } => {
                 out.push_str("array<");
-                self.pod_type_name_packed_referenced(inner, referenced, out);
+                self.pod_type_name_packed_referenced(
+                    inner,
+                    referenced,
+                    out,
+                    raw_struct_names,
+                );
                 out.push_str(">");
             }
             _ => self.pod_type_name_packed(ty, out),
@@ -1613,6 +1955,17 @@ impl ShaderBackend {
             ScriptPodTy::Mat(m) => write!(out, "{}", self.map_packed_pod_name(m.name()))
                 .ok()
                 .unwrap_or(()),
+            ScriptPodTy::Packed(p) => write!(out, "{}", self.map_packed_pod_name(p.name()))
+                .ok()
+                .unwrap_or(()),
+            ScriptPodTy::Struct { .. } => {
+                let name = self.map_pod_name(ty.data.name.unwrap());
+                if matches!(self, Self::Metal) {
+                    write!(out, "{}Raw", name).ok().unwrap_or(())
+                } else {
+                    write!(out, "{}", name).ok().unwrap_or(())
+                }
+            }
             // For other types, fall back to regular type names
             _ => self.pod_type_name(ty, out),
         }
@@ -1661,6 +2014,17 @@ impl ShaderBackend {
                 out.push_str("array<");
                 self.pod_type_name(inner, out);
                 out.push_str(">");
+            }
+            // Compact fetch formats are logical vec2f / vec4f in shader code.
+            ScriptPodTy::Packed(p) => {
+                let logical = if p.is_vec4() {
+                    id!(vec4f)
+                } else {
+                    id!(vec2f)
+                };
+                write!(out, "{}", self.map_pod_name(logical))
+                    .ok()
+                    .unwrap_or(());
             }
             _ => out.push_str("unknown"),
         }

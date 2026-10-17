@@ -1,5 +1,6 @@
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use makepad_live_id::LiveId;
@@ -36,6 +37,12 @@ impl NetworkRuntime {
 
     pub fn set_wake_fn(&self, wake_fn: Option<Arc<dyn Fn() + Send + Sync>>) {
         self.sink.set_wake_fn(wake_fn);
+    }
+
+    /// Events of `socket_id` are delivered without waking or signaling the
+    /// UI thread: its loop blocks on this runtime and reads them itself.
+    pub fn set_quiet_socket(&self, socket_id: Option<LiveId>) {
+        self.sink.set_quiet_socket(socket_id);
     }
 
     pub fn http_start(&self, request_id: LiveId, request: HttpRequest) -> Result<(), NetworkError> {
@@ -78,8 +85,18 @@ impl NetworkRuntime {
             .map_err(|_| NetworkError::ChannelClosed)
     }
 
+    // Timed std channel waits read an unavailable clock on wasm workers.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn recv_timeout(&self, duration: Duration) -> Option<NetworkResponse> {
-        self.receiver.lock().ok()?.recv_timeout(duration).ok()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.receiver.lock().ok()?.recv_timeout(duration).ok()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = duration;
+            self.try_recv()
+        }
     }
 }
 
@@ -139,6 +156,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn runtime_supports_headless_queue_and_wake_fn() {
         let runtime = NetworkRuntime::with_backend(Arc::new(TestBackend));

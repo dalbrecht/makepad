@@ -1,4 +1,5 @@
 use crate::apple::{AppleOs, AppleTarget};
+use crate::font_assets::{is_font_path, remove_existing_fonts, FontAssetManifest, FontPackage};
 use crate::makepad_shell::*;
 use crate::utils::*;
 use std::path::{Path, PathBuf};
@@ -236,7 +237,7 @@ pub fn list_profiles()->Result<(), String>{
 }
 */
 impl PlistValues {
-    fn to_plist_file(&self, os: AppleOs) -> String {
+    pub(super) fn to_plist_file(&self, os: AppleOs) -> String {
         match os {
             AppleOs::Tvos => self.to_tvos_plist_file(),
             AppleOs::Ios => self.to_ios_plist_file(),
@@ -262,6 +263,8 @@ impl PlistValues {
                 <string>{version}</string>
                 <key>CFBundleShortVersionString</key>
                 <string>{version}</string>
+                <key>CFBundleDevelopmentRegion</key>
+                <string>en</string>
                 <key>CFBundleIconName</key>
                 <string>AppIcon</string>
                 <key>UILaunchStoryboardName</key>
@@ -446,12 +449,30 @@ impl Scent {
     }
 }
 
-/// Generate and compile an Asset Catalog with AppIcon from the crate's
-/// `resources/` directory.  Requires a 1024×1024 PNG at minimum
-/// (`icon_1024.png`).  Smaller sizes are optional; iOS will scale down
-/// from the largest available.
+/// Generate and compile an Asset Catalog with AppIcon for iOS.
+///
+/// Two sources are supported, in priority order:
+/// 1. A project-supplied catalog at `<crate>/packaging/ios/icons/Assets.xcassets/`
+///    with an `AppIcon.appiconset/` inside. This is preferred because iOS
+///    icons must be fully opaque with no baked-in rounded corners — the
+///    macOS-style `resources/icon_1024.png` (transparent corners, baked
+///    squircle, drop shadow) renders with a black border on iOS.
+/// 2. Fallback: synthesize a catalog from `resources/icon_1024.png`.
 fn generate_app_icon_xcassets(app_dir: &Path, build_crate: &str) -> Result<bool, String> {
     let crate_dir = get_crate_dir(build_crate)?;
+
+    let project_xcassets = crate_dir
+        .join("packaging")
+        .join("ios")
+        .join("icons")
+        .join("Assets.xcassets");
+    if project_xcassets.join("AppIcon.appiconset").is_dir() {
+        let xcassets = app_dir.join("Assets.xcassets");
+        cp_all(&project_xcassets, &xcassets, false)?;
+        copy_loose_iphone_icons(&xcassets.join("AppIcon.appiconset"), app_dir)?;
+        return compile_xcassets(&xcassets, app_dir);
+    }
+
     let res = crate_dir.join("resources");
     let icon_1024 = res.join("icon_1024.png");
     if !icon_1024.is_file() {
@@ -598,7 +619,35 @@ fn generate_app_icon_xcassets(app_dir: &Path, build_crate: &str) -> Result<bool,
         r#"{"info":{"author":"cargo-makepad","version":1}}"#,
     )?;
 
-    // Compile with actool
+    compile_xcassets(&xcassets, app_dir)
+}
+
+/// Copy the iPhone/iPad primary icon PNGs from a project-supplied
+/// AppIcon.appiconset into the bundle root with iOS's conventional
+/// `<basename>@<scale>x[~ipad].png` filenames. These act as a fallback for
+/// the CFBundleIcons entries actool merges into Info.plist, so iOS can
+/// still find an icon if `Assets.car` is missing, stale, or unreadable.
+/// Source filenames not present are silently skipped.
+fn copy_loose_iphone_icons(appiconset: &Path, app_dir: &Path) -> Result<(), String> {
+    let pairs: &[(&str, &str)] = &[
+        ("AppIcon120x120.png", "AppIcon60x60@2x.png"),
+        ("AppIcon180x180.png", "AppIcon60x60@3x.png"),
+        ("AppIcon152x152.png", "AppIcon76x76@2x~ipad.png"),
+        ("AppIcon167x167.png", "AppIcon83.5x83.5@2x~ipad.png"),
+    ];
+    for (src_name, dst_name) in pairs {
+        let src = appiconset.join(src_name);
+        if src.is_file() {
+            cp(&src, &app_dir.join(dst_name), false)?;
+        }
+    }
+    Ok(())
+}
+
+/// Invoke `actool` to compile an Assets.xcassets directory into `Assets.car`
+/// inside `app_dir`, then merge actool's partial Info.plist (which contains
+/// the CFBundleIcons keys iOS 15 expects) into the app's main Info.plist.
+fn compile_xcassets(xcassets: &Path, app_dir: &Path) -> Result<bool, String> {
     let cwd = std::env::current_dir().unwrap();
     shell_env_cap(
         &[],
@@ -620,12 +669,9 @@ fn generate_app_icon_xcassets(app_dir: &Path, build_crate: &str) -> Result<bool,
         ],
     )?;
 
-    // Merge actool's partial Info.plist (contains CFBundleIcons for iOS 15)
-    // into the main Info.plist.
     let actool_plist = app_dir.join("actool-Info.plist");
     if actool_plist.is_file() {
         let main_plist = app_dir.join("Info.plist");
-        // PlistBuddy Merge copies all keys from source into destination
         shell_env_cap(
             &[],
             &cwd,
@@ -646,6 +692,7 @@ pub struct IosBuildResult {
     pub build_dir: PathBuf,
     pub plist: PlistValues,
     pub dst_bin: PathBuf,
+    pub font_manifest: FontAssetManifest,
 }
 
 pub fn build(
@@ -656,18 +703,46 @@ pub fn build(
     apple_target: AppleTarget,
 ) -> Result<IosBuildResult, String> {
     let build_crate = get_build_crate_from_args(args)?;
+    let cwd = std::env::current_dir().unwrap();
+    let info_plist = crate::apple::info_plist::load(&cwd, build_crate, apple_target.os())?;
     let binary_name =
         get_package_binary_name(build_crate).unwrap_or_else(|| build_crate.to_string());
 
-    let cwd = std::env::current_dir().unwrap();
+    // Capitalize the first letter for the user-visible name (CFBundleDisplayName /
+    // CFBundleName) so the iOS home-screen icon doesn't show a lowercased crate name,
+    // while keeping the bundle identifier lowercase so existing provisioning profiles
+    // still match.
+    let display_name = {
+        let mut chars = product.chars();
+        match chars.next() {
+            Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        }
+    };
+    let plist = PlistValues {
+        identifier: format!("{org}.{product}").to_string(),
+        display_name: display_name.clone(),
+        name: display_name,
+        executable: binary_name.clone(),
+        version: "1.0.0".to_string(),
+    };
+    let generated_plist = plist.to_plist_file(apple_target.os());
+    let plist_contents = match info_plist {
+        Some(overrides) => overrides.merge(&generated_plist)?,
+        None => generated_plist,
+    };
+
     let target_dir = cargo_target_dir(&cwd);
     let target_dir_str = target_dir.to_string_lossy().to_string();
     let target_dir_arg = format!("--target-dir={target_dir_str}");
     let target_opt = format!("--target={}", apple_target.toolchain());
 
+    // Channel resolution lives on AppleTarget: tvOS always nightly (build-std),
+    // iOS stable unless `--nightly`. This keeps the build channel consistent
+    // with what `install-toolchain` provisioned for the same target.
     let base_args = &[
         "run",
-        if stable { "stable" } else { "nightly" },
+        apple_target.rust_channel(stable),
         "cargo",
         "build",
         &target_opt,
@@ -687,7 +762,9 @@ pub fn build(
 
     let mut rust_env = vec![
         ("RUST_BACKTRACE", "1"),
-        ("MAKEPAD", if stable { "" } else { "lines" }),
+        // The aws-lc-sys crate requires the cmake builder (not the cc builder)
+        // for iOS/tvOS cross-compilation targets.
+        ("AWS_LC_SYS_CMAKE_BUILDER", "1"),
     ];
     if matches!(apple_target.os(), AppleOs::Ios) {
         rust_env.push(("IPHONEOS_DEPLOYMENT_TARGET", IOS_DEPLOYMENT_TARGET));
@@ -695,15 +772,15 @@ pub fn build(
     }
     shell_env(&rust_env, &cwd, "rustup", &args_out)?;
 
-    // alright lets make the .app file with manifest
-    let plist = PlistValues {
-        identifier: format!("{org}.{product}").to_string(),
-        display_name: product.to_string(),
-        name: product.to_string(),
-        executable: binary_name.clone(),
-        version: "1.0.0".to_string(),
-    };
+    // Read the application contract directly from the freshly linked Mach-O before copying or
+    // signing can transform the binary.
     let profile = get_profile_from_args(args);
+    let build_dir = target_dir.join(format!("{}/{profile}/", apple_target.toolchain()));
+    let src_bin = target_dir.join(format!(
+        "{}/{profile}/{binary_name}",
+        apple_target.toolchain()
+    ));
+    let font_manifest = FontAssetManifest::from_native_file(&src_bin)?;
 
     let app_dir = target_dir.join(format!(
         "makepad-apple-app/{}/{profile}/{build_crate}.app",
@@ -712,7 +789,7 @@ pub fn build(
     mkdir(&app_dir)?;
 
     let plist_file = app_dir.join("Info.plist");
-    write_text(&plist_file, &plist.to_plist_file(apple_target.os()))?;
+    write_text(&plist_file, &plist_contents)?;
 
     if matches!(apple_target.os(), AppleOs::Ios) {
         match generate_app_icon_xcassets(&app_dir, build_crate) {
@@ -728,11 +805,6 @@ pub fn build(
         }
     }
 
-    let build_dir = target_dir.join(format!("{}/{profile}/", apple_target.toolchain()));
-    let src_bin = target_dir.join(format!(
-        "{}/{profile}/{binary_name}",
-        apple_target.toolchain()
-    ));
     let dst_bin = app_dir.join(binary_name.clone());
 
     cp(&src_bin, &dst_bin, false)?;
@@ -742,6 +814,7 @@ pub fn build(
         app_dir,
         plist,
         dst_bin,
+        font_manifest,
     })
 }
 
@@ -771,6 +844,7 @@ pub fn run_on_sim(
         build_crate,
         &result.build_dir,
         apple_target,
+        &result.font_manifest,
     )?;
     let app_dir = result.app_dir.into_os_string().into_string().unwrap();
 
@@ -986,53 +1060,133 @@ pub fn copy_resources(
     build_crate: &str,
     build_dir: &Path,
     apple_target: AppleTarget,
+    font_manifest: &FontAssetManifest,
 ) -> Result<(), String> {
-    /*let mut assets_to_add: Vec<String> = Vec::new();*/
-    let add_assets_dir =
-        |crate_name: &str, source_dir: &Path, asset_subdir: &str| -> Result<(), String> {
-            if !source_dir.is_dir() {
-                return Ok(());
-            }
-            let crate_name = crate_name.replace('-', "_");
-            let dst_dir = app_dir.join(format!("makepad/{crate_name}/{asset_subdir}"));
-            mkdir(&dst_dir)?;
-            cp_all(source_dir, &dst_dir, false)?;
-            Ok(())
-        };
-    let add_font_assets_dir = |crate_name: &str, source_dir: &Path| -> Result<(), String> {
-        if !source_dir.is_dir() {
-            return Ok(());
-        }
-        let crate_name = crate_name.replace('-', "_");
-        let dst_dir = app_dir.join(format!("makepad/{crate_name}/fonts"));
-        let assets = ls(source_dir)?;
-        for path in &assets {
-            let ext = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.to_ascii_lowercase());
-            if !matches!(
-                ext.as_deref(),
-                Some("ttf" | "otf" | "ttc" | "woff" | "woff2")
-            ) {
-                continue;
-            }
-            cp(&source_dir.join(path), &dst_dir.join(path), false)?;
-        }
-        Ok(())
-    };
+    remove_existing_fonts(&app_dir.join("makepad"))?;
+    let mut font_package = FontPackage::new(font_manifest);
 
     let build_crate_dir = get_crate_dir(build_crate)?;
-    add_assets_dir(build_crate, &build_crate_dir.join("resources"), "resources")?;
-    add_font_assets_dir(build_crate, &build_crate_dir.join("fonts"))?;
+    add_apple_resources_dir(
+        app_dir,
+        build_crate,
+        &build_crate_dir.join("resources"),
+        &mut font_package,
+    )?;
+    add_apple_font_assets_dir(
+        app_dir,
+        build_crate,
+        &build_crate_dir.join("fonts"),
+        &build_crate_dir.join("resources"),
+        &mut font_package,
+    )?;
 
     let deps = get_crate_dep_dirs(build_crate, &build_dir, apple_target.toolchain());
     for (name, dep_dir) in deps.iter() {
-        add_assets_dir(name, &dep_dir.join("resources"), "resources")?;
-        add_font_assets_dir(name, &dep_dir.join("fonts"))?;
+        add_apple_resources_dir(
+            app_dir,
+            name,
+            &dep_dir.join("resources"),
+            &mut font_package,
+        )?;
+        add_apple_font_assets_dir(
+            app_dir,
+            name,
+            &dep_dir.join("fonts"),
+            &dep_dir.join("resources"),
+            &mut font_package,
+        )?;
     }
 
+    font_package.finish()?.print();
     Ok(())
+}
+
+fn add_apple_resources_dir(
+    app_dir: &Path,
+    crate_name: &str,
+    source_dir: &Path,
+    font_package: &mut FontPackage<'_>,
+) -> Result<(), String> {
+    let crate_name = crate_name.replace('-', "_");
+    font_package.copy_tree_filtered(
+        source_dir,
+        &app_dir.join(format!("makepad/{crate_name}/resources")),
+        &format!("{crate_name}/resources"),
+        |relative| relative.starts_with("android"),
+        |_| Ok(()),
+    )
+}
+
+fn add_apple_font_assets_dir(
+    app_dir: &Path,
+    crate_name: &str,
+    source_dir: &Path,
+    resource_dir: &Path,
+    font_package: &mut FontPackage<'_>,
+) -> Result<(), String> {
+    let crate_name = crate_name.replace('-', "_");
+    let dst_dir = app_dir.join(format!("makepad/{crate_name}/fonts"));
+    font_package.copy_tree_filtered(
+        source_dir,
+        &dst_dir,
+        &format!("{crate_name}/fonts"),
+        |relative| {
+            let supported = relative
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "ttf" | "otf" | "ttc" | "woff" | "woff2"
+                    )
+                })
+                .unwrap_or(false);
+            !supported || (!is_font_path(relative) && resource_dir.join(relative).is_file())
+        },
+        |_| Ok(()),
+    )
+}
+
+#[cfg(test)]
+mod font_asset_tests {
+    use super::add_apple_resources_dir;
+    use crate::font_assets::{FontAssetManifest, FontPackage};
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn apple_bundle_resources_use_the_manifest_allowlist() {
+        let manifest = FontAssetManifest::parse(
+            b"format=makepad.font-assets.v1\nset=Latin\nasset=demo_app/resources/latin.otf\n",
+        )
+        .unwrap();
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cargo-makepad-apple-fonts-{}-{serial}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let app_dir = root.join("Demo.app");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("latin.otf"), b"latin").unwrap();
+        fs::write(source.join("international.otf"), b"international").unwrap();
+        fs::write(source.join("data.bin"), b"data").unwrap();
+
+        let mut package = FontPackage::new(&manifest);
+        add_apple_resources_dir(&app_dir, "demo-app", &source, &mut package).unwrap();
+        package.finish().unwrap();
+
+        let resources = app_dir.join("makepad/demo_app/resources");
+        assert!(resources.join("latin.otf").is_file());
+        assert!(!resources.join("international.otf").exists());
+        assert!(resources.join("data.bin").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 pub struct AppleArgs {
@@ -1106,6 +1260,7 @@ pub fn run_on_device(
         build_crate,
         &result.build_dir,
         apple_target,
+        &result.font_manifest,
     )?;
 
     let cert = parsed

@@ -9,7 +9,10 @@ use makepad_widgets::text::{
 use makepad_widgets::*;
 use std::path::Path;
 
-app_main!(App);
+app_main!(
+    App,
+    font_assets: ["makepad_widgets/resources/jetbrains_mono_variable.ttf", MATH_VIEW_FONT_ASSET]
+);
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -197,7 +200,8 @@ script_mod! {
             title := Label{text: "Item Title" draw_text.color: #fff draw_text.text_style.font_size: 11}
             subtitle := Label{text: "Item subtitle text" draw_text.color: #888 draw_text.text_style.font_size: 9}
         }
-        action_btn := ButtonFlatter{text: "View" draw_text.text_style.font_size: 9}
+        /** the row's borderless action button: no face until it is disabled */
+        action_btn := ButtonFlatter{text: "View" draw_text.text_style.font_size: /** row button type size 6..24 step 0.5 */ 9}
     }
 
     let ListHeader = View{
@@ -240,14 +244,19 @@ script_mod! {
             Label{text: "Button Variants" draw_text.color: #fff draw_text.text_style.font_size: 13}
 
             View{width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}}
+            /** the stock button: outset gradient face plus bevel */
             button := Button{text: "Standard"}
+            /** the flat variant: the same face without the outset gradient */
             flat_button := ButtonFlat{text: "Flat"}
+            /** the borderless variant: face and bevel hidden until disabled */
             flatter_button := ButtonFlatter{text: "Flatter"}
 
+            /** a standard button with an SVG mark left of the label */
             icon_button := Button{
                 text: "With Icon"
-                icon_walk: Walk{width: 16 height: 16}
-                draw_icon.color: #fff
+                /** the icon's box, smaller than the button default */
+                icon_walk: Walk{/** icon width in pixels 8..64 step 1 */ width: 16 /** icon height in pixels 8..64 step 1 */ height: 16}
+                draw_icon.color: /** icon tint */ #fff
                 draw_icon.svg: crate_resource("self:../../widgets/resources/icons/icon_file.svg")
             }
 
@@ -257,18 +266,23 @@ script_mod! {
             Label{text: "on_press fires on pointer down and can call widget methods directly" draw_text.color: #888 draw_text.text_style.font_size: 10}
 
             View{width: Fill height: Fit flow: Right spacing: 10 align: Align{y: 0.5}}
+            /** fires on pointer down, before any click is decided */
             press_demo_button := Button{
                 text: "Run on_press"
+                /** the down hook: writes the status line straight from script */
                 on_press: || ui.press_status.set_text("Last press: Run on_press")
             }
+            /** fires on release, clearing the status line */
             press_reset_button := ButtonFlat{
                 text: "Reset"
+                /** the click hook: runs on release over the button */
                 on_click: || ui.press_status.set_text("Last press: none")
             }
+            /** the line both hooks write into */
             press_status := Label{
                 text: "Last press: none"
-                draw_text.color: #8fd
-                draw_text.text_style.font_size: 10
+                draw_text.color: /** status ink */ #8fd
+                draw_text.text_style.font_size: /** status type size 6..24 step 0.5 */ 10
             }
 
             Hr{}
@@ -299,7 +313,9 @@ script_mod! {
             Label{text: "Click button to show tooltip, click elsewhere to hide" draw_text.color: #888 draw_text.text_style.font_size: 10}
 
             View{width: Fill height: Fit flow: Right spacing: 10}
+            /** opens the plain tooltip overlay below */
             normal_tooltip_button := Button{text: "Show Normal Tooltip"}
+            /** opens the callout tooltip, the pointed variant */
             callout_tooltip_button := Button{text: "Show Callout Tooltip"}
 
             Hr{}
@@ -308,7 +324,9 @@ script_mod! {
             Label{text: "Click to show/hide notification popup" draw_text.color: #888 draw_text.text_style.font_size: 10}
 
             View{width: Fill height: Fit flow: Right spacing: 10}
+            /** raises the corner notification overlay */
             show_popup_btn := Button{text: "Show Notification"}
+            /** dismisses it again */
             hide_popup_btn := ButtonFlat{text: "Hide Notification"}
         }
 
@@ -392,6 +410,20 @@ script_mod! {
             Label{text: "Fine Control" draw_text.color: #888 draw_text.text_style.font_size: 10}
             Slider{width: Fill text: "Font Size" min: 8.0 max: 24.0 default: 12.0}
             Slider{width: Fill text: "Line Height" min: 1.0 max: 3.0 default: 1.5}
+        }
+    }
+
+    let TabGlass = SolidView{
+        width: Fill height: Fill
+        draw_bg.color: #333
+        ScrollYView{
+            width: Fill height: Fill flow: Down padding: 15 spacing: 12
+
+            Label{text: "Gauss" draw_text.color: #fff draw_text.text_style.font_size: 13}
+            open_gauss_popup_btn := Button{text: "Open Gauss"}
+            open_apple_glass_popup_btn := Button{text: "Open Apple Glass"}
+            open_glass_lens_button_btn := Button{text: "Open Lens Button"}
+            open_gradient_blur_popup_btn := Button{text: "Open Gradient Blur"}
         }
     }
 
@@ -1646,8 +1678,8 @@ script_mod! {
 
         // Left panel - Selection test first, then input widgets
         left_tabs := DockTabs{
-            tabs: [@scrollbar_test_tab, @selection_test_tab, @toggles_tab, @sliders_tab, @text_tab, @dropdowns_tab]
-            selected: 1
+            tabs: [@glass_tab, @scrollbar_test_tab, @selection_test_tab, @toggles_tab, @sliders_tab, @text_tab, @dropdowns_tab]
+            selected: 0
             closable: false
         }
 
@@ -1712,6 +1744,11 @@ script_mod! {
             name: "Sliders"
             template: @CloseableTab
             kind: @TabSliders        }
+
+        glass_tab := DockTab{
+            name: "Gauss"
+            template: @CloseableTab
+            kind: @TabGlass        }
 
         text_tab := DockTab{
             name: "Text"
@@ -1778,6 +1815,7 @@ script_mod! {
         TabButtons := TabButtons{}
         TabToggles := TabToggles{}
         TabSliders := TabSliders{}
+        TabGlass := TabGlass{}
         TabText := TabText{}
         TabDropdowns := TabDropdowns{}
         TabMarkup := TabMarkup{}
@@ -1802,7 +1840,241 @@ script_mod! {
                 window.title: "Splash Example"
                 body +: {
                     padding: 4
+                    flow: Overlay
                     dock := AppDock{}
+                    gauss_demo_layer := View{
+                        width: Fill
+                        height: Fill
+                        flow: Overlay
+                        align: Align{x: 1.0 y: 0.0}
+
+                        gauss_popup := PopupNotification{
+                            align: Align{x: 0.5 y: 0.5}
+                            content +: {
+                                width: 430
+                                height: 300
+                                flow: Overlay
+                                clip_x: false
+                                clip_y: false
+
+                                gauss_popup_bg := GaussRoundedView{
+                                    width: Fill
+                                    height: Fill
+                                    draw_bg +: {
+                                        blur_level: 5.0
+                                        lensing_effect: 0.0
+                                        corner_radius: 18.0
+                                        tint_color: #b8b8b8
+                                        tint_alpha: 0.07
+                                        surface_alpha: 0.82
+                                        border_alpha: 0.36
+                                        specular_strength: 0.10
+                                        fallback_color: #8c8c8c
+                                        shadow_color: #000b
+                                        shadow_radius: 44.0
+                                        shadow_offset: vec2(0.0, 18.0)
+                                    }
+                                }
+
+                                gauss_popup_content := View{
+                                    width: Fill
+                                    height: Fill
+                                    padding: 22
+                                    flow: Down
+                                    spacing: 12
+
+                                    Label{
+                                        text: "Gauss"
+                                        draw_text.color: #fff
+                                        draw_text.text_style.font_size: 18
+                                    }
+                                    gauss_blur_slider := Slider{width: Fill text: "Blurriness" min: 0.0 max: 6.0 default: 5.0}
+                                    gauss_lensing_slider := Slider{width: Fill text: "Lensing Effect" min: 0.0 max: 100.0 default: 0.0}
+                                    View{
+                                        width: Fill
+                                        height: Fill
+                                    }
+                                    View{
+                                        width: Fill
+                                        height: 72
+                                        flow: Right
+                                        align: Align{x: 1.0 y: 0.5}
+                                        close_gauss_popup_btn := ButtonFlat{text: "Close"}
+                                    }
+                                }
+                            }
+                        }
+
+                        apple_glass_popup := PopupNotification{
+                            align: Align{x: 0.5 y: 0.5}
+                            content +: {
+                                width: 430
+                                height: 300
+                                flow: Overlay
+                                clip_x: false
+                                clip_y: false
+
+                                apple_glass_popup_bg := AppleGlassRoundedView{
+                                    width: Fill
+                                    height: Fill
+                                    draw_bg +: {
+                                        blur_level: 5.2
+                                        lensing_effect: 0.75
+                                        corner_radius: 18.0
+                                        tint_color: #b8b8b8
+                                        tint_alpha: 0.08
+                                        surface_alpha: 0.76
+                                        border_alpha: 0.56
+                                        specular_strength: 0.14
+                                        fallback_color: #8c8c8c
+                                        shadow_color: #000c
+                                        shadow_radius: 46.0
+                                        shadow_offset: vec2(0.0, 20.0)
+                                        diffraction_strength: 2.4
+                                    }
+                                }
+
+                                apple_glass_popup_content := View{
+                                    width: Fill
+                                    height: Fill
+                                    padding: 22
+                                    flow: Down
+                                    spacing: 12
+
+                                    Label{
+                                        text: "Apple Glass"
+                                        draw_text.color: #fff
+                                        draw_text.text_style.font_size: 18
+                                    }
+                                    apple_glass_blur_slider := Slider{width: Fill text: "Blurriness" min: 0.0 max: 6.0 default: 5.2}
+                                    apple_glass_lensing_slider := Slider{width: Fill text: "Lensing Effect" min: 0.0 max: 100.0 default: 75.0}
+                                    View{
+                                        width: Fill
+                                        height: Fill
+                                    }
+                                    View{
+                                        width: Fill
+                                        height: 72
+                                        flow: Right
+                                        align: Align{x: 1.0 y: 0.5}
+                                        close_apple_glass_popup_btn := ButtonFlat{text: "Close"}
+                                    }
+                                }
+                            }
+                        }
+
+                        glass_lens_button_popup := PopupNotification{
+                            align: Align{x: 0.5 y: 0.5}
+                            content +: {
+                                width: 300
+                                height: 92
+                                flow: Overlay
+                                clip_x: false
+                                clip_y: false
+
+                                glass_lens_button_bg := AppleGlassRoundedView{
+                                    width: Fill
+                                    height: Fill
+                                    draw_bg +: {
+                                        blur_level: 0.25
+                                        lensing_effect: 1.0
+                                        lensing_strength: 38.0
+                                        lensing_width: 13.0
+                                        corner_radius: 23.0
+                                        tint_color: #b8b8b8
+                                        tint_alpha: 0.025
+                                        border_alpha: 0.82
+                                        specular_strength: 0.24
+                                        noise_strength: 0.004
+                                        fallback_color: #4a4a4a
+                                        shadow_color: #0009
+                                        shadow_radius: 34.0
+                                        shadow_offset: vec2(0.0, 14.0)
+                                        diffraction_strength: 5.2
+                                    }
+                                }
+                                /** the click target over the glass lens: label only, face erased */
+                                close_glass_lens_button_btn := ButtonFlat{
+                                    width: Fill
+                                    height: Fill
+                                    text: "Focus"
+                                    draw_text.color: /** lens label ink */ #fff
+                                    draw_text.text_style.font_size: /** lens label size in points 8..48 step 1 */ 22
+                                    /** every face state erased so the glass panel behind shows through */
+                                    draw_bg +: {
+                                        /** no bevel: the glass draws its own edge 0..4 step 0.5 */
+                                        border_size: 0.0
+                                        /** face transparent in every state */
+                                        color: #0000
+                                        color_hover: #0000
+                                        color_down: #0000
+                                        color_focus: #0000
+                                        /** bevel transparent in every state */
+                                        border_color: #0000
+                                        border_color_hover: #0000
+                                        border_color_down: #0000
+                                        border_color_focus: #0000
+                                    }
+                                }
+                            }
+                        }
+
+                        gradient_blur_popup := PopupNotification{
+                            align: Align{x: 0.5 y: 0.5}
+                            content +: {
+                                width: 520
+                                height: 280
+                                flow: Overlay
+                                clip_x: false
+                                clip_y: false
+
+                                gradient_blur_popup_bg := GaussGradientRoundedView{
+                                    width: Fill
+                                    height: Fill
+                                    draw_bg +: {
+                                        blur_level: 4.35
+                                        gradient_blur_edge: 1.45
+                                        gradient_blur_edge_width: 0.20
+                                        gradient_blur_power: 0.75
+                                        corner_radius: 18.0
+                                        tint_color: #b8b8b8
+                                        tint_alpha: 0.045
+                                        border_alpha: 0.44
+                                        specular_strength: 0.08
+                                        fallback_color: #6a6a6a
+                                        shadow_color: #000b
+                                        shadow_radius: 44.0
+                                        shadow_offset: vec2(0.0, 18.0)
+                                    }
+                                }
+
+                                gradient_blur_popup_content := View{
+                                    width: Fill
+                                    height: Fill
+                                    padding: 22
+                                    flow: Down
+                                    spacing: 12
+
+                                    Label{
+                                        text: "Gradient Blur"
+                                        draw_text.color: #fff
+                                        draw_text.text_style.font_size: 18
+                                    }
+                                    View{
+                                        width: Fill
+                                        height: Fill
+                                    }
+                                    View{
+                                        width: Fill
+                                        height: 72
+                                        flow: Right
+                                        align: Align{x: 1.0 y: 0.5}
+                                        close_gradient_blur_popup_btn := ButtonFlat{text: "Close"}
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1813,6 +2085,46 @@ script_mod! {
 pub struct App {
     #[live]
     ui: WidgetRef,
+    #[rust]
+    lens_press_next_frame: NextFrame,
+    #[rust]
+    lens_press_started_at: f64,
+    #[rust]
+    lens_release_started_at: f64,
+    #[rust]
+    lens_press_flatten: f32,
+    #[rust]
+    lens_pressing: bool,
+    #[rust]
+    lens_ripple_animating: bool,
+    #[rust]
+    lens_pending_close: bool,
+}
+
+impl App {
+    fn set_focus_lens_press_response(
+        &mut self,
+        cx: &mut Cx,
+        flatten: f32,
+        ripple_age: f32,
+        ripple_strength: f32,
+    ) {
+        if let Some(mut glass) = self
+            .ui
+            .widget(cx, ids!(glass_lens_button_bg))
+            .borrow_mut::<GaussRoundedView>()
+        {
+            glass.set_press_response(cx, flatten, ripple_age, ripple_strength);
+        }
+    }
+
+    fn start_focus_lens_release(&mut self, cx: &mut Cx, close_after_rebound: bool) {
+        self.lens_pressing = false;
+        self.lens_ripple_animating = true;
+        self.lens_release_started_at = 0.0;
+        self.lens_pending_close |= close_after_rebound;
+        self.lens_press_next_frame = cx.new_next_frame();
+    }
 }
 
 impl MatchEvent for App {
@@ -1826,6 +2138,53 @@ impl MatchEvent for App {
             .load_image_file_by_path(cx, image_path)
         {
             log!("Failed to load image: {:?}", e);
+        }
+    }
+
+    fn handle_next_frame(&mut self, cx: &mut Cx, e: &NextFrameEvent) {
+        if !self.lens_ripple_animating || !e.set.contains(&self.lens_press_next_frame) {
+            return;
+        }
+
+        if self.lens_pressing {
+            if self.lens_press_started_at <= 0.0 {
+                self.lens_press_started_at = e.time;
+            }
+            let age = (e.time - self.lens_press_started_at).max(0.0);
+            let t = (age / 0.78).min(1.0) as f32;
+            let flatten = t * t * (3.0 - 2.0 * t);
+            self.lens_press_flatten = flatten;
+            let ripple_strength = ((1.0 - age / 1.05).max(0.0) as f32) * (1.0 - flatten * 0.10);
+            self.set_focus_lens_press_response(cx, flatten, age as f32, ripple_strength);
+
+            if age < 1.08 {
+                self.lens_press_next_frame = cx.new_next_frame();
+            } else {
+                self.lens_ripple_animating = false;
+                self.set_focus_lens_press_response(cx, 1.0, 1000.0, 0.0);
+            }
+        } else {
+            if self.lens_release_started_at <= 0.0 {
+                self.lens_release_started_at = e.time;
+            }
+            let age = (e.time - self.lens_release_started_at).max(0.0);
+            let restore = self.lens_press_flatten.clamp(0.0, 1.0);
+            let ripple_strength = ((1.0 - age / 1.05).max(0.0) as f32) * 0.62;
+            self.set_focus_lens_press_response(cx, -restore, age as f32, ripple_strength);
+
+            if age < 1.08 {
+                self.lens_press_next_frame = cx.new_next_frame();
+            } else {
+                self.lens_ripple_animating = false;
+                self.lens_press_flatten = 0.0;
+                self.set_focus_lens_press_response(cx, 0.0, 1000.0, 0.0);
+                if self.lens_pending_close {
+                    self.lens_pending_close = false;
+                    self.ui
+                        .popup_notification(cx, ids!(glass_lens_button_popup))
+                        .close(cx);
+                }
+            }
         }
     }
 
@@ -1880,6 +2239,165 @@ impl MatchEvent for App {
         if self.ui.button(cx, ids!(hide_popup_btn)).clicked(actions) {
             log!("Hiding popup notification");
             self.ui.popup_notification(cx, ids!(popup_notif)).close(cx);
+        }
+        if self
+            .ui
+            .button(cx, ids!(open_gauss_popup_btn))
+            .clicked(actions)
+        {
+            self.ui
+                .popup_notification(cx, ids!(apple_glass_popup))
+                .close(cx);
+            self.ui
+                .popup_notification(cx, ids!(glass_lens_button_popup))
+                .close(cx);
+            self.ui
+                .popup_notification(cx, ids!(gradient_blur_popup))
+                .close(cx);
+            self.ui.popup_notification(cx, ids!(gauss_popup)).open(cx);
+        }
+        if self
+            .ui
+            .button(cx, ids!(open_apple_glass_popup_btn))
+            .clicked(actions)
+        {
+            self.ui.popup_notification(cx, ids!(gauss_popup)).close(cx);
+            self.ui
+                .popup_notification(cx, ids!(glass_lens_button_popup))
+                .close(cx);
+            self.ui
+                .popup_notification(cx, ids!(gradient_blur_popup))
+                .close(cx);
+            self.ui
+                .popup_notification(cx, ids!(apple_glass_popup))
+                .open(cx);
+        }
+        if self
+            .ui
+            .button(cx, ids!(open_glass_lens_button_btn))
+            .clicked(actions)
+        {
+            self.ui.popup_notification(cx, ids!(gauss_popup)).close(cx);
+            self.ui
+                .popup_notification(cx, ids!(apple_glass_popup))
+                .close(cx);
+            self.ui
+                .popup_notification(cx, ids!(gradient_blur_popup))
+                .close(cx);
+            self.lens_pressing = false;
+            self.lens_ripple_animating = false;
+            self.lens_pending_close = false;
+            self.lens_press_flatten = 0.0;
+            self.set_focus_lens_press_response(cx, 0.0, 1000.0, 0.0);
+            self.ui
+                .popup_notification(cx, ids!(glass_lens_button_popup))
+                .open(cx);
+        }
+        if self
+            .ui
+            .button(cx, ids!(open_gradient_blur_popup_btn))
+            .clicked(actions)
+        {
+            self.ui.popup_notification(cx, ids!(gauss_popup)).close(cx);
+            self.ui
+                .popup_notification(cx, ids!(apple_glass_popup))
+                .close(cx);
+            self.ui
+                .popup_notification(cx, ids!(glass_lens_button_popup))
+                .close(cx);
+            self.ui
+                .popup_notification(cx, ids!(gradient_blur_popup))
+                .open(cx);
+        }
+        if self
+            .ui
+            .button(cx, ids!(close_gauss_popup_btn))
+            .clicked(actions)
+        {
+            self.ui.popup_notification(cx, ids!(gauss_popup)).close(cx);
+        }
+        if self
+            .ui
+            .button(cx, ids!(close_apple_glass_popup_btn))
+            .clicked(actions)
+        {
+            self.ui
+                .popup_notification(cx, ids!(apple_glass_popup))
+                .close(cx);
+        }
+        let focus_lens_button = self.ui.button(cx, ids!(close_glass_lens_button_btn));
+        if focus_lens_button.pressed(actions) {
+            self.lens_pressing = true;
+            self.lens_ripple_animating = true;
+            self.lens_press_started_at = 0.0;
+            self.lens_release_started_at = 0.0;
+            self.lens_press_flatten = 0.0;
+            self.lens_pending_close = false;
+            self.set_focus_lens_press_response(cx, 0.0, 1000.0, 0.0);
+            self.lens_press_next_frame = cx.new_next_frame();
+        }
+        if focus_lens_button.released(actions) {
+            self.start_focus_lens_release(cx, false);
+        }
+        if focus_lens_button.clicked(actions) {
+            self.start_focus_lens_release(cx, true);
+        }
+        if self
+            .ui
+            .button(cx, ids!(close_gradient_blur_popup_btn))
+            .clicked(actions)
+        {
+            self.ui
+                .popup_notification(cx, ids!(gradient_blur_popup))
+                .close(cx);
+        }
+        if let Some(value) = self.ui.slider(cx, ids!(gauss_blur_slider)).slided(actions) {
+            if let Some(mut glass) = self
+                .ui
+                .widget(cx, ids!(gauss_popup_bg))
+                .borrow_mut::<GaussRoundedView>()
+            {
+                glass.set_blurriness(cx, value as f32);
+            }
+        }
+        if let Some(value) = self
+            .ui
+            .slider(cx, ids!(gauss_lensing_slider))
+            .slided(actions)
+        {
+            if let Some(mut glass) = self
+                .ui
+                .widget(cx, ids!(gauss_popup_bg))
+                .borrow_mut::<GaussRoundedView>()
+            {
+                glass.set_lensing_effect(cx, value as f32 / 100.0);
+            }
+        }
+        if let Some(value) = self
+            .ui
+            .slider(cx, ids!(apple_glass_blur_slider))
+            .slided(actions)
+        {
+            if let Some(mut glass) = self
+                .ui
+                .widget(cx, ids!(apple_glass_popup_bg))
+                .borrow_mut::<GaussRoundedView>()
+            {
+                glass.set_blurriness(cx, value as f32);
+            }
+        }
+        if let Some(value) = self
+            .ui
+            .slider(cx, ids!(apple_glass_lensing_slider))
+            .slided(actions)
+        {
+            if let Some(mut glass) = self
+                .ui
+                .widget(cx, ids!(apple_glass_popup_bg))
+                .borrow_mut::<GaussRoundedView>()
+            {
+                glass.set_lensing_effect(cx, value as f32 / 100.0);
+            }
         }
 
         if let Some(value) = self.ui.check_box(cx, ids!(checkbox)).changed(actions) {
@@ -2050,6 +2568,7 @@ impl MatchEvent for App {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         makepad_widgets::script_mod(vm);
+        makepad_code_editor::script_mod(vm);
         self::script_mod(vm)
     }
 
@@ -2196,9 +2715,15 @@ impl VarGlyphLabel {
             return;
         }
 
-        let laidout = self
-            .draw_text
-            .layout(cx.cx.cx, 0.0, 0.0, None, false, Align::default(), &self.text);
+        let laidout = self.draw_text.layout(
+            cx.cx.cx,
+            0.0,
+            0.0,
+            None,
+            false,
+            Align::default(),
+            &self.text,
+        );
         self.size = vec2(laidout.size_in_lpxs.width, laidout.size_in_lpxs.height);
         self.shape_id = build_laidout_text_shape(&mut self.draw_glyph, laidout.as_ref());
     }

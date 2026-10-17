@@ -1,0 +1,40 @@
+# The AI services layer.
+#
+# One conversation, many apps. An app EXPOSES an AI service: a manifest (who
+# it is, a short brief, the tools it will execute) and a port that receives
+# calls and answers them. A HOST owns the conversation: the desktop (wm's
+# slide-in chat pane) or an app that embeds the chat panel itself. The host's
+# engine aggregates every connected service into one tool table, drives the
+# model, routes each call to the service that owns it, and shows the result.
+#
+# `wire` + `port` are what every app links (platform-only, no widgets, no
+# model runtime). The `engine` feature is what a host links: the agent seam
+# and the chat backends — the person's own Claude Code / Codex CLIs, Claude
+# Desktop over MCP, the Claude API. The machine's own model (the hub's local
+# runtime: Qwen on Metal/CUDA) is the separate `localai` feature.
+#
+# Design of record: local/agent_state/aichat/DESIGN.md
+
+[package]
+name = "makepad-ai-services"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "What an app exposes to a central AI chat (manifest, tools, calls, results) and the engine that drives many apps from one conversation"
+
+[features]
+default = []
+# The chat backends: the CLI, MCP and cloud providers from the hub. Off by
+# default so an app that only exposes a service never links them. No model
+# runtime: the hub comes without `llm`.
+engine = ["makepad-ai-hub"]
+# The machine's own model: Qwen through the hub's local runtime
+# (makepad-ai-llm, the Metal/CUDA stores and their kernel builds).
+localai = ["engine", "makepad-ai-hub/localai"]
+
+[dependencies]
+makepad-platform = { path = "../../../platform" }
+makepad-micro-serde = { path = "../../micro_serde" }
+makepad-strict-json = { path = "../../strict_json" }
+makepad-bounded-http = { path = "../../bounded_http" }
+makepad-ai-hub = { path = "../hub", default-features = false, optional = true }

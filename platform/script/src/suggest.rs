@@ -86,24 +86,14 @@ pub fn format_value_brief(heap: &ScriptHeap, value: ScriptValue) -> String {
 
     // Handle inline strings
     if let Some(s) = value.as_inline_string(|s| s.to_string()) {
-        let truncated = if s.len() > 12 {
-            format!("{}...", &s[..12])
-        } else {
-            s
-        };
-        return format!("\"{}\"", truncated);
+        return format!("\"{}\"", truncate_preview(&s, 12));
     }
 
     // Handle heap strings
     if let Some(s) = value.as_string() {
         if let Some(str_data) = &heap.strings[s] {
             let s = &str_data.string.0;
-            let truncated = if s.len() > 12 {
-                format!("{}...", &s[..12])
-            } else {
-                s.to_string()
-            };
-            return format!("\"{}\"", truncated);
+            return format!("\"{}\"", truncate_preview(s, 12));
         }
         return "\"\"".to_string();
     }
@@ -149,6 +139,16 @@ pub fn format_value_brief(heap: &ScriptHeap, value: ScriptValue) -> String {
     format!("{:?}", value.value_type())
 }
 
+/// Truncate a string preview at a character boundary. A fixed byte slice
+/// panics when a multibyte character crosses the cut while formatting an
+/// otherwise recoverable script error.
+fn truncate_preview(value: &str, maximum_characters: usize) -> String {
+    let Some((end, _)) = value.char_indices().nth(maximum_characters) else {
+        return value.to_owned();
+    };
+    format!("{}...", &value[..end])
+}
+
 /// Format the type of a ScriptValue as a human-readable string for error messages.
 /// Unlike format_value_brief which shows the value, this shows the type.
 /// Examples: "number", "string", "bool", "vec4f", "MyStruct", "object", "function", "array"
@@ -163,8 +163,8 @@ pub fn format_value_type(heap: &ScriptHeap, value: ScriptValue) -> String {
         return "bool".to_string();
     }
 
-    // Handle numbers (f64, f32, u32, i32, u40)
-    if value.as_f64().is_some() || value.as_u40().is_some() {
+    // Handle numbers (f64, f32, f16, u32, i32, u40)
+    if value.is_number() {
         return "number".to_string();
     }
 
@@ -678,5 +678,20 @@ pub fn suggest_pod_field(heap: &ScriptHeap, pod_ty: ScriptPodType, field: LiveId
             suggest_from_iter(&key_str, components.into_iter())
         }
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_preview;
+
+    #[test]
+    fn preview_truncation_preserves_utf8_boundaries() {
+        let value = "abcdefghijk\u{057e}";
+        assert_eq!(truncate_preview(value, 12), value);
+        assert_eq!(
+            truncate_preview(&format!("{value}z"), 12),
+            format!("{value}...")
+        );
     }
 }

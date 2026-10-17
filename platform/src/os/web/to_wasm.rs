@@ -19,6 +19,7 @@ use {
 #[derive(ToWasm)]
 pub struct WGpuInfo {
     pub min_uniform_vectors: u32,
+    pub float_color_targets: bool,
     pub vendor: String,
     pub renderer: String,
 }
@@ -32,7 +33,7 @@ pub struct WBrowserInfo {
     pub search: String,
     pub hash: String,
     pub has_thread_support: bool,
-    pub small_font_aliases: bool,
+    pub is_phone: bool,
 }
 
 impl Into<OsType> for WBrowserInfo {
@@ -44,7 +45,7 @@ impl Into<OsType> for WBrowserInfo {
             pathname: self.pathname,
             search: self.search,
             hash: self.hash,
-            small_font_aliases: self.small_font_aliases,
+            is_phone: self.is_phone,
         })
     }
 }
@@ -99,6 +100,7 @@ impl Into<XrCapabilities> for WXrCapabilities {
 pub struct ToWasmInit {
     pub gpu_info: WGpuInfo,
     pub cpu_cores: u32,
+    pub wasm_memory_max_pages: u32,
     pub xr_capabilities: WXrCapabilities,
     pub browser_info: WBrowserInfo,
     pub window_info: WWindowInfo,
@@ -120,8 +122,32 @@ pub struct ToWasmTimerFired {
 }
 
 #[derive(ToWasm)]
+pub struct ToWasmLocationUpdate {
+    pub lon: f64,
+    pub lat: f64,
+    pub accuracy_m: f64,
+    pub altitude_m: Option<f64>,
+    pub speed_mps: Option<f64>,
+    pub heading_deg: Option<f64>,
+    pub time: f64,
+}
+
+#[derive(ToWasm)]
+pub struct ToWasmLocationError {
+    /// GeolocationPositionError code: 1 = permission denied,
+    /// 2 = position unavailable, 3 = timeout, 0 = no geolocation API.
+    pub code: u32,
+    pub message: String,
+}
+
+#[derive(ToWasm)]
 pub struct ToWasmSignal {
     pub flags: u32,
+}
+
+#[derive(ToWasm)]
+pub struct ToWasmAppLifecycle {
+    pub state: u32,
 }
 
 #[derive(ToWasm)]
@@ -129,6 +155,15 @@ pub struct ToWasmPaintDirty {}
 
 #[derive(ToWasm)]
 pub struct ToWasmRedrawAll {}
+
+/// `count` WebGL programs finished compiling (or failed) since the last
+/// report. Pairs with the compiles queued through `FromWasmCompileWebGLShader`
+/// so `Cx::draw_shaders_pending` can say whether draws are still being
+/// dropped for a program that has not linked yet.
+#[derive(ToWasm)]
+pub struct ToWasmWebGLShadersDone {
+    pub count: usize,
+}
 
 #[derive(ToWasm)]
 pub struct ToWasmLiveFileChange {
@@ -143,12 +178,50 @@ pub struct ToWasmLocationChange {
     pub hash: String,
 }
 
+#[derive(ToWasm)]
+pub struct WVirtualFile {
+    pub name: String,
+    pub mime: String,
+    pub bytes: WasmDataU8,
+}
+
+#[derive(ToWasm)]
+pub struct ToWasmFileDrag {
+    pub x: f64,
+    pub y: f64,
+    pub modifiers: u32,
+    pub file_count: u32,
+    pub left: bool,
+}
+
+#[derive(ToWasm)]
+pub struct ToWasmFileDrop {
+    pub x: f64,
+    pub y: f64,
+    pub modifiers: u32,
+    pub files: Vec<WVirtualFile>,
+}
+
+#[derive(ToWasm)]
+pub struct ToWasmFileDropError {
+    pub error: String,
+}
+
+#[derive(ToWasm)]
+pub struct ToWasmFileDialogResult {
+    pub id_lo: u32,
+    pub id_hi: u32,
+    pub cancelled: bool,
+    pub error: String,
+    pub files: Vec<WVirtualFile>,
+}
+
 // Touch API
 
 #[derive(ToWasm, Clone, Debug)]
 pub struct WTouchPoint {
     pub time: f64,
-    pub state: u32, // 0 stable, 1 start, 2 end, 3 move
+    pub state: u32, // 0 stable, 1 start, 2 move, 3 end, 4 cancel
     pub x: f64,
     pub y: f64,
     pub radius_x: f64,
@@ -254,6 +327,7 @@ pub struct ToWasmMouseMove {
 impl From<ToWasmMouseMove> for MouseMoveEvent {
     fn from(v: ToWasmMouseMove) -> Self {
         Self {
+            lock_delta: Default::default(),
             abs: dvec2(v.mouse.x, v.mouse.y),
             window_id: CxWindowPool::id_zero(),
             modifiers: unpack_key_modifier(v.mouse.modifiers),
@@ -304,6 +378,7 @@ impl From<ToWasmScroll> for ScrollEvent {
             handled_y: Cell::new(false),
             is_mouse: true,
             time: v.time,
+            phase: crate::event::ScrollPhase::None,
         }
     }
 }
@@ -487,6 +562,39 @@ impl Into<TextInputEvent> for ToWasmTextInput {
 #[derive(ToWasm)]
 pub struct ToWasmTextCopy {}
 
+#[derive(ToWasm)]
+pub struct ToWasmStorageResult {
+    pub request_id_lo: u32,
+    pub request_id_hi: u32,
+    pub op: u32,
+    pub found: bool,
+    pub value: WasmDataU8,
+    pub keys: Vec<String>,
+    pub has_next: bool,
+    pub next: String,
+    pub length_lo: u32,
+    pub length_hi: u32,
+    pub usage_lo: u32,
+    pub usage_hi: u32,
+    pub quota_lo: u32,
+    pub quota_hi: u32,
+    pub error_kind: u32,
+    pub error: String,
+}
+
+#[derive(ToWasm)]
+pub struct ToWasmRenderTextureCapture {
+    pub texture_id: usize,
+    pub ticket_lo: u32,
+    pub ticket_hi: u32,
+    pub width: usize,
+    pub height: usize,
+    pub offset: usize,
+    pub complete: bool,
+    pub data: WasmDataU8,
+    pub error: String,
+}
+
 // Keyboard API
 
 #[derive(ToWasm)]
@@ -630,7 +738,22 @@ pub struct ToWasmVideoPlaybackCompleted {
 }
 
 #[derive(ToWasm)]
+pub struct ToWasmGpuCompletion {
+    pub serial_lo: u32,
+    pub serial_hi: u32,
+    pub success: bool,
+}
+
+#[derive(ToWasm)]
 pub struct ToWasmVideoPlaybackResourcesReleased {
     pub video_id_lo: u32,
     pub video_id_hi: u32,
+}
+
+/// A retained instance buffer's segment update could not be applied on the
+/// GPU side (the buffer was lost or too small); the app re-uploads it whole
+/// from its CPU segments.
+#[derive(ToWasm)]
+pub struct ToWasmRetainedUploadFailed {
+    pub buffer_id: usize,
 }

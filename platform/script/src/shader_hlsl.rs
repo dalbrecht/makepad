@@ -1,5 +1,5 @@
 use crate::pod::ScriptPodTy;
-use crate::shader::{SamplerAddress, SamplerFilter, ShaderIoKind, ShaderOutput, TextureType};
+use crate::shader::{ShaderIoKind, ShaderOutput, TextureType};
 use crate::vm::ScriptVm;
 use makepad_live_id::{id, LiveId};
 use std::fmt::Write;
@@ -156,6 +156,24 @@ impl ShaderOutput {
 
     /// Emit HLSL helper functions that are needed by the shader
     pub fn hlsl_create_helpers(&self, _vm: &ScriptVm, out: &mut String) {
+        // Packed vertex attribute unpackers (map / vector geometry).
+        // Two f16s or four unorm8s are bitcast into one f32 geometry slot.
+        writeln!(out, "float2 _mp_unpack2f16(float x) {{").ok();
+        writeln!(out, "    uint u = asuint(x);").ok();
+        writeln!(
+            out,
+            "    return float2(f16tof32(u & 0xffff), f16tof32(u >> 16));"
+        )
+        .ok();
+        writeln!(out, "}}").ok();
+        writeln!(out, "float4 _mp_unpack4u8(float x) {{").ok();
+        writeln!(out, "    uint u = asuint(x);").ok();
+        writeln!(
+            out,
+            "    return float4(float(u & 0xff), float((u >> 8) & 0xff), float((u >> 16) & 0xff), float((u >> 24) & 0xff)) * (1.0 / 255.0);"
+        )
+        .ok();
+        writeln!(out, "}}").ok();
         if self.hlsl_needs_tex_size {
             writeln!(out, "float2 _mpTexSize2D(Texture2D tex) {{ uint w, h; tex.GetDimensions(w, h); return float2(w, h); }}").ok();
         }
@@ -407,6 +425,7 @@ impl ShaderOutput {
         }
 
         writeln!(out, "    uint vid : SV_VertexID;").ok();
+        // Portable instance_index(); retained buffers bind their complete prefix.
         writeln!(out, "    uint iid : SV_InstanceID;").ok();
         writeln!(out, "}};").ok();
     }
@@ -470,7 +489,7 @@ impl ShaderOutput {
                         TextureType::Texture3dArray => "Texture3D", // HLSL doesn't support 3D array textures
                         TextureType::TextureCube => "TextureCube",
                         TextureType::TextureCubeArray => "TextureCubeArray",
-                        TextureType::TextureDepth => "Texture2D",
+                        TextureType::TextureDepth => "Texture2D<float>",
                         TextureType::TextureDepthArray => "Texture2DArray",
                         TextureType::TextureVideo => "Texture2D", // Video textures are standard Texture2D on HLSL
                     };
@@ -488,20 +507,16 @@ impl ShaderOutput {
         }
 
         for (idx, sampler) in self.samplers.iter().enumerate() {
-            let filter = match sampler.filter {
-                SamplerFilter::Nearest => "MIN_MAG_MIP_POINT",
-                SamplerFilter::Linear => "MIN_MAG_MIP_LINEAR",
-            };
-            let address = match sampler.address {
-                SamplerAddress::Repeat => "Wrap",
-                SamplerAddress::ClampToEdge => "Clamp",
-                SamplerAddress::ClampToZero => "Border",
-                SamplerAddress::MirroredRepeat => "Mirror",
-            };
             writeln!(
                 out,
-                "SamplerState _s{} {{ Filter = {}; AddressU = {}; AddressV = {}; AddressW = {}; }};",
-                idx, filter, address, address, address
+                "{} _s{} : register(s{});",
+                if sampler.compare {
+                    "SamplerComparisonState"
+                } else {
+                    "SamplerState"
+                },
+                idx,
+                idx
             )
             .ok();
         }

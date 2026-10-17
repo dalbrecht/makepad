@@ -1,6 +1,8 @@
 // stripped mac core foundation + core audio + metal layer only whats needed
 
-#![cfg(any(target_os = "macos", target_os = "ios"))]
+// tvOS shares iOS's frameworks; without it here the whole crate compiled to
+// nothing on tvOS and every `msg_send!` user lost the macro.
+#![cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
 #![allow(non_snake_case)]
@@ -65,10 +67,17 @@ impl Drop for RcObjcId {
 unsafe impl Send for RcObjcId {}
 unsafe impl Sync for RcObjcId {}
 
-#[link(name = "system")]
+#[link(name = "System")]
 extern "C" {
     pub static _NSConcreteStackBlock: [*const c_void; 32];
     pub static _NSConcreteBogusBlock: [*const c_void; 32];
+}
+
+#[link(name = "objc")]
+extern "C" {
+    /// libobjc: replace an instance's class at runtime (isa swizzle).
+    /// Returns the previous class.
+    pub fn object_setClass(obj: ObjcId, cls: ObjcId) -> ObjcId;
 }
 
 #[cfg(target_os = "ios")]
@@ -85,6 +94,19 @@ extern "C" {
     pub static UIKeyboardAnimationDurationUserInfoKey: ObjcId;
     pub static UIKeyboardAnimationCurveUserInfoKey: ObjcId;
     pub static UITextInputCurrentInputModeDidChangeNotification: ObjcId;
+    pub static UIKeyInputUpArrow: ObjcId;
+    pub static UIKeyInputDownArrow: ObjcId;
+    pub static UIKeyInputLeftArrow: ObjcId;
+    pub static UIKeyInputRightArrow: ObjcId;
+    pub static UITextContentTypePassword: ObjcId;
+    pub static UITextContentTypeNone: ObjcId;
+    pub static UITextContentTypeUsername: ObjcId;
+    pub static UITextContentTypeNewPassword: ObjcId;
+    pub static UITextContentTypeEmailAddress: ObjcId;
+    pub static UITextContentTypeURL: ObjcId;
+    pub static UITextContentTypeFullStreetAddress: ObjcId;
+    pub static UITextContentTypeTelephoneNumber: ObjcId;
+    pub static UITextContentTypeOneTimeCode: ObjcId;
 }
 
 #[cfg(any(target_os = "ios", target_os = "tvos"))]
@@ -198,13 +220,28 @@ extern "C" {
     ) -> ObjcId;
     pub fn CGMainDisplayID() -> u32;
     pub fn CGDisplayPixelsHigh(display: u32) -> u64;
+    /// Pointer lock (FPS mouse capture): 0 freezes the hardware cursor
+    /// while NSEvent deltaX/deltaY keep flowing; nonzero restores normal
+    /// cursor-follows-mouse behaviour. boolean_t is a 32-BIT int — declared
+    /// as Rust `bool` the register's undefined upper bits made `false`
+    /// arrive nonzero and the disassociation silently never engaged.
+    pub fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32;
+    pub fn CGDisplayHideCursor(display: u32) -> i32;
+    pub fn CGDisplayShowCursor(display: u32) -> i32;
+    /// Global display coordinates, top-left origin. Generates no events.
+    pub fn CGWarpMouseCursorPosition(point: NSPoint) -> i32;
+    /// After a warp, macOS suppresses local hardware events for 0.25s by
+    /// default — freezing look deltas after every recapture. Zeroing the
+    /// interval is the standard pointer-lock companion call (deprecated but
+    /// universally used; SDL does the same).
+    pub fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
     pub fn CGColorCreateGenericRGB(red: f64, green: f64, blue: f64, alpha: f64) -> ObjcId;
 }
 
 #[link(name = "Metal", kind = "framework")]
 extern "C" {
     pub fn MTLCreateSystemDefaultDevice() -> ObjcId;
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "macos")]
     pub fn MTLCopyAllDevices() -> ObjcId; //TODO: Array
 }
 
@@ -227,10 +264,59 @@ extern "C" {
     pub static AVCaptureDeviceWasDisconnectedNotification: ObjcId;
 }
 
+// AVAssetReader / AVAssetWriter settings keys for the video FILE codec seam
+// (platform/src/os/apple/video_file_{encoder,decoder}.rs).
+#[link(name = "AVFoundation", kind = "framework")]
+extern "C" {
+    pub static AVFileTypeMPEG4: ObjcId;
+    pub static AVVideoCodecKey: ObjcId;
+    pub static AVVideoWidthKey: ObjcId;
+    pub static AVVideoHeightKey: ObjcId;
+    pub static AVVideoCompressionPropertiesKey: ObjcId;
+    pub static AVVideoAverageBitRateKey: ObjcId;
+    pub static AVVideoExpectedSourceFrameRateKey: ObjcId;
+    pub static AVVideoMaxKeyFrameIntervalKey: ObjcId;
+    pub static AVVideoCodecTypeHEVC: ObjcId;
+    pub static AVVideoCodecTypeH264: ObjcId;
+    pub static AVFormatIDKey: ObjcId;
+    pub static AVSampleRateKey: ObjcId;
+    pub static AVNumberOfChannelsKey: ObjcId;
+    pub static AVEncoderBitRateKey: ObjcId;
+    pub static AVLinearPCMBitDepthKey: ObjcId;
+    pub static AVLinearPCMIsFloatKey: ObjcId;
+    pub static AVLinearPCMIsBigEndianKey: ObjcId;
+    pub static AVLinearPCMIsNonInterleaved: ObjcId;
+}
+
+#[link(name = "CoreLocation", kind = "framework")]
+extern "C" {
+    pub static kCLLocationAccuracyBest: f64;
+    pub static kCLLocationAccuracyNearestTenMeters: f64;
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct CLLocationCoordinate2D {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+unsafe impl Encode for CLLocationCoordinate2D {
+    fn encode() -> Encoding {
+        let encoding = format!(
+            "{{CLLocationCoordinate2D={}{}}}",
+            f64::encode().as_str(),
+            f64::encode().as_str()
+        );
+        unsafe { Encoding::from_str(&encoding) }
+    }
+}
+
 pub type CMFormatDescriptionRef = ObjcId;
 pub const kCMPixelFormat_422YpCbCr8: u32 = four_char_as_u32("2vuy");
 pub const kCMPixelFormat_422YpCbCr8_yuvs: u32 = four_char_as_u32("yuvs");
 pub const kCMVideoCodecType_H264: u32 = four_char_as_u32("avc1");
+pub const kCMVideoCodecType_HEVC: u32 = four_char_as_u32("hvc1");
 pub const kCMVideoCodecType_JPEG: u32 = four_char_as_u32("jpeg");
 pub const kCMVideoCodecType_JPEG_OpenDML: u32 = four_char_as_u32("dmb1");
 pub const kCMPixelFormat_8IndexedGray_WhiteIsZero: u32 = 0x00000028;
@@ -312,6 +398,13 @@ pub const kCMTimeInvalid: CMTime = CMTime {
     epoch: 0,
 };
 
+pub const kCMTimePositiveInfinity: CMTime = CMTime {
+    value: 0,
+    timescale: 0,
+    flags: kCMTimeFlags_Valid | kCMTimeFlags_PositiveInfinity,
+    epoch: 0,
+};
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct CMSampleTimingInfo {
@@ -354,6 +447,16 @@ extern "C" {
         formatDescriptionOut: *mut CMFormatDescriptionRef,
     ) -> OSStatus;
 
+    pub fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+        allocator: *const c_void,
+        parameterSetCount: usize,
+        parameterSetPointers: *const *const u8,
+        parameterSetSizes: *const usize,
+        nalUnitHeaderLength: i32,
+        extensions: CFDictionaryRef,
+        formatDescriptionOut: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
+
     pub fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
         videoDesc: CMFormatDescriptionRef,
         parameterSetIndex: usize,
@@ -364,12 +467,21 @@ extern "C" {
     ) -> OSStatus;
 
     pub fn CMSampleBufferGetImageBuffer(sbuf: CMSampleBufferRef) -> CVImageBufferRef;
+    /// The codec's own sample-description extensions — for HEVC this is where
+    /// the ready-made `hvcC` atom lives, which an mp4 needs verbatim.
+    pub fn CMFormatDescriptionGetExtension(
+        desc: CMFormatDescriptionRef,
+        extensionKey: CFStringRef,
+    ) -> *const c_void;
     pub fn CMSampleBufferGetFormatDescription(sbuf: CMSampleBufferRef) -> CMFormatDescriptionRef;
     pub fn CMSampleBufferGetDataBuffer(sbuf: CMSampleBufferRef) -> CMBlockBufferRef;
     pub fn CMSampleBufferDataIsReady(sbuf: CMSampleBufferRef) -> BOOL;
+    // CoreMedia declares this parameter as CoreFoundation `Boolean` (a u8 on
+    // every Apple arch), not Objective-C `BOOL` (`bool` on arm64, `signed
+    // char` on x86_64) — the old signature only compiled on arm64.
     pub fn CMSampleBufferGetSampleAttachmentsArray(
         sbuf: CMSampleBufferRef,
-        createIfNecessary: BOOL,
+        createIfNecessary: Boolean,
     ) -> CFArrayRef;
     pub fn CMSampleBufferGetPresentationTimeStamp(sbuf: CMSampleBufferRef) -> CMTime;
 
@@ -407,6 +519,41 @@ extern "C" {
 
     pub fn CMTimeMakeWithSeconds(seconds: f64, preferredTimescale: i32) -> CMTime;
     pub fn CMTimeGetSeconds(time: CMTime) -> f64;
+
+    // Video file codec seam (AVAssetReader/Writer backends).
+    pub fn CMAudioFormatDescriptionCreate(
+        allocator: *const c_void,
+        asbd: *const CAudioStreamBasicDescription,
+        layoutSize: usize,
+        layout: *const c_void,
+        magicCookieSize: usize,
+        magicCookie: *const c_void,
+        extensions: CFDictionaryRef,
+        formatDescriptionOut: *mut CMFormatDescriptionRef,
+    ) -> OSStatus;
+
+    pub fn CMAudioFormatDescriptionGetStreamBasicDescription(
+        desc: CMFormatDescriptionRef,
+    ) -> *const CAudioStreamBasicDescription;
+
+    pub fn CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+        allocator: *const c_void,
+        dataBuffer: CMBlockBufferRef,
+        formatDescription: CMFormatDescriptionRef,
+        numSamples: isize,
+        presentationTimeStamp: CMTime,
+        packetDescriptions: *const c_void,
+        sampleBufferOut: *mut CMSampleBufferRef,
+    ) -> OSStatus;
+
+    pub fn CMBlockBufferAssureBlockMemory(theBuffer: CMBlockBufferRef) -> OSStatus;
+
+    pub fn CMBlockBufferReplaceDataBytes(
+        sourceBytes: *const c_void,
+        destinationBuffer: CMBlockBufferRef,
+        offsetIntoDestination: usize,
+        dataLength: usize,
+    ) -> OSStatus;
 }
 
 #[link(name = "CoreVideo", kind = "framework")]
@@ -540,6 +687,14 @@ extern "C" {
     pub static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
     pub static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     pub static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
+    pub static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
+    pub static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;
+    pub static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
+    pub static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
+    pub static kVTCompressionPropertyKey_Quality: CFStringRef;
+    /// The dictionary of codec atoms hung off a format description, keyed by
+    /// atom name (`hvcC` for HEVC).
+    pub static kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: CFStringRef;
     pub static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
 
     pub fn VTCompressionSessionCreate(
@@ -605,6 +760,19 @@ extern "C" {
 
     pub fn VTIsHardwareEncodeSupported(codecType: u32) -> BOOL;
     pub fn VTIsHardwareDecodeSupported(codecType: u32) -> BOOL;
+
+    // Video file codec seam: hardware-encoder probe (the public API —
+    // VTIsHardwareEncodeSupported above is NOT an exported symbol on macOS,
+    // see apple_media.rs's dlsym workaround).
+    pub static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
+    pub fn VTCopySupportedPropertyDictionaryForEncoder(
+        width: i32,
+        height: i32,
+        codecType: u32,
+        encoderSpecification: CFDictionaryRef,
+        encoderIDOut: *mut CFStringRef,
+        supportedPropertiesOut: *mut CFDictionaryRef,
+    ) -> OSStatus;
 }
 
 // Foundation
@@ -975,10 +1143,10 @@ pub struct MTLClearColor {
 #[allow(non_camel_case_types)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum MTLPixelFormat {
-    //RGBA8Unorm = 70,
     R8Unorm = 10,
     RG8Unorm = 30,
     R32Float = 55,
+    RGBA8Unorm = 70,
     BGRA8Unorm = 80,
     RGBA16Float = 115,
     RGBA32Float = 125,
@@ -1756,11 +1924,47 @@ pub type IOHIDValueRef = *mut c_void;
 pub type IOHIDElementRef = *mut c_void;
 #[cfg(target_os = "macos")]
 pub type IOHIDReportType = u32;
+#[cfg(target_os = "macos")]
+pub const kIOHIDReportTypeInput: IOHIDReportType = 0;
+#[cfg(target_os = "macos")]
+pub const kIOHIDReportTypeOutput: IOHIDReportType = 1;
+#[cfg(target_os = "macos")]
+pub const kIOHIDReportTypeFeature: IOHIDReportType = 2;
+#[cfg(target_os = "macos")]
+pub type IOHIDValueCallback = Option<
+    unsafe extern "C" fn(
+        context: *mut c_void,
+        result: IOReturn,
+        sender: *mut c_void,
+        value: IOHIDValueRef,
+    ),
+>;
+#[cfg(target_os = "macos")]
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    pub fn IOHIDDeviceSetReport(
+        device: IOHIDDeviceRef,
+        report_type: IOHIDReportType,
+        report_id: CFIndex,
+        report: *const u8,
+        report_length: CFIndex,
+    ) -> IOReturn;
+    pub fn IOHIDDeviceRegisterInputValueCallback(
+        device: IOHIDDeviceRef,
+        callback: IOHIDValueCallback,
+        context: *mut c_void,
+    );
+    pub fn IOHIDValueGetElement(value: IOHIDValueRef) -> IOHIDElementRef;
+    pub fn IOHIDValueGetIntegerValue(value: IOHIDValueRef) -> CFIndex;
+    pub fn IOHIDElementGetUsagePage(element: IOHIDElementRef) -> u32;
+    pub fn IOHIDElementGetUsage(element: IOHIDElementRef) -> u32;
+    pub fn IOHIDElementGetLogicalMin(element: IOHIDElementRef) -> CFIndex;
+    pub fn IOHIDElementGetLogicalMax(element: IOHIDElementRef) -> CFIndex;
+}
 
 #[cfg(target_os = "macos")]
-pub type IOHIDCallback = Option<
-    unsafe extern "C" fn(context: *mut c_void, result: IOReturn, sender: *mut c_void),
->;
+pub type IOHIDCallback =
+    Option<unsafe extern "C" fn(context: *mut c_void, result: IOReturn, sender: *mut c_void)>;
 #[cfg(target_os = "macos")]
 pub type IOHIDDeviceCallback = Option<
     unsafe extern "C" fn(
@@ -1798,17 +2002,17 @@ extern "C" {
 }
 
 // IOSurface framework for cross-process texture sharing
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type IOSurfaceRef = *mut c_void;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type IOSurfaceID = u32;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type mach_port_t = u32;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const MACH_PORT_NULL: mach_port_t = 0;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[link(name = "IOSurface", kind = "framework")]
 extern "C" {
     pub fn IOSurfaceCreate(properties: ObjcId) -> IOSurfaceRef;
@@ -1822,7 +2026,7 @@ extern "C" {
     pub fn IOSurfaceDecrementUseCount(surface: IOSurfaceRef);
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     pub static kCFBooleanTrue: CFBooleanRef;
@@ -1860,11 +2064,7 @@ extern "C" {
         theType: i32,
         valuePtr: *const c_void,
     ) -> CFNumberRef;
-    pub fn CFNumberGetValue(
-        number: CFNumberRef,
-        theType: i32,
-        valuePtr: *mut c_void,
-    ) -> Boolean;
+    pub fn CFNumberGetValue(number: CFNumberRef, theType: i32, valuePtr: *mut c_void) -> Boolean;
     pub fn CFStringCreateWithBytes(
         alloc: CFAllocatorRef,
         bytes: *const u8,
@@ -1883,10 +2083,7 @@ extern "C" {
 #[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
-    pub fn IOHIDManagerCreate(
-        allocator: CFAllocatorRef,
-        options: IOOptionBits,
-    ) -> IOHIDManagerRef;
+    pub fn IOHIDManagerCreate(allocator: CFAllocatorRef, options: IOOptionBits) -> IOHIDManagerRef;
     pub fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: IOOptionBits) -> IOReturn;
     pub fn IOHIDManagerClose(manager: IOHIDManagerRef, options: IOOptionBits) -> IOReturn;
     pub fn IOHIDManagerScheduleWithRunLoop(
@@ -1899,10 +2096,7 @@ extern "C" {
         run_loop: CFRunLoopRef,
         run_loop_mode: CFStringRef,
     );
-    pub fn IOHIDManagerSetDeviceMatchingMultiple(
-        manager: IOHIDManagerRef,
-        multiple: CFArrayRef,
-    );
+    pub fn IOHIDManagerSetDeviceMatchingMultiple(manager: IOHIDManagerRef, multiple: CFArrayRef);
     pub fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) -> CFSetRef;
     pub fn IOHIDManagerRegisterDeviceMatchingCallback(
         manager: IOHIDManagerRef,
@@ -1927,35 +2121,35 @@ extern "C" {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SSLContextRef = *mut c_void;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SSLConnectionRef = *mut c_void;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SSLProtocol = u32;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SSLProtocolSide = u32;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SSLConnectionType = u32;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const kSSLClientSide: SSLProtocolSide = 1;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const kSSLServerSide: SSLProtocolSide = 0;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const kSSLStreamType: SSLConnectionType = 0;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const kSSLDatagramType: SSLConnectionType = 1;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const kDTLSProtocol1: SSLProtocol = 9;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const kDTLSProtocol12: SSLProtocol = 11;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const errSSLWouldBlock: OSStatus = -9803;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const errSSLClosedGraceful: OSStatus = -9805;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const errSSLClosedAbort: OSStatus = -9806;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const errSSLServerAuthCompleted: OSStatus = -9841;
@@ -1968,16 +2162,16 @@ pub const kSSLSessionOptionBreakOnServerAuth: i32 = 0;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub const kSSLSessionOptionBreakOnClientAuth: i32 = 2;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SecIdentityRef = *const c_void;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SecCertificateRef = *const c_void;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SecKeyRef = *const c_void;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SecTrustRef = *const c_void;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SSLReadFunc = Option<
     unsafe extern "C" fn(
         connection: SSLConnectionRef,
@@ -1985,7 +2179,7 @@ pub type SSLReadFunc = Option<
         data_len: *mut usize,
     ) -> OSStatus,
 >;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub type SSLWriteFunc = Option<
     unsafe extern "C" fn(
         connection: SSLConnectionRef,
@@ -1994,7 +2188,7 @@ pub type SSLWriteFunc = Option<
     ) -> OSStatus,
 >;
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     pub fn SSLCreateContext(
