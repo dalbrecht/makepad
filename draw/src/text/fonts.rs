@@ -1,41 +1,104 @@
 use {
     super::{
-        font::FontId,
+        font::{Font, FontId, GlyphId},
         font_family::{FontFamily, FontFamilyId},
         image::{Bgra, Image},
         layouter::{self, LaidoutText, LayoutParams, Layouter},
         loader::{FontDefinition, FontFamilyDefinition},
         msdfer::Msdfer,
         rasterizer::{CompletedMsdfJob, OutlineRasterizationMode, QueuedMsdfJob, Rasterizer},
+        slug_atlas::{SlugAtlas, SlugGlyphCacheResult},
     },
     crate::makepad_platform::*,
+    fxhash::FxHashSet,
     std::{cell::RefCell, mem::ManuallyDrop, rc::Rc},
 };
 
+#[derive(Default)]
+struct LazyFontRequests {
+    requested: FxHashSet<(FontFamilyId, LazyFontFamily)>,
+}
+
+impl LazyFontRequests {
+    fn take_for_glyph_miss(
+        &mut self,
+        family_id: FontFamilyId,
+        lazy_family: LazyFontFamily,
+        text: &str,
+        has_missing_glyph: bool,
+    ) -> bool {
+        has_missing_glyph
+            && text.chars().any(|ch| lazy_family.contains(ch))
+            && self.requested.insert((family_id, lazy_family))
+    }
+
+    fn contains(&self, family_id: FontFamilyId, lazy_family: LazyFontFamily) -> bool {
+        self.requested.contains(&(family_id, lazy_family))
+    }
+}
+
+fn default_slug_new_glyphs_per_redraw(cx: &Cx) -> usize {
+    match cx.os_type() {
+        OsType::LinuxWindow(_) | OsType::LinuxDirect | OsType::Windows => 1,
+        _ => usize::MAX,
+    }
+}
+
+fn default_slug_min_dpxs_per_em(cx: &Cx, rasterizer: &Rasterizer) -> f32 {
+    match cx.os_type() {
+        OsType::LinuxWindow(_) | OsType::LinuxDirect | OsType::Windows => {
+            rasterizer.msdf_resolution().max_dpxs_per_em
+        }
+        _ => 0.0,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FontsMemoryBytes {
+    pub atlas_bytes: usize,
+    pub layout_cache_bytes: usize,
+}
+
 pub struct Fonts {
     layouter: Layouter,
+    lazy_font_requests: LazyFontRequests,
+    missing_font_paths: FxHashSet<String>,
     needs_prepare_atlases: bool,
     atlas_texture: Texture,
+    slug_atlas: SlugAtlas,
+    slug_min_dpxs_per_em: f32,
+    slug_new_glyphs_per_redraw: usize,
+    slug_budget_redraw_id: u64,
+    slug_built_glyphs_this_redraw: usize,
     msdf_job_sender: FromUISender<QueuedMsdfJob>,
     msdf_result_receiver: ToUIReceiver<CompletedMsdfJob>,
+    /// Fonts whose resource this process could not read (see
+    /// [`Self::note_font_unavailable`]); their families render without them
+    /// until the resource registry moves on (`unavailable_generation`).
+    unavailable_fonts: FxHashSet<FontId>,
+    /// The `Cx::script_resource_generation` the set was built under.
+    unavailable_generation: u64,
 }
 
 impl Fonts {
     pub fn new(cx: &mut Cx, settings: layouter::Settings) -> Self {
         let layouter = Layouter::new(settings);
-        let (atlas_size, msdfer_settings) = {
+        let (atlas_size, msdfer_settings, slug_min_dpxs_per_em) = {
             let rasterizer = layouter.rasterizer().borrow();
             (
                 rasterizer.color_atlas().size(),
                 rasterizer.msdfer().settings(),
+                default_slug_min_dpxs_per_em(cx, &rasterizer),
             )
         };
 
         let mut msdf_job_sender: FromUISender<QueuedMsdfJob> = Default::default();
         let msdf_result_receiver: ToUIReceiver<CompletedMsdfJob> = Default::default();
-        let worker_rx = msdf_job_sender.receiver();
+        let worker_rx = msdf_job_sender
+            .receiver()
+            .expect("MSDF worker receiver is taken exactly once");
         let worker_tx = msdf_result_receiver.sender();
-        cx.spawn_thread(move || {
+        if let Ok(task) = cx.spawn_worker(move || {
             let mut msdfer = Msdfer::new(msdfer_settings);
             while let Ok(job) = worker_rx.recv() {
                 let mut msdf = Image::<Bgra>::new(job.key.size);
@@ -55,10 +118,14 @@ impl Fonts {
                     break;
                 }
             }
-        });
+        }) {
+            task.detach();
+        }
 
         Self {
             layouter,
+            lazy_font_requests: Default::default(),
+            missing_font_paths: FxHashSet::default(),
             needs_prepare_atlases: false,
             atlas_texture: Texture::new_with_format(
                 cx,
@@ -69,8 +136,15 @@ impl Fonts {
                     updated: TextureUpdated::Empty,
                 },
             ),
+            slug_atlas: SlugAtlas::new(cx),
+            slug_min_dpxs_per_em,
+            slug_new_glyphs_per_redraw: default_slug_new_glyphs_per_redraw(cx),
+            slug_budget_redraw_id: 0,
+            slug_built_glyphs_this_redraw: 0,
             msdf_job_sender,
             msdf_result_receiver,
+            unavailable_fonts: FxHashSet::default(),
+            unavailable_generation: 0,
         }
     }
 
@@ -104,21 +178,148 @@ impl Fonts {
         &self.atlas_texture
     }
 
+    pub fn slug_curve_texture(&self) -> &Texture {
+        self.slug_atlas.curve_texture()
+    }
+
+    pub fn slug_band_texture(&self) -> &Texture {
+        self.slug_atlas.band_texture()
+    }
+
+    pub fn should_use_slug_glyph(&self, dpxs_per_em: f32) -> bool {
+        dpxs_per_em >= self.slug_min_dpxs_per_em
+    }
+
+    pub fn max_rasterized_glyph_dpxs_per_em(&self) -> f32 {
+        self.layouter
+            .rasterizer()
+            .borrow()
+            .msdf_resolution()
+            .max_dpxs_per_em
+    }
+
+    pub fn get_or_cache_slug_glyph(
+        &mut self,
+        redraw_id: u64,
+        font: &Font,
+        glyph_id: GlyphId,
+    ) -> SlugGlyphCacheResult {
+        match self.slug_atlas.get_or_cache_glyph(font, glyph_id, false) {
+            SlugGlyphCacheResult::Deferred => {}
+            result => return result,
+        }
+
+        if self.slug_new_glyphs_per_redraw != usize::MAX {
+            if self.slug_budget_redraw_id != redraw_id {
+                self.slug_budget_redraw_id = redraw_id;
+                self.slug_built_glyphs_this_redraw = 0;
+            }
+            if self.slug_built_glyphs_this_redraw >= self.slug_new_glyphs_per_redraw {
+                return SlugGlyphCacheResult::Deferred;
+            }
+            self.slug_built_glyphs_this_redraw += 1;
+        }
+
+        self.slug_atlas.get_or_cache_glyph(font, glyph_id, true)
+    }
+
+    pub fn slug_cache_generation(&self) -> u64 {
+        self.slug_atlas.cache_generation()
+    }
+
+    pub fn slug_uploaded_generation(&self) -> u64 {
+        self.slug_atlas.uploaded_generation()
+    }
+
+    /// Uploads any newly appended SLUG curve/band data immediately so draw calls
+    /// in the current frame can see glyphs cached during the draw loop.
+    /// CPU bytes the text system holds: the glyph atlas pixels while the
+    /// atlas (not its texture) owns them, and the laid-out text cache. Font
+    /// file bytes are script resources and are counted by `Cx::memory_report`.
+    pub fn memory_bytes(&self) -> FontsMemoryBytes {
+        let rasterizer = self.layouter.rasterizer().borrow();
+        FontsMemoryBytes {
+            atlas_bytes: rasterizer
+                .color_atlas()
+                .image()
+                .as_pixels()
+                .len()
+                .saturating_mul(4),
+            layout_cache_bytes: self.layouter.cache_bytes(),
+        }
+    }
+
+    pub fn flush_slug_textures(&mut self, cx: &mut Cx) -> bool {
+        self.slug_atlas.prepare_textures(cx)
+    }
+
     pub fn is_font_family_known(&self, id: FontFamilyId) -> bool {
         self.layouter.is_font_family_known(id)
     }
 
-    pub fn is_font_family_complete(&self, id: FontFamilyId) -> bool {
+    pub(crate) fn lazy_font_is_requested(
+        &self,
+        id: FontFamilyId,
+        family: LazyFontFamily,
+    ) -> bool {
+        self.lazy_font_requests.contains(id, family)
+    }
+
+    pub(crate) fn take_lazy_font_request(
+        &mut self,
+        id: FontFamilyId,
+        family: LazyFontFamily,
+        text: &str,
+        has_missing_glyph: bool,
+    ) -> bool {
+        self.lazy_font_requests
+            .take_for_glyph_miss(id, family, text, has_missing_glyph)
+    }
+
+    pub fn is_font_family_complete(
+        &self,
+        id: FontFamilyId,
+        expected_member_count: usize,
+    ) -> bool {
         self.layouter
             .loader
             .font_family_definitions
             .get(&id)
-            .map(|def| def.font_ids.len() == def.expected_member_count)
+            .map(|def| {
+                def.expected_member_count == expected_member_count
+                    && def.font_ids.len() == expected_member_count
+            })
             .unwrap_or(false)
+    }
+
+    /// Records that `id`'s resource could not be read; true the first time,
+    /// so the caller can say so once. The family drops the member instead
+    /// of asking for it again every frame.
+    pub fn note_font_unavailable(&mut self, id: FontId) -> bool {
+        self.unavailable_fonts.insert(id)
+    }
+
+    /// A resource was registered or loaded since the unavailable set was
+    /// built: forget it, so the missing members are asked for once more
+    /// (a font file provisioned later, a resource registered again).
+    pub fn sync_unavailable_fonts(&mut self, resource_generation: u64) {
+        if self.unavailable_generation != resource_generation {
+            self.unavailable_generation = resource_generation;
+            self.unavailable_fonts.clear();
+        }
+    }
+
+    pub fn is_font_unavailable(&self, id: FontId) -> bool {
+        self.unavailable_fonts.contains(&id)
     }
 
     pub fn is_font_known(&self, id: FontId) -> bool {
         self.layouter.is_font_known(id)
+    }
+
+    /// True the first time a resource path fails to load, so the error logs once.
+    pub fn note_missing_font(&mut self, resource_path: &str) -> bool {
+        self.missing_font_paths.insert(resource_path.to_string())
     }
 
     pub fn define_font_family(&mut self, id: FontFamilyId, definition: FontFamilyDefinition) {
@@ -147,17 +348,30 @@ impl Fonts {
 
     pub fn prepare_textures(&mut self, cx: &mut Cx) -> bool {
         assert!(!self.needs_prepare_atlases);
+        // Frame boundary for the layout cache's working-set protection.
+        self.layouter.advance_cache_generation();
         let mut rasterizer = self.layouter.rasterizer().borrow_mut();
         if rasterizer.color_atlas_mut().reset_if_needed() {
             rasterizer.on_atlas_reset();
             return false;
         }
         drop(rasterizer);
+        // Same idea for the append-only slug glyph atlas: if it grew past its cap, clear it
+        // here (before any upload below) and force a full redraw so every slug glyph rebuilds
+        // into the fresh atlas. Returning false leaves the existing slug textures intact for
+        // the current frame's GPU render.
+        if self.slug_atlas.reset_if_needed() {
+            return false;
+        }
         let completed = self.apply_completed_msdf_jobs();
         if completed > 0 {
             cx.redraw_all();
         }
         self.dispatch_msdf_jobs();
+        let slug_changed = self.flush_slug_textures(cx);
+        if slug_changed {
+            cx.redraw_all();
+        }
         self.prepare_atlas_texture(cx);
         self.needs_prepare_atlases = true;
         true
@@ -234,4 +448,49 @@ fn u32_vec_into_bgra(vec: Vec<u32>) -> Vec<Bgra> {
     // `Bgra` is `#[repr(transparent)]` over `u32`, so element layout matches exactly.
     // We preserve the same pointer/len/cap and only reinterpret the element type.
     unsafe { Vec::from_raw_parts(vec.as_mut_ptr().cast::<Bgra>(), vec.len(), vec.capacity()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LazyFontRequests;
+    use crate::{
+        makepad_platform::LazyFontFamily,
+        text::font_family::FontFamilyId,
+    };
+
+    #[test]
+    fn glyph_miss_requests_each_lazy_family_once() {
+        let family_id: FontFamilyId = 0xFA17_u64.into();
+        let mut requests = LazyFontRequests::default();
+        assert!(!requests.take_for_glyph_miss(
+            family_id,
+            LazyFontFamily::Cjk,
+            "\u{4f60}",
+            false,
+        ));
+        assert!(requests.take_for_glyph_miss(
+            family_id,
+            LazyFontFamily::Cjk,
+            "\u{4f60}",
+            true,
+        ));
+        assert!(!requests.take_for_glyph_miss(
+            family_id,
+            LazyFontFamily::Cjk,
+            "\u{597d}",
+            true,
+        ));
+        assert!(requests.take_for_glyph_miss(
+            family_id,
+            LazyFontFamily::Emoji,
+            "\u{1f600}",
+            true,
+        ));
+        assert!(!requests.take_for_glyph_miss(
+            family_id,
+            LazyFontFamily::Emoji,
+            "\u{1f680}",
+            true,
+        ));
+    }
 }

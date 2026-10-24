@@ -110,6 +110,21 @@ impl<T> GenVec<T> {
         self.slots.len()
     }
 
+    /// Reclaim over-allocated backing capacity. This only shrinks spare capacity (it never
+    /// changes `len`), so every existing raw index / `GenRef` remains valid. Useful after a
+    /// large allocation spike followed by a GC: the slot count stays at its high-water mark
+    /// (slots are reused via the free list), but the Vec's doubling overhead is returned.
+    #[inline]
+    pub fn shrink_to_fit(&mut self) {
+        self.slots.shrink_to_fit();
+    }
+
+    /// Backing capacity, for deciding whether a `shrink_to_fit` is worthwhile.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
     /// Check if empty
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -247,6 +262,32 @@ fn check_generation<R: GenRef>(
     }
 }
 
+/// An index past len can't come from this GenVec (len never shrinks), so it is
+/// a value minted by ANOTHER heap. Name the table and the numbers so the
+/// cross-heap route can be identified from the panic alone.
+#[cold]
+#[inline(never)]
+fn foreign_index_panic<T>(index: u32, len: usize) -> ! {
+    panic!(
+        "GenVec<{}> index {} out of bounds (len {}): value belongs to a different heap",
+        std::any::type_name::<T>(),
+        index,
+        len
+    );
+}
+
+/// Bounds-checked accessors for paths that must SURVIVE a foreign-heap ref
+/// (e.g. the GC mark walk): a miss means the value was minted by another
+/// heap, and the caller skips it instead of panicking.
+impl<T> GenVec<T> {
+    pub fn get_checked<R: GenRef>(&self, r: R) -> Option<&T> {
+        self.slots.get(r.index() as usize).map(|slot| &slot.data)
+    }
+    pub fn get_checked_mut<R: GenRef>(&mut self, r: R) -> Option<&mut T> {
+        self.slots.get_mut(r.index() as usize).map(|slot| &mut slot.data)
+    }
+}
+
 /// Index by a GenRef type - checked access
 impl<T, R: GenRef> std::ops::Index<R> for GenVec<T> {
     type Output = T;
@@ -254,7 +295,9 @@ impl<T, R: GenRef> std::ops::Index<R> for GenVec<T> {
     #[cfg(feature = "check_gen")]
     #[inline]
     fn index(&self, r: R) -> &Self::Output {
-        let slot = &self.slots[r.index() as usize];
+        let Some(slot) = self.slots.get(r.index() as usize) else {
+            foreign_index_panic::<T>(r.index(), self.slots.len());
+        };
         check_generation::<R>(
             slot.generation,
             r.generation(),
@@ -276,7 +319,10 @@ impl<T, R: GenRef> std::ops::IndexMut<R> for GenVec<T> {
     #[cfg(feature = "check_gen")]
     #[inline]
     fn index_mut(&mut self, r: R) -> &mut Self::Output {
-        let slot = &mut self.slots[r.index() as usize];
+        let len = self.slots.len();
+        let Some(slot) = self.slots.get_mut(r.index() as usize) else {
+            foreign_index_panic::<T>(r.index(), len);
+        };
         check_generation::<R>(
             slot.generation,
             r.generation(),

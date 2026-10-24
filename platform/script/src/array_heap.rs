@@ -24,6 +24,12 @@ impl ScriptHeap {
             array.tag.set_alloced();
             arr
         } else {
+            if !self.charge_allocation(
+                std::mem::size_of::<ScriptArrayData>(),
+                "creating an array",
+            ) {
+                return self.allocation_poison_array;
+            }
             let index = self.arrays.len();
             let mut array = ScriptArrayData::default();
             array.tag.set_alloced();
@@ -38,11 +44,16 @@ impl ScriptHeap {
     }
 
     pub fn array_push(&mut self, array: ScriptArray, value: ScriptValue, trap: ScriptTrap) {
-        let array = &mut self.arrays[array];
-        if array.tag.is_immutable() {
+        if self.is_allocation_poison_array(array) || self.arrays[array].tag.is_immutable() {
             script_err_immutable!(trap, "array is immutable");
             return;
         }
+        let bytes = self.arrays[array].storage.allocation_element_bytes();
+        if !self.charge_allocation(bytes, "pushing an array element") {
+            return;
+        }
+        self.escape_value(value);
+        let array = &mut self.arrays[array];
         array.tag.set_dirty();
         array.storage.push(value);
     }
@@ -57,11 +68,23 @@ impl ScriptHeap {
     }
 
     pub fn array_push_vec(&mut self, array: ScriptArray, object: ScriptObject, trap: ScriptTrap) {
-        let array = &mut self.arrays[array];
-        if array.tag.is_immutable() {
+        if self.is_allocation_poison_array(array) || self.arrays[array].tag.is_immutable() {
             script_err_immutable!(trap, "array is immutable");
             return;
         }
+        let vec_len = self.objects[object].vec.len();
+        let bytes = vec_len
+            .checked_mul(self.arrays[array].storage.allocation_element_bytes())
+            .unwrap_or(usize::MAX);
+        if !self.charge_allocation(bytes, "extending an array") {
+            return;
+        }
+        // escape barrier: the object's vec values become reachable from the array
+        for i in 0..vec_len {
+            let v = self.objects[object].vec[i].value;
+            self.escape_value(v);
+        }
+        let array = &mut self.arrays[array];
         array.tag.set_dirty();
         let object = &self.objects[object];
         for kv in &object.vec {
@@ -72,6 +95,19 @@ impl ScriptHeap {
     /// Merges all elements from source array into target array.
     /// Used by the splat operator (..) to spread one array into another.
     pub fn merge_array(&mut self, target: ScriptArray, source: ScriptArray, trap: ScriptTrap) {
+        if self.is_allocation_poison_array(target) || self.arrays[target].tag.is_immutable() {
+            script_err_immutable!(trap, "array is immutable");
+            return;
+        }
+        let source_len = self.arrays[source].storage.len();
+        let element_bytes = self.arrays[target].storage.allocation_element_bytes();
+        // One temporary ScriptValue vector plus the target's new elements.
+        let bytes = source_len
+            .checked_mul(std::mem::size_of::<ScriptValue>().saturating_add(element_bytes))
+            .unwrap_or(usize::MAX);
+        if !self.charge_allocation(bytes, "merging arrays") {
+            return;
+        }
         // Get the storage from source first
         let source_storage = &self.arrays[source].storage;
         let values: Vec<ScriptValue> = match source_storage {
@@ -90,11 +126,11 @@ impl ScriptHeap {
             }
         };
 
-        let target_arr = &mut self.arrays[target];
-        if target_arr.tag.is_immutable() {
-            script_err_immutable!(trap, "array is immutable");
-            return;
+        // escape barrier: source values become reachable from target
+        for v in &values {
+            self.escape_value(*v);
         }
+        let target_arr = &mut self.arrays[target];
         target_arr.tag.set_dirty();
         for v in values {
             target_arr.storage.push(v);
@@ -102,6 +138,13 @@ impl ScriptHeap {
     }
 
     pub fn array_push_unchecked(&mut self, array: ScriptArray, value: ScriptValue) {
+        if self.is_allocation_poison_array(array) || self.allocation_exceeded() {
+            return;
+        }
+        let bytes = self.arrays[array].storage.allocation_element_bytes();
+        if !self.charge_allocation(bytes, "pushing an array element") {
+            return;
+        }
         let array = &mut self.arrays[array];
         array.tag.set_dirty();
         array.storage.push(value);
@@ -114,9 +157,29 @@ impl ScriptHeap {
 
     pub fn new_array_from_vec_u8(&mut self, data: Vec<u8>) -> ScriptArray {
         let ptr = self.new_array();
+        if self.is_allocation_poison_array(ptr) {
+            return ptr;
+        }
+        if !self.charge_allocation(data.capacity(), "creating a byte array") {
+            return ptr;
+        }
         let array = &mut self.arrays[ptr];
         array.tag.set_dirty();
         array.storage = ScriptArrayStorage::U8(data);
+        ptr
+    }
+
+    pub fn new_array_from_slice_u8(&mut self, data: &[u8]) -> ScriptArray {
+        let ptr = self.new_array();
+        if self.is_allocation_poison_array(ptr) {
+            return ptr;
+        }
+        if !self.charge_allocation(data.len(), "creating a byte array") {
+            return ptr;
+        }
+        let array = &mut self.arrays[ptr];
+        array.tag.set_dirty();
+        array.storage = ScriptArrayStorage::U8(data.to_vec());
         ptr
     }
 
@@ -234,10 +297,24 @@ impl ScriptHeap {
         value: ScriptValue,
         trap: ScriptTrap,
     ) -> ScriptValue {
-        let array = &mut self.arrays[array];
-        if array.tag.is_immutable() {
+        if self.is_allocation_poison_array(array) || self.arrays[array].tag.is_immutable() {
             return script_err_immutable!(trap, "array is immutable");
         }
+        let len = self.arrays[array].storage.len();
+        if index >= len {
+            let additional = index
+                .checked_add(1)
+                .and_then(|target| target.checked_sub(len))
+                .and_then(|elements| {
+                    elements.checked_mul(self.arrays[array].storage.allocation_element_bytes())
+                })
+                .unwrap_or(usize::MAX);
+            if !self.charge_allocation(additional, "growing a sparse array index") {
+                return NIL;
+            }
+        }
+        self.escape_value(value);
+        let array = &mut self.arrays[array];
         array.tag.set_dirty();
         array.storage.set_index(index, value);
         NIL
@@ -270,5 +347,48 @@ mod tests {
             ScriptArrayStorage::ScriptValue(_)
         ));
         assert_eq!(heap.array_len(reused), 0);
+    }
+
+    #[test]
+    fn capped_sparse_array_growth_is_refused_before_mutation() {
+        let mut heap = ScriptHeap::empty();
+        let array = heap.new_array();
+        heap.set_max_heap_bytes(Some(usize::MAX));
+        let baseline = heap.accounted_heap_bytes();
+        heap.set_max_heap_bytes(Some(baseline + 1024));
+
+        let trap = ScriptTrap::NoTrap;
+        let before = heap.arrays[array].storage.retained_bytes();
+        heap.set_array_index(array, 1 << 20, NIL, trap.pass());
+        assert!(heap.take_heap_limit_exceeded());
+        assert_eq!(heap.array_len(array), 0);
+        assert_eq!(heap.arrays[array].storage.retained_bytes(), before);
+
+        // A write that fits is accepted and charged.
+        let accounted = heap.accounted_heap_bytes();
+        heap.set_array_index(array, 3, NIL, trap.pass());
+        assert!(!heap.take_heap_limit_exceeded());
+        assert_eq!(heap.array_len(array), 4);
+        assert!(heap.accounted_heap_bytes() > accounted);
+    }
+
+    #[test]
+    fn numeric_storage_variants_report_retained_capacity() {
+        let mut heap = ScriptHeap::empty();
+        let bytes = heap.new_array_from_vec_u8(vec![1, 2, 3, 4]);
+        assert!(heap.arrays[bytes].storage.retained_bytes() >= 4);
+        let text = heap.new_string_from_str("héllo wörld");
+        let chars = heap.string_to_chars_array(text);
+        assert!(matches!(heap.arrays[chars].storage, ScriptArrayStorage::U32(_)));
+        assert!(heap.arrays[chars].storage.retained_bytes() >= 11 * 4);
+        let generic = heap.new_array();
+        let trap = ScriptTrap::NoTrap;
+        for index in 0..8 {
+            heap.array_push(generic, ScriptValue::from_f64(index as f64), trap.pass());
+        }
+        assert!(
+            heap.arrays[generic].storage.retained_bytes()
+                >= 8 * std::mem::size_of::<ScriptValue>()
+        );
     }
 }

@@ -4,9 +4,10 @@ use super::xr_select::XrSelectAction;
 use super::{arm_pair_metrics, flat_head_forward, hand_closed_fist_contact_point};
 use crate::prelude::*;
 use crate::util::scene_draw::{ray_from_scene_viewport, SceneState3D};
+use crate::util::clock::Instant;
 use makepad_widgets::event::{XrFingerTip, XrSyncAnchor, XrSyncAnchorExtrema};
 use makepad_widgets::makepad_script::ScriptFnRef;
-use std::{cell::Cell, collections::HashMap, fmt::Write as _, rc::Rc, time::Instant};
+use std::{cell::Cell, collections::HashMap, fmt::Write as _, rc::Rc};
 
 const DESKTOP_TOUCH_DOWN_Z: f32 = 0.0;
 const DESKTOP_TOUCH_UP_Z: f32 = 64.0;
@@ -1148,8 +1149,8 @@ impl XrRoot {
         self.env.physics_tsdf_query_ms()
     }
 
-    pub fn physics_rapier_step_ms(&self) -> f64 {
-        self.env.physics_rapier_step_ms()
+    pub fn physics_engine_step_ms(&self) -> f64 {
+        self.env.physics_engine_step_ms()
     }
 
     pub fn physics_time_scale(&self) -> f32 {

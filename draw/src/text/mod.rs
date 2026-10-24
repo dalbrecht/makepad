@@ -1,4 +1,6 @@
 pub mod color;
+#[cfg(target_os = "macos")]
+pub(crate) mod coretext;
 pub mod font;
 pub mod font_atlas;
 pub mod font_face;
@@ -18,6 +20,7 @@ pub mod sdfer;
 pub mod selection;
 pub mod shaper;
 pub mod slice;
+pub mod slug_atlas;
 pub mod substr;
 
 // Debug test commented out - requires png encoder
@@ -26,3 +29,4 @@ pub mod substr;
 //     #[test]
 //     fn test() { ... }
 // }
+pub mod async_labels;

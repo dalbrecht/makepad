@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
+#[link(wasm_import_module = "env")]
 unsafe extern "C" {
     fn js_network_http_request(
         request_id_lo: u32,
@@ -22,6 +23,8 @@ unsafe extern "C" {
         headers_len: u32,
         body_ptr: u32,
         body_len: u32,
+        max_body_lo: u32,
+        max_body_hi: u32,
     );
     fn js_network_http_cancel(request_id_lo: u32, request_id_hi: u32);
 
@@ -267,6 +270,7 @@ impl NetworkBackend for WasmNetworkShimBackend {
         let headers_string = request.get_headers_string();
         let url = request.url;
         let body = request.body.unwrap_or_default();
+        let max_body = request.max_response_body_bytes;
         let method_string = method.as_str().to_string();
 
         unsafe {
@@ -283,6 +287,8 @@ impl NetworkBackend for WasmNetworkShimBackend {
                 headers_string.len() as u32,
                 body.as_ptr() as u32,
                 body.len() as u32,
+                max_body as u32,
+                (max_body >> 32) as u32,
             );
         }
         Ok(())
@@ -290,14 +296,13 @@ impl NetworkBackend for WasmNetworkShimBackend {
 
     fn http_cancel(&self, request_id: LiveId) -> Result<(), NetworkError> {
         let internal_id = {
-            let mut state = self
+            let state = self
                 .http
                 .lock()
                 .map_err(|_| NetworkError::backend("wasm shim http lock poisoned"))?;
-            let Some(internal_id) = state.by_public.remove(&request_id) else {
+            let Some(internal_id) = state.by_public.get(&request_id).copied() else {
                 return Ok(());
             };
-            state.by_internal.remove(&internal_id);
             internal_id
         };
         unsafe {

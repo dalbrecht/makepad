@@ -45,6 +45,7 @@ script_mod! {
                 @tImageBlend
                 @tGlassPanel
                 @tLabel
+                @tSlug
                 @tLinkLabel
                 @tMarkdown
                 @tPageFlip
@@ -86,6 +87,7 @@ script_mod! {
         tImageBlend := DockTab{name: "ImageBlend" template: @PermanentTab kind: @TabImageBlend}
         tGlassPanel := DockTab{name: "GlassPanel" template: @PermanentTab kind: @TabGlassPanel}
         tLabel := DockTab{name: "Label" template: @PermanentTab kind: @TabLabel}
+        tSlug := DockTab{name: "SLUG" template: @PermanentTab kind: @TabSlug}
         tLinkLabel := DockTab{name: "LinkLabel" template: @PermanentTab kind: @TabLinkLabel}
         tMarkdown := DockTab{name: "Markdown" template: @PermanentTab kind: @TabMarkdown}
         tPageFlip := DockTab{name: "PageFlip" template: @PermanentTab kind: @TabPageFlip}
@@ -117,6 +119,7 @@ script_mod! {
         TabImageBlend := UIZooTab{DemoImageBlend{}}
         TabGlassPanel := UIZooTab{DemoGlassPanel{}}
         TabLabel := UIZooTab{DemoLabel{}}
+        TabSlug := UIZooTab{DemoSlug{}}
         TabLinkLabel := UIZooTab{DemoLinkLabel{}}
         TabMarkdown := UIZooTab{DemoMarkdown{}}
         TabPageFlip := UIZooTab{DemoPageFlip{}}
@@ -359,6 +362,9 @@ impl MatchEvent for App {
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
         crate::makepad_widgets::script_mod(vm);
+        // The design tweaker's shader view uses the real code editor when
+        // the app registers it.
+        makepad_code_editor::script_mod(vm);
         crate::layout_templates::script_mod(vm);
         crate::demofiletree::script_mod(vm);
         crate::tab_button::script_mod(vm);
@@ -383,6 +389,7 @@ impl AppMain for App {
         crate::tab_rotatedimage::script_mod(vm);
         crate::tab_scrollbar::script_mod(vm);
         crate::tab_slider::script_mod(vm);
+        crate::tab_slug::script_mod(vm);
         crate::tab_slidesview::script_mod(vm);
         crate::tab_stacknavigation::script_mod(vm);
         crate::tab_adaptiveview::script_mod(vm);

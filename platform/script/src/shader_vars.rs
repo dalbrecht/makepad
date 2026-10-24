@@ -5,6 +5,7 @@
 
 use crate::mod_shader::*;
 use crate::opcode::*;
+use crate::pod::ScriptPodTy;
 use crate::shader::*;
 use crate::shader_backend::*;
 use crate::shader_tables::*;
@@ -17,6 +18,16 @@ use makepad_live_id::*;
 use std::fmt::Write;
 
 impl ShaderFnCompiler {
+    fn logical_fetch_pod_type(vm: &ScriptVm, pod_ty: ScriptPodType) -> ScriptPodType {
+        match vm.bx.heap.pod_type_ref(pod_ty).ty {
+            ScriptPodTy::Packed(packed) if packed.is_vec4() => {
+                vm.bx.code.builtins.pod.pod_vec4f
+            }
+            ScriptPodTy::Packed(_) => vm.bx.code.builtins.pod.pod_vec2f,
+            _ => pod_ty,
+        }
+    }
+
     pub(crate) fn handle_log(&mut self, vm: &ScriptVm) {
         let (ty, value_str) = self.stack.peek(self.trap.pass());
         let type_name = self.shader_type_to_string(vm, ty);
@@ -86,13 +97,12 @@ impl ShaderFnCompiler {
                     script_err_immutable!(self.trap, "cannot assign to let binding {:?}", id);
                 }
                 let mut s = self.stack.new_string();
-                let var_name = if matches!(var, ShaderScopeItem::Param { .. }) {
+                if matches!(var, ShaderScopeItem::Param { .. }) {
                     // Params are immutable and should not reach assignment, but keep this path stable.
-                    output.backend.map_param_name(id, shadow)
+                    output.backend.write_param_name(&mut s, id, shadow);
                 } else {
-                    output.backend.map_local_name(id, shadow)
-                };
-                write!(s, "{}", var_name).ok();
+                    output.backend.write_local_name(&mut s, id, shadow);
+                }
                 write!(s, " = {}", value).ok();
                 self.stack.push(
                     self.trap.pass(),
@@ -156,8 +166,9 @@ impl ShaderFnCompiler {
                             vm.bx.heap.pod_types[pod_ty.index as usize].ty,
                             crate::pod::ScriptPodTy::Struct { .. }
                         );
-                    let field_name = output.backend.map_field_name_typed(field_id, is_vec);
-                    write!(s, "{}.{} = {}", instance_s, field_name, value_s).ok();
+                    write!(s, "{}.", instance_s).ok();
+                    output.backend.write_field_name_typed(&mut s, field_id, is_vec);
+                    write!(s, " = {}", value_s).ok();
                     self.stack.push(
                         self.trap.pass(),
                         ShaderType::Pod(vm.bx.code.builtins.pod.pod_void),
@@ -204,8 +215,9 @@ impl ShaderFnCompiler {
                             vm.bx.heap.pod_types[pod_ty.index as usize].ty,
                             crate::pod::ScriptPodTy::Struct { .. }
                         );
-                    let field_name = output.backend.map_field_name_typed(field_id, is_vec);
-                    write!(s, "{}->{} = {}", instance_s, field_name, value_s).ok();
+                    write!(s, "{}->", instance_s).ok();
+                    output.backend.write_field_name_typed(&mut s, field_id, is_vec);
+                    write!(s, " = {}", value_s).ok();
                     self.stack.push(
                         self.trap.pass(),
                         ShaderType::Pod(vm.bx.code.builtins.pod.pod_void),
@@ -292,18 +304,8 @@ impl ShaderFnCompiler {
                                 });
                             }
                             let mut s = self.stack.new_string();
-                            match prefix {
-                                ShaderIoPrefix::Prefix(prefix) => {
-                                    let io_name = output.backend.map_io_name(field_id);
-                                    write!(s, "{}{} = {}", prefix, io_name, value_s).ok()
-                                }
-                                ShaderIoPrefix::Full(full) => {
-                                    write!(s, "{} = {}", full, value_s).ok()
-                                }
-                                ShaderIoPrefix::FullOwned(full) => {
-                                    write!(s, "{} = {}", full, value_s).ok()
-                                }
-                            };
+                            output.backend.write_prefixed_io_name(&mut s, &prefix, field_id);
+                            write!(s, " = {}", value_s).ok();
                             self.stack.push(
                                 self.trap.pass(),
                                 ShaderType::Pod(vm.bx.code.builtins.pod.pod_void),
@@ -659,6 +661,14 @@ impl ShaderFnCompiler {
         let (instance_ty, instance_s) = self.pop_resolved(vm, output);
 
         if let ShaderType::Id(field_id) = field_ty {
+            // Backends spell this read differently, so we flag it here instead of searching their output.
+            if let ShaderType::Pod(pod_ty) | ShaderType::PodPtr(pod_ty) = instance_ty {
+                if field_id == id!(time)
+                    && output.io.iter().any(|io| io.name == id!(draw_pass) && io.ty == pod_ty)
+                {
+                    output.uses_time = true;
+                }
+            }
             if let ShaderType::Pod(pod_ty) = instance_ty {
                 if let Some(ret_ty) =
                     vm.bx
@@ -695,18 +705,25 @@ impl ShaderFnCompiler {
                                         vm.bx.heap.pod_types[pod_ty.index as usize].ty,
                                         crate::pod::ScriptPodTy::Struct { .. }
                                     );
-                                let field_name =
-                                    output.backend.map_field_name_typed(field_id, is_vec);
-                                write!(s, "{}.{}", instance_s, field_name).ok();
+                                write!(s, "{}.", instance_s).ok();
+                                output.backend.write_field_name_typed(&mut s, field_id, is_vec);
                                 self.stack
-                                    .push(self.trap.pass(), ShaderType::Pod(ret_ty), s);
+                                    .push(
+                                        self.trap.pass(),
+                                        ShaderType::Pod(Self::logical_fetch_pod_type(vm, ret_ty)),
+                                        s,
+                                    );
                                 self.stack.free_string(field_s);
                                 self.stack.free_string(instance_s);
                                 return;
                             }
                         }
                         self.stack
-                            .push(self.trap.pass(), ShaderType::Pod(ret_ty), s);
+                            .push(
+                                self.trap.pass(),
+                                ShaderType::Pod(Self::logical_fetch_pod_type(vm, ret_ty)),
+                                s,
+                            );
                         self.stack.free_string(field_s);
                         self.stack.free_string(instance_s);
                         return;
@@ -741,18 +758,25 @@ impl ShaderFnCompiler {
                                         vm.bx.heap.pod_types[pod_ty.index as usize].ty,
                                         crate::pod::ScriptPodTy::Struct { .. }
                                     );
-                                let field_name =
-                                    output.backend.map_field_name_typed(field_id, is_vec);
-                                write!(s, "{}.{}", instance_s, field_name).ok();
+                                write!(s, "{}.", instance_s).ok();
+                                output.backend.write_field_name_typed(&mut s, field_id, is_vec);
                                 self.stack
-                                    .push(self.trap.pass(), ShaderType::Pod(ret_ty), s);
+                                    .push(
+                                        self.trap.pass(),
+                                        ShaderType::Pod(Self::logical_fetch_pod_type(vm, ret_ty)),
+                                        s,
+                                    );
                                 self.stack.free_string(field_s);
                                 self.stack.free_string(instance_s);
                                 return;
                             }
                         }
                         self.stack
-                            .push(self.trap.pass(), ShaderType::Pod(ret_ty), s);
+                            .push(
+                                self.trap.pass(),
+                                ShaderType::Pod(Self::logical_fetch_pod_type(vm, ret_ty)),
+                                s,
+                            );
                         self.stack.free_string(field_s);
                         self.stack.free_string(instance_s);
                         return;
@@ -765,10 +789,14 @@ impl ShaderFnCompiler {
                             vm.bx.heap.pod_types[pod_ty.index as usize].ty,
                             crate::pod::ScriptPodTy::Struct { .. }
                         );
-                    let field_name = output.backend.map_field_name_typed(field_id, is_vec);
-                    write!(s, "{}.{}", instance_s, field_name).ok();
+                    write!(s, "{}.", instance_s).ok();
+                    output.backend.write_field_name_typed(&mut s, field_id, is_vec);
                     self.stack
-                        .push(self.trap.pass(), ShaderType::Pod(ret_ty), s);
+                        .push(
+                            self.trap.pass(),
+                            ShaderType::Pod(Self::logical_fetch_pod_type(vm, ret_ty)),
+                            s,
+                        );
                 } else {
                     script_err_not_found!(
                         self.trap,
@@ -800,10 +828,14 @@ impl ShaderFnCompiler {
                             vm.bx.heap.pod_types[pod_ty.index as usize].ty,
                             crate::pod::ScriptPodTy::Struct { .. }
                         );
-                    let field_name = output.backend.map_field_name_typed(field_id, is_vec);
-                    write!(s, "{}->{}", instance_s, field_name).ok();
+                    write!(s, "{}->", instance_s).ok();
+                    output.backend.write_field_name_typed(&mut s, field_id, is_vec);
                     self.stack
-                        .push(self.trap.pass(), ShaderType::Pod(ret_ty), s);
+                        .push(
+                            self.trap.pass(),
+                            ShaderType::Pod(Self::logical_fetch_pod_type(vm, ret_ty)),
+                            s,
+                        );
                 } else {
                     script_err_not_found!(
                         self.trap,
@@ -830,10 +862,10 @@ impl ShaderFnCompiler {
                 return;
             } else if let ShaderType::ScopeObject(obj) = instance_ty {
                 // Field access on a scope object (e.g., test_obj.p2 or test_obj.objfn or test_obj.sub_obj)
-                // Look up the field value
-                let value = vm.bx.heap.value(obj, field_id.into(), self.trap.pass());
+                // Look up the field value. A miss falls back to the type-check lookup below.
+                let value = vm.bx.heap.value(obj, field_id.into(), NoTrap);
 
-                if !value.is_nil() && self.trap.err.borrow().is_empty() {
+                if !value.is_nil() && !value.is_err() && self.trap.err_is_empty() {
                     // Check if this is an object
                     if let Some(value_obj) = value.as_object() {
                         // Check if this is a shader_io type - not supported for scope objects
@@ -871,10 +903,10 @@ impl ShaderFnCompiler {
                         let enum_value = vm.bx.heap.value(
                             value_obj,
                             id!(_repr_u32_enum_value).into(),
-                            self.trap.pass(),
+                            NoTrap,
                         );
                         if !enum_value.is_nil() {
-                            self.trap.err.take(); // Clear any error
+                            self.trap.err_take(); // Clear any error
                             if let Some(f) = enum_value.as_f64() {
                                 let mut s = self.stack.new_string();
                                 match output.backend {
@@ -891,7 +923,7 @@ impl ShaderFnCompiler {
                                 return;
                             }
                         }
-                        self.trap.err.take(); // Clear any error from value lookup
+                        self.trap.err_take(); // Clear any queued error
 
                         // It's a regular sub-object (like test_obj.sub_obj) - return it as ScopeObject
                         // so that further field access can continue (e.g., test_obj.sub_obj.test_p1)
@@ -925,6 +957,7 @@ impl ShaderFnCompiler {
                                 key: field_id,
                                 shader_name,
                                 ty: pod_ty,
+                                table_const: None,
                             });
                             // Also add to IO list
                             if !output.io.iter().any(|io| {
@@ -946,14 +979,7 @@ impl ShaderFnCompiler {
                         let (_, prefix) = output
                             .backend
                             .get_shader_io_kind_and_prefix(output.mode, SHADER_IO_SCOPE_UNIFORM);
-                        match prefix {
-                            ShaderIoPrefix::Prefix(prefix) => {
-                                let io_name = output.backend.map_io_name(shader_name);
-                                write!(s, "{}{}", prefix, io_name).ok()
-                            }
-                            ShaderIoPrefix::Full(full) => write!(s, "{}", full).ok(),
-                            ShaderIoPrefix::FullOwned(full) => write!(s, "{}", full).ok(),
-                        };
+                        output.backend.write_prefixed_io_name(&mut s, &prefix, shader_name);
                         self.stack
                             .push(self.trap.pass(), ShaderType::Pod(pod_ty), s);
                         self.stack.free_string(field_s);
@@ -963,7 +989,7 @@ impl ShaderFnCompiler {
                 }
 
                 // Value not found on prototype - try to get the type from type-check structure
-                self.trap.err.take(); // Clear any error from value lookup
+                self.trap.err_take(); // Clear any queued error
                 if let Some(field_type_id) = vm.bx.heap.field_type_from_type_check(obj, field_id) {
                     // Found field type in type-check structure - convert to pod type
                     if let Some(pod_ty) = vm
@@ -987,6 +1013,7 @@ impl ShaderFnCompiler {
                                 key: field_id,
                                 shader_name,
                                 ty: pod_ty,
+                                table_const: None,
                             });
                             if !output.io.iter().any(|io| {
                                 io.name == shader_name
@@ -1007,14 +1034,7 @@ impl ShaderFnCompiler {
                         let (_, prefix) = output
                             .backend
                             .get_shader_io_kind_and_prefix(output.mode, SHADER_IO_SCOPE_UNIFORM);
-                        match prefix {
-                            ShaderIoPrefix::Prefix(prefix) => {
-                                let io_name = output.backend.map_io_name(shader_name);
-                                write!(s, "{}{}", prefix, io_name).ok()
-                            }
-                            ShaderIoPrefix::Full(full) => write!(s, "{}", full).ok(),
-                            ShaderIoPrefix::FullOwned(full) => write!(s, "{}", full).ok(),
-                        };
+                        output.backend.write_prefixed_io_name(&mut s, &prefix, shader_name);
                         self.stack
                             .push(self.trap.pass(), ShaderType::Pod(pod_ty), s);
                         self.stack.free_string(field_s);
@@ -1114,8 +1134,9 @@ impl ShaderFnCompiler {
                 return;
             } else if let ShaderType::IoSelf(obj) = instance_ty {
                 // Look up field value, preferring the highest shader IO marker in the prototype chain
+                // A miss is expected for Rust instance fields, which resolve below.
                 let (value, maybe_io_type) =
-                    Self::get_io_self_field_value(vm, obj, field_id, self.trap.pass());
+                    Self::get_io_self_field_value(vm, obj, field_id, NoTrap);
 
                 if let Some(io_type) = maybe_io_type {
                     // Found a shader IO marker (uniform, varying, texture, etc.)
@@ -1181,14 +1202,7 @@ impl ShaderFnCompiler {
                             });
                         }
                         let mut s = self.stack.new_string();
-                        match &resolved_prefix {
-                            ShaderIoPrefix::Prefix(prefix) => {
-                                let io_name = output.backend.map_io_name(field_id);
-                                write!(s, "{}{}", prefix, io_name).ok()
-                            }
-                            ShaderIoPrefix::Full(full) => write!(s, "{}", full).ok(),
-                            ShaderIoPrefix::FullOwned(full) => write!(s, "{}", full).ok(),
-                        };
+                        output.backend.write_prefixed_io_name(&mut s, &resolved_prefix, field_id);
                         self.stack
                             .push(self.trap.pass(), ShaderType::Texture(*tex_type), s);
                         self.stack.free_string(field_s);
@@ -1200,6 +1214,12 @@ impl ShaderFnCompiler {
                         // lets see if our podtype has a name. ifnot use pod_ty
                         vm.bx.heap.pod_type_name_if_not_set(pod_ty, field_id);
                         if !output.io.iter().any(|io| io.name == field_id) {
+                            output.validate_vertex_fetch_io(
+                                &vm.bx.heap,
+                                &kind,
+                                field_id,
+                                pod_ty,
+                            );
                             output.io.push(ShaderIo {
                                 kind: kind.clone(),
                                 name: field_id,
@@ -1208,14 +1228,7 @@ impl ShaderFnCompiler {
                             });
                         }
                         let mut s = self.stack.new_string();
-                        match &resolved_prefix {
-                            ShaderIoPrefix::Prefix(prefix) => {
-                                let io_name = output.backend.map_io_name(field_id);
-                                write!(s, "{}{}", prefix, io_name).ok()
-                            }
-                            ShaderIoPrefix::Full(full) => write!(s, "{}", full).ok(),
-                            ShaderIoPrefix::FullOwned(full) => write!(s, "{}", full).ok(),
-                        };
+                        output.backend.write_prefixed_io_name(&mut s, &resolved_prefix, field_id);
                         // UniformBuffer in Metal is a pointer, use PodPtr for correct -> access
                         let shader_ty = if matches!(kind, ShaderIoKind::UniformBuffer)
                             && matches!(output.backend, ShaderBackend::Metal)
@@ -1278,6 +1291,12 @@ impl ShaderFnCompiler {
 
                     vm.bx.heap.pod_type_name_if_not_set(pod_ty, field_id);
                     if !output.io.iter().any(|io| io.name == field_id) {
+                        output.validate_vertex_fetch_io(
+                            &vm.bx.heap,
+                            &kind,
+                            field_id,
+                            pod_ty,
+                        );
                         output.io.push(ShaderIo {
                             kind: kind.clone(),
                             name: field_id,
@@ -1287,14 +1306,7 @@ impl ShaderFnCompiler {
                     }
 
                     let mut s = self.stack.new_string();
-                    match &resolved_prefix {
-                        ShaderIoPrefix::Prefix(prefix) => {
-                            let io_name = output.backend.map_io_name(field_id);
-                            write!(s, "{}{}", prefix, io_name).ok()
-                        }
-                        ShaderIoPrefix::Full(full) => write!(s, "{}", full).ok(),
-                        ShaderIoPrefix::FullOwned(full) => write!(s, "{}", full).ok(),
-                    };
+                    output.backend.write_prefixed_io_name(&mut s, &resolved_prefix, field_id);
                     self.stack
                         .push(self.trap.pass(), ShaderType::Pod(pod_ty), s);
                     self.stack.free_string(field_s);
@@ -1302,9 +1314,9 @@ impl ShaderFnCompiler {
                     return;
                 }
 
-                // No shader IO marker found - clear any trap error from value lookup
+                // No shader IO marker found - clear any queued trap error
                 // before checking RustInstance fields (which don't depend on prototype values)
-                self.trap.err.take();
+                self.trap.err_take();
 
                 // Check if this is a RustInstance field
                 // RustInstance fields are pre-collected into output.io, so just look it up there
@@ -1318,14 +1330,7 @@ impl ShaderFnCompiler {
                         .backend
                         .get_shader_io_kind_and_prefix(output.mode, SHADER_IO_RUST_INSTANCE);
                     let mut s = self.stack.new_string();
-                    match prefix {
-                        ShaderIoPrefix::Prefix(prefix) => {
-                            let io_name = output.backend.map_io_name(field_id);
-                            write!(s, "{}{}", prefix, io_name).ok()
-                        }
-                        ShaderIoPrefix::Full(full) => write!(s, "{}", full).ok(),
-                        ShaderIoPrefix::FullOwned(full) => write!(s, "{}", full).ok(),
-                    };
+                    output.backend.write_prefixed_io_name(&mut s, &prefix, field_id);
                     self.stack
                         .push(self.trap.pass(), ShaderType::Pod(pod_ty), s);
                     self.stack.free_string(field_s);

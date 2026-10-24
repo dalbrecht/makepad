@@ -243,6 +243,56 @@ impl ShaderFnCompiler {
                     if let ScriptPodTy::Struct { .. } = &pod_ty_data.ty {
                         write!(out, "{} {{ ", name).ok();
                     } else {
+                        // Scalar constructors are casts, and Rust has no u32(x) call
+                        // form — emit `as` casts (with != for bool, which `as` can't
+                        // target, and via u32 for bool→float, which `as` can't source).
+                        let is_scalar = matches!(
+                            pod_ty_data.ty,
+                            ScriptPodTy::F32
+                                | ScriptPodTy::F16
+                                | ScriptPodTy::U32
+                                | ScriptPodTy::I32
+                                | ScriptPodTy::Bool
+                        );
+                        if is_scalar && args.len() == 1 {
+                            let builtins = &vm.bx.code.builtins.pod;
+                            let arg = &args[0];
+                            let arg_ty =
+                                arg.ty.make_concrete(builtins).unwrap_or(builtins.pod_void);
+                            let arg_is_float =
+                                arg_ty == builtins.pod_f32 || arg_ty == builtins.pod_f16;
+                            let arg_is_bool = arg_ty == builtins.pod_bool;
+                            match &pod_ty_data.ty {
+                                ScriptPodTy::Bool if arg_is_bool => {
+                                    write!(out, "({})", arg.s).ok();
+                                }
+                                ScriptPodTy::Bool if arg_is_float => {
+                                    write!(out, "(({}) != 0.0)", arg.s).ok();
+                                }
+                                ScriptPodTy::Bool => {
+                                    write!(out, "(({}) != 0)", arg.s).ok();
+                                }
+                                ScriptPodTy::F32 | ScriptPodTy::F16 if arg_is_bool => {
+                                    write!(out, "(({}) as u32 as f32)", arg.s).ok();
+                                }
+                                ScriptPodTy::F32 | ScriptPodTy::F16 => {
+                                    write!(out, "(({}) as f32)", arg.s).ok();
+                                }
+                                ScriptPodTy::U32 => {
+                                    write!(out, "(({}) as u32)", arg.s).ok();
+                                }
+                                ScriptPodTy::I32 => {
+                                    write!(out, "(({}) as i32)", arg.s).ok();
+                                }
+                                _ => unreachable!(),
+                            }
+                            for arg in args {
+                                self.stack.free_string(arg.s);
+                            }
+                            self.stack
+                                .push(self.trap.pass(), ShaderType::Pod(pod_ty), out);
+                            return;
+                        }
                         // For vec types, we need to expand heterogeneous constructors
                         // like vec4f(vec3, f32) → vec4(v.x, v.y, v.z, s)
                         // This is handled by rust_expand_pod_construct below
@@ -508,7 +558,7 @@ impl ShaderFnCompiler {
         fnobj: ScriptObject,
         sself: ShaderType,
         args: Vec<ShaderType>,
-    ) -> (ScriptPodType, String) {
+    ) -> (ScriptPodType, String, Option<usize>) {
         let mut method_name_prefix = String::new();
         if let ShaderType::PodType(ty) = sself {
             if let Some(name) = vm.bx.heap.pod_type_name(ty) {
@@ -521,8 +571,16 @@ impl ShaderFnCompiler {
         } else if let ShaderType::IoSelf(_) = sself {
             write!(method_name_prefix, "io_").ok();
         } else if let ShaderType::ScopeObject(obj) = sself {
-            // Use the object index to create a unique prefix for scope object methods
-            write!(method_name_prefix, "scope{}_", obj.index).ok();
+            // A prefix unique within this shader and stable across module
+            // re-evaluation: the object's place in the order of first use.
+            let at = match output.scope_prefixes.iter().position(|&i| i == obj.index as usize) {
+                Some(at) => at,
+                None => {
+                    output.scope_prefixes.push(obj.index as usize);
+                    output.scope_prefixes.len() - 1
+                }
+            };
+            write!(method_name_prefix, "scope{}_", at).ok();
         }
 
         // First pass: resolve AbstractInt/AbstractFloat against declared parameter types
@@ -566,7 +624,17 @@ impl ShaderFnCompiler {
 
         // Validate argument count
         if args.len() != expected_param_count {
-            output.has_errors = true;
+            // Also on the output: entry points (vertex/fragment) compile
+            // under NoTrap, which DISCARDS script_err_*! messages — without
+            // this the shader failed with no diagnostic at all.
+            output.push_error(format!(
+                "shader function {:?} expects {} argument{}, but {} {} provided",
+                name,
+                expected_param_count,
+                if expected_param_count == 1 { "" } else { "s" },
+                args.len(),
+                if args.len() == 1 { "was" } else { "were" }
+            ));
             script_err_invalid_args!(
                 trap,
                 "function {:?} expects {} argument{}, but {} {} provided",
@@ -579,10 +647,11 @@ impl ShaderFnCompiler {
         }
 
         // lets see if we already have fnobj with our argstypes
-        if let Some(fun) = output
+        if let Some((index, fun)) = output
             .functions
             .iter()
-            .find(|v| v.fnobj == fnobj && v.args == resolved_args)
+            .enumerate()
+            .find(|(_, v)| v.fnobj == fnobj && v.args == resolved_args)
         {
             let mut fn_name_base = String::new();
             if fun.overload != 0 {
@@ -597,7 +666,7 @@ impl ShaderFnCompiler {
             }
             let mut fn_name = output.backend.map_function_name(&fn_name_base);
             write!(fn_name, "(").ok(); // Add opening paren to match new function path
-            return (fun.ret, fn_name);
+            return (fun.ret, fn_name, Some(index));
         }
 
         let overload = output.functions.iter().filter(|v| v.name == name).count();
@@ -692,7 +761,10 @@ impl ShaderFnCompiler {
 
             if kv.key == id!(self).into() {
                 if !has_self || argi != 0 {
-                    output.has_errors = true;
+                    output.push_error(format!(
+                        "shader function {:?}: self arg must be first with has_self",
+                        name
+                    ));
                     script_err_not_found!(trap, "self arg must be first with has_self");
                 }
                 continue;
@@ -703,7 +775,10 @@ impl ShaderFnCompiler {
                     write!(fn_args, ", ").ok();
                 }
                 if argi >= resolved_args.len() {
-                    output.has_errors = true;
+                    output.push_error(format!(
+                        "shader function {:?}: more formal params than resolved args",
+                        name
+                    ));
                     script_err_invalid_args!(trap, "more formal params than resolved args");
                     break;
                 }
@@ -742,16 +817,22 @@ impl ShaderFnCompiler {
             argi += 1;
         }
         if argi < resolved_args.len() {
-            output.has_errors = true;
+            output.push_error(format!(
+                "shader function {:?}: fewer formal params than resolved args",
+                name
+            ));
             script_err_invalid_args!(trap, "fewer formal params than resolved args");
         }
 
         if let Some(fnptr) = vm.bx.heap.as_fn(fnobj) {
             if let ScriptFnPtr::Script(fnip) = fnptr {
                 if output.recur_block.iter().any(|v| *v == fnobj) {
-                    output.has_errors = true;
+                    output.push_error(format!(
+                        "shader function {:?}: shader functions cannot recurse",
+                        name
+                    ));
                     script_err_not_allowed!(trap, "shader functions cannot recurse");
-                    (vm.bx.code.builtins.pod.pod_void, fn_name)
+                    (vm.bx.code.builtins.pod.pod_void, fn_name, None)
                 } else {
                     output.recur_block.push(fnobj);
                     let ret = compiler.compile_fn(vm, output, fnip);
@@ -795,6 +876,7 @@ impl ShaderFnCompiler {
                         }
                     }
 
+                    let index = output.functions.len();
                     output.functions.push(ShaderFn {
                         overload,
                         call_sig,
@@ -802,10 +884,11 @@ impl ShaderFnCompiler {
                         args: resolved_args,
                         fnobj,
                         out: compiler.out,
+                        callees: compiler.callees,
                         ret,
                     });
                     write!(fn_name, "(").ok();
-                    (ret, fn_name)
+                    (ret, fn_name, Some(index))
                 }
             } else {
                 panic!()
@@ -830,8 +913,11 @@ impl ShaderFnCompiler {
         let arg_types = args.clone();
         let resolved_arg_types =
             Self::resolve_script_call_arg_types(vm, fnobj, &arg_types, self.trap.pass());
-        let (ret, fn_name) =
+        let (ret, fn_name, callee) =
             Self::compile_shader_def(vm, output, self.trap.pass(), name, fnobj, sself, args);
+        if let Some(callee) = callee {
+            self.callees.push(callee);
+        }
         if matches!(output.backend, ShaderBackend::Glsl | ShaderBackend::Rust) {
             out = Self::glsl_rewrite_call_args(vm, &out, &arg_types, &resolved_arg_types);
         }
@@ -1038,6 +1124,29 @@ impl ShaderFnCompiler {
     ) {
         let builtins = &vm.bx.code.builtins.pod;
 
+        if name == id!(instance_index) {
+            if output.mode != ShaderMode::Vertex || !args.is_empty() {
+                script_err_not_impl!(
+                    self.trap,
+                    "instance_index() requires vertex stage and no arguments"
+                );
+            }
+            for (_, s) in args {
+                self.stack.free_string(s);
+            }
+            let mut out = self.stack.new_string();
+            out.push_str(match output.backend {
+                ShaderBackend::Metal => "_iov.iid",
+                ShaderBackend::Hlsl => "_mp_iov.iid",
+                ShaderBackend::Glsl => "uint(gl_InstanceID)",
+                ShaderBackend::Wgsl => "_mp_instance_index",
+                ShaderBackend::Rust => "rcx.instance_index",
+            });
+            self.stack
+                .push(self.trap.pass(), ShaderType::Pod(builtins.pod_u32), out);
+            return;
+        }
+
         // Special case: discard() - emits backend-specific discard statement
         if name == id!(discard) {
             for (_, s) in args {
@@ -1051,7 +1160,11 @@ impl ShaderFnCompiler {
                 ShaderBackend::Glsl | ShaderBackend::Wgsl | ShaderBackend::Hlsl => {
                     write!(out, "discard").ok()
                 }
-                ShaderBackend::Rust => write!(out, "{{ rcx.discard = 1.0; return }}").ok(),
+                // Rust: the JIT'd fn returns a value (vec4f for io_pixel), so the early
+                // return must produce one; the caller ignores it when rcx.discard is set.
+                ShaderBackend::Rust => {
+                    write!(out, "{{ rcx.discard = 1.0; return Default::default() }}").ok()
+                }
             };
             self.stack
                 .push(self.trap.pass(), ShaderType::Pod(builtins.pod_void), out);
@@ -1394,6 +1507,16 @@ impl ShaderFnCompiler {
                         || id == id!(cos)
                         || id == id!(step)
                         || id == id!(smoothstep)
+                        // exp/log/pow family: the analytic sky is exp(vec3)
+                        // and pow(vec3, s) — unsuffixed they hit the scalar
+                        // preamble fns and the whole shader fails the JIT.
+                        || id == id!(exp)
+                        || id == id!(exp2)
+                        || id == id!(log)
+                        || id == id!(log2)
+                        || id == id!(pow)
+                        || id == id!(tan)
+                        || id == id!(modf)
                 );
                 if needs_suffix && !concrete_args.is_empty() {
                     let first_ty = concrete_args[0];
@@ -1438,6 +1561,61 @@ impl ShaderFnCompiler {
     ) {
         // Handle texture methods - these are virtual methods that transpile to backend-specific code
         match method_id {
+            id!(sample_compare) => {
+                let mut s = self.stack.new_string();
+                if tex_type != TextureType::TextureDepth || args.len() != 2 {
+                    script_err_invalid_args!(
+                        self.trap,
+                        "texture_depth.sample_compare requires (uv, reference_depth)"
+                    );
+                    s.push_str("0.0");
+                } else {
+                    let sampler = output.get_or_create_sampler(ShaderSampler {
+                        compare: true,
+                        ..ShaderSampler::default()
+                    });
+                    let uv = &args[0];
+                    let depth = &args[1];
+                    match output.backend {
+                        ShaderBackend::Metal => {
+                            write!(
+                                s,
+                                "{}.sample_compare(_s{}, {}, {})",
+                                texture_expr, sampler, uv, depth
+                            )
+                            .ok();
+                        }
+                        ShaderBackend::Hlsl => {
+                            write!(
+                                s,
+                                "{}.SampleCmpLevelZero(_s{}, {}, {})",
+                                texture_expr, sampler, uv, depth
+                            )
+                            .ok();
+                        }
+                        ShaderBackend::Wgsl => {
+                            write!(
+                                s,
+                                "textureSampleCompareLevel({}, _s{}, {}, {})",
+                                texture_expr, sampler, uv, depth
+                            )
+                            .ok();
+                        }
+                        ShaderBackend::Glsl => {
+                            output.bind_texture_sampler(&texture_expr, sampler);
+                            write!(s, "texture({}, vec3({}, {}))", texture_expr, uv, depth).ok();
+                        }
+                        ShaderBackend::Rust => {
+                            write!(s, "{}.sample_compare({}, {})", texture_expr, uv, depth).ok();
+                        }
+                    }
+                }
+                self.stack.push(
+                    self.trap.pass(),
+                    ShaderType::Pod(vm.bx.code.builtins.pod.pod_f32),
+                    s,
+                );
+            }
             id!(size) => {
                 // size() returns vec2f with the texture dimensions
                 let mut s = self.stack.new_string();
@@ -1480,25 +1658,56 @@ impl ShaderFnCompiler {
                     s,
                 );
             }
-            id!(sample) | id!(sample_as_bgra) | id!(sample_lod) => {
+            id!(sample)
+            | id!(sample_as_bgra)
+            | id!(sample_as_bgra_nearest)
+            | id!(sample_lod)
+            | id!(sample_nearest)
+            | id!(sample_repeat)
+            | id!(sample_as_bgra_repeat) => {
                 // sample(coord) samples the texture at normalized coordinates.
                 // sample_as_bgra(coord) is identical except on WebGL GLSL, where it
                 // applies a BGRA->RGBA swizzle in the sampler helper.
-                let method_name = if method_id == id!(sample_as_bgra) {
+                // There is deliberately NO render-target variant: every
+                // backend stores offscreen targets in top-left row order
+                // (GL renders them through a Y-inverted projection), so a
+                // render texture samples exactly like any other.
+                let method_name = if method_id == id!(sample_as_bgra)
+                    || method_id == id!(sample_as_bgra_nearest)
+                    || method_id == id!(sample_as_bgra_repeat)
+                {
                     "sample_as_bgra"
+                } else if method_id == id!(sample_nearest) {
+                    "sample_nearest"
                 } else if method_id == id!(sample_lod) {
                     "sample_lod"
                 } else {
                     "sample"
                 };
-                let required_args = if method_id == id!(sample_lod) { 2 } else { 1 };
-                if args.len() != required_args {
+                // sample_nearest accepts an OPTIONAL explicit lod: a VERTEX
+                // stage must sample with explicit lod (Metal/GLSL reject
+                // implicit-gradient sampling there), and float textures are
+                // not linearly filterable on every GLES/WebGPU device — so a
+                // vertex-stage data fetch needs nearest + lod together. The
+                // lod codegen below is shared by every method that passes one.
+                let args_ok = if method_id == id!(sample_lod) {
+                    args.len() == 2
+                } else if method_id == id!(sample_nearest) {
+                    args.len() == 1 || args.len() == 2
+                } else {
+                    args.len() == 1
+                };
+                if !args_ok {
                     script_err_invalid_args!(
                         self.trap,
                         "texture.{} requires {} arg{}",
                         method_name,
-                        required_args,
-                        if required_args == 1 { "" } else { "s" }
+                        if method_id == id!(sample_lod) { 2 } else { 1 },
+                        if method_id == id!(sample_lod) {
+                            "s"
+                        } else {
+                            ""
+                        }
                     );
                     let empty = self.stack.new_string();
                     self.stack.push(
@@ -1511,47 +1720,122 @@ impl ShaderFnCompiler {
                     let lod = args.get(1);
                     let mut s = self.stack.new_string();
 
-                    // Get or create the default sampler (linear, clamp_to_edge, normalized)
-                    let sampler = ShaderSampler::default();
+                    let sampler = if method_id == id!(sample_nearest)
+                        || method_id == id!(sample_as_bgra_nearest)
+                    {
+                        ShaderSampler {
+                            filter: SamplerFilter::Nearest,
+                            ..ShaderSampler::default()
+                        }
+                    } else if method_id == id!(sample_repeat)
+                        || method_id == id!(sample_as_bgra_repeat)
+                    {
+                        ShaderSampler {
+                            address: SamplerAddress::Repeat,
+                            ..ShaderSampler::default()
+                        }
+                    } else {
+                        ShaderSampler::default()
+                    };
                     let sampler_idx = output.get_or_create_sampler(sampler);
 
                     match output.backend {
                         ShaderBackend::Metal => {
                             if let Some(lod) = lod {
-                                write!(
-                                    s,
-                                    "{}.sample(_s{}, {}, level({}))",
-                                    texture_expr, sampler_idx, coord, lod
-                                )
-                                .ok();
+                                match tex_type {
+                                    TextureType::Texture2dArray
+                                    | TextureType::TextureDepthArray
+                                    | TextureType::Texture1dArray => {
+                                        // Array sample: coord is float3(uv, layer) or float2 + layer 0.
+                                        write!(
+                                            s,
+                                            "{}.sample(_s{}, ({}).xy, uint(({}).z + 0.5), level({}))",
+                                            texture_expr, sampler_idx, coord, coord, lod
+                                        )
+                                        .ok();
+                                    }
+                                    _ => {
+                                        write!(
+                                            s,
+                                            "{}.sample(_s{}, {}, level({}))",
+                                            texture_expr, sampler_idx, coord, lod
+                                        )
+                                        .ok();
+                                    }
+                                }
                             } else {
-                                // Metal: texture.sample(sampler, coord)
-                                write!(s, "{}.sample(_s{}, {})", texture_expr, sampler_idx, coord)
-                                    .ok();
+                                match tex_type {
+                                    TextureType::Texture2dArray
+                                    | TextureType::TextureDepthArray
+                                    | TextureType::Texture1dArray => {
+                                        write!(
+                                            s,
+                                            "{}.sample(_s{}, ({}).xy, uint(({}).z + 0.5))",
+                                            texture_expr, sampler_idx, coord, coord
+                                        )
+                                        .ok();
+                                    }
+                                    _ => {
+                                        write!(
+                                            s,
+                                            "{}.sample(_s{}, {})",
+                                            texture_expr, sampler_idx, coord
+                                        )
+                                        .ok();
+                                    }
+                                }
                             }
                         }
                         ShaderBackend::Wgsl => {
                             if let Some(lod) = lod {
-                                write!(
-                                    s,
-                                    "textureSampleLevel({}, _s{}, {}, {})",
-                                    texture_expr, sampler_idx, coord, lod
-                                )
-                                .ok();
+                                match tex_type {
+                                    TextureType::Texture2dArray
+                                    | TextureType::TextureDepthArray
+                                    | TextureType::Texture1dArray => {
+                                        write!(
+                                            s,
+                                            "textureSampleLevel({}, _s{}, ({}).xy, i32(({}).z), {})",
+                                            texture_expr, sampler_idx, coord, coord, lod
+                                        )
+                                        .ok();
+                                    }
+                                    _ => {
+                                        write!(
+                                            s,
+                                            "textureSampleLevel({}, _s{}, {}, {})",
+                                            texture_expr, sampler_idx, coord, lod
+                                        )
+                                        .ok();
+                                    }
+                                }
                             } else {
-                                // WGSL: textureSample(texture, sampler, coord)
-                                write!(
-                                    s,
-                                    "textureSample({}, _s{}, {})",
-                                    texture_expr, sampler_idx, coord
-                                )
-                                .ok();
+                                match tex_type {
+                                    TextureType::Texture2dArray
+                                    | TextureType::TextureDepthArray
+                                    | TextureType::Texture1dArray => {
+                                        write!(
+                                            s,
+                                            "textureSample({}, _s{}, ({}).xy, i32(({}).z))",
+                                            texture_expr, sampler_idx, coord, coord
+                                        )
+                                        .ok();
+                                    }
+                                    _ => {
+                                        write!(
+                                            s,
+                                            "textureSample({}, _s{}, {})",
+                                            texture_expr, sampler_idx, coord
+                                        )
+                                        .ok();
+                                    }
+                                }
                             }
                         }
                         ShaderBackend::Hlsl => {
                             // D3D11 uses DXGI_FORMAT_B8G8R8A8_UNORM, so the GPU already
                             // interprets BGRA data as RGBA when sampling. No swizzle needed
                             // for sample_as_bgra (same as Metal).
+                            // Texture2DArray.SampleLevel expects float3(uv, array_index).
                             let lod_expr = lod.map_or("0.0", |lod| lod.as_str());
                             write!(
                                 s,
@@ -1574,11 +1858,29 @@ impl ShaderFnCompiler {
                                             texture_expr, coord, lod
                                         )
                                         .ok();
-                                    } else if method_id == id!(sample_as_bgra) {
+                                    } else if method_id == id!(sample_as_bgra)
+                                        || method_id == id!(sample_as_bgra_nearest)
+                                        || method_id == id!(sample_as_bgra_repeat)
+                                    {
                                         write!(s, "samplecube_bgra({}, {})", texture_expr, coord)
                                             .ok();
                                     } else {
                                         write!(s, "samplecube({}, {})", texture_expr, coord).ok();
+                                    }
+                                }
+                                TextureType::Texture2dArray
+                                | TextureType::TextureDepthArray
+                                | TextureType::Texture1dArray => {
+                                    // sampler2DArray takes vec3(uv, layer).
+                                    if let Some(lod) = lod {
+                                        write!(
+                                            s,
+                                            "textureLod({}, {}, {})",
+                                            texture_expr, coord, lod
+                                        )
+                                        .ok();
+                                    } else {
+                                        write!(s, "texture({}, {})", texture_expr, coord).ok();
                                     }
                                 }
                                 _ => {
@@ -1589,7 +1891,10 @@ impl ShaderFnCompiler {
                                             texture_expr, coord, lod
                                         )
                                         .ok();
-                                    } else if method_id == id!(sample_as_bgra) {
+                                    } else if method_id == id!(sample_as_bgra)
+                                        || method_id == id!(sample_as_bgra_nearest)
+                                        || method_id == id!(sample_as_bgra_repeat)
+                                    {
                                         write!(s, "sample2d_bgra({}, {})", texture_expr, coord)
                                             .ok();
                                     } else {
@@ -1599,9 +1904,21 @@ impl ShaderFnCompiler {
                             }
                         }
                         ShaderBackend::Rust => {
-                            // Rust headless backend keeps texture data in logical RGBA,
-                            // so sample_as_bgra is a no-op alias of sample.
-                            if let Some(lod) = lod {
+                            // Rust gpusim backend keeps texture data in logical RGBA,
+                            // so sample_as_bgra is a no-op alias of sample. The
+                            // sampler STATE is not: `sample_nearest` means an exact
+                            // texel fetch (every data pass depends on it) and only
+                            // the *_repeat forms wrap, so each maps to its own
+                            // runtime method rather than collapsing to `sample`.
+                            if method_id == id!(sample_nearest)
+                                || method_id == id!(sample_as_bgra_nearest)
+                            {
+                                write!(s, "{}.sample_nearest({})", texture_expr, coord).ok();
+                            } else if method_id == id!(sample_repeat)
+                                || method_id == id!(sample_as_bgra_repeat)
+                            {
+                                write!(s, "{}.sample_repeat({})", texture_expr, coord).ok();
+                            } else if let Some(lod) = lod {
                                 write!(s, "{}.sample_lod({}, {})", texture_expr, coord, lod).ok();
                             } else {
                                 write!(s, "{}.sample({})", texture_expr, coord).ok();
@@ -1636,7 +1953,9 @@ impl ShaderFnCompiler {
                             let sampler = ShaderSampler::default();
                             let sampler_idx = output.get_or_create_sampler(sampler);
                             output.bind_texture_sampler(&texture_expr, sampler_idx);
-                            if cfg!(target_os = "android") && !output.use_vulkan {
+                            if cfg!(any(target_os = "android", target_os = "linux"))
+                                && !output.use_vulkan
+                            {
                                 write!(s, "sample2dOES({}, {})", texture_expr, coord).ok();
                             } else {
                                 write!(s, "sample2d({}, {})", texture_expr, coord).ok();
@@ -1689,6 +2008,9 @@ impl ShaderFnCompiler {
                         &[
                             id!(sample),
                             id!(sample_as_bgra),
+                            id!(sample_as_bgra_nearest),
+                            id!(sample_repeat),
+                            id!(sample_as_bgra_repeat),
                             id!(sample_lod),
                             id!(sample_video),
                             id!(size)
@@ -2304,6 +2626,14 @@ impl ShaderFnCompiler {
                 ShaderType::Pod(pt) | ShaderType::PodPtr(pt) => {
                     vm.bx.heap.pod_types[pt.index as usize].ty.slots()
                 }
+                // A bare variable reference reaches here unresolved — look it
+                // up in the scope, or `vec4(some_vec3, s)` counts it as one
+                // slot and the splat-fill below pads with repeated scalars.
+                ShaderType::Id(id) => self
+                    .shader_scope
+                    .find_var(*id)
+                    .map(|(sc, _)| vm.bx.heap.pod_types[sc.ty().index as usize].ty.slots())
+                    .unwrap_or(1),
                 ShaderType::AbstractInt | ShaderType::AbstractFloat => 1,
                 _ => 1,
             };
