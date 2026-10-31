@@ -12,6 +12,37 @@ pub fn derive_script_impl(input: TokenStream) -> TokenStream {
     }
 }
 
+/// The default a `#[live(expr)]` field declares for itself, if it does.
+fn declared_default(field: &StructField) -> Option<TokenStream> {
+    field
+        .attrs
+        .iter()
+        .find(|a| a.name == "live")
+        .and_then(|a| a.args.clone())
+        .filter(|args| !args.is_empty())
+}
+
+/// Adds the expression for a field's declared default (`args`), converted to its type.
+fn add_declared_default(tb: &mut TokenBuilder, field: &StructField, args: TokenStream) {
+    // for primitive numeric fields, cast instead of .into() -
+    // unsuffixed literals like #[live(1.0)] on an f32 field
+    // otherwise hit the deprecated f64->f32 inference fallback
+    let ty = field.ty.to_string().replace(' ', "");
+    if matches!(
+        ty.as_str(),
+        "f32" | "f64"
+            | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+            | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+    ) {
+        tb.add("(")
+            .stream(Some(args))
+            .add(") as ")
+            .stream(Some(field.ty.clone()));
+    } else {
+        tb.add("(").stream(Some(args)).add(").into()");
+    }
+}
+
 fn derive_script_impl_inner(
     parser: &mut TokenParser,
     tb: &mut TokenBuilder,
@@ -140,30 +171,51 @@ fn derive_script_impl_inner(
                 .iter()
                 .any(|a| a.name == "live" || a.name == "apply_default")
             {
-                tb.add("{ let mut __field_value = vm.bx.heap.value_for_apply(value, id!(")
-                    .ident(&field.name)
-                    .add(").into(), apply);");
-                tb.add("if __field_value.is_none() && apply.is_reload(){");
-                tb.add("    let default_value = <")
-                    .stream(Some(field.ty.clone()))
-                    .add(" as ScriptNew>::script_reload_default(vm);");
-                tb.add("    if !default_value.is_nil(){");
-                tb.add("        __field_value = Some(default_value);");
-                tb.add("    }");
-                tb.add("}");
-                tb.add("if let Some(v) = __field_value {");
-                tb.add("<")
-                    .stream(Some(field.ty.clone()))
-                    .add(" as ScriptApply>::script_apply(&mut self.")
-                    .ident(&field.name)
-                    .add(",vm, apply, scope, v);");
-                tb.add("}");
-                tb.add("}");
+                // Runtime widget state survives a stylesheet reapply and a
+                // Rebake (`script_mod` re-run with unchanged DSL). Explicit
+                // edits and ordinary source reloads still update the property.
+                // `#[apply_state]` is the stylesheet-reapply mark; `#[visible]`
+                // / `#[imperative]` mark fields whose canonical mutation path
+                // is an imperative setter sharing storage with the DSL value.
+                let preserve_state = field.attrs.iter().any(|a| a.name == "apply_state");
+                let imperative = field
+                    .attrs
+                    .iter()
+                    .any(|a| a.name == "imperative" || a.name == "visible");
+                if preserve_state || imperative {
+                    tb.add("if !apply.preserves_runtime_state() {");
+                }
+                // One call into a helper generic over the field type: it
+                // looks the field up in `value` (prototype chain included),
+                // falls back to the type's registered default on a reload,
+                // and applies what it found to the field. A field with a
+                // default of its own (`#[live(expr)]`) falls back to that
+                // instead, the same as a new one gets; e.g. a Label's
+                // `#[live(Flow::right_wrap())] flow` would otherwise stop
+                // wrapping after a reload.
+                if let Some(args) = declared_default(field) {
+                    tb.add("vm.script_derive_apply_field_or_default(apply, scope, value, id!(")
+                        .ident(&field.name)
+                        .add("), &mut self.")
+                        .ident(&field.name)
+                        .add(", || ");
+                    add_declared_default(tb, field, args);
+                    tb.add(");");
+                } else {
+                    tb.add("vm.script_derive_apply_field(apply, scope, value, id!(")
+                        .ident(&field.name)
+                        .add("), &mut self.")
+                        .ident(&field.name)
+                        .add(");");
+                }
+                if preserve_state || imperative {
+                    tb.add("}");
+                }
             }
             if field
                 .attrs
                 .iter()
-                .any(|a| a.name == "splat" || a.name == "walk" || a.name == "layout")
+                .any(|a| a.name == "script_splat" || a.name == "walk" || a.name == "layout")
             {
                 tb.add("<")
                     .stream(Some(field.ty.clone()))
@@ -179,6 +231,37 @@ fn derive_script_impl_inner(
                 .add(".register_as_ui_root(vm);");
         }
 
+        // Deref'd fields are applied BEFORE apply_default's recursive apply.
+        //
+        // Why this order matters: an `#[apply_default]` field (always an
+        // `Animator` in practice) returns an apply block describing how the
+        // widget's runtime fields should look in its current state — e.g.
+        // `{ height: 0 }` for a "hidden" state. The recursive call then
+        // re-walks the widget with that block as the value, setting the
+        // matching widget fields. If the deref'd field's `script_apply`
+        // (which reapplies the widget's *template* defaults via the inner
+        // base widget) ran AFTER this, it would overwrite the animator's
+        // state-driven values with the template defaults, leaving the
+        // widget visually in its template state for the rest of the apply
+        // pass. On `Apply::ScriptReapply` that produces the "flicker to
+        // defaults" most users notice when a preference change forces a
+        // tree-wide re-walk: every animator-driven widget briefly drops
+        // back to its template visual until the next event handler patches
+        // it up. Running deref first and apply_default's recursive last
+        // means the animator's apply block wins, the widget never visibly
+        // touches its template default, and `Animator::script_apply_default`
+        // can return the *current* state's apply on `ScriptReapply` to
+        // restore the runtime visual state in a single pass.
+        for field in &fields {
+            if field.attrs.iter().any(|a| a.name == "deref") {
+                tb.add("<")
+                    .stream(Some(field.ty.clone()))
+                    .add(" as ScriptApply>::script_apply(&mut self.")
+                    .ident(&field.name)
+                    .add(", vm, apply, scope, value);");
+            }
+        }
+
         for field in &fields {
             if field.attrs.iter().any(|a| a.name == "apply_default") {
                 tb.add("    if let Some(default_value) = <")
@@ -191,20 +274,12 @@ fn derive_script_impl_inner(
             }
         }
 
-        for field in &fields {
-            if field.attrs.iter().any(|a| a.name == "deref") {
-                tb.add("<")
-                    .stream(Some(field.ty.clone()))
-                    .add(" as ScriptApply>::script_apply(&mut self.")
-                    .ident(&field.name)
-                    .add(", vm, apply, scope, value);");
-            }
-        }
-
         tb.add("            <Self as ScriptHookDeref>::on_deref_after_apply(self, vm, apply, scope, value);");
         tb.add("    }");
 
         tb.add("    fn script_to_value(&self, vm: &mut ScriptVm)->ScriptValue {");
+
+        tb.add("        if let Some(value) = <Self as ScriptHook>::on_custom_to_value(self, vm) { return value; }");
 
         tb.add("        let proto = Self::script_proto(vm).into();");
         tb.add("        let obj = vm.bx.heap.new_with_proto(proto);");
@@ -220,11 +295,11 @@ fn derive_script_impl_inner(
                     .ident(&field.name)
                     .add(".script_to_value_props(vm, obj);");
             }
-            // Also cascade walk/layout/splat fields' properties to the object
+            // Also cascade walk/layout/script_splat fields' properties to the object
             if field
                 .attrs
                 .iter()
-                .find(|a| a.name == "walk" || a.name == "layout" || a.name == "splat")
+                .find(|a| a.name == "walk" || a.name == "layout" || a.name == "script_splat")
                 .is_some()
             {
                 tb.add("self.")
@@ -236,20 +311,23 @@ fn derive_script_impl_inner(
                 .iter()
                 .find(|a| a.name == "live" || a.name == "apply_default")
             {
-                tb.add("let value:ScriptValue = <")
-                    .stream(Some(field.ty.clone()))
-                    .add(" as ScriptApply>::script_to_value( &self.")
+                tb.add("vm.script_derive_field_to_value(obj,")
+                    .string(&field.name)
+                    .add(", &self.")
                     .ident(&field.name)
-                    .add(", vm); ");
-                tb.add("vm.bx.heap.set_value(obj, ScriptValue::from_id(id_lut!(")
-                    .ident(&field.name)
-                    .add(")), value, vm.bx.threads.cur().trap.pass());");
+                    .add(");");
             }
         }
 
         tb.add("    }");
 
-        // Generate script_source if there's a #[source] field
+        // Generate script_source. A struct with its own #[source] field reports
+        // that object directly. Otherwise, if it derefs to a base class (e.g. a
+        // custom widget wrapping `#[deref] view: View`), forward to the base's
+        // source so that `script_apply_eval!` on the custom widget can resolve
+        // `__script_source__` (and thus the proto scope, type names, etc.) just
+        // like it would on the bare base. Without this a custom widget's source
+        // falls back to ZERO and every eval against it fails to resolve names.
         let source_field = fields
             .iter()
             .find(|field| field.attrs.iter().any(|a| a.name == "source"));
@@ -257,6 +335,12 @@ fn derive_script_impl_inner(
             tb.add("    fn script_source(&self) -> ScriptObject {self.")
                 .ident(&source_field.name)
                 .add(".as_object()");
+            tb.add("    }");
+        } else if let Some(deref_field) = deref_field {
+            tb.add("    fn script_source(&self) -> ScriptObject {")
+                .add("ScriptApply::script_source(&self.")
+                .ident(&deref_field.name)
+                .add(")");
             tb.add("    }");
         }
 
@@ -303,7 +387,7 @@ fn derive_script_impl_inner(
                         tb.add("Default::default()");
                     }
                 } else {
-                    tb.add("(").stream(attr.args.clone()).add(").into()");
+                    add_declared_default(tb, field, attr.args.clone().unwrap());
                 }
             } else {
                 tb.add("Default::default()");
@@ -329,7 +413,7 @@ fn derive_script_impl_inner(
             if field
                 .attrs
                 .iter()
-                .find(|a| a.name == "walk" || a.name == "layout" || a.name == "splat")
+                .find(|a| a.name == "walk" || a.name == "layout" || a.name == "script_splat")
                 .is_some()
             {
                 tb.add("<")
@@ -343,14 +427,11 @@ fn derive_script_impl_inner(
                 .iter()
                 .find(|a| a.name == "live" || a.name == "apply_default")
             {
-                tb.add("<")
+                tb.add("vm.script_derive_proto_field::<")
                     .stream(Some(field.ty.clone()))
-                    .add(" as ScriptNew>::script_proto(vm);");
-                tb.add("props.insert(id_lut!(")
-                    .ident(&field.name)
-                    .add("),<")
-                    .stream(Some(field.ty.clone()))
-                    .add(" as ScriptNew>::script_type_id_static());");
+                    .add(">(props,")
+                    .string(&field.name)
+                    .add(");");
             }
         }
 
@@ -549,17 +630,22 @@ fn derive_script_impl_inner(
         for item in &items {
             match &item.kind {
                 EnumKind::Bare => {
-                    tb.add("let bare = vm.bx.heap.new_with_proto(id_lut!(")
+                    // The variant object: its root proto is the variant's id,
+                    // it records the enum's name for reflection and, for a
+                    // repr(u32) enum, the discriminant as f64.
+                    tb.add("vm.script_derive_enum_bare_variant(enum_object,")
+                        .string(&item.name)
+                        .add(", id!(")
                         .ident(&item.name)
-                        .add(").into());");
-                    // If this is a repr(u32) enum, store the discriminant value as f64
+                        .add("),")
+                        .string(&enum_name)
+                        .add(",");
                     if let Some(disc) = &item.discriminant {
-                        tb.add("vm.bx.heap.set_value(bare, id!(_repr_u32_enum_value).into(), ScriptValue::from((").stream(Some(disc.clone())).add(") as f64), vm.bx.threads.cur().trap.pass());");
+                        tb.add("Some((").stream(Some(disc.clone())).add(") as f64)");
+                    } else {
+                        tb.add("None");
                     }
-                    tb.add("vm.bx.heap.set_value(enum_object, id!(")
-                        .ident(&item.name)
-                        .add(").into(), bare.into(), vm.bx.threads.cur().trap.pass());");
-                    tb.add("vm.bx.heap.freeze(bare);");
+                    tb.add(");");
                 }
                 EnumKind::Tuple(args) => {
                     for arg in args.iter() {
@@ -570,27 +656,21 @@ fn derive_script_impl_inner(
                     tb.add("vm.add_method(enum_object, id_lut!(")
                         .ident(&item.name)
                         .add("), &[], |vm, args|{");
-                    tb.add("    let tuple = vm.bx.heap.new_with_proto(id!(")
+                    // A non-generic helper builds the tuple and checks its
+                    // arguments with each type's check; `file!()` and
+                    // `line!()` name this expansion for its errors, as the
+                    // `script_err_*!` calls it replaces did.
+                    tb.add("    vm.script_derive_enum_tuple_new(args, id!(")
                         .ident(&item.name)
-                        .add(").into());");
-                    tb.add("    if vm.bx.heap.vec_len(args) != ")
-                        .unsuf_usize(args.len())
-                        .add("{");
-                    tb.add("        makepad_script::script_err_invalid_args!(vm.bx.threads.cur().trap, \"wrong argument count\");");
-                    tb.add("    }");
-                    for (i, arg) in args.iter().enumerate() {
-                        tb.add("if let Some(a) = vm.bx.heap.vec_value_if_exist(args, ")
-                            .unsuf_usize(i)
-                            .add("){");
-                        tb.add("    if!<")
+                        .add("),")
+                        .string(&enum_name)
+                        .add(", &[");
+                    for arg in args.iter() {
+                        tb.add("<")
                             .stream(Some(arg.clone()))
-                            .add(" as ScriptNew>::script_type_check(&vm.bx.heap, a){");
-                        tb.add("        makepad_script::script_err_type_mismatch!(vm.bx.threads.cur().trap, \"argument type mismatch\");");
-                        tb.add("    }");
-                        tb.add("}");
+                            .add(" as ScriptNew>::script_type_check,");
                     }
-                    tb.add("    vm.bx.heap.vec_push_vec(tuple, args, vm.bx.threads.cur().trap.pass());");
-                    tb.add("    tuple.into()");
+                    tb.add("], file!(), line!())");
                     tb.add("});");
                 }
                 EnumKind::Named(fields) => {
@@ -629,6 +709,10 @@ fn derive_script_impl_inner(
                     tb.add("}");
                     tb.add("let ty_check = ScriptTypeCheck{props, object: None, is_repr_u32_enum: false};");
                     tb.add("let ty_index = vm.bx.heap.register_type(None, ty_check);");
+                    // Set hidden metadata before attaching the restricted property type.
+                    tb.add("vm.bx.heap.set_value(named, id_lut!(__enum).into(), id_lut!(")
+                        .ident(&enum_name)
+                        .add(").into(), vm.bx.threads.cur().trap.pass());");
                     tb.add("vm.bx.heap.set_type(named, ty_index);");
                     tb.add("vm.bx.heap.freeze_component(named);");
                     tb.add("vm.bx.heap.set_value(enum_object, id!(")
@@ -737,36 +821,31 @@ fn derive_script_impl_inner(
                 }
             }
         }
+        // The errors are reported by non-generic helpers; `file!()` and
+        // `line!()` stay here so they name this expansion, as the
+        // `script_err_unknown_type!` calls they replace did.
         tb.add("                    other=>{");
-        tb.add("                        let obj_desc = vm.format_object_for_error(object);");
-        tb.add("                        makepad_script::script_err_unknown_type!(vm.bx.threads.cur().trap,").string(&format!("unknown variant '{{}}' for enum {}, object: {{}}", enum_name)).add(", other, obj_desc);");
+        tb.add("                        vm.script_derive_enum_unknown_variant(")
+            .string(&enum_name)
+            .add(", other, object, file!(), line!());");
         tb.add("                        return;");
         tb.add("                    }");
         tb.add("                }");
         tb.add("            }");
         tb.add("            else{");
-        tb.add("                let obj_desc = vm.format_object_for_error(object);");
-        tb.add(
-            "                makepad_script::script_err_unknown_type!(vm.bx.threads.cur().trap,",
-        )
-        .string(&format!(
-            "expected variant id for enum {}, got object: {{}}",
-            enum_name
-        ))
-        .add(", obj_desc);");
+        tb.add("                vm.script_derive_enum_not_variant(")
+            .string(&enum_name)
+            .add(", object, file!(), line!());");
         tb.add("                return;");
         tb.add("            }");
         tb.add("        }");
-        tb.add("        let value_desc = vm.format_enum_variant_error(value);");
-        tb.add("        makepad_script::script_err_unknown_type!(vm.bx.threads.cur().trap,")
-            .string(&format!(
-                "expected variant for enum {}, got {{}}",
-                enum_name
-            ))
-            .add(", value_desc);");
+        tb.add("        vm.script_derive_enum_bad_value(")
+            .string(&enum_name)
+            .add(", value, file!(), line!());");
         tb.add("    }");
 
         tb.add("    fn script_to_value(&self, vm:&mut ScriptVm)->ScriptValue{");
+        tb.add("        if let Some(value) = <Self as ScriptHook>::on_custom_to_value(self, vm) { return value; }");
         tb.add("        match self{");
         for item in &items {
             match &item.kind {
@@ -786,6 +865,9 @@ fn derive_script_impl_inner(
                     tb.add("    let tuple = vm.bx.heap.new_with_proto(id!(")
                         .ident(&item.name)
                         .add(").into());");
+                    tb.add("vm.bx.heap.set_value(tuple, id_lut!(__enum).into(), id_lut!(")
+                        .ident(&enum_name)
+                        .add(").into(), vm.bx.threads.cur().trap.pass());");
                     for (i, arg) in args.iter().enumerate() {
                         tb.add("let value = <")
                             .stream(Some(arg.clone()))

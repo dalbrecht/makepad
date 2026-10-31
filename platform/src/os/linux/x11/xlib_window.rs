@@ -1,9 +1,15 @@
 use {
     self::super::{x11_sys, xlib_app::*, xlib_event::XlibEvent},
-    crate::{area::Area, cursor::MouseCursor, event::*, makepad_math::Vec2d, window::WindowId},
+    crate::{
+        area::Area, cursor::MouseCursor, event::*,
+        makepad_math::{dvec2, Rect, Vec2d},
+        os::linux::x11::x11_screen::x11_screens,
+        screen::{fit_window_rect_to_screens, sanitize_resize},
+        window::WindowId,
+    },
     std::{
         cell::Cell,
-        ffi::{CStr, CString, OsStr},
+        ffi::{CStr, CString},
         mem,
         os::raw::{c_char, c_int, c_long, c_ulong, c_void},
         ptr,
@@ -14,7 +20,7 @@ use {
 #[derive(Clone)]
 pub struct XlibWindow {
     pub window: Option<c_ulong>,
-    pub xic: Option<x11_sys::XIC>,
+    pub xic: Option<XimInputContext>,
     pub attributes: Option<x11_sys::XSetWindowAttributes>,
     pub visual_info: Option<x11_sys::XVisualInfo>,
     //pub child_windows: Vec<XlibChildWindow>,
@@ -22,7 +28,10 @@ pub struct XlibWindow {
     pub window_id: WindowId,
     pub last_window_geom: WindowGeom,
 
-    pub ime_spot: Vec2d,
+    // Caret/composition line and current-line area in window-relative native
+    // points; fed to the IM as spot plus clipping area.
+    pub ime_rect: Rect,
+    pub ime_area_rect: Rect,
     pub current_cursor: MouseCursor,
     pub last_mouse_pos: Vec2d,
     // When ime_active is false, XSetICFocus is not used so the IME candidate window does not show.
@@ -42,6 +51,27 @@ pub struct XlibChildWindow {
 }*/
 
 impl XlibWindow {
+    pub fn set_title(&self, title: &str) {
+        let Some(window) = self.window else { return };
+        unsafe {
+            let display = get_xlib_app_global().display;
+            let title = format!("{}\0", title);
+            let title_ptr = title.as_ptr() as *mut c_char;
+            x11_sys::Xutf8SetWMProperties(
+                display,
+                window,
+                title_ptr,
+                title_ptr,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            x11_sys::XFlush(display);
+        }
+    }
+
     pub fn new(window_id: WindowId) -> XlibWindow {
         XlibWindow {
             window: None,
@@ -52,7 +82,8 @@ impl XlibWindow {
             window_id,
             last_window_geom: WindowGeom::default(),
             last_nc_mode: None,
-            ime_spot: Vec2d::default(),
+            ime_rect: Rect::default(),
+            ime_area_rect: Rect::default(),
             current_cursor: MouseCursor::Default,
             last_mouse_pos: Vec2d::default(),
             ime_active: false,
@@ -64,6 +95,7 @@ impl XlibWindow {
     pub fn init(
         &mut self,
         title: &str,
+        app_id: &str,
         size: Vec2d,
         position: Option<Vec2d>,
         is_fullscreen: bool,
@@ -105,22 +137,26 @@ impl XlibWindow {
                 | x11_sys::LeaveWindowMask) as c_long;
 
             let dpi_factor = self.get_dpi_factor();
+            // A restored size and position are only as good as the desktop layout they were
+            // saved on, so the request is fitted before it reaches the server. Doing it here
+            // covers the geometry, the size hints and the pre-map move alike.
+            let (position, size) = fit_create_geom(position, size, dpi_factor);
             // Create a window
+            // X11 encodes a window position as INT16 and an extent as CARD16, and a request
+            // outside those ranges is a BadValue protocol error — which, with no error handler
+            // installed, terminates the process. The fit above already keeps a placement on the
+            // desktop; these clamps are what guarantee the request is expressible at all.
+            let (create_x, create_y) = match position {
+                Some(position) => (clamp_coord(position.x), clamp_coord(position.y)),
+                None => (150, 60),
+            };
             let window = x11_sys::XCreateWindow(
                 display,
                 root_window,
-                if position.is_some() {
-                    position.unwrap().x
-                } else {
-                    150.0
-                } as i32,
-                if position.is_some() {
-                    position.unwrap().y
-                } else {
-                    60.0
-                } as i32,
-                (size.x * dpi_factor) as u32,
-                (size.y * dpi_factor) as u32,
+                create_x,
+                create_y,
+                clamp_extent(size.x * dpi_factor),
+                clamp_extent(size.y * dpi_factor),
                 0,
                 visual_info.depth,
                 x11_sys::InputOutput as u32,
@@ -191,14 +227,11 @@ impl XlibWindow {
             // Set the WM_CLASS before mapping the window.
             // Based on <https://www.x.org/releases/X11R7.5/doc/man/man3/XSetWMProperties.3.html>
             {
-                // Use the binary name by default (the first arg).
-                let class = std::env::args_os()
-                    .next()
-                    .as_ref()
-                    .and_then(|arg0| std::path::Path::new(arg0).file_name())
-                    .and_then(OsStr::to_str)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| String::from("Makepad"));
+                let class = if app_id.is_empty() {
+                    crate::window::default_app_id()
+                } else {
+                    app_id.to_string()
+                };
                 let instance = std::env::var("RESOURCE_NAME")
                     .ok()
                     .unwrap_or_else(|| class.clone());
@@ -234,20 +267,7 @@ impl XlibWindow {
             x11_sys::XMapWindow(display, window);
             x11_sys::XFlush(display);
 
-            let xic = if !get_xlib_app_global().xim.is_null() {
-                Some(x11_sys::XCreateIC(
-                    get_xlib_app_global().xim,
-                    x11_sys::XNInputStyle.as_ptr(),
-                    (x11_sys::XIMPreeditNothing | x11_sys::XIMStatusNothing) as i32,
-                    x11_sys::XNClientWindow.as_ptr(),
-                    window,
-                    x11_sys::XNFocusWindow.as_ptr(),
-                    window,
-                    ptr::null_mut() as *mut c_void,
-                ))
-            } else {
-                None
-            };
+            let xic = create_xim_input_context(get_xlib_app_global().xim, window);
 
             // Create a window
             get_xlib_app_global().window_map.insert(window, self);
@@ -339,23 +359,14 @@ impl XlibWindow {
             x11_sys::XMapRaised(display, window);
             x11_sys::XFlush(display);
 
-            let xic = x11_sys::XCreateIC(
-                get_xlib_app_global().xim,
-                x11_sys::XNInputStyle.as_ptr(),
-                (x11_sys::XIMPreeditNothing | x11_sys::XIMStatusNothing) as i32,
-                x11_sys::XNClientWindow.as_ptr(),
-                window,
-                x11_sys::XNFocusWindow.as_ptr(),
-                window,
-                ptr::null_mut() as *mut c_void,
-            );
+            let xic = create_xim_input_context(get_xlib_app_global().xim, window);
 
             get_xlib_app_global().window_map.insert(window, self);
 
             self.attributes = Some(attributes);
             self.visual_info = Some(visual_info);
             self.window = Some(window);
-            self.xic = Some(xic);
+            self.xic = xic;
             self.last_window_geom = self.get_window_geom();
 
             let new_geom = self.get_window_geom();
@@ -399,6 +410,16 @@ impl XlibWindow {
     }
 
     fn restore_or_maximize(&self, add_remove: c_long) {
+        let atoms = &get_xlib_app_global().atoms;
+        let (horz, vert) = (
+            atoms.new_wm_state_maximized_horz,
+            atoms.new_wm_state_maximized_vert,
+        );
+        self.set_net_wm_state(add_remove, horz, vert);
+    }
+
+    /// Sends a `_NET_WM_STATE` client message. `second` is 0 when only one state changes.
+    fn set_net_wm_state(&self, add_remove: c_long, first: x11_sys::Atom, second: x11_sys::Atom) {
         unsafe {
             let default_screen = x11_sys::XDefaultScreen(get_xlib_app_global().display);
             let root_window = x11_sys::XRootWindow(get_xlib_app_global().display, default_screen);
@@ -413,8 +434,8 @@ impl XlibWindow {
                 data: {
                     let mut msg = mem::zeroed::<x11_sys::XClientMessageEvent__bindgen_ty_1>();
                     msg.l[0] = add_remove;
-                    msg.l[1] = get_xlib_app_global().atoms.new_wm_state_maximized_horz as c_long;
-                    msg.l[2] = get_xlib_app_global().atoms.new_wm_state_maximized_vert as c_long;
+                    msg.l[1] = first as c_long;
+                    msg.l[2] = second as c_long;
                     msg
                 },
             };
@@ -436,11 +457,28 @@ impl XlibWindow {
         self.restore_or_maximize(_NET_WM_STATE_ADD);
     }
 
+    pub fn fullscreen(&self) {
+        let atom = get_xlib_app_global().atoms.net_wm_state_fullscreen;
+        self.set_net_wm_state(_NET_WM_STATE_ADD, atom, 0);
+    }
+
+    /// Leaves fullscreen. Maximized is left alone, so a window that was maximized
+    /// before it went fullscreen comes back maximized.
+    pub fn normal(&self) {
+        let atom = get_xlib_app_global().atoms.net_wm_state_fullscreen;
+        self.set_net_wm_state(_NET_WM_STATE_REMOVE, atom, 0);
+    }
+
     pub fn close_window(&mut self) {
-        unsafe {
-            x11_sys::XDestroyWindow(get_xlib_app_global().display, self.window.unwrap());
-            self.window = None;
-            // lets remove us from the mapping
+        if let Some(window) = self.window.take() {
+            unsafe {
+                let xlib_app = get_xlib_app_global();
+                if xlib_app.active_popup == Some(window) {
+                    xlib_app.release_popup_grab(window);
+                }
+                xlib_app.window_map.remove(&window);
+                x11_sys::XDestroyWindow(xlib_app.display, window);
+            }
         }
     }
 
@@ -467,7 +505,10 @@ impl XlibWindow {
             xr_is_presenting: false,
             can_fullscreen: false,
             is_topmost: self.get_is_topmost(),
-            is_fullscreen: self.get_is_maximized(),
+            // Maximize-or-fullscreen, the flag's meaning everywhere; Wayland reports
+            // the same union. Creation still only ever maximizes, so a saved `true`
+            // cannot come back as fullscreen.
+            is_fullscreen: self.get_is_maximized() || self.get_is_fullscreen(),
             inner_size: self.get_inner_size(),
             outer_size: self.get_outer_size(),
             dpi_factor: self.get_dpi_factor(),
@@ -477,7 +518,22 @@ impl XlibWindow {
     }
 
     pub fn get_is_maximized(&self) -> bool {
-        let mut maximized = false;
+        let atoms = &get_xlib_app_global().atoms;
+        let wanted = [
+            atoms.new_wm_state_maximized_horz,
+            atoms.new_wm_state_maximized_vert,
+        ];
+        self.has_net_wm_state(&wanted)
+    }
+
+    pub fn get_is_fullscreen(&self) -> bool {
+        let wanted = [get_xlib_app_global().atoms.net_wm_state_fullscreen];
+        self.has_net_wm_state(&wanted)
+    }
+
+    /// Whether `_NET_WM_STATE` currently carries any of `wanted`.
+    fn has_net_wm_state(&self, wanted: &[x11_sys::Atom]) -> bool {
+        let mut found = false;
         unsafe {
             let mut prop_type = mem::MaybeUninit::uninit();
             let mut format = mem::MaybeUninit::uninit();
@@ -507,39 +563,188 @@ impl XlibWindow {
                 let items =
                     std::slice::from_raw_parts::<c_ulong>(properties as *mut _, n_item as usize);
                 for item in items {
-                    if *item == get_xlib_app_global().atoms.new_wm_state_maximized_horz
-                        || *item == get_xlib_app_global().atoms.new_wm_state_maximized_vert
-                    {
-                        maximized = true;
+                    if wanted.contains(item) {
+                        found = true;
                         break;
                     }
                 }
                 x11_sys::XFree(properties as *mut _);
             }
         }
-        maximized
+        found
     }
 
-    pub fn set_ime_spot(&mut self, spot: Vec2d) {
-        if self.ime_spot == spot {
+    unsafe fn create_position_xic_with_spot(
+        &self,
+        preferred_status_style: c_ulong,
+        spot_px: x11_sys::XPoint,
+        area_px: x11_sys::XRectangle,
+    ) -> Option<XimInputContext> {
+        let window = self.window?;
+        let xim = get_xlib_app_global().xim;
+        if let Some(context) = create_xim_position_input_context_with_spot(
+            xim,
+            window,
+            preferred_status_style,
+            spot_px,
+            area_px,
+        ) {
+            return Some(context);
+        }
+        for status_style in xim_status_candidates() {
+            if status_style == preferred_status_style {
+                continue;
+            }
+            if let Some(context) = create_xim_position_input_context_with_spot(
+                xim,
+                window,
+                status_style,
+                spot_px,
+                area_px,
+            ) {
+                return Some(context);
+            }
+        }
+        None
+    }
+
+    pub fn set_ime_rect(&mut self, rect: Rect, area_rect: Rect) {
+        if self.ime_rect == rect && self.ime_area_rect == area_rect {
             return;
         }
-        self.ime_spot = spot;
-        let Some(xic) = self.xic else {
+        self.ime_rect = rect;
+        self.ime_area_rect = area_rect;
+        let Some(mut xim_context) = self.xic else {
             return;
         };
         let dpi_factor = self.get_dpi_factor();
+        // XIM defines XNSpotLocation.y as the current text line baseline, but
+        // ibus' XIM bridge uses it as the candidate anchor and ignores XNArea.
+        // Put that anchor just outside the current line so the popup has a real
+        // gap both when ibus places it below the line and when it flips above.
+        let line_height_px = rect.size.y * dpi_factor;
+        let line_top_px = rect.pos.y * dpi_factor;
+        let baseline_px = line_top_px + line_height_px * 0.85;
+        let line_area = if area_rect.size.x > 0.0 && area_rect.size.y > 0.0 {
+            area_rect
+        } else {
+            rect
+        };
+        let (padding_x_px, padding_y_px) = if line_height_px > 0.0 {
+            (
+                (line_height_px * 0.25).max(3.0),
+                (line_height_px * 1.25).max(20.0),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let area_line_left_px = line_area.pos.x * dpi_factor;
+        let area_line_top_px = line_area.pos.y * dpi_factor;
+        let area_line_right_px = (line_area.pos.x + line_area.size.x) * dpi_factor;
+        let area_line_bottom_px = (line_area.pos.y + line_area.size.y) * dpi_factor;
+        let area_left_px = (area_line_left_px - padding_x_px).max(0.0);
+        let area_top_px = (area_line_top_px - padding_y_px).max(0.0);
+        let area_right_px = area_line_right_px + padding_x_px;
+        let area_bottom_px = area_line_bottom_px + padding_y_px;
+        let spot_clearance_px = if line_height_px > 0.0 {
+            (line_height_px * 0.65).max(10.0).min(18.0)
+        } else {
+            0.0
+        };
+        let spot_above_y_px = if line_height_px > 0.0 && area_line_top_px < line_top_px {
+            area_line_top_px
+        } else {
+            line_top_px
+        };
+        let spot_below_y_px = line_top_px + line_height_px + spot_clearance_px;
+        let line_area_height_px = (area_line_bottom_px - area_line_top_px).max(line_height_px);
+        let candidate_height_guess_px = if line_height_px > 0.0 {
+            (line_area_height_px * 3.3).max(line_height_px * 7.0).max(124.0).min(260.0)
+        } else {
+            0.0
+        };
+        let flip_above_cutoff_px = candidate_height_guess_px;
+        let mut root_space_px = None;
+        if line_height_px > 0.0 {
+            if let Some(window) = self.window {
+                unsafe {
+                    let display = get_xlib_app_global().display;
+                    let default_screen = x11_sys::XDefaultScreen(display);
+                    let root_window = x11_sys::XRootWindow(display, default_screen);
+                    let mut root_x = 0;
+                    let mut root_y = 0;
+                    let mut child = 0;
+                    let mut root_attrs = mem::MaybeUninit::uninit();
+                    if x11_sys::XTranslateCoordinates(
+                        display,
+                        window,
+                        root_window,
+                        0,
+                        0,
+                        &mut root_x,
+                        &mut root_y,
+                        &mut child,
+                    ) != 0
+                        && x11_sys::XGetWindowAttributes(
+                            display,
+                            root_window,
+                            root_attrs.as_mut_ptr(),
+                        ) != 0
+                    {
+                        let root_attrs = root_attrs.assume_init();
+                        let above_anchor_root_y_px = root_y as f64 + spot_above_y_px;
+                        let below_anchor_root_y_px = root_y as f64 + spot_below_y_px;
+                        root_space_px = Some((
+                            above_anchor_root_y_px,
+                            root_attrs.height as f64 - below_anchor_root_y_px,
+                        ));
+                    }
+                }
+            }
+        }
+        let anchor_above = root_space_px
+            .map(|(above_anchor_top_space_px, below_anchor_bottom_space_px)| {
+                below_anchor_bottom_space_px < flip_above_cutoff_px
+                    && above_anchor_top_space_px > below_anchor_bottom_space_px
+            })
+            .unwrap_or(false);
+        let spot_y_px = if line_height_px <= 0.0 {
+            baseline_px
+        } else if anchor_above {
+            spot_above_y_px
+        } else {
+            spot_below_y_px
+        };
         let spot_px = x11_sys::XPoint {
-            x: (spot.x * dpi_factor) as i16,
-            y: (spot.y * dpi_factor) as i16,
+            x: (rect.pos.x * dpi_factor) as i16,
+            y: spot_y_px as i16,
         };
         let area_px = x11_sys::XRectangle {
-            x: spot_px.x,
-            y: spot_px.y,
-            width: 1,
-            height: 1,
+            x: area_left_px as i16,
+            y: area_top_px as i16,
+            width: (area_right_px - area_left_px).max(1.0) as u16,
+            height: (area_bottom_px - area_top_px).max(1.0) as u16,
         };
         unsafe {
+            let mut xic = xim_context.xic;
+            if xim_context.preedit_style == XimPreeditStyle::Position
+                && !xim_context.spot_initialized_at_creation
+            {
+                if let Some(new_context) = self.create_position_xic_with_spot(
+                    xim_context.status_style(),
+                    spot_px,
+                    area_px,
+                ) {
+                    x11_sys::XDestroyIC(xic);
+                    self.xic = Some(new_context);
+                    xim_context = new_context;
+                    xic = new_context.xic;
+                    if self.ime_active {
+                        x11_sys::XSetICFocus(xic);
+                    }
+                }
+            }
+
             let preedit_attr = x11_sys::XVaCreateNestedList(
                 0,
                 x11_sys::XNSpotLocation.as_ptr(),
@@ -552,12 +757,31 @@ impl XlibWindow {
                 return;
             }
 
-            x11_sys::XSetICValues(
+            let failed_attr = x11_sys::XSetICValues(
                 xic,
                 x11_sys::XNPreeditAttributes.as_ptr(),
                 preedit_attr,
                 ptr::null_mut::<c_void>(),
             );
+            if !failed_attr.is_null() && xim_context.preedit_style != XimPreeditStyle::Position {
+                if let Some(new_context) = self.create_position_xic_with_spot(
+                    xim_context.status_style(),
+                    spot_px,
+                    area_px,
+                ) {
+                    x11_sys::XDestroyIC(xic);
+                    self.xic = Some(new_context);
+                    if self.ime_active {
+                        x11_sys::XSetICFocus(new_context.xic);
+                    }
+                    let _ = x11_sys::XSetICValues(
+                        new_context.xic,
+                        x11_sys::XNPreeditAttributes.as_ptr(),
+                        preedit_attr,
+                        ptr::null_mut::<c_void>(),
+                    );
+                }
+            }
             x11_sys::XFree(preedit_attr);
         }
     }
@@ -567,15 +791,24 @@ impl XlibWindow {
             return;
         }
         self.ime_active = active;
-        if let Some(xic) = self.xic {
+        if let Some(xim_context) = self.xic {
             if self.ime_active {
-                unsafe { x11_sys::XSetICFocus(xic) };
+                unsafe { x11_sys::XSetICFocus(xim_context.xic) };
+                if self.ime_rect != Rect::default() {
+                    let ime_rect = self.ime_rect;
+                    let ime_area_rect = self.ime_area_rect;
+                    self.ime_rect = Rect::default();
+                    self.ime_area_rect = Rect::default();
+                    self.set_ime_rect(ime_rect, ime_area_rect);
+                }
             } else {
-                unsafe { x11_sys::XUnsetICFocus(xic) };
+                unsafe { x11_sys::XUnsetICFocus(xim_context.xic) };
             }
         }
     }
 
+    /// The window's top-left corner in physical screen pixels; see [`Self::set_position`]
+    /// for why positions are not scaled the way sizes are.
     pub fn get_position(&self) -> Vec2d {
         unsafe {
             let display = get_xlib_app_global().display;
@@ -631,24 +864,73 @@ impl XlibWindow {
         }
     }
 
+    /// Moves the window's top-left corner to `pos`, in physical screen pixels — the same
+    /// space [`Self::get_position`] reports and `XCreateWindow` takes, so
+    /// `set_position(get_position())` leaves the window where it is. Sizes are logical and
+    /// scale with the DPI; positions are not, because a screen coordinate on a multi-monitor
+    /// desktop has no single scale factor to be logical in.
     pub fn set_position(&mut self, pos: Vec2d) {
         unsafe {
             let display = get_xlib_app_global().display;
-            let dpi_factor = self.get_dpi_factor();
+            // A caller placing the window cannot know the desktop it is placing into, so the
+            // request is fitted to the desktop that is actually there.
+            let want = Rect {
+                pos,
+                size: self.get_outer_size(),
+            };
+            let fitted = fit_window_rect_to_screens(&x11_screens(), want);
             x11_sys::XMoveWindow(
                 display,
                 self.window.unwrap(),
-                (pos.x * dpi_factor) as i32,
-                (pos.y * dpi_factor) as i32,
+                clamp_coord(fitted.pos.x),
+                clamp_coord(fitted.pos.y),
             );
             x11_sys::XFlush(display);
-            self.last_window_geom.position = pos;
+            self.last_window_geom.position = fitted.pos;
         }
     }
 
-    pub fn set_outer_size(&self, _size: Vec2d) {}
+    /// Resizes the window to `size`, given in logical pixels.
+    ///
+    /// X11 draws no decorations of its own — the window manager reparents the client into its
+    /// own frame — so the client window's extent IS its inner size, and the outer size is not
+    /// something a client can set. `set_outer_size` therefore delegates here rather than
+    /// pretending to a precision it does not have.
+    pub fn set_inner_size(&self, size: Vec2d) {
+        let Some(window) = self.window else {
+            return;
+        };
+        // A request that carries no usable size is refused rather than clamped: flooring a zero
+        // or a negative to the CARD16 minimum would produce a one-pixel window, which is a worse
+        // answer than leaving the window alone. Matches what the Wayland backend does.
+        let Some(size) = sanitize_resize(size) else {
+            crate::error!(
+                "ResizeWindow ignored: {}x{} is not a usable window extent.",
+                size.x,
+                size.y
+            );
+            return;
+        };
+        unsafe {
+            let display = get_xlib_app_global().display;
+            let dpi = self.get_dpi_factor();
+            // X11 encodes an extent as CARD16 and rejects zero with a BadValue, which without
+            // an error handler installed would terminate the process.
+            x11_sys::XResizeWindow(
+                display,
+                window,
+                clamp_extent(size.x * dpi),
+                clamp_extent(size.y * dpi),
+            );
+            x11_sys::XFlush(display);
+        }
+    }
 
-    pub fn set_inner_size(&self, _size: Vec2d) {}
+    /// The window manager owns the decoration frame, so a client can only ask for its own
+    /// extent; this is the inner size by another name.
+    pub fn set_outer_size(&self, size: Vec2d) {
+        self.set_inner_size(size);
+    }
 
     pub fn get_dpi_factor(&self) -> f64 {
         unsafe {
@@ -757,8 +1039,19 @@ impl XlibWindow {
     pub fn send_mouse_move(&mut self, pos: Vec2d, modifiers: KeyModifiers) {
         self.last_mouse_pos = pos;
         self.do_callback(XlibEvent::MouseMove(MouseMoveEvent {
+                lock_delta: Default::default(),
             window_id: self.window_id,
             abs: pos,
+            modifiers,
+            time: self.time_now(),
+            handled: Cell::new(Area::Empty),
+        }));
+    }
+
+    pub fn send_mouse_leave(&mut self, modifiers: KeyModifiers) {
+        self.do_callback(XlibEvent::MouseLeave(MouseLeaveEvent {
+            window_id: self.window_id,
+            abs: self.last_mouse_pos,
             modifiers,
             time: self.time_now(),
             handled: Cell::new(Area::Empty),
@@ -1120,4 +1413,49 @@ impl DndAtoms {
             uri_list: x11_sys::XInternAtom(display, "text/uri-list\0".as_ptr() as *const _, 0),
         }
     }
+}
+
+/// Fits a requested window placement onto the desktop.
+///
+/// Takes and returns the pair `XCreateWindow` is called with: a position in physical pixels
+/// and an inner size in logical pixels. `None` leaves placement to the window manager, which
+/// already puts the window somewhere visible, so it passes straight through.
+fn fit_create_geom(
+    position: Option<Vec2d>,
+    size: Vec2d,
+    dpi_factor: f64,
+) -> (Option<Vec2d>, Vec2d) {
+    let Some(pos) = position else {
+        return (None, size);
+    };
+    let screens = x11_screens();
+    if screens.is_empty() {
+        return (position, size);
+    }
+    let want = Rect {
+        pos,
+        size: dvec2(size.x * dpi_factor, size.y * dpi_factor),
+    };
+    let fitted = fit_window_rect_to_screens(&screens, want);
+    (
+        Some(fitted.pos),
+        dvec2(fitted.size.x / dpi_factor, fitted.size.y / dpi_factor),
+    )
+}
+
+/// Clamps a window coordinate into the INT16 range the X11 protocol encodes it in.
+fn clamp_coord(v: f64) -> c_int {
+    if !v.is_finite() {
+        return 0;
+    }
+    (v as i64).clamp(-32768, 32767) as c_int
+}
+
+/// Clamps a window extent into the CARD16 range the X11 protocol encodes it in. Zero is not
+/// a legal extent, so the floor is one pixel.
+fn clamp_extent(v: f64) -> u32 {
+    if !v.is_finite() {
+        return 1;
+    }
+    (v as i64).clamp(1, 65535) as u32
 }

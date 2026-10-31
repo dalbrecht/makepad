@@ -68,6 +68,17 @@ impl ScriptObjectRef {
     pub fn as_object(&self) -> ScriptObject {
         self.obj
     }
+
+    /// A stable, unique identity for the heap that minted this ref. All refs from
+    /// the same heap share one `root_objects` `Rc`, so its pointer identifies the
+    /// heap for the heap's lifetime. Returns 0 for a heap-less (empty) ref. Use
+    /// this to route a widget's script objects back to their owning VM instead of
+    /// dereferencing them against the wrong heap.
+    pub fn heap_key(&self) -> usize {
+        self.roots
+            .as_ref()
+            .map_or(0, |rc| Rc::as_ptr(rc) as *const () as usize)
+    }
 }
 
 pub trait ScriptRefOptionExt {
@@ -609,15 +620,45 @@ pub struct ScriptVecValue {
     pub value: ScriptValue,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct ScriptObjectData {
     pub tag: ScriptObjectTag,
     pub proto: ScriptValue,
     pub map: ScriptObjectMap,
     pub vec: Vec<ScriptVecValue>,
+    /// Instruction pointer of the BEGIN_PROTO / BEGIN_BARE opcode that
+    /// constructed this object; `ScriptIp::UNKNOWN` for Rust-built objects.
+    /// The proto chain of `made_at` ips is the object's construction chain:
+    /// the tweaker's cascade view resolves each ip to a source location and
+    /// its `///` doc comments (`vm.construction_chain`). Not stored in the
+    /// tag: the tag's low 40 bits already carry the fn ip for fn objects.
+    pub made_at: ScriptIp,
+}
+
+impl Default for ScriptObjectData {
+    fn default() -> Self {
+        Self {
+            tag: Default::default(),
+            proto: Default::default(),
+            map: Default::default(),
+            vec: Default::default(),
+            made_at: ScriptIp::UNKNOWN,
+        }
+    }
 }
 
 impl ScriptObjectData {
+    /// Backing allocation retained by this object's dynamic property storage
+    /// (map buckets plus the ordered vector), excluding the struct itself.
+    /// Used by the retained-heap estimate.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.map.retained_bytes().saturating_add(
+            self.vec
+                .capacity()
+                .saturating_mul(::std::mem::size_of::<ScriptVecValue>()),
+        )
+    }
+
     pub fn add_type_methods(native: &mut ScriptNative, heap: &mut ScriptHeap) {
         native.add_type_method(
             heap,
@@ -919,28 +960,31 @@ impl ScriptObjectData {
     }
 
     pub fn map_insert(&mut self, key: ScriptValue, value: ScriptValue) {
+        let order = self.map.len() as u32;
         if self.tag.is_tracked() {
-            let order = self.map.len() as u32;
-            match self.map.entry(key) {
-                VecMapEntry::Occupied(mut occ) => {
-                    let old = occ.get_mut();
-                    if old.value != value {
-                        old.tag.set_dirty();
-                        self.tag.set_dirty();
-                        old.value = value;
-                    }
-                    return;
+            if let Some(old) = self.map.get_mut(&key) {
+                if old.value != value {
+                    old.tag.set_dirty();
+                    self.tag.set_dirty();
+                    old.value = value;
                 }
-                VecMapEntry::Vacant(vac) => {
-                    vac.insert(ScriptMapValue {
-                        value,
-                        tag: ScriptMapTag::dirty_with_order(order),
-                    });
-                    return;
-                }
+                return;
             }
+            self.map.insert(
+                key,
+                ScriptMapValue {
+                    value,
+                    tag: ScriptMapTag::dirty_with_order(order),
+                },
+            );
         } else {
-            let order = self.map.len() as u32;
+            // Updating an existing field keeps its original insertion order,
+            // matching the tracked path above; re-inserting would move it to
+            // the end and reorder iteration, JSON output and equality.
+            if let Some(existing) = self.map.get_mut(&key) {
+                existing.value = value;
+                return;
+            }
             self.map.insert(
                 key,
                 ScriptMapValue {
@@ -952,25 +996,21 @@ impl ScriptObjectData {
     }
 
     pub fn map_set_if_exist(&mut self, key: ScriptValue, value: ScriptValue) -> bool {
-        if self.tag.is_tracked() {
-            match self.map.entry(key) {
-                VecMapEntry::Occupied(mut occ) => {
-                    let old = occ.get_mut();
-                    if old.value != value {
-                        old.tag.set_dirty();
-                        self.tag.set_dirty();
-                        old.value = value;
-                    }
-                    return true;
+        let tracked = self.tag.is_tracked();
+        if let Some(old) = self.map.get_mut(&key) {
+            if tracked {
+                if old.value != value {
+                    old.tag.set_dirty();
+                    old.value = value;
+                    self.tag.set_dirty();
                 }
-                VecMapEntry::Vacant(_) => {}
+            } else {
+                old.value = value;
             }
+            true
+        } else {
+            false
         }
-        if let Some(val) = self.map.get_mut(&key) {
-            val.value = value;
-            return true;
-        }
-        false
     }
 
     pub fn map_get(&self, key: &ScriptValue) -> Option<ScriptValue> {
@@ -983,16 +1023,12 @@ impl ScriptObjectData {
 
     pub fn map_get_if_dirty(&mut self, key: &ScriptValue) -> Option<ScriptValue> {
         if self.tag.is_tracked() {
-            match self.map.entry(*key) {
-                VecMapEntry::Occupied(mut occ) => {
-                    let val = occ.get_mut();
-                    if val.tag.get_and_clear_dirty() {
-                        return Some(val.value);
-                    }
-                    return None;
+            if let Some(val) = self.map.get_mut(key) {
+                if val.tag.get_and_clear_dirty() {
+                    return Some(val.value);
                 }
-                VecMapEntry::Vacant(_) => return None,
-            };
+            }
+            return None;
         }
         self.map_get(key)
     }
@@ -1079,6 +1115,7 @@ impl ScriptObjectData {
         self.tag.clear();
         self.map.clear();
         self.vec.clear();
+        self.made_at = ScriptIp::UNKNOWN;
         // Debug: verify clear worked
         debug_assert!(self.map.is_empty(), "map.clear() didn't work!");
     }

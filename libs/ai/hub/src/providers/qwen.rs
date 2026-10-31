@@ -1,0 +1,1834 @@
+//! Fleet/local Qwen chat provider — the adapter seam onto the
+//! `libs/asset/ai` service wire.
+//!
+//! ## The proposed additive chat contract (for the fleet backend owner)
+//!
+//! This adapter speaks the existing job protocol (`POST /generate`,
+//! `GET /job/<id>`, `POST /job/<id>/cancel`) plus the following ADDITIVE
+//! fields, chosen so the service's lenient JSON parsing accepts them today
+//! and a `chat` backend can implement them without breaking any existing
+//! client:
+//!
+//! - `/health.capabilities` gains `"chat"` when at least one chat-capable
+//!   model passes the existing honest `model_availability` gate.
+//! - `/models` entries for chat models carry `"domain": "chat"` and the
+//!   existing `available` / `unavailable_reason` fields.
+//! - `POST /generate` accepts `{"model", "domain": "chat", "chat_system",
+//!   "chat_messages": [{"role", "text"}...], "max_tokens"?, "thinking"?}`. `prompt` is
+//!   also set (last user text) for forward compatibility.
+//! - `GET /job/<id>` gains `"partial_text"`: the assistant text so far, a
+//!   monotonically growing prefix of the final text. The final text is the
+//!   terminal `partial_text` — no separate artifact fetch is required for
+//!   chat.
+//! - The `/generate` response optionally carries `"think_open"`, saying
+//!   whether the node's generation prefill opened a think block. Older nodes
+//!   omit it, in which case the client retains its model-id inference.
+//!
+//! Until a fleet node implements this, `availability()` honestly reports
+//! `Unavailable` with the per-node reasons — which is exactly what the UI
+//! shows. There is no fallback from here to any other provider.
+//!
+//! Qwen3.8 (`qwen3.8-27b`) is preferred when a node reports it ready;
+//! any other advertised chat model is used otherwise, and the picked model
+//! id is surfaced in `Available.model` so the UI can label the row
+//! honestly.
+
+use crate::chat_wire::{ChatMessage, ChatRole, ProviderAvailability, ProviderKind, ServingFacts};
+use crate::providers::fleet_http;
+use crate::providers::provider::{ChatProvider, ProviderEvent, TurnInput};
+use makepad_strict_json::{self as json, Value};
+use std::time::{Duration, Instant};
+#[path = "qwen_vision.rs"]
+mod vision;
+
+/// Transport seam so the provider is deterministic under test. The real
+/// implementation is [`HttpFleetTransport`]; tests script one.
+pub trait FleetTransport {
+    fn get_json(&mut self, url: &str) -> Result<Value, String>;
+    fn post_json(&mut self, url: &str, body: &Value) -> Result<Value, String>;
+
+    /// Legacy transports remain source compatible. An untyped error cannot
+    /// establish admission safety, so it is never grounds for POST replay.
+    fn get_json_detailed(&mut self, url: &str) -> Result<Value, FleetError> {
+        self.get_json(url).map_err(FleetError::Other)
+    }
+    fn post_json_detailed(&mut self, url: &str, body: &Value) -> Result<Value, FleetError> {
+        self.post_json(url, body).map_err(FleetError::Other)
+    }
+    /// Admission scheduling clock; scripted transports can advance fake time.
+    fn now(&self) -> Instant { Instant::now() }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FleetError {
+    /// DNS/connect failed before any request could be sent.
+    Connection(String),
+    /// A complete rejection. `no_job` requires an absent/null job id and an
+    /// explicit JSON error, or the typed low-level empty 503 refusal.
+    Http { status: u16, reason: String, no_job: bool },
+    Other(String),
+}
+
+impl std::fmt::Display for FleetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http { status, reason, .. } => write!(f, "http {status}: {reason}"),
+            Self::Connection(s) | Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+pub struct HttpFleetTransport;
+
+impl HttpFleetTransport {
+    fn request(method: &str, url: &str, body: Option<&Value>) -> Result<Value, FleetError> {
+        let secret = std::env::var("MAKEPAD_AI_HUB_SECRET").ok();
+        let (status, value) = fleet_http::request_json_detailed(method, url, body, secret.as_deref().map(str::trim))
+            .map_err(Self::request_error)?;
+        Self::response(status, value, body, secret.as_deref())
+    }
+
+    fn request_error(error: fleet_http::RequestError) -> FleetError {
+        match error {
+            fleet_http::RequestError::Connection(s) => FleetError::Connection(s),
+            e @ fleet_http::RequestError::Empty503 => FleetError::Http {
+                status: 503, reason: e.to_string(), no_job: true,
+            },
+            fleet_http::RequestError::Other(s) => FleetError::Other(s),
+        }
+    }
+
+    fn response(status: u16, value: Value, body: Option<&Value>, secret: Option<&str>) -> Result<Value, FleetError> {
+        if (200..300).contains(&status) { return Ok(value); }
+        let error = value.get("error").and_then(|e| {
+            e.as_str().or_else(|| e.get("message").and_then(Value::as_str))
+        }).filter(|s| !s.trim().is_empty());
+        let no_job = matches!(value.get("job_id"), None | Some(Value::Null)) && error.is_some();
+        let mut reason = error.unwrap_or("server rejected request without a reason").to_string();
+        // Only the error field is shown, never the response/request object or
+        // headers. Redact echoed credentials and request text before bounding.
+        for text in secret.into_iter().map(str::trim).filter(|s| !s.is_empty()) {
+            reason = reason.replace(text, "[redacted]");
+        }
+        if let Some(body) = body {
+            for key in ["prompt", "chat_system"] {
+                if let Some(text) = body.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    reason = reason.replace(text, "[request text]");
+                }
+            }
+            if let Some(messages) = body.get("chat_messages").and_then(Value::as_arr) {
+                for message in messages {
+                    if let Some(text) = message.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                        reason = reason.replace(text, "[request text]");
+                    }
+                }
+            }
+        }
+        let reason = reason.lines().map(|line| {
+            if line.to_ascii_lowercase().contains("authorization:") {
+                "[redacted header]"
+            } else { line }
+        }).collect::<Vec<_>>().join(" ");
+        Err(FleetError::Http { status, reason: bounded_reason(&reason), no_job })
+    }
+}
+
+impl FleetTransport for HttpFleetTransport {
+    fn get_json(&mut self, url: &str) -> Result<Value, String> {
+        self.get_json_detailed(url).map_err(|e| e.to_string())
+    }
+    fn post_json(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+        self.post_json_detailed(url, body).map_err(|e| e.to_string())
+    }
+    fn get_json_detailed(&mut self, url: &str) -> Result<Value, FleetError> {
+        Self::request("GET", url, None)
+    }
+    fn post_json_detailed(&mut self, url: &str, body: &Value) -> Result<Value, FleetError> {
+        Self::request("POST", url, Some(body))
+    }
+}
+
+fn bounded_reason(reason: &str) -> String {
+    let mut out: String = reason.chars().take(384).map(|c| if c.is_control() { ' ' } else { c }).collect();
+    if reason.chars().count() > 384 { out.push('…'); }
+    out
+}
+
+// Eight admission rounds, including rounds with no eligible node. At most
+// one POST per round; backoff is cooperative and capped, never a sleep here.
+const MAX_ADMISSION_ATTEMPTS: u8 = 8;
+const ADMISSION_BUDGET: Duration = Duration::from_secs(90);
+
+struct PendingSubmission {
+    base: String,
+    model: String,
+    body: Value,
+    inferred_open_think: bool,
+    attempts: u8,
+    retry_at: Instant,
+    deadline: Instant,
+    reasons: Vec<String>,
+    note: Option<String>,
+    interrupted_bases: Vec<String>,
+}
+
+/// Model ids preferred in order when several chat models are available.
+const PREFERRED: &[&str] = &["qwen3.8-27b", "qwen3.6-27b", "qwen3.5-9b"];
+/// Reuse a live pick so send() does not wait on dead fleet boxes again.
+const PICK_TTL: Duration = Duration::from_secs(60);
+/// Skip a node that just failed connect/read for this long.
+const DEAD_TTL: Duration = Duration::from_secs(30);
+
+struct ActiveJob {
+    submission: PendingSubmission,
+    base: String,
+    job: String,
+    delivered: usize,
+    finished: bool,
+    last_note: String,
+    /// Tokens the box reports having generated for THIS job, read off its
+    /// `decode k/n` stage. Per job, so it restarts every tool round.
+    gen_tokens: u32,
+    /// Last serving facts forwarded, so a poll that changed nothing does not
+    /// re-emit. Compared as a whole: warmth arrives before any token exists,
+    /// so keying only on the token count would swallow it.
+    think_tokens: Option<u32>,
+    /// We emitted a synthetic `<think>` for this turn. The service's chat
+    /// template opens the think block ITSELF, so the streamed text starts
+    /// inside it with no tag: clients rendered the whole chain-of-thought
+    /// as the visible answer until `</think>` arrived (the "bouncy,
+    /// second-guessing" reply). The box's `think_tokens` says when the
+    /// model is reasoning; we open the block the client can see.
+    think_opened: bool,
+    /// The model's template opens `<think>` on every turn (qwen3.8): every
+    /// token before a `</think>` is think content, structurally.
+    open_think: bool,
+    visible_tokens: Option<u32>,
+    prefix_ingested: Option<u32>,
+    /// Consecutive failed polls. A single dropped TCP connect must not
+    /// kill a long generation turn; the job keeps running server-side.
+    poll_fails: u8,
+}
+
+/// Consecutive poll failures tolerated before the turn is declared dead.
+/// Connect timeouts run ~3 s each, so this rides out a ~1 minute node
+/// stall (a busy box mid-import evicts and reloads the LLM; the job
+/// itself survives server-side).
+const MAX_POLL_FAILS: u8 = 20;
+
+#[derive(Clone)]
+struct CachedPick {
+    base: String,
+    model: String,
+    text_fallback: bool,
+    at: Instant,
+}
+
+/// The picked node/model and the dead-node marks, behind one lock so MANY
+/// providers can share them.
+///
+/// One provider per chat session is the design (a provider owns exactly one
+/// conversation lane), but the fleet ROSTER is a fact about the LAN, not
+/// about a session: without sharing, N concurrent sessions each run their
+/// own `/health` + `/models` scan and each pays its own 3 s connect timeouts
+/// on a box that just went dark. Sharing turns that into one scan per
+/// [`PICK_TTL`] for the whole process, and a node that goes dark is skipped
+/// by every session at once.
+///
+/// [`FleetQwenChatProvider::new`] gives a provider a private cache, so a
+/// standalone provider (and every test) behaves exactly as before.
+#[derive(Default)]
+pub struct FleetPickCache {
+    state: std::sync::Mutex<PickState>,
+}
+
+#[derive(Default)]
+struct PickState {
+    pick: Option<CachedPick>,
+    dead_until: Vec<(String, Instant)>,
+    /// Decode lanes the last probed node advertised on `/health`, keyed by
+    /// its base URL: `(base, (lanes_active, slots_total))`. One heavy
+    /// resident per box means one set of lane facts at a time, so a single
+    /// slot is the whole story. Absent for a box that advertises no lanes
+    /// — which that protocol defines as ONE lane, never as "unknown".
+    lanes: Option<(String, (u32, u32))>,
+}
+
+impl FleetPickCache {
+    pub fn new() -> FleetPickCache {
+        FleetPickCache::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PickState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn is_dead(&self, base: &str) -> bool {
+        self.lock()
+            .dead_until
+            .iter()
+            .any(|(b, until)| b == base && Instant::now() < *until)
+    }
+
+    fn mark_dead(&self, base: &str) {
+        let until = Instant::now() + DEAD_TTL;
+        let mut state = self.lock();
+        if let Some(slot) = state.dead_until.iter_mut().find(|(b, _)| b == base) {
+            slot.1 = until;
+        } else {
+            state.dead_until.push((base.to_string(), until));
+        }
+        // Deliberately KEEP the cached pick even when it names this base:
+        // the dead-list already stops its EARLY reuse (the TTL fast path
+        // checks is_dead), while the scan's last-resort stale fallback
+        // needs it — clearing it here turned one flaky probe into a dead
+        // turn on a single-node fleet, mid-burst.
+    }
+
+    fn remember(&self, base: String, model: String, text_fallback: bool) {
+        self.lock().pick =
+            Some(CachedPick { base, model, text_fallback, at: Instant::now() });
+    }
+
+    /// The pick if it is still warm AND its node is not on the dead list.
+    fn fresh(&self) -> Option<(String, String, bool)> {
+        let pick = self.lock().pick.clone()?;
+        if pick.at.elapsed() < PICK_TTL && !self.is_dead(&pick.base) {
+            Some((pick.base, pick.model, pick.text_fallback))
+        } else {
+            None
+        }
+    }
+
+    fn last_base(&self) -> Option<String> {
+        self.lock().pick.as_ref().map(|p| p.base.clone())
+    }
+
+    /// Record what `base`'s `/health` said about its decode lanes (`None`
+    /// clears an earlier advert: a box that stopped advertising is a box
+    /// with nothing to say, not one that kept its old numbers).
+    fn remember_lanes(&self, base: &str, lanes: Option<(u32, u32)>) {
+        self.lock().lanes = lanes.map(|l| (base.to_string(), l));
+    }
+
+    /// Lane facts for `base`, if that is the box the last probe read.
+    fn lanes_for(&self, base: &str) -> Option<(u32, u32)> {
+        let state = self.lock();
+        let (probed, lanes) = state.lanes.as_ref()?;
+        (probed == base).then_some(*lanes)
+    }
+
+    /// Inspect the stale pick for the scan's last-resort fallback. A caller
+    /// looking for another model must not remove the shared last-good pick.
+    fn stale(&self) -> Option<(String, String, bool)> {
+        let pick = self.lock().pick.clone()?;
+        Some((pick.base, pick.model, pick.text_fallback))
+    }
+}
+
+pub struct FleetQwenChatProvider<T: FleetTransport> {
+    transport: T,
+    /// Node base URLs from LAN discovery, e.g. `http://10.0.0.169:8123`.
+    bases: Vec<String>,
+    /// Exact fleet model requested by the caller. `None` keeps the normal
+    /// provider preference order.
+    preferred_model: Option<String>,
+    /// `None` leaves the field off the wire so the serving node chooses its
+    /// own default. A positive value is forwarded without alteration.
+    max_tokens: Option<u32>,
+    /// `None` preserves the serving model's default thinking mode.
+    thinking: Option<bool>,
+    /// Every logical turn gets a fresh sample; admission attempts reuse it.
+    sample_seed: u64,
+    active: Option<ActiveJob>,
+    pending: Option<PendingSubmission>,
+    cancel_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Private by default; the broker hands EVERY session's provider the
+    /// same one so the fleet is probed once, not once per session.
+    picks: std::sync::Arc<FleetPickCache>,
+    /// The worker that accepted this conversation, independent of the
+    /// process-wide discovery cache and other conversations' choices.
+    home: Option<(String, String, bool)>,
+    /// Conversation identity for lane stickiness — one per provider
+    /// instance, which is one per session. Travels as `chat_session`.
+    conversation: String,
+    /// The WIRE transcript: every turn exactly as this provider sent it,
+    /// raw replies echoed verbatim — which is precisely what the node's
+    /// lane KV holds, so each new prompt token-extends the resident state
+    /// and the box prefills only the delta (aicore §7). The session's own
+    /// history strips thinking for storage and display; this mirror exists
+    /// because the KV cannot (the recurrent layers never rewind).
+    wire: Vec<WireTurn>,
+    images: Vec<crate::providers::provider::ToolImage>,
+    vision: Option<vision::VisionTurn>,
+    vision_base: Option<String>,
+}
+
+/// One wire turn: the session-history role it mirrors, and the exact text
+/// that went to the node.
+struct WireTurn {
+    role: ChatRole,
+    wire_role: &'static str,
+    text: String,
+}
+
+impl<T: FleetTransport> FleetQwenChatProvider<T> {
+    pub fn new(transport: T, bases: Vec<String>) -> FleetQwenChatProvider<T> {
+        Self::new_inner(transport, bases)
+    }
+
+    fn conversation_id() -> String {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{:016x}{:08x}", t as u64, std::process::id())
+    }
+
+    fn new_inner(transport: T, bases: Vec<String>) -> FleetQwenChatProvider<T> {
+        FleetQwenChatProvider::with_pick_cache(
+            transport,
+            bases,
+            std::sync::Arc::new(FleetPickCache::new()),
+        )
+    }
+
+    /// Share one node/model pick (and one dead-node list) across providers.
+    pub fn with_pick_cache(
+        transport: T,
+        bases: Vec<String>,
+        picks: std::sync::Arc<FleetPickCache>,
+    ) -> FleetQwenChatProvider<T> {
+        FleetQwenChatProvider {
+            transport,
+            bases,
+            preferred_model: None,
+            // NOT a policy number: the client requests the maximum and the
+            // serving lane clamps to its physics (context minus prompt).
+            // Every policy cap tried here got observed cutting a real
+            // level-building turn mid-source (2048, then 3072 on 2026-08-27,
+            // dog-shop interior). Boxes serving an older build clamp this to
+            // their fixed ceiling, which is merely what they did before.
+            max_tokens: Some(u32::MAX),
+            thinking: None,
+            sample_seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ std::process::id() as u64,
+            active: None,
+            pending: None,
+            cancel_signal: None,
+            picks,
+            home: None,
+            conversation: Self::conversation_id(),
+            wire: Vec::new(),
+            images: Vec::new(),
+            vision: None,
+            vision_base: None,
+        }
+    }
+
+    /// Require this exact advertised fleet model id when supplied.
+    pub fn with_preferred_model(mut self, model: Option<String>) -> Self {
+        self.preferred_model = model.map(|model| model.trim().to_string()).filter(|model| !model.is_empty());
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens.filter(|tokens| *tokens > 0);
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: Option<bool>) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
+    #[cfg(any(feature = "llm", test))]
+    pub(crate) fn with_cancel_signal(mut self, signal: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel_signal = Some(signal);
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel_signal.as_ref().is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn mark_dead(&mut self, base: &str) {
+        self.picks.mark_dead(base);
+    }
+
+    /// Probe fleet nodes; pick the best available chat model.
+    /// Prefer an advertised `chat` domain; otherwise a live `text` Qwen
+    /// model (current fleet) is an honest fallback.
+    ///
+    /// A warm pick is reused for [`PICK_TTL`] so `availability` + `begin_turn`
+    /// (both called on every send) do not pay connect-timeouts on dead boxes
+    /// twice. Recently-failed bases are skipped for [`DEAD_TTL`], and the
+    /// scan stops at the first usable node (last-good first).
+    fn probe(&mut self) -> Result<(String, String, bool), String> {
+        if let Some(home) = &self.home {
+            if self.bases.contains(&home.0) && !self.picks.is_dead(&home.0)
+                && crate::fleet::role_allows(&home.0, "chat")
+                && self.preferred_model.as_deref().is_none_or(|wanted| wanted == home.1)
+            {
+                return Ok(home.clone());
+            }
+        }
+        if let Some(pick) = self.picks.fresh() {
+            if self.bases.contains(&pick.0)
+                && crate::fleet::role_allows(&pick.0, "chat")
+                && self.preferred_model.as_deref().is_none_or(|wanted| wanted == pick.1) {
+                return Ok(pick);
+            }
+        }
+        if self.bases.is_empty() {
+            return Err(format!(
+                "no fleet nodes heard on the LAN yet (listening for fleet '{}')",
+                crate::discovery::wanted_fleet()
+            ));
+        }
+        let mut reasons = Vec::new();
+        let mut order = self.bases.clone();
+        if let Some(last) = self.picks.last_base() {
+            if let Some(i) = order.iter().position(|b| b == &last) {
+                let good = order.remove(i);
+                order.insert(0, good);
+            }
+        }
+        // One scan, three tiers. A chat HOME — a box whose /health
+        // advertises decode lanes — beats a box that merely holds the
+        // weights (that one reloads and re-prefills the whole context on
+        // every visit; the old stop-at-first-usable rule kept chat exactly
+        // there, "it just keeps running prefill"). And a home WITH A FREE
+        // LANE beats a home whose every lane is mid-generation: a full
+        // home queues the turn behind whatever those lanes are doing —
+        // measured tonight as one runaway think-loop starving every other
+        // conversation on the box.
+        let mut preferred = PickLadder::default();
+        let mut fallback = PickLadder::default();
+        for base in order {
+            if self.picks.is_dead(&base) {
+                reasons.push(format!("{base}: skipped (recently unreachable)"));
+                continue;
+            }
+            if let Some(hit) = self.probe_one(&base, &mut reasons, self.preferred_model.clone().as_deref()) {
+                if let Some((model, text_fallback)) = hit.preferred {
+                    let pick = (base.clone(), model, text_fallback);
+                    if hit.tier == HomeTier::FreeLane {
+                        self.picks.remember(pick.0.clone(), pick.1.clone(), pick.2);
+                        return Ok(pick);
+                    }
+                    preferred.offer(pick, hit.tier);
+                }
+                if let Some((model, text_fallback)) = hit.fallback {
+                    fallback.offer((base, model, text_fallback), hit.tier);
+                }
+            }
+        }
+        if let Some((base, model, text_fallback)) = preferred.best().or_else(|| self.preferred_model.is_none().then(|| fallback.best()).flatten()) {
+            self.picks.remember(base.clone(), model.clone(), text_fallback);
+            return Ok((base, model, text_fallback));
+        }
+        // STALE-OK: the LAN to a busy GPU box drops the odd connect, and a
+        // probe window can catch two drops in a row. A node that served
+        // this session seconds ago is better evidence than one failed
+        // probe — fall back to the stale pick and let the actual generate
+        // POST decide (it has its own connect handling). Without this the
+        // FINAL round of a long successful turn died at the re-probe and
+        // the user saw an error after their level had already built.
+        if let Some((base, model, text_fallback)) = self.picks.stale().filter(|(base, model, _)| {
+            self.bases.contains(base) && crate::fleet::role_allows(base, "chat")
+                && self.preferred_model.as_deref().is_none_or(|wanted| wanted == model)
+                && self.picks.is_dead(base)
+        }) {
+            self.picks.remember(base.clone(), model.clone(), text_fallback);
+            return Ok((base, model, text_fallback));
+        }
+        Err(if reasons.is_empty() {
+            "no fleet node advertises a chat or Qwen text model".to_string()
+        } else {
+            reasons.join("; ")
+        })
+    }
+
+    /// One immediate retry on idempotent GETs: the LAN path to a busy GPU
+    /// box drops the odd connect, and a single lost packet must not mark
+    /// the node dead for [`DEAD_TTL`].
+    fn get_json_retry(&mut self, url: &str) -> Result<Value, FleetError> {
+        match self.transport.get_json_detailed(url) {
+            Ok(v) => Ok(v),
+            Err(e @ FleetError::Http { status, .. }) if !matches!(status, 429 | 503) => Err(e),
+            Err(_) => self.transport.get_json_detailed(url),
+        }
+    }
+
+    /// The third element of a hit places this box on the scan's ladder
+    /// (see `probe`).
+    fn probe_one(&mut self, base: &str, reasons: &mut Vec<String>, wanted: Option<&str>) -> Option<NodePicks> {
+        if self.cancelled() { return None; }
+        if !crate::fleet::role_allows(base, "chat") {
+            reasons.push(format!("{base}: role excludes chat"));
+            return None;
+        }
+        let health = match self.get_json_retry(&format!("{base}/health")) {
+            Ok(v) => {
+                self.picks.lock().dead_until.retain(|(b, _)| b != base);
+                v
+            }
+            Err(e) => {
+                if matches!(e, FleetError::Connection(_)) { self.mark_dead(base); }
+                reasons.push(format!("{base}: probe failed ({e})"));
+                return None;
+            }
+        };
+        let has_chat = health
+            .get("capabilities")
+            .and_then(Value::as_arr)
+            .map(|caps| caps.iter().any(|c| c.as_str() == Some("chat")))
+            .unwrap_or(false);
+        // 0.2 nodes advertise chat/lanes but rebuild the Qwen reasoning
+        // prefix on continuation. A live failover repeatedly ingested 16k
+        // tokens there. Do not route conversations back to that protocol.
+        if legacy_chat_cache(&health) {
+            reasons.push(format!("{base}: AIHub 0.3 or newer is required for conversation cache reuse; update this node"));
+            return None;
+        }
+        // Lane contention rides along with the probe we already pay for —
+        // never its own request. Absence is meaningful (one lane), so it is
+        // recorded as absence.
+        let lanes = parse_lanes(&health);
+        let mut tier = match lanes {
+            Some((active, total)) if active < total => HomeTier::FreeLane,
+            Some(_) => HomeTier::FullLanes,
+            None => HomeTier::NoLanes,
+        };
+        self.picks.remember_lanes(base, lanes);
+        let models = match self.get_json_retry(&format!("{base}/models")) {
+            Ok(v) => v,
+            Err(e) => {
+                if matches!(e, FleetError::Connection(_)) { self.mark_dead(base); }
+                reasons.push(format!("{base}: models probe failed ({e})"));
+                return None;
+            }
+        };
+        let Some(rows) = models.get("models").and_then(Value::as_arr) else {
+            reasons.push(format!("{base}: malformed models response"));
+            return None;
+        };
+        // A cold chat load evicts the separate vision model on this node.
+        // Prefer another eligible node before tearing down a warm image worker.
+        if tier == HomeTier::NoLanes
+            && rows.iter().any(|row| {
+                row.get("domain").and_then(Value::as_str) == Some("vision")
+                    && row.get("state").and_then(Value::as_str) == Some("loaded")
+            })
+        {
+            tier = HomeTier::VisionResident;
+        }
+        if !has_chat {
+            reasons.push(format!("{base}: no chat capability (will try text models)"));
+        }
+        let mut preferred_chat: Option<String> = None;
+        let mut preferred_text: Option<String> = None;
+        let mut chat_id: Option<String> = None;
+        let mut text_id: Option<String> = None;
+        for row in rows {
+            let domain = row.get("domain").and_then(Value::as_str).unwrap_or("");
+            let Some(id) = row.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !matches!(domain, "chat" | "text") { continue; }
+            if !crate::fleet::role_allows(base, domain) || (domain == "chat" && !has_chat) {
+                reasons.push(format!("{base}: {id} is excluded by role or capability"));
+                continue;
+            }
+            if row.get("available").and_then(Value::as_bool) != Some(true) {
+                let why = row
+                    .get("unavailable_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable");
+                reasons.push(format!("{base}: {id} {}", bounded_reason(why)));
+                continue;
+            }
+            if let Some(state) = row.get("state").and_then(Value::as_str) {
+                if !matches!(state, "loaded" | "ready") {
+                    reasons.push(format!("{base}: {id} not ready ({})", bounded_reason(state)));
+                    continue;
+                }
+            }
+            if let Some(wanted) = wanted {
+                if id == wanted {
+                    if domain == "chat" {
+                        preferred_chat = Some(id.to_string());
+                    } else if domain == "text" {
+                        preferred_text = Some(id.to_string());
+                    }
+                }
+            }
+            if domain == "chat" {
+                if better_pick(chat_id.as_deref(), id, row) {
+                    chat_id = Some(id.to_string());
+                }
+            } else if domain == "text" && id.to_ascii_lowercase().contains("qwen") {
+                if better_pick(text_id.as_deref(), id, row) {
+                    text_id = Some(id.to_string());
+                }
+            }
+        }
+        if let Some(wanted) = wanted {
+            if preferred_chat.is_none() && preferred_text.is_none() {
+                reasons.push(format!("{base}: {wanted} is not eligible"));
+            }
+        }
+        let preferred = preferred_chat
+            .map(|model| (model, false))
+            .or_else(|| preferred_text.map(|model| (model, true)));
+        let fallback = chat_id
+            .map(|model| (model, false))
+            .or_else(|| text_id.map(|model| (model, true)));
+        (preferred.is_some() || fallback.is_some()).then_some(NodePicks {
+            preferred,
+            fallback,
+            tier,
+        })
+    }
+
+    fn admission_error(&self, pending: &PendingSubmission) -> String {
+        format!("{} admission failed after {} rounds: {}", pending.model,
+            pending.attempts, pending.reasons.join("; "))
+    }
+
+    fn wait_submission(&mut self, mut pending: PendingSubmission, reason: String) -> Result<(), String> {
+        let reason = bounded_reason(&reason);
+        if !pending.reasons.contains(&reason) { pending.reasons.push(reason.clone()); }
+        let now = self.transport.now();
+        if pending.attempts >= MAX_ADMISSION_ATTEMPTS || now >= pending.deadline {
+            return Err(self.admission_error(&pending));
+        }
+        let backoff_ms = (500u64 << pending.attempts.saturating_sub(1)).min(8_000);
+        // Stable per-turn jitter separates concurrent queues without changing
+        // the request's sample seed or creating another source of identity.
+        let jitter_ms = pending.body.get("seed").and_then(Value::as_u64).unwrap_or(0) % 251;
+        pending.retry_at = now + Duration::from_millis(backoff_ms + jitter_ms);
+        pending.note = Some(format!("waiting for {} admission (round {}/{}; retry in {:.1}s): {}",
+            pending.model, pending.attempts, MAX_ADMISSION_ATTEMPTS,
+            (backoff_ms + jitter_ms) as f64 / 1000.0, reason));
+        self.pending = Some(pending);
+        Ok(())
+    }
+
+    fn submit(&mut self, mut pending: PendingSubmission) -> Result<(), String> {
+        // The proxy's atomic also covers cancellation during a slow probe,
+        // and Drop of the consumer while this worker is between requests.
+        if self.cancelled() {
+            self.cancel();
+            return Ok(());
+        }
+        if self.transport.now() >= pending.deadline {
+            return Err(self.admission_error(&pending));
+        }
+        pending.attempts += 1;
+        let url = format!("{}/generate", pending.base);
+        let resp = match self.transport.post_json_detailed(&url, &pending.body) {
+            Ok(value) => value,
+            Err(error) => {
+                let retry = matches!(error, FleetError::Connection(_)
+                    | FleetError::Http { status: 409 | 429 | 503, no_job: true, .. });
+                if matches!(error, FleetError::Connection(_)) { self.mark_dead(&pending.base); }
+                let reason = format!("{}: {error}", pending.base);
+                if retry { return self.wait_submission(pending, reason); }
+                return Err(reason);
+            }
+        };
+        let job = resp.get("job_id").and_then(Value::as_str).filter(|s| !s.is_empty())
+            .ok_or_else(|| "generate response missing job_id (submission outcome unknown)".to_string())?
+            .to_string();
+        let open_think = resp.get("think_open").and_then(Value::as_bool)
+            .unwrap_or(pending.inferred_open_think);
+        self.home = Some((pending.base.clone(), pending.model.clone(),
+            pending.body.get("domain").and_then(Value::as_str) == Some("text")));
+        self.active = Some(ActiveJob {
+            base: pending.base.clone(), submission: pending, job, delivered: 0, finished: false,
+            last_note: String::new(), gen_tokens: 0, think_tokens: None,
+            think_opened: false, open_think, visible_tokens: None,
+            prefix_ingested: None, poll_fails: 0,
+        });
+        if self.cancelled() { self.cancel(); }
+        Ok(())
+    }
+
+    fn poll_submission(&mut self) -> Vec<ProviderEvent> {
+        let mut pending = self.pending.take().expect("pending submission");
+        if let Some(note) = pending.note.take() {
+            self.pending = Some(pending);
+            return vec![ProviderEvent::Status { note, permille: 0 }];
+        }
+        let now = self.transport.now();
+        if now >= pending.deadline {
+            self.wire.clear();
+            return vec![ProviderEvent::Error(self.admission_error(&pending))];
+        }
+        if now < pending.retry_at {
+            self.pending = Some(pending);
+            return Vec::new();
+        }
+        // Revalidate the SAME model; no cached/stale pick may override a
+        // current refusal or send this logical turn to a different model.
+        // Alternatives go first, with the usual free/full/laneless ranking.
+        let mut order = self.bases.clone();
+        order.retain(|b| b != &pending.base);
+        order.push(pending.base.clone());
+        order.retain(|base| !pending.interrupted_bases.contains(base));
+        let mut ladder = PickLadder::default();
+        let mut reasons = Vec::new();
+        for base in order {
+            if self.transport.now() >= pending.deadline {
+                self.wire.clear();
+                return vec![ProviderEvent::Error(self.admission_error(&pending))];
+            }
+            if self.cancelled() {
+                self.cancel();
+                return Vec::new();
+            }
+            if let Some(hit) = self.probe_one(&base, &mut reasons, Some(&pending.model)) {
+                if let Some((model, text_fallback)) = hit.preferred {
+                    let domain = if text_fallback { "text" } else { "chat" };
+                    if pending.body.get("domain").and_then(Value::as_str) == Some(domain) {
+                        ladder.offer((base, model, text_fallback), hit.tier);
+                        if hit.tier == HomeTier::FreeLane { break; }
+                    } else {
+                        reasons.push(format!("{base}: {} has incompatible domain {domain}", pending.model));
+                    }
+                } else {
+                    reasons.push(format!("{base}: {} is not eligible", pending.model));
+                }
+            }
+        }
+        if self.cancelled() {
+            self.cancel();
+            return Vec::new();
+        }
+        let result = if let Some((base, model, text_fallback)) = ladder.best() {
+            self.picks.remember(base.clone(), model, text_fallback);
+            pending.base = base;
+            self.submit(pending)
+        } else {
+            pending.attempts += 1;
+            if reasons.is_empty() { reasons.push(format!("no eligible node for {}", pending.model)); }
+            self.wait_submission(pending, reasons.join("; "))
+        };
+        match result {
+            Err(error) => {
+                self.wire.clear();
+                vec![ProviderEvent::Error(error)]
+            }
+            Ok(()) => {
+                // Deliver each waiting note once, as soon as the refusal is
+                // known. Accepted jobs are polled on the next worker tick.
+                self.pending.as_mut().and_then(|p| p.note.take())
+                    .map(|note| vec![ProviderEvent::Status { note, permille: 0 }])
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+}
+
+struct NodePicks {
+    preferred: Option<(String, bool)>,
+    fallback: Option<(String, bool)>,
+    tier: HomeTier,
+}
+
+#[derive(Default)]
+struct PickLadder {
+    free: Option<(String, String, bool)>,
+    full: Option<(String, String, bool)>,
+    laneless: Option<(String, String, bool)>,
+    vision: Option<(String, String, bool)>,
+}
+
+impl PickLadder {
+    fn offer(&mut self, pick: (String, String, bool), tier: HomeTier) {
+        match tier {
+            HomeTier::FreeLane if self.free.is_none() => self.free = Some(pick),
+            HomeTier::FullLanes if self.full.is_none() => self.full = Some(pick),
+            HomeTier::NoLanes if self.laneless.is_none() => self.laneless = Some(pick),
+            HomeTier::VisionResident if self.vision.is_none() => self.vision = Some(pick),
+            _ => {}
+        }
+    }
+
+    fn best(self) -> Option<(String, String, bool)> {
+        self.free
+            .or(self.full)
+            .or(self.laneless)
+            .or(self.vision)
+    }
+}
+
+/// Where a usable node sits on the scan's ladder: a lane home with a slot
+/// to give, a lane home mid-generation on every slot, or a box that merely
+/// holds the weights.
+#[derive(Clone, Copy, PartialEq)]
+enum HomeTier {
+    FreeLane,
+    FullLanes,
+    NoLanes,
+    VisionResident,
+}
+
+fn preferred_rank(id: &str) -> usize {
+    PREFERRED
+        .iter()
+        .position(|w| *w == id)
+        .unwrap_or(PREFERRED.len())
+}
+
+fn legacy_chat_cache(health: &Value) -> bool {
+    let Some(version) = health.get("version").and_then(Value::as_str) else { return false; };
+    let mut parts = version.split('.').filter_map(|part| part.parse::<u32>().ok());
+    matches!((parts.next(), parts.next()), (Some(0), Some(0..=2)))
+}
+
+fn residency_rank(row: &Value) -> u8 {
+    match row.get("state").and_then(Value::as_str).unwrap_or("") {
+        "loaded" => 0,
+        "ready" => 1,
+        "downloading" => 2,
+        _ => 3,
+    }
+}
+
+/// Prefer a strictly better model id, then a more resident copy of the same
+/// rank. Being *on* the preferred list is not enough — otherwise the last
+/// listed Qwen (3.6 after 3.8) wins and we start a download.
+fn better_pick(have: Option<&str>, id: &str, row: &Value) -> bool {
+    match have {
+        None => true,
+        Some(have) if have == id => false,
+        Some(have) => {
+            let id_rank = preferred_rank(id);
+            let have_rank = preferred_rank(have);
+            id_rank < have_rank
+                || (id_rank == have_rank && residency_rank(row) == 0)
+        }
+    }
+}
+
+impl<T: FleetTransport> ChatProvider for FleetQwenChatProvider<T> {
+    fn history_pruned(&mut self, _removed: usize) {
+        // A compacted context no longer extends the exact KV prefix. Rebuild
+        // once on the next request; do not re-elect or reset the provider.
+        self.wire.clear();
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::FleetQwen
+    }
+
+    fn availability(&mut self) -> ProviderAvailability {
+        match self.probe() {
+            Ok((base, model, _)) => ProviderAvailability::Available { model, detail: base },
+            Err(reason) => ProviderAvailability::Unavailable { reason },
+        }
+    }
+
+    fn attach_tool_images(&mut self, images: Vec<crate::providers::provider::ToolImage>) -> Result<(), String> {
+        crate::providers::provider::validate_tool_images(&images)?;
+        if self.vision.is_some() { return Err("vision review is still running".into()); }
+        self.images = images;
+        Ok(())
+    }
+
+    fn begin_turn(&mut self, input: &TurnInput) -> Result<(), String> {
+        if self.vision.is_some() { return Err("vision review is still running".into()); }
+        if !self.images.is_empty() {
+            if self.active.is_some() || self.pending.is_some() { return Err("a turn is already in flight".into()); }
+            // Prefer the node that actually completed the last visual review.
+            // Keep chat routing independent; switching its model just to review
+            // another frame would discard a warm vision worker on small cards.
+            let mut bases = self.bases.clone();
+            if let Some(index) = self.vision_base.as_ref().and_then(|base| bases.iter().position(|b| b == base)) { bases.swap(0, index); }
+            let chat_base = self.probe().ok().map(|pick| pick.0);
+            self.vision = Some(vision::VisionTurn::new(
+                input.clone(),
+                std::mem::take(&mut self.images),
+                bases,
+                self.conversation.clone(),
+                chat_base,
+            ));
+            return Ok(());
+        }
+        if self.active.is_some() || self.pending.is_some() {
+            return Err("a turn is already in flight".to_string());
+        }
+        tap_turn_input(input);
+        let (base, model, text_fallback) = self.probe()?;
+        // Older nodes do not advertise the prefill shape, so retain the
+        // historical model/request inference only as a compatibility fallback.
+        let inferred_open_think = self.thinking != Some(false)
+            && crate::protocol::model_uses_open_think(&model);
+        // The WIRE transcript is append-only, mirroring the lane's KV: turns
+        // already sent are reused byte-for-byte (raw assistant replies
+        // included — the node's own tokens), and only the tail the session
+        // added since last turn is rendered fresh. When the session's
+        // history no longer extends the mirror (a resume, a seal, an edit),
+        // the mirror rebuilds cold and the node re-prefills once.
+        //
+        // Fresh rendering follows the model's TRAINED shape (harness law):
+        // - An assistant turn with no raw on record (resume/cold) closes the
+        //   think block immediately — an open `<think>` followed by the
+        //   answer reads as unfinished reasoning.
+        // - Tool outcomes travel as user-role turns wrapped in the trained
+        //   `<tool_response>` tags.
+        // - The volatile dynamic context (a game's world manifest) rides
+        //   INSIDE the newest user turn, where it extends the prefix; baked
+        //   into the system block it would invalidate the whole KV on every
+        //   world edit.
+        let mirrored = self.wire.len();
+        let extends = input.messages.len() >= mirrored
+            && input.messages[..mirrored]
+                .iter()
+                .zip(self.wire.iter())
+                .all(|(m, w)| m.role == w.role);
+        if !extends {
+            self.wire.clear();
+        }
+        let start = self.wire.len();
+        let last_index = input.messages.len().saturating_sub(1);
+        for (index, m) in input.messages.iter().enumerate().skip(start) {
+            let (wire_role, text) = match m.role {
+                ChatRole::Assistant => {
+                    ("assistant", format!("\n</think>\n\n{}", m.text))
+                }
+                ChatRole::Tool => {
+                    ("user", format!("<tool_response>\n{}\n</tool_response>", m.text))
+                }
+                _ => {
+                    let text = if index == last_index
+                        && m.role == ChatRole::User
+                        && !input.dynamic_context.is_empty()
+                    {
+                        format!("{}\n\n{}", input.dynamic_context, m.text)
+                    } else {
+                        m.text.clone()
+                    };
+                    (m.role.slug(), text)
+                }
+            };
+            self.wire.push(WireTurn { role: m.role, wire_role, text });
+        }
+        let messages: Vec<Value> = self
+            .wire
+            .iter()
+            .map(|w| {
+                json::obj(vec![
+                    ("role", json::s(w.wire_role)),
+                    ("text", json::s(w.text.clone())),
+                ])
+            })
+            .collect();
+        let last_user = input
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::User)
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        let prompt = if text_fallback {
+            flatten_text_prompt(&input.system, &input.messages)
+        } else {
+            last_user
+        };
+        let domain = if text_fallback { "text" } else { "chat" };
+        let seed = self.sample_seed & i64::MAX as u64;
+        self.sample_seed = self.sample_seed.wrapping_add(1);
+        let mut fields = vec![
+            ("model", json::s(model.clone())),
+            ("domain", json::s(domain)),
+            ("seed", Value::Int(seed as i64)),
+            ("prompt", json::s(prompt)),
+            ("chat_system", json::s(input.system.clone())),
+            ("chat_session", json::s(self.conversation.clone())),
+            ("chat_messages", Value::Arr(messages)),
+        ];
+        if let Some(max_tokens) = self.max_tokens {
+            fields.push(("max_tokens", Value::Int(max_tokens as i64)));
+        }
+        if let Some(thinking) = self.thinking {
+            fields.push(("thinking", Value::Bool(thinking)));
+        }
+        let body = json::obj(fields);
+        let now = self.transport.now();
+        let pending = PendingSubmission {
+            base, model, body, inferred_open_think,
+            attempts: 0, retry_at: now, deadline: now + ADMISSION_BUDGET,
+            reasons: Vec::new(), note: None, interrupted_bases: Vec::new(),
+        };
+        let result = self.submit(pending);
+        if result.is_err() { self.wire.clear(); }
+        result
+    }
+
+    fn poll(&mut self) -> Vec<ProviderEvent> {
+        if self.cancelled() {
+            self.cancel();
+            return Vec::new();
+        }
+        if let Some(mut vision) = self.vision.take() {
+            match vision.poll(&mut self.transport) {
+                vision::Poll::Pending(event) => { self.vision = Some(vision); return event.into_iter().collect(); }
+                vision::Poll::Failed(message) => return vec![ProviderEvent::Error(message)],
+                vision::Poll::Ready(input, base) => {
+                    self.vision_base = base;
+                    return match self.begin_turn(&input) {
+                        Ok(()) => vec![ProviderEvent::Status { note: "local vision complete · continuing with Qwen".into(), permille: 0 }],
+                        Err(message) => vec![ProviderEvent::Error(message)],
+                    };
+                }
+            }
+        }
+        if self.pending.is_some() {
+            return self.poll_submission();
+        }
+        let Some(active) = &mut self.active else {
+            return Vec::new();
+        };
+        if active.finished {
+            self.active = None;
+            return Vec::new();
+        }
+        let url = format!("{}/job/{}", active.base, active.job);
+        let status = match self.transport.get_json_detailed(&url) {
+            Ok(v) => {
+                active.poll_fails = 0;
+                v
+            }
+            Err(e) => {
+                active.poll_fails += 1;
+                let terminal = matches!(e, FleetError::Http { status, .. } if !matches!(status, 429 | 503));
+                if !terminal && active.poll_fails < MAX_POLL_FAILS {
+                    // Transient: the job is still running on the node.
+                    return Vec::new();
+                }
+                self.active = None;
+                return vec![ProviderEvent::Error(format!("fleet job poll failed: {e}"))];
+            }
+        };
+        // A terminal local-use interruption proves the old job stopped. Keep
+        // its request intact and pick another worker; neither a lost poll nor
+        // an ordinary/user cancellation is proof that replay is appropriate.
+        if status.get("state").and_then(Value::as_str) == Some("cancelled") {
+            let reason = status.get("error").and_then(Value::as_str)
+                .filter(|reason| !reason.trim().is_empty()).unwrap_or("fleet job cancelled");
+            let active = self.active.take().unwrap();
+            if reason.starts_with("local-use:") && active.delivered == 0 {
+                let mut pending = active.submission;
+                pending.interrupted_bases.push(active.base.clone());
+                if pending.interrupted_bases.len() < 3 {
+                    // Loading/generation time does not consume the admission
+                    // wait budget, but total attempts and failed nodes remain
+                    // bounded across the entire logical turn.
+                    pending.deadline = self.transport.now() + ADMISSION_BUDGET;
+                    let note = format!("{} interrupted: {}; choosing another worker",
+                        active.base, bounded_reason(reason));
+                    return match self.wait_submission(pending, note) {
+                        Ok(()) => self.poll_submission(),
+                        Err(error) => { self.wire.clear(); vec![ProviderEvent::Error(error)] }
+                    };
+                }
+            }
+            self.wire.clear();
+            return vec![ProviderEvent::Error(format!("{}: {}", active.base, bounded_reason(reason)))];
+        }
+        let mut events = Vec::new();
+        if let Some((note, permille)) = job_status_note(&status) {
+            if note != active.last_note {
+                active.last_note = note.clone();
+                events.push(ProviderEvent::Status { note, permille });
+            }
+        }
+        // The box's own account of the turn, when it offers one: how much it
+        // had to ingest (warmth) and how much of what it generated the user
+        // will never see (the think block). Absent from an older service, and
+        // then simply not forwarded.
+        let serving = status.get("serving");
+        // How many tokens the turn has generated. `serving.gen_tokens` is the
+        // box REPORTING a count; the `decode k/n` stage is a progress LABEL we
+        // scrape when the box is too old to report one.
+        //
+        // Preferring the count matters because the label is only the current
+        // one some of the time: while the stage reads `starting`, `prefill k/n
+        // tok` or `encode`, the scrape yields nothing — and the think/visible
+        // counters keep moving, so `moved` fires anyway and the facts go out
+        // carrying `gen_tokens: 0`. A client meter that trusts that reads an
+        // exact-looking `0 tok/s` for the rest of the turn.
+        let generated = serving
+            .and_then(|s| s.get("gen_tokens"))
+            .and_then(Value::as_u64)
+            .map(|n| n.min(u32::MAX as u64) as u32)
+            .or_else(|| {
+                status
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .and_then(parse_decode_tokens)
+            });
+        let field = |key: &str| {
+            serving
+                .and_then(|s| s.get(key))
+                .and_then(Value::as_u64)
+                .map(|n| n as u32)
+        };
+        let think_tokens = field("think_tokens");
+        let visible_tokens = field("visible_tokens");
+        let prefix_ingested = field("prefix_ingested");
+        let prefix_resumed = serving
+            .and_then(|s| s.get("prefix_resumed"))
+            .and_then(|b| match b {
+                Value::Bool(value) => Some(*value),
+                _ => None,
+            });
+        // Emit when ANY of it moved, not only the token count: warmth is known
+        // at prefill, before a single token exists, and it is the fact that
+        // explains the wait the user is sitting through right then.
+        let moved = generated.is_some_and(|g| g != active.gen_tokens)
+            || think_tokens != active.think_tokens
+            || visible_tokens != active.visible_tokens
+            || prefix_ingested != active.prefix_ingested;
+        if moved {
+            if let Some(generated) = generated {
+                active.gen_tokens = generated;
+            }
+            active.think_tokens = think_tokens;
+            active.visible_tokens = visible_tokens;
+            active.prefix_ingested = prefix_ingested;
+            let base = active.base.clone();
+            let lanes = self.picks.lanes_for(&base);
+            events.push(ProviderEvent::Serving(ServingFacts {
+                gen_tokens: active.gen_tokens,
+                lanes_active: lanes.map(|(active, _)| active),
+                slots_total: lanes.map(|(_, total)| total),
+                think_tokens,
+                visible_tokens,
+                prefix_ingested,
+                prefix_resumed,
+            }));
+        }
+        let Some(active) = &mut self.active else {
+            return events;
+        };
+        let partial = status.get("partial_text").and_then(Value::as_str).unwrap_or("");
+        if !active.think_opened
+            && active.delivered == 0
+            && active.open_think
+            && !partial.is_empty()
+            && !partial.starts_with("<think>")
+        {
+            // First tokens of a reasoning turn, template-opened: give the
+            // client the tag the template swallowed.
+            events.push(ProviderEvent::Delta("<think>".to_string()));
+            active.think_opened = true;
+        }
+        if partial.len() > active.delivered {
+            events.push(ProviderEvent::Delta(partial[active.delivered..].to_string()));
+            active.delivered = partial.len();
+        }
+        let unclosed_think = active.think_opened && !partial.contains("</think>");
+        match status.get("state").and_then(Value::as_str) {
+            Some("done") => {
+                if unclosed_think {
+                    // The model never closed what the template opened;
+                    // close it so the client's split sees a finished block.
+                    events.push(ProviderEvent::Delta("</think>\n".to_string()));
+                }
+                // Done.text is what the session PERSISTS (it prefers a
+                // non-empty Done text over accumulated deltas), so the
+                // synthetic tags must be in it too: without them a
+                // template-opened think block reads as visible answer and
+                // reasoning lands in the durable history.
+                let mut full = String::with_capacity(partial.len() + 20);
+                if active.think_opened {
+                    full.push_str("<think>");
+                }
+                full.push_str(partial);
+                if unclosed_think {
+                    full.push_str("</think>\n");
+                }
+                tap_completion(&full);
+                // Mirror the RAW reply — without the synthetic tags — onto
+                // the wire transcript: the lane's KV holds exactly these
+                // tokens after the open `<think>\n` the template laid down,
+                // so echoing them verbatim next turn is what lets the node
+                // resume instead of re-prefilling the conversation. An
+                // unclosed think (budget ran out mid-reasoning) is echoed
+                // as-is and simply re-prefills once.
+                let raw = partial.to_string();
+                events.push(ProviderEvent::Done { text: full });
+                self.active = None;
+                self.wire.push(WireTurn {
+                    role: ChatRole::Assistant,
+                    wire_role: "assistant",
+                    text: raw,
+                });
+            }
+            Some("error") => {
+                let msg =
+                    status.get("error").and_then(Value::as_str).unwrap_or("fleet job failed");
+                events.push(ProviderEvent::Error(msg.to_string()));
+                self.active = None;
+            }
+            Some("cancelled") => {
+                events.push(ProviderEvent::Error("fleet job cancelled".to_string()));
+                self.active = None;
+            }
+            _ => {}
+        }
+        events
+    }
+
+    fn cancel(&mut self) {
+        self.images.clear();
+        if let Some(mut vision) = self.vision.take() { vision.cancel(&mut self.transport); }
+        self.pending = None;
+        // The next history can replace the unsubmitted user/tool tail.
+        // Rebuild it cold instead of reusing that tail by role alone.
+        self.wire.clear();
+        if let Some(active) = self.active.take() {
+            let url = format!("{}/job/{}/cancel", active.base, active.job);
+            let _ = self.transport.post_json(&url, &Value::Obj(Vec::new()));
+        }
+    }
+}
+
+fn job_status_note(status: &Value) -> Option<(String, u16)> {
+    let state = status.get("state").and_then(Value::as_str).unwrap_or("");
+    let stage = status
+        .get("stage")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let permille = match status.get("progress") {
+        Some(Value::F64(p)) => (*p).clamp(0.0, 1.0) * 1000.0,
+        Some(Value::Int(p)) if *p >= 0 && *p <= 1 => *p as f64 * 1000.0,
+        Some(Value::Int(p)) if *p > 1 && *p <= 1000 => *p as f64,
+        _ => 0.0,
+    } as u16;
+    let stage_l = stage.to_ascii_lowercase();
+    // Name WHAT is loading. A bare "loading 42%" is the least informative
+    // thing a two-minute wait can say: the person watching it wants to know
+    // that a 17 GB model is being paged onto a GPU, not that some percentage
+    // exists. The job carries the model id, so use it.
+    let what = status
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(" {m}"))
+        .unwrap_or_default();
+    let note = match state {
+        "queued" => "queued behind another GPU job".to_string(),
+        "running" if is_active_download(&stage_l, permille) => {
+            format!("downloading{what} {pct}%", pct = permille / 10)
+        }
+        "running" if is_active_load(&stage_l, permille) => {
+            format!("loading{what} {pct}%", pct = permille / 10)
+        }
+        "running" if stage_l.starts_with("prefill") || stage_l.starts_with("kv reuse") => {
+            let pct = prefill_own_pct(&stage_l).unwrap_or(permille / 10);
+            let resumed = stage_l.starts_with("kv reuse") || status.get("serving")
+                .and_then(|s| s.get("prefix_resumed")).and_then(Value::as_bool) == Some(true);
+            let action = if resumed { "reading new input" }
+                else if stage_l.contains("session switch") || stage_l.contains("context full") { "restoring conversation cache" }
+                else { "processing conversation" };
+            format!("{action} {pct}%")
+        }
+        _ => return None,
+    };
+    Some((note, permille))
+}
+
+/// Tokens generated so far, off an asset-ai LLM job's `decode k/n` stage.
+/// Anything else — prefill, load, download, a stage string this service
+/// does not have — is not a token count and reads as `None`.
+/// Prefill completion out of the stage's own counts: "prefill 32/256 tok"
+/// -> 12. `None` when the stage carries no pair of numbers.
+fn prefill_own_pct(stage: &str) -> Option<u16> {
+    let mut nums = stage
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|p| p.parse::<u64>().ok());
+    let done = nums.next()?;
+    let total = nums.next()?.max(1);
+    Some(((done.min(total) * 100) / total) as u16)
+}
+
+fn parse_decode_tokens(stage: &str) -> Option<u32> {
+    let rest = stage.trim().strip_prefix("decode")?;
+    let digits: String = rest.trim_start().chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// `(lanes_active, slots_total)` from an asset-ai `/health.lanes` block.
+/// The block's ABSENCE is that protocol's way of saying "one lane"; this
+/// returns `None` there too, so a consumer shows nothing rather than a
+/// meaningless "1/1".
+fn parse_lanes(health: &Value) -> Option<(u32, u32)> {
+    let lanes = health.get("lanes")?;
+    let total = lanes.get("slots_total").and_then(Value::as_u64)?;
+    let active = lanes.get("lanes_active").and_then(Value::as_u64)?;
+    if total == 0 {
+        return None;
+    }
+    Some((active.min(u32::MAX as u64) as u32, total.min(u32::MAX as u64) as u32))
+}
+
+fn is_active_download(stage: &str, permille: u16) -> bool {
+    stage.contains("download") && permille > 0 && permille < 1000 && !stage.contains("100%")
+}
+
+fn is_active_load(stage: &str, permille: u16) -> bool {
+    if stage.contains("download") {
+        return false;
+    }
+    // The load walks through named phases now — parse, vocab, plan, mmap,
+    // device, cache, reserve k/n, gguf upload, compile k/n — so match the
+    // family rather than one label. A phase this filter does not recognise
+    // shows the user NOTHING while the box is visibly busy, which is the
+    // failure this list exists to prevent; err on the side of recognising.
+    let loading = stage.contains("gguf")
+        || stage.contains("loading")
+        || stage.contains("load llm")
+        || stage.contains("load weights")
+        || stage.contains("compile")
+        || stage.contains("reserve")
+        || stage.contains("upload");
+    loading && permille < 1000
+}
+
+/// Iteration tap: `MAKEPAD_CHAT_TAP=/path/file.log` appends EXACTLY what
+/// goes into the model (system + full history) before every provider turn
+/// and the raw completion after it. The autonomous-iteration instrument —
+/// reading this file replaces screengrab-based transcript archaeology.
+fn tap_file() -> Option<std::path::PathBuf> {
+    std::env::var("MAKEPAD_CHAT_TAP").ok().filter(|p| !p.is_empty()).map(Into::into)
+}
+
+fn tap_write(text: &str) {
+    let Some(path) = tap_file() else { return };
+    use std::io::Write;
+    if let Ok(mut f) =
+        std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+fn tap_turn_input(input: &TurnInput) {
+    if tap_file().is_none() {
+        return;
+    }
+    let mut out = String::from("\n==== TURN INPUT ====\n---- system ----\n");
+    out.push_str(&input.system);
+    for m in &input.messages {
+        out.push_str(&format!("\n---- {} ----\n", m.role.slug()));
+        out.push_str(&m.text);
+    }
+    out.push('\n');
+    tap_write(&out);
+}
+
+fn tap_completion(text: &str) {
+    if tap_file().is_none() {
+        return;
+    }
+    tap_write(&format!("\n==== COMPLETION ====\n{text}\n"));
+}
+
+fn flatten_text_prompt(system: &str, messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    if !system.is_empty() {
+        out.push_str(system);
+        out.push_str("\n\n");
+    }
+    for m in messages {
+        out.push_str(m.role.slug());
+        out.push_str(": ");
+        out.push_str(&m.text);
+        out.push('\n');
+    }
+    // Trailing "assistant: " (space, no newline) matches how a completed
+    // assistant turn is flattened (`assistant: {text}\n`), so the next
+    // prompt is a strict string prefix extension and the fleet worker can
+    // keep the KV cache.
+    out.push_str("assistant: ");
+    out
+}
+
+#[cfg(test)]
+mod preload_note_tests {
+    use super::*;
+    use makepad_strict_json::Value;
+
+    /// The preload note percents the PREFILL, not the whole job: a job bar
+    /// that gives prefill a 2-8% sliver must still read 0..100 while the
+    /// conversation loads (the "3%… 5%… done" bug, live-test 2026-09-01).
+    #[test]
+    fn preload_note_uses_the_prefills_own_counts() {
+        let status = Value::Obj(vec![
+            ("state".into(), Value::Str("running".into())),
+            ("stage".into(), Value::Str("prefill 128/256 tok".into())),
+            ("progress".into(), Value::F64(0.05)),
+        ]);
+        let (note, _) = job_status_note(&status).expect("prefill notes");
+        assert_eq!(note, "processing conversation 50%");
+
+        // No counts in the stage: fall back to the job bar rather than lie.
+        let status = Value::Obj(vec![
+            ("state".into(), Value::Str("running".into())),
+            ("stage".into(), Value::Str("prefill".into())),
+            ("progress".into(), Value::F64(0.04)),
+        ]);
+        let (note, _) = job_status_note(&status).expect("prefill notes");
+        assert_eq!(note, "processing conversation 4%");
+    }
+}
+
+#[cfg(test)]
+mod wire_transcript_tests {
+    use super::*;
+    use crate::providers::provider::{ChatProvider, TurnInput};
+    use makepad_strict_json as json;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    /// Scripted transport: answers probe/health/models generically, records
+    /// every /generate body, and replies each job poll from a queue.
+    #[derive(Clone, Default)]
+    struct Scripted {
+        generates: Rc<RefCell<Vec<Value>>>,
+        replies: Rc<RefCell<VecDeque<String>>>,
+        polls: Rc<RefCell<VecDeque<Value>>>,
+        think_open: Rc<RefCell<Option<bool>>>,
+    }
+
+    impl FleetTransport for Scripted {
+        fn post_json(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+            assert!(url.ends_with("/generate"), "{url}");
+            self.generates.borrow_mut().push(body.clone());
+            let n = self.generates.borrow().len();
+            let mut fields = vec![("job_id", json::s(format!("j{n}")))];
+            if let Some(think_open) = *self.think_open.borrow() {
+                fields.push(("think_open", Value::Bool(think_open)));
+            }
+            Ok(json::obj(fields))
+        }
+        fn get_json(&mut self, url: &str) -> Result<Value, String> {
+            if url.ends_with("/health") {
+                return Ok(json::obj(vec![(
+                    "capabilities",
+                    Value::Arr(vec![json::s("chat")]),
+                )]));
+            }
+            if url.ends_with("/models") {
+                return Ok(json::obj(vec![(
+                    "models",
+                    Value::Arr(vec![
+                        json::obj(vec![
+                            ("id", json::s("qwen3.8-27b")),
+                            ("domain", json::s("chat")),
+                            ("available", Value::Bool(true)),
+                            ("state", json::s("loaded")),
+                        ]),
+                        json::obj(vec![
+                            ("id", json::s("qwen3.6-27b")),
+                            ("domain", json::s("chat")),
+                            ("available", Value::Bool(true)),
+                            ("state", json::s("loaded")),
+                        ]),
+                    ]),
+                )]));
+            }
+            if let Some(status) = self.polls.borrow_mut().pop_front() {
+                return Ok(status);
+            }
+            // A job poll: pop the scripted raw reply.
+            let raw = self
+                .replies
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected job poll");
+            Ok(json::obj(vec![
+                ("state", json::s("done")),
+                ("partial_text", json::s(raw)),
+                ("text", json::s("")),
+            ]))
+        }
+    }
+
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage { role: ChatRole::User, text: text.to_string() }
+    }
+
+    fn assistant(text: &str) -> ChatMessage {
+        ChatMessage { role: ChatRole::Assistant, text: text.to_string() }
+    }
+
+    fn drain_done(p: &mut FleetQwenChatProvider<Scripted>) {
+        for _ in 0..10 {
+            let events = p.poll();
+            if events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Done { .. } | ProviderEvent::Error(_)))
+            {
+                return;
+            }
+        }
+        panic!("turn never finished");
+    }
+
+    fn wire_messages(body: &Value) -> Vec<(String, String)> {
+        body.get("chat_messages")
+            .and_then(Value::as_arr)
+            .expect("chat_messages")
+            .iter()
+            .map(|m| {
+                (
+                    m.get("role").and_then(Value::as_str).unwrap().to_string(),
+                    m.get("text").and_then(Value::as_str).unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_exact_preferred_model_overrides_the_default_rank() {
+        let transport = Scripted::default();
+        let mut provider = FleetQwenChatProvider::new(transport.clone(), vec!["http://n1:1".into()])
+            .with_preferred_model(Some("qwen3.6-27b".into()));
+        assert!(matches!(
+            provider.availability(),
+            ProviderAvailability::Available { model, .. } if model == "qwen3.6-27b"
+        ));
+        provider
+            .begin_turn(&TurnInput::new("SYS", vec![user("hello")]))
+            .unwrap();
+        assert_eq!(
+            transport.generates.borrow()[0].get("model").and_then(Value::as_str),
+            Some("qwen3.6-27b")
+        );
+    }
+
+    #[test]
+    fn a_missing_preferred_model_is_unavailable() {
+        let transport = Scripted::default();
+        let mut provider = FleetQwenChatProvider::new(transport, vec!["http://n1:1".into()])
+            .with_preferred_model(Some("qwen-does-not-exist".into()));
+        assert!(matches!(
+            provider.availability(),
+            ProviderAvailability::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn authoritative_closed_think_keeps_tagless_short_answers() {
+        for answer in ["x", "7", "✅"] {
+            let transport = Scripted::default();
+            *transport.think_open.borrow_mut() = Some(false);
+            transport.replies.borrow_mut().push_back(answer.to_string());
+            let mut provider = FleetQwenChatProvider::new(
+                transport,
+                vec!["http://n1:1".into()],
+            );
+            provider
+                .begin_turn(&TurnInput::new("SYS", vec![user("hello")]))
+                .unwrap();
+            let events = provider.poll();
+            assert!(events.iter().any(
+                |event| matches!(event, ProviderEvent::Delta(text) if text == answer)
+            ));
+            assert!(events.iter().any(
+                |event| matches!(event, ProviderEvent::Done { text } if text == answer)
+            ));
+        }
+    }
+
+    #[test]
+    fn tagless_visible_text_streams_incrementally_when_think_is_closed() {
+        let transport = Scripted::default();
+        *transport.think_open.borrow_mut() = Some(false);
+        transport.polls.borrow_mut().extend([
+            json::obj(vec![
+                ("state", json::s("running")),
+                ("partial_text", json::s("✅")),
+                (
+                    "serving",
+                    json::obj(vec![("think_tokens", Value::Int(1))]),
+                ),
+            ]),
+            json::obj(vec![
+                ("state", json::s("done")),
+                ("partial_text", json::s("✅7")),
+            ]),
+        ]);
+        let mut provider = FleetQwenChatProvider::new(
+            transport,
+            vec!["http://n1:1".into()],
+        );
+        provider
+            .begin_turn(&TurnInput::new("SYS", vec![user("hello")]))
+            .unwrap();
+        let first = provider.poll();
+        assert!(first
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Delta(text) if text == "✅")));
+        assert!(first
+            .iter()
+            .all(|event| !matches!(event, ProviderEvent::Delta(text) if text.contains("<think>"))));
+        let second = provider.poll();
+        assert!(second.iter().any(
+            |event| matches!(event, ProviderEvent::Delta(text) if text == "7")
+        ));
+        assert!(second.iter().any(
+            |event| matches!(event, ProviderEvent::Done { text } if text == "✅7")
+        ));
+    }
+
+    #[test]
+    fn generation_options_are_additive_and_token_caps_are_exact() {
+        let omitted = Scripted::default();
+        let mut provider = FleetQwenChatProvider::new(
+            omitted.clone(),
+            vec!["http://n1:1".into()],
+        )
+        .with_max_tokens(None)
+        .with_thinking(Some(false));
+        provider
+            .begin_turn(&TurnInput::new("SYS", vec![user("hello")]))
+            .unwrap();
+        let body = &omitted.generates.borrow()[0];
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body.get("thinking").and_then(Value::as_bool), Some(false));
+
+        let capped = Scripted::default();
+        let mut provider = FleetQwenChatProvider::new(
+            capped.clone(),
+            vec!["http://n1:1".into()],
+        )
+        .with_max_tokens(Some(73));
+        provider
+            .begin_turn(&TurnInput::new("SYS", vec![user("hello")]))
+            .unwrap();
+        let body = &capped.generates.borrow()[0];
+        assert_eq!(body.get("max_tokens").and_then(Value::as_u64), Some(73));
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn a_new_map_conversation_sends_its_first_turn_tools_and_current_manifest() {
+        let transport = Scripted::default();
+        transport.replies.borrow_mut().extend([
+            "\n</think>\n\nold response".into(),
+            "\n</think>\n\nfirst response".into(),
+            "\n</think>\n\nsecond response".into(),
+        ]);
+        let tools = "sandbox tools: world.get_source, world.get_plan, world.place, world.add_addon";
+        let mut old = FleetQwenChatProvider::new(transport.clone(), vec!["http://n1:1".into()]);
+        let mut input = TurnInput::new(tools, vec![user("old map instruction")]);
+        input.dynamic_context = "WORLD MANIFEST: map A; revision 1".into();
+        old.begin_turn(&input).unwrap();
+        drain_done(&mut old);
+        drop(old);
+
+        let mut current = FleetQwenChatProvider::new(transport.clone(), vec!["http://n1:1".into()]);
+        let mut input = TurnInput::new(tools, vec![user("please add tons of houses")]);
+        input.dynamic_context = "WORLD MANIFEST: map B; revision 42".into();
+        current.begin_turn(&input).unwrap();
+        drain_done(&mut current);
+        let generated = transport.generates.borrow();
+        assert_eq!(generated.len(), 2);
+        assert_ne!(generated[0].get("chat_session"), generated[1].get("chat_session"));
+        assert_eq!(generated[1].get("chat_system").and_then(Value::as_str), Some(tools));
+        assert_eq!(wire_messages(&generated[1]), vec![("user".into(),
+            "WORLD MANIFEST: map B; revision 42\n\nplease add tons of houses".into())]);
+        drop(generated);
+
+        input.messages.push(assistant("first response"));
+        input.messages.push(user("add another house"));
+        input.dynamic_context = "WORLD MANIFEST: map B; revision 43".into();
+        current.begin_turn(&input).unwrap();
+        drain_done(&mut current);
+        let generated = transport.generates.borrow();
+        let messages = wire_messages(&generated[2]);
+        assert!(messages.last().unwrap().1.starts_with(&input.dynamic_context));
+        assert!(!messages.iter().any(|(_, text)| text.contains("map A")));
+        assert_eq!(generated[1].get("chat_session"), generated[2].get("chat_session"));
+    }
+
+    /// The wire mirror echoes the RAW reply and carries a stable
+    /// conversation id, and the volatile dynamic context rides inside the
+    /// newest user turn — the three client-side halves of KV warmth.
+    #[test]
+    fn the_wire_transcript_echoes_raw_and_stays_appended() {
+        let t = Scripted::default();
+        let raw1 = "door is at x=3\n</think>\n\nplace(lamp)";
+        t.replies.borrow_mut().push_back(raw1.to_string());
+        let mut p = FleetQwenChatProvider::new(t.clone(), vec!["http://n1:1".into()]);
+
+        // Turn 1, with a world manifest in the dynamic layer.
+        let mut input = TurnInput::new("SYS", vec![user("put a lamp by the door")]);
+        input.dynamic_context = "world: {door: x3}".to_string();
+        p.begin_turn(&input).expect("turn 1");
+        drain_done(&mut p);
+
+        let g1 = t.generates.borrow()[0].clone();
+        assert_eq!(
+            g1.get("chat_session").and_then(Value::as_str),
+            Some(p.conversation.as_str()),
+            "the conversation id travels"
+        );
+        let m1 = wire_messages(&g1);
+        assert_eq!(m1.len(), 1);
+        assert!(
+            m1[0].1.starts_with("world: {door: x3}\n\n"),
+            "dynamic context rides inside the user turn: {:?}",
+            m1[0].1
+        );
+
+        // Turn 2: the session stored the STRIPPED reply; the wire echoes RAW.
+        t.replies.borrow_mut().push_back("ok\n</think>\n\ndone".to_string());
+        let input2 = TurnInput::new(
+            "SYS",
+            vec![user("put a lamp by the door"), assistant("place(lamp)"), user("move it left")],
+        );
+        p.begin_turn(&input2).expect("turn 2");
+        drain_done(&mut p);
+
+        let g2 = t.generates.borrow()[1].clone();
+        assert_eq!(
+            g2.get("chat_session").and_then(Value::as_str),
+            Some(p.conversation.as_str()),
+            "same conversation, same id"
+        );
+        let m2 = wire_messages(&g2);
+        assert_eq!(m2.len(), 3);
+        assert_eq!(m2[0].1, m1[0].1, "turn 1's wire text is reused byte-for-byte");
+        assert_eq!(m2[1].0, "assistant");
+        assert_eq!(m2[1].1, raw1, "the assistant turn is the RAW reply, not the stripped one");
+        assert_eq!(m2[2].1, "move it left");
+
+        // A history that no longer extends the mirror rebuilds cold.
+        let input3 = TurnInput::new("SYS", vec![user("fresh start")]);
+        t.replies.borrow_mut().push_back("hi\n</think>\n\nhello".to_string());
+        p.begin_turn(&input3).expect("turn 3");
+        drain_done(&mut p);
+        let g3 = t.generates.borrow()[2].clone();
+        assert_eq!(wire_messages(&g3).len(), 1, "mirror rebuilt from the new history");
+    }
+}
+
+#[cfg(test)]
+#[path = "qwen_admission_tests.rs"]
+mod admission_tests;

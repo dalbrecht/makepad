@@ -1,13 +1,13 @@
 use std::{
     fmt,
-    io::{self, Read},
+    io,
     path::Path,
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-use std::fs::File;
+use std::{fs::File, io::Read};
 
 #[derive(Clone)]
 pub enum SharedBytes {
@@ -209,6 +209,12 @@ mod os {
     const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
     unsafe extern "C" {
+        // On 32-bit bionic and glibc, the plain `mmap` symbol takes a 32-bit
+        // `off_t`; `mmap64` takes 64 bits on every ABI (on 64-bit, it's an alias).
+        #[cfg_attr(
+            any(target_os = "android", all(target_os = "linux", target_env = "gnu")),
+            link_name = "mmap64"
+        )]
         fn mmap(
             addr: *mut c_void,
             length: usize,
@@ -343,11 +349,13 @@ mod os {
 
 #[cfg(not(any(all(unix, not(target_arch = "wasm32")), windows)))]
 mod os {
+    #[cfg(not(target_arch = "wasm32"))]
     use std::{fs::File, io};
 
     pub struct MappedBytesInner;
 
     impl MappedBytesInner {
+        #[cfg(not(target_arch = "wasm32"))]
         pub fn map_file(_file: &File, _len: usize) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,

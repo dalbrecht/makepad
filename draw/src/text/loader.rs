@@ -2,7 +2,7 @@ use {
     super::{
         font::{Font, FontId},
         font_face::FontFace,
-        font_family::{FontFamily, FontFamilyId},
+        font_family::{FontDiagnostics, FontFamily, FontFamilyId},
         rasterizer,
         rasterizer::Rasterizer,
         shaper,
@@ -20,6 +20,8 @@ pub struct Loader {
     shaper: Rc<RefCell<Shaper>>,
     rasterizer: Rc<RefCell<rasterizer::Rasterizer>>,
     pub(crate) font_family_definitions: FxHashMap<FontFamilyId, FontFamilyDefinition>,
+    // How many of those still wait for some of their fonts.
+    loading_font_family_count: usize,
     font_definitions: FxHashMap<FontId, FontDefinition>,
     font_family_cache: FxHashMap<FontFamilyId, Rc<FontFamily>>,
     font_cache: FxHashMap<FontId, Rc<Font>>,
@@ -31,6 +33,7 @@ impl Loader {
             shaper: Rc::new(RefCell::new(Shaper::new(settings.shaper))),
             rasterizer: Rc::new(RefCell::new(Rasterizer::new(settings.rasterizer))),
             font_family_definitions: FxHashMap::default(),
+            loading_font_family_count: 0,
             font_definitions: FxHashMap::default(),
             font_family_cache: FxHashMap::default(),
             font_cache: FxHashMap::default(),
@@ -62,30 +65,46 @@ impl Loader {
             !self.is_font_family_known(id),
             "can't redefine a font family that is already known"
         );
-        self.font_family_definitions.insert(id, definition);
+        self.insert_font_family_definition(id, definition);
     }
 
+    /// Returns whether the family changed, so text laid out with it may come out different.
     pub fn set_font_family_definition(
         &mut self,
         id: FontFamilyId,
         definition: FontFamilyDefinition,
-    ) {
+    ) -> bool {
         // Skip cache eviction if the definition is unchanged.
         if let Some(existing) = self.font_family_definitions.get(&id) {
             if *existing == definition {
-                return;
+                return false;
             }
         }
         if let Some(cached) = self.font_family_cache.get(&id) {
             let cached_ids: Vec<FontId> = cached.fonts().iter().map(|f| f.id()).collect();
             if cached_ids == definition.font_ids
                 && definition.expected_member_count == definition.font_ids.len()
+                && cached.diagnostics() == &definition.diagnostics
             {
-                return;
+                return false;
             }
         }
         self.font_family_cache.remove(&id);
-        self.font_family_definitions.insert(id, definition);
+        self.insert_font_family_definition(id, definition);
+        true
+    }
+
+    fn insert_font_family_definition(&mut self, id: FontFamilyId, definition: FontFamilyDefinition) {
+        self.loading_font_family_count += usize::from(definition.is_loading());
+        if let Some(old) = self.font_family_definitions.insert(id, definition) {
+            self.loading_font_family_count -= usize::from(old.is_loading());
+        }
+    }
+
+    /// Returns whether a family still waits for some of its fonts.
+    pub fn is_font_family_loading(&self, id: FontFamilyId) -> bool {
+        self.loading_font_family_count > 0
+            && self.font_family_definitions.get(&id).is_some_and(FontFamilyDefinition::is_loading)
     }
 
     pub fn define_font(&mut self, id: FontId, definition: FontDefinition) {
@@ -122,6 +141,7 @@ impl Loader {
             id,
             self.shaper.clone(),
             fonts.into(),
+            definition.diagnostics,
         ))
     }
 
@@ -172,6 +192,13 @@ pub struct Settings {
 pub struct FontFamilyDefinition {
     pub font_ids: Vec<FontId>,
     pub expected_member_count: usize,
+    pub diagnostics: FontDiagnostics,
+}
+
+impl FontFamilyDefinition {
+    fn is_loading(&self) -> bool {
+        self.font_ids.len() < self.expected_member_count
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -188,10 +215,10 @@ pub struct FontDefinition {
 
 #[cfg(test)]
 mod tests {
-    use super::{FontDefinition, Loader};
+    use super::{FontDefinition, FontFamilyDefinition, Loader};
     use crate::{
-        makepad_platform::SharedBytes,
-        text::{font::FontId, layouter},
+        makepad_platform::{Cx, SharedBytes},
+        text::{font::FontId, font_family::FontDiagnostics, layouter},
     };
     use std::path::PathBuf;
 
@@ -223,12 +250,125 @@ mod tests {
         assert!(std::rc::Rc::ptr_eq(&first, &second));
     }
 
+    #[test]
+    fn glyph_miss_does_not_start_or_discover_a_font_load() {
+        let cx = Cx::new(Box::new(|_, _| {}));
+        let mut loader = Loader::new(layouter::Settings::default().loader);
+        let font_id: FontId = 0xCAFE_C001_u64.into();
+        let family_id = 0xCAFE_C002_u64.into();
+        let font_data = SharedBytes::from_file_mmap_or_read(bundled_font_path())
+            .expect("font bytes should load");
+        loader.define_font(
+            font_id,
+            FontDefinition {
+                data: font_data,
+                index: 0,
+                ascender_fudge_in_ems: -0.1,
+                descender_fudge_in_ems: 0.0,
+                weight: None,
+                variations: Vec::new(),
+            },
+        );
+        loader.define_font_family(
+            family_id,
+            FontFamilyDefinition {
+                font_ids: vec![font_id],
+                expected_member_count: 1,
+                diagnostics: FontDiagnostics {
+                    role: "regular".to_string(),
+                    set: "Latin".to_string(),
+                    tried: vec!["ibm_plex_text".to_string()],
+                },
+            },
+        );
+
+        let family = loader
+            .get_or_load_font_family_rc(family_id)
+            .expect("test font family should load");
+        let before = (
+            loader.font_definitions.len(),
+            loader.font_cache.len(),
+            loader.font_family_definitions.len(),
+            loader.font_family_cache.len(),
+        );
+        let queued_http_before = cx.script_data.resources.http_resources.len();
+        let shaped = family.get_or_shape("\u{10FFFF}".into());
+
+        assert!(shaped.glyphs.iter().any(|glyph| glyph.id == 0));
+        assert_eq!(
+            cx.script_data.resources.http_resources.len(),
+            queued_http_before,
+            "a glyph miss must not enqueue an HTTP resource request"
+        );
+        assert_eq!(
+            before,
+            (
+                loader.font_definitions.len(),
+                loader.font_cache.len(),
+                loader.font_family_definitions.len(),
+                loader.font_family_cache.len(),
+            ),
+            "shaping a miss must only exhaust the declared in-memory chain"
+        );
+    }
+
+    #[test]
+    fn fallback_font_handles_a_primary_glyph_miss() {
+        let mut loader = Loader::new(layouter::Settings::default().loader);
+        let primary_id: FontId = 0xCAFE_D001_u64.into();
+        let fallback_id: FontId = 0xCAFE_D002_u64.into();
+        let family_id = 0xCAFE_D003_u64.into();
+        for (id, name) in [
+            (primary_id, "IBMPlexSans-Text.ttf"),
+            (fallback_id, "jetbrains_mono_variable.ttf"),
+        ] {
+            let data = SharedBytes::from_file_mmap_or_read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../widgets/resources")
+                    .join(name),
+            )
+            .expect("font bytes should load");
+            loader.define_font(
+                id,
+                FontDefinition {
+                    data,
+                    index: 0,
+                    ascender_fudge_in_ems: 0.0,
+                    descender_fudge_in_ems: 0.0,
+                    weight: None,
+                    variations: Vec::new(),
+                },
+            );
+        }
+        loader.define_font_family(
+            family_id,
+            FontFamilyDefinition {
+                font_ids: vec![primary_id, fallback_id],
+                expected_member_count: 2,
+                diagnostics: Default::default(),
+            },
+        );
+
+        let shaped = loader
+            .get_or_load_font_family_rc(family_id)
+            .expect("test font family should load")
+            .get_or_shape("⌘".into());
+        assert!(shaped.glyphs.iter().all(|glyph| glyph.id != 0));
+        assert!(shaped
+            .glyphs
+            .iter()
+            .all(|glyph| glyph.font.id() == fallback_id));
+    }
+
     fn bundled_variable_font_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../widgets/resources/jetbrains_mono_variable.ttf")
     }
 
-    fn outline_signature(font: &crate::text::font::Font, glyph_id: crate::text::font::GlyphId) -> u64 {
+    fn outline_signature(
+        font: &crate::text::font::Font,
+        glyph_id: crate::text::font::GlyphId,
+    ) -> u64 {
         use crate::text::glyph_outline::Command;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -317,5 +457,79 @@ mod tests {
             outline_signature(bold.as_ref(), glyph_id),
             "different weight masters should produce different outlines"
         );
+    }
+}
+
+#[cfg(test)]
+mod system_font_tests {
+    use super::{FontDefinition, Loader};
+    use crate::{
+        makepad_platform::SharedBytes,
+        text::{font::FontId, layouter},
+    };
+
+    fn load_font(path: &str) -> Option<std::rc::Rc<crate::text::font::Font>> {
+        let mut loader = Loader::new(layouter::Settings::default().loader);
+        let font_id: FontId = 0xFEED_0001_u64.into();
+        let data = SharedBytes::from_file_mmap_or_read(path).ok()?;
+        loader.define_font(
+            font_id,
+            FontDefinition {
+                data,
+                index: 0,
+                ascender_fudge_in_ems: 0.0,
+                descender_fudge_in_ems: 0.0,
+                weight: None,
+                variations: Vec::new(),
+            },
+        );
+        loader.get_or_load_font(font_id).cloned()
+    }
+
+    fn outline_works(path: &str, ch: char) -> Option<bool> {
+        let font = load_font(path)?;
+        let gid = font.with_ttf_parser_face(|face| face.glyph_index(ch).map(|g| g.0))?;
+        Some(font.glyph_outline(gid).is_some())
+    }
+
+    /// San Francisco is a 4-axis variable font whose glyphs carry more than
+    /// 32 gvar tuples (54 on current macOS). Without ttf-parser's
+    /// `gvar-alloc` feature the tuple store cannot grow past its stack
+    /// capacity and EVERY outline silently fails, rendering variable-font
+    /// text blank. This is the regression test for enabling that feature.
+    #[test]
+    fn macos_san_francisco_variable_font_outlines() {
+        match outline_works("/System/Library/Fonts/SFNS.ttf", 'A') {
+            None => eprintln!("SFNS.ttf not present, skipping"),
+            Some(ok) => assert!(ok, "SF 'A' outline should extract (gvar-alloc enabled?)"),
+        }
+    }
+
+    /// Hiragino Sans GB is the CFF-outline system Chinese sans that apps fall
+    /// back to on macOS 26+, where PingFangUI.ttc is `hvgl`-only.
+    #[test]
+    fn macos_hiragino_sans_gb_outlines() {
+        match outline_works("/System/Library/Fonts/Hiragino Sans GB.ttc", '性') {
+            None => eprintln!("Hiragino Sans GB not present, skipping"),
+            Some(ok) => assert!(ok, "Hiragino '性' outline should extract"),
+        }
+    }
+
+    /// On macOS 26+ PingFangUI.ttc has no glyf/CFF tables at all — outlines
+    /// live only in Apple's proprietary `hvgl` table, which ttf_parser
+    /// cannot read (cmap lookups succeed but ttf outlines are None). The
+    /// CoreText fallback in `text::coretext` fills the gap through the full
+    /// `Font::glyph_outline` path; this is its end-to-end regression test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pingfang_ui_hvgl_outlines_via_coretext_fallback() {
+        const PINGFANG: &str = "/System/Library/PrivateFrameworks/FontServices.framework/Resources/Reserved/PingFangUI.ttc";
+        match outline_works(PINGFANG, '性') {
+            None => eprintln!("PingFangUI.ttc not present, skipping"),
+            Some(ok) => assert!(
+                ok,
+                "hvgl PingFang '性' should outline through the CoreText fallback"
+            ),
+        }
     }
 }

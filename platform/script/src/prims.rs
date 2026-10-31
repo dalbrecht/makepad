@@ -31,6 +31,219 @@ macro_rules!script_primitive {
     }
 }
 
+trait CompactScriptPrimitive: Copy + Default {
+    type Logical: ScriptNew + ScriptApply;
+
+    fn packed_type() -> ScriptPodPacked;
+    fn pod_type(vm: &ScriptVm) -> ScriptPodType;
+    fn from_words(words: &[u32]) -> Self;
+    fn to_words(self) -> Vec<u32>;
+    fn from_logical(value: Self::Logical) -> Self;
+    fn to_logical(self) -> Self::Logical;
+}
+
+macro_rules! script_compact_primitive {
+    ($ty:ty) => {
+        impl ScriptHook for $ty {}
+
+        impl ScriptNew for $ty {
+            fn script_new(_vm: &mut ScriptVm) -> Self {
+                Self::default()
+            }
+
+            fn script_type_name() -> Option<LiveId> {
+                LiveId::from_str_with_lut(stringify!($ty)).ok()
+            }
+
+            fn script_type_check(heap: &ScriptHeap, value: ScriptValue) -> bool {
+                if let Some(pod) = value.as_pod() {
+                    let ty = &heap.pod_types[heap.pods[pod].ty.index as usize].ty;
+                    if *ty == ScriptPodTy::Packed(<Self as CompactScriptPrimitive>::packed_type()) {
+                        return true;
+                    }
+                }
+                <<Self as CompactScriptPrimitive>::Logical as ScriptNew>::script_type_check(
+                    heap, value,
+                )
+            }
+
+            fn script_default(vm: &mut ScriptVm) -> ScriptValue {
+                Self::default().script_to_value(vm)
+            }
+
+            fn script_proto_build(vm: &mut ScriptVm, _props: &mut ScriptTypeProps) -> ScriptValue {
+                Self::script_default(vm)
+            }
+        }
+
+        impl ScriptApply for $ty {
+            fn script_type_id(&self) -> ScriptTypeId {
+                ScriptTypeId::of::<Self>()
+            }
+
+            fn script_apply(
+                &mut self,
+                vm: &mut ScriptVm,
+                apply: &Apply,
+                scope: &mut Scope,
+                value: ScriptValue,
+            ) {
+                if let Some(pod) = value.as_pod() {
+                    let pod_data = &vm.bx.heap.pods[pod];
+                    if pod_data.ty == <Self as CompactScriptPrimitive>::pod_type(vm) {
+                        *self = <Self as CompactScriptPrimitive>::from_words(&pod_data.data);
+                        return;
+                    }
+                }
+                let mut logical = <Self as CompactScriptPrimitive>::to_logical(*self);
+                logical.script_apply(vm, apply, scope, value);
+                *self = <Self as CompactScriptPrimitive>::from_logical(logical);
+            }
+
+            fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
+                let pod = vm
+                    .bx
+                    .heap
+                    .new_pod(<Self as CompactScriptPrimitive>::pod_type(vm));
+                vm.bx.heap.pods[pod].data =
+                    <Self as CompactScriptPrimitive>::to_words(*self);
+                pod.into()
+            }
+        }
+
+    };
+}
+
+impl CompactScriptPrimitive for makepad_math::F16x2 {
+    type Logical = makepad_math::Vec2f;
+    fn packed_type() -> ScriptPodPacked { ScriptPodPacked::F16x2 }
+    fn pod_type(vm: &ScriptVm) -> ScriptPodType { vm.bx.code.builtins.pod.pod_f16x2 }
+    fn from_words(v: &[u32]) -> Self {
+        let v = v.first().copied().unwrap_or(0);
+        Self { x: v as u16, y: (v >> 16) as u16 }
+    }
+    fn to_words(self) -> Vec<u32> { vec![self.x as u32 | ((self.y as u32) << 16)] }
+    fn from_logical(v: Self::Logical) -> Self { Self::from_f32(v.x, v.y) }
+    fn to_logical(self) -> Self::Logical {
+        let (x, y) = self.to_f32();
+        makepad_math::Vec2f { x, y }
+    }
+}
+
+impl CompactScriptPrimitive for makepad_math::F16x4 {
+    type Logical = makepad_math::Vec4f;
+    fn packed_type() -> ScriptPodPacked { ScriptPodPacked::F16x4 }
+    fn pod_type(vm: &ScriptVm) -> ScriptPodType { vm.bx.code.builtins.pod.pod_f16x4 }
+    fn from_words(v: &[u32]) -> Self {
+        let a = v.first().copied().unwrap_or(0);
+        let b = v.get(1).copied().unwrap_or(0);
+        Self { x: a as u16, y: (a >> 16) as u16, z: b as u16, w: (b >> 16) as u16 }
+    }
+    fn to_words(self) -> Vec<u32> {
+        vec![self.x as u32 | ((self.y as u32) << 16), self.z as u32 | ((self.w as u32) << 16)]
+    }
+    fn from_logical(v: Self::Logical) -> Self { Self::from_f32(v.x, v.y, v.z, v.w) }
+    fn to_logical(self) -> Self::Logical {
+        let (x, y, z, w) = self.to_f32();
+        makepad_math::Vec4f { x, y, z, w }
+    }
+}
+
+macro_rules! impl_compact_u16x2 {
+    ($ty:ty, $packed:expr, $builtin:ident, $from:expr, $to:expr) => {
+        impl CompactScriptPrimitive for $ty {
+            type Logical = makepad_math::Vec2f;
+            fn packed_type() -> ScriptPodPacked { $packed }
+            fn pod_type(vm: &ScriptVm) -> ScriptPodType { vm.bx.code.builtins.pod.$builtin }
+            fn from_words(v: &[u32]) -> Self {
+                let word = v.first().copied().unwrap_or(0);
+                ($from)(word)
+            }
+            fn to_words(self) -> Vec<u32> { vec![($to)(self)] }
+            fn from_logical(v: Self::Logical) -> Self { Self::from_f32(v.x, v.y) }
+            fn to_logical(self) -> Self::Logical {
+                let (x, y) = self.to_f32();
+                makepad_math::Vec2f { x, y }
+            }
+        }
+    };
+}
+
+impl_compact_u16x2!(
+    makepad_math::UNorm16x2,
+    ScriptPodPacked::U16x2Norm,
+    pod_unorm16x2,
+    |v: u32| makepad_math::UNorm16x2 { x: v as u16, y: (v >> 16) as u16 },
+    |v: makepad_math::UNorm16x2| v.x as u32 | ((v.y as u32) << 16)
+);
+impl_compact_u16x2!(
+    makepad_math::SNorm16x2,
+    ScriptPodPacked::I16x2Norm,
+    pod_snorm16x2,
+    |v: u32| makepad_math::SNorm16x2 { x: v as u16 as i16, y: (v >> 16) as u16 as i16 },
+    |v: makepad_math::SNorm16x2| v.x as u16 as u32 | ((v.y as u16 as u32) << 16)
+);
+
+impl CompactScriptPrimitive for makepad_math::U16x2 {
+    type Logical = makepad_math::Vec2f;
+    fn packed_type() -> ScriptPodPacked { ScriptPodPacked::U16x2 }
+    fn pod_type(vm: &ScriptVm) -> ScriptPodType { vm.bx.code.builtins.pod.pod_u16x2 }
+    fn from_words(v: &[u32]) -> Self {
+        let v = v.first().copied().unwrap_or(0);
+        Self { x: v as u16, y: (v >> 16) as u16 }
+    }
+    fn to_words(self) -> Vec<u32> { vec![self.x as u32 | ((self.y as u32) << 16)] }
+    fn from_logical(v: Self::Logical) -> Self { Self::from_f32(v.x, v.y) }
+    fn to_logical(self) -> Self::Logical { makepad_math::Vec2f { x: self.x as f32, y: self.y as f32 } }
+}
+
+impl CompactScriptPrimitive for makepad_math::I16x2 {
+    type Logical = makepad_math::Vec2f;
+    fn packed_type() -> ScriptPodPacked { ScriptPodPacked::I16x2 }
+    fn pod_type(vm: &ScriptVm) -> ScriptPodType { vm.bx.code.builtins.pod.pod_i16x2 }
+    fn from_words(v: &[u32]) -> Self {
+        let v = v.first().copied().unwrap_or(0);
+        Self { x: v as u16 as i16, y: (v >> 16) as u16 as i16 }
+    }
+    fn to_words(self) -> Vec<u32> { vec![self.x as u16 as u32 | ((self.y as u16 as u32) << 16)] }
+    fn from_logical(v: Self::Logical) -> Self { Self::from_f32(v.x, v.y) }
+    fn to_logical(self) -> Self::Logical { makepad_math::Vec2f { x: self.x as f32, y: self.y as f32 } }
+}
+
+macro_rules! impl_compact_i8x4 {
+    ($ty:ty, $packed:expr, $builtin:ident) => {
+        impl CompactScriptPrimitive for $ty {
+            type Logical = makepad_math::Vec4f;
+            fn packed_type() -> ScriptPodPacked { $packed }
+            fn pod_type(vm: &ScriptVm) -> ScriptPodType { vm.bx.code.builtins.pod.$builtin }
+            fn from_words(v: &[u32]) -> Self {
+                let bytes = v.first().copied().unwrap_or(0).to_le_bytes();
+                Self(bytes.map(|v| v as _))
+            }
+            fn to_words(self) -> Vec<u32> {
+                vec![u32::from_le_bytes(self.0.map(|v| v as u8))]
+            }
+            fn from_logical(v: Self::Logical) -> Self { Self::from_f32(v.x, v.y, v.z, v.w) }
+            fn to_logical(self) -> Self::Logical {
+                let (x, y, z, w) = self.to_f32();
+                makepad_math::Vec4f { x, y, z, w }
+            }
+        }
+    };
+}
+
+impl_compact_i8x4!(makepad_math::UNorm8x4, ScriptPodPacked::U8x4Norm, pod_unorm8x4);
+impl_compact_i8x4!(makepad_math::SNorm8x4, ScriptPodPacked::I8x4Norm, pod_snorm8x4);
+
+script_compact_primitive!(makepad_math::F16x2);
+script_compact_primitive!(makepad_math::F16x4);
+script_compact_primitive!(makepad_math::U16x2);
+script_compact_primitive!(makepad_math::I16x2);
+script_compact_primitive!(makepad_math::UNorm16x2);
+script_compact_primitive!(makepad_math::SNorm16x2);
+script_compact_primitive!(makepad_math::UNorm8x4);
+script_compact_primitive!(makepad_math::SNorm8x4);
+
 script_primitive!(
     f32,
     fn script_new(_vm: &mut ScriptVm) -> Self {
@@ -334,10 +547,22 @@ script_primitive!(
     fn script_apply(
         &mut self,
         vm: &mut ScriptVm,
-        _apply: &Apply,
+        apply: &Apply,
         _scope: &mut Scope,
         value: ScriptValue,
     ) {
+        // Same rationale as `ArcStringMut::script_apply`: text-bearing fields
+        // (`TextInput.text`, `TextInput.empty_text`, etc.) are canonically
+        // mutated through imperative setters at runtime. A re-walk that
+        // carries no authored change (`cx.request_script_reapply()` preference
+        // broadcast, or the `script_mod` re-run a safe-area inset change
+        // forces) would otherwise clobber that runtime value with the stale
+        // DSL literal. Strings are not part of the shared-heap-object
+        // propagation pipeline (which uses `Size`/numerics), so bailing here
+        // is safe.
+        if apply.preserves_runtime_state() {
+            return;
+        }
         self.clear();
         vm.bx.heap.cast_to_string(value, self);
     },
@@ -553,6 +778,13 @@ where
             for (key, value) in self.iter() {
                 let key = key.script_to_value(vm);
                 let value = value.script_to_value(vm);
+                if !vm.bx.heap.charge_object_map_entry(
+                    obj,
+                    key,
+                    "converting a Rust map to a script object",
+                ) {
+                    continue;
+                }
                 obj_map.insert(
                     key,
                     ScriptMapValue {
@@ -1035,5 +1267,97 @@ where
         } else {
             NIL
         }
+    }
+}
+
+// Box: the same component as T, stored on the heap. A #[live] field of a
+// large T (a set of draw shaders) boxes it so the struct that holds it, and
+// every constructor frame that builds that struct by value, stays small; a
+// 1 MB Windows main stack does not fit several nested copies of it.
+
+impl<T> ScriptHook for Box<T> where T: ScriptApply + ScriptNew + 'static {}
+impl<T> ScriptNew for Box<T>
+where
+    T: ScriptApply + ScriptNew + 'static,
+{
+    fn script_type_name() -> Option<LiveId> {
+        T::script_type_name()
+    }
+    fn script_type_id_static() -> ScriptTypeId {
+        T::script_type_id_static()
+    }
+    fn script_type_check(heap: &ScriptHeap, value: ScriptValue) -> bool {
+        T::script_type_check(heap, value)
+    }
+    fn script_default(vm: &mut ScriptVm) -> ScriptValue {
+        T::script_default(vm)
+    }
+    fn script_reload_default(vm: &mut ScriptVm) -> ScriptValue {
+        T::script_reload_default(vm)
+    }
+    fn script_new(vm: &mut ScriptVm) -> Self {
+        Box::new(T::script_new(vm))
+    }
+    fn script_new_with_default(vm: &mut ScriptVm) -> Self {
+        Box::new(T::script_new_with_default(vm))
+    }
+    fn script_proto(vm: &mut ScriptVm) -> ScriptValue {
+        T::script_proto(vm)
+    }
+    fn script_proto_props(vm: &mut ScriptVm, object: ScriptObject, props: &mut ScriptTypeProps) {
+        T::script_proto_props(vm, object, props)
+    }
+}
+impl<T> ScriptApply for Box<T>
+where
+    T: ScriptApply + ScriptNew + 'static,
+{
+    fn script_type_id(&self) -> ScriptTypeId {
+        (**self).script_type_id()
+    }
+    fn script_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        apply: &Apply,
+        scope: &mut Scope,
+        value: ScriptValue,
+    ) {
+        (**self).script_apply(vm, apply, scope, value)
+    }
+    fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
+        (**self).script_to_value(vm)
+    }
+    fn script_source(&self) -> ScriptObject {
+        (**self).script_source()
+    }
+}
+
+#[cfg(test)]
+mod compact_primitive_tests {
+    use super::*;
+
+    fn round_trip<T>(vm: &mut ScriptVm, value: T)
+    where
+        T: ScriptNew + ScriptApply + Copy + PartialEq + std::fmt::Debug,
+    {
+        let script_value = value.script_to_value(vm);
+        assert_eq!(T::script_from_value(vm, script_value), value);
+    }
+
+    #[test]
+    fn compact_primitives_round_trip_through_pod_values() {
+        let mut host = ScriptVmHost::new((), ());
+        let mut vm = ScriptVm {
+            host: &mut host,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        round_trip(&mut vm, makepad_math::F16x2::from_f32(0.5, -2.0));
+        round_trip(&mut vm, makepad_math::F16x4::from_f32(0.5, -2.0, 3.0, 4.0));
+        round_trip(&mut vm, makepad_math::U16x2::from_u16(1, u16::MAX));
+        round_trip(&mut vm, makepad_math::I16x2::from_i16(i16::MIN, i16::MAX));
+        round_trip(&mut vm, makepad_math::UNorm16x2 { x: 1, y: u16::MAX });
+        round_trip(&mut vm, makepad_math::SNorm16x2 { x: i16::MIN, y: i16::MAX });
+        round_trip(&mut vm, makepad_math::UNorm8x4([1, 2, 3, 255]));
+        round_trip(&mut vm, makepad_math::SNorm8x4([i8::MIN, -1, 0, i8::MAX]));
     }
 }
