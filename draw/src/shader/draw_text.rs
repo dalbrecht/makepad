@@ -3955,15 +3955,28 @@ impl TextStyle {
     /// Returns the hyphen the layouter draws where a row wraps right after a soft hyphen.
     pub fn get_hyphen(&self, cx: &mut Cx) -> &'static str {
         let fonts = self.font_family.ensure_fonts_loaded(cx);
-        let font_family = fonts.borrow_mut().get_or_load_font_family(self.font_family_id());
-        get_hyphen(&font_family)
+        // Bind the result so the `RefMut` drops before `fonts`.
+        let hyphen = match fonts.borrow_mut().get_or_load_font_family(self.font_family_id()) {
+            Some(font_family) => get_hyphen(&font_family),
+            // The family is not loaded yet (common on WASM). ASCII hyphen is the
+            // same fallback `get_hyphen` uses when U+2010 is missing.
+            None => "-",
+        };
+        hyphen
     }
 
     /// Shapes `text` like the layouter does, sharing its cache, without laying it out.
     pub fn get_or_shape(&self, cx: &mut Cx, text: &str) -> Rc<ShapedText> {
         let fonts = self.font_family.ensure_fonts_loaded(cx);
-        let font_family = fonts.borrow_mut().get_or_load_font_family(self.font_family_id());
-        font_family.get_or_shape(text.into())
+        let shaped = match fonts.borrow_mut().get_or_load_font_family(self.font_family_id()) {
+            Some(font_family) => font_family.get_or_shape(text.into()),
+            None => Rc::new(ShapedText {
+                text: text.into(),
+                width_in_ems: 0.0,
+                glyphs: Vec::new(),
+            }),
+        };
+        shaped
     }
 }
 
@@ -4092,13 +4105,29 @@ mod tests {
         // The second time, the family finds all its fonts loaded.
         family.ensure_fonts_loaded(&mut cx);
         let fonts = family.ensure_fonts_loaded(&mut cx);
-        assert_eq!(fonts.borrow_mut().get_or_load_font_family(family_id).fonts().len(), 1);
+        assert_eq!(
+            fonts
+                .borrow_mut()
+                .get_or_load_font_family(family_id)
+                .expect("test font family should load")
+                .fonts()
+                .len(),
+            1
+        );
         // LabelCache asks for a lazy font itself, and then loads the family's fonts.
         let is_new_request =
             fonts.borrow_mut().take_lazy_font_request(family_id, LazyFontFamily::Cjk, "\u{4E2D}");
         assert!(is_new_request);
         family.ensure_fonts_loaded(&mut cx);
-        assert_eq!(fonts.borrow_mut().get_or_load_font_family(family_id).fonts().len(), 2);
+        assert_eq!(
+            fonts
+                .borrow_mut()
+                .get_or_load_font_family(family_id)
+                .expect("test font family should load")
+                .fonts()
+                .len(),
+            2
+        );
     }
 
     #[test]

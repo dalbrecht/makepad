@@ -249,7 +249,10 @@ impl Layouter {
                     text: params.text,
                     size_in_lpxs: Size::ZERO,
                     rows: Vec::new(),
+                    has_missing_glyph: false,
                     is_truncated: false,
+                    line_break_before_next_run: Default::default(),
+                    is_trailing_glue_reserved: false,
                 };
             }
         };
@@ -2547,6 +2550,7 @@ mod tests {
         let style = get_test_style(family);
         layouter
             .get_or_load_font_family(style.font_family_id)
+            .expect("test font family should load")
             .get_or_shape(text.into())
             .width_in_ems
             * style.font_size_in_lpxs()
@@ -2554,7 +2558,10 @@ mod tests {
 
     /// Measures the hyphen the layouter draws where a row breaks after a soft hyphen.
     fn measure_hyphen_width(layouter: &mut Layouter, family: u64) -> f32 {
-        let hyphen = get_hyphen(&layouter.get_or_load_font_family(family.into()));
+        let font_family = layouter
+            .get_or_load_font_family(family.into())
+            .expect("test font family should load");
+        let hyphen = get_hyphen(&font_family);
         measure_width(layouter, family, hyphen)
     }
 
@@ -3468,7 +3475,9 @@ mod tests {
             (LATIN_FAMILY, "Thanks, that worked! I'll try the new build tonight and report back."),
             (CJK_FAMILY, "我们明天见（下午三点），请带上笔记本。日本語のテキストも"),
         ] {
-            let font_family = layouter.get_or_load_font_family(family.into());
+            let font_family = layouter
+                .get_or_load_font_family(family.into())
+                .expect("test font family should load");
             let get_params = |text: Substr| ShapeParams {
                 text,
                 fonts: font_family.fonts().into(),
