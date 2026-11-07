@@ -248,6 +248,7 @@ mod tests {
     #[test]
     fn draw_nv12_compiles_on_every_backend() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
         cx.with_vm(|vm| {
             crate::script_mod(vm);
             for (backend, value) in [
