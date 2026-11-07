@@ -65,6 +65,7 @@ fn sources(vm: &mut ScriptVm, mode: &str) -> [String; 5] {
 #[test]
 fn fragment_depth_reaches_every_backend() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
+    cx.init_script_vm();
     cx.with_vm(|vm| {
         probe(vm);
         let cases = [

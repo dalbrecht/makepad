@@ -513,6 +513,7 @@ mod tests {
     #[test]
     fn every_function_compiles_on_every_backend() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
         cx.with_vm(|vm| {
             probe(vm);
             for (backend, value) in [
