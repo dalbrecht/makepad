@@ -1,0 +1,5430 @@
+use {
+    crate::makepad_draw::{cx_2d::Cx2d, cx_3d::Cx3d, *},
+    crate::widget::{WidgetRef, WidgetRegistry, WidgetUid, WidgetWeakRef},
+    crate::widget_async::update_global_ui_handle,
+    crate::window::Window,
+    std::cell::RefCell,
+    std::collections::{HashMap, HashSet},
+};
+use crate::widget_hooks::WidgetHooks;
+
+// WidgetTree contains weak widget refs (Rc/Weak-based) and RefCell,
+// but we only ever access the tree from the main thread.
+// The OnceLock for the empty static tree requires Sync.
+unsafe impl Send for WidgetTree {}
+unsafe impl Sync for WidgetTree {}
+
+const NONE: u32 = u32::MAX;
+/// Placeholder roots don't get swept until there are at least this many, so a few cost nothing.
+const MIN_PLACEHOLDER_ROOTS_TO_SWEEP: usize = 64;
+
+/// Cheap always-on counters for the path lookup hot path. Three integer
+/// adds; no hashing, no allocation. They exist because "does this lookup
+/// walk the tree?" is the difference between a hash probe and a thousand
+/// node visits, and that is not observable any other way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WidgetTreeStats {
+    /// Path lookups served (hit or miss).
+    pub lookups: u64,
+    /// Lookups that could not be answered from the path cache.
+    pub cache_misses: u64,
+    /// Graph nodes visited by tree walks.
+    pub walk_nodes: u64,
+    /// Path-cache invalidations (anything that could turn a miss into a hit).
+    pub invalidations: u64,
+    /// Walks whose result could not be cached because the walk itself
+    /// changed the graph underneath it.
+    pub stores_skipped: u64,
+}
+
+fn allow_duplicate_sibling_names(name: LiveId) -> bool {
+    name == LiveId(0)
+}
+
+pub fn live_id_token(id: LiveId) -> String {
+    if id == LiveId(0) {
+        return "-".to_string();
+    }
+    id.as_string(|name| {
+        if let Some(name) = name {
+            name.to_string()
+        } else {
+            format!("{:x}", id.0)
+        }
+    })
+}
+
+pub fn widget_type_names(cx: &Cx) -> HashMap<ScriptTypeId, LiveId> {
+    let mut widget_type_names = HashMap::new();
+    let widget_registry = cx.components.get::<WidgetRegistry>();
+    for (type_id, (info, _)) in widget_registry.map.iter() {
+        widget_type_names.insert(*type_id, info.name);
+    }
+    widget_type_names
+}
+
+/// The screen rect a viewer actually sees for `area`, or `None` when the area
+/// is stale or clipped away entirely.
+///
+/// Always the *clipped* rect. `Area::rect` is unclipped, and a widget can be
+/// drawn well outside its container's clip: a `PortalList` deliberately draws
+/// recycled rows past both viewport edges (at least one every frame, more
+/// after a scroll) and relies on the clip to hide them, and every scroll view
+/// does the same at its margins. Reporting those unclipped rects makes the
+/// tree describe rows at coordinates where they are invisible and where a
+/// *different*, genuinely visible widget is drawn — so anything that turns a
+/// reported rect into a click (the `--remote` `/snap` + `/click` loop, a
+/// `makepad_test` locator, an accessibility reader) aims at the wrong widget.
+/// Event hit-testing uses `Area::clipped_rect`; the tree must agree with it.
+#[cfg(test)]
+fn widget_screen_rect(area: &Area, cx: &Cx) -> Option<Rect> {
+    if !area.is_valid(cx) {
+        return None;
+    }
+    let rect = area.clipped_rect(cx);
+    if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+        return None;
+    }
+    Some(rect)
+}
+
+/// Snapshot coordinates follow the rendered 2D draw-list transform. Areas
+/// intentionally retain local coordinates for canvas hosts' inverse-mapped
+/// input, so this conversion must not change `Area` or ordinary hit-testing.
+#[cfg(test)]
+use makepad_platform::a11y::snapshot_rect as widget_snapshot_rect;
+
+// ============================================================================
+// WidgetTree: persistent graph + dense query index
+// ============================================================================
+
+pub struct WidgetTree {
+    inner: RefCell<WidgetTreeInner>,
+}
+
+#[derive(Default)]
+struct WidgetTreeInner {
+    // Hot path (dense query index)
+    names: Vec<LiveId>,
+    subtree_end: Vec<u32>,
+    scope: Vec<bool>,
+    nodes: Vec<WidgetTreeNode>,
+    uid_map: HashMap<WidgetUid, u32>,
+
+    root_uid: WidgetUid,
+
+    // Persistent graph, lazily synced from WidgetNode::children()
+    graph: HashMap<WidgetUid, GraphNode>,
+    // Per-entrypoint path cache keyed by xor-combined path hash.
+    path_cache: HashMap<WidgetUid, HashMap<u64, Vec<PathCacheEntry>>>,
+    /// Bumped by every invalidation that could turn a cached MISS into a
+    /// hit (a node appearing, being renamed, re-parented, becoming
+    /// searchable). A walk snapshots it and only writes its result back if
+    /// nothing invalidated underneath it — otherwise the walk's own graph
+    /// discoveries could persist a stale "not found" forever.
+    path_cache_epoch: u64,
+    stats: WidgetTreeStats,
+    dirty: HashSet<WidgetUid>,
+    discovery_buffers: Vec<Vec<(LiveId, WidgetRef)>>,
+    refresh_pending: Vec<WidgetUid>,
+    refresh_retry: Vec<WidgetUid>,
+    // Only set when tree topology changes (nodes added/removed, parent changes).
+    // Property-only changes (name, widget ref, scope) are patched in-place.
+    structure_dirty: bool,
+    /// A LOOKUP found a topology change. Lookups settle stale nodes on their
+    /// way through the graph and must not schedule a dense rebuild for it (a
+    /// recycling list would make every frame pay one), so they leave
+    /// `structure_dirty` alone. But they also consume the dirty mark, and with
+    /// it the only thing that told `sync_dirty` the dense arrays are behind:
+    /// children a lookup discovered first (a view's `on_render` output, for
+    /// one) then never reached the dump, the snapshot or the flood searches.
+    /// This remembers it, and only those dense readers act on it.
+    dense_stale: bool,
+    /// Graph nodes by name (unnamed ones aside): a path lookup the cache cannot answer checks
+    /// the nodes with the path's last name instead of walking the root's whole subtree
+    /// (collect_within_indexed). Holds every node of the graph under its current name; may
+    /// also hold renamed or removed ones, which the lookup filters out.
+    by_name: HashMap<LiveId, Vec<WidgetUid>>,
+    /// Placeholder nodes that list children they never adopted (refresh's keep_real_parent):
+    /// a walk through one reaches nodes whose parent chain does not lead through it, so the
+    /// index answers no lookup whose subtree holds one.
+    foreign_listers: HashSet<WidgetUid>,
+    /// Parentless placeholders, tracked so `note_placeholder_root()` can sweep out the dead ones.
+    ///
+    /// They're made when a lookup starts at a widget nothing reports as a child (like one made from
+    /// a template) or a child gets inserted under one. Nothing else notices when their widgets die.
+    placeholder_roots: Vec<WidgetUid>,
+    /// How many placeholder roots the last sweep kept. The next sweep waits for twice as many.
+    placeholder_roots_kept: usize,
+    /// Children that a widget stopped reporting while something in them was alive (like a pooled row),
+    /// keyed by that widget's uid.
+    ///
+    /// They get removed once nothing in them is alive, or along with their parent. Most apps never
+    /// have any, so these live apart from the graph's nodes and only get looked at if there are some.
+    detached: HashMap<WidgetUid, Vec<WidgetUid>>,
+}
+
+struct WidgetTreeNode {
+    uid: WidgetUid,
+    widget: WidgetWeakRef,
+    parent: u32,
+}
+
+struct GraphNode {
+    name: LiveId,
+    widget: WidgetWeakRef,
+    placeholder: bool,
+    scope: bool,
+    parent: Option<WidgetUid>,
+    children: Vec<WidgetUid>,
+    /// `Cx::nesting_depth` at this widget's last draw while the exploded view
+    /// was up — the plane it renders on. 0 = never stamped.
+    nesting_depth: u32,
+    /// Inserted via `insert_child`/`insert_child_deep` but not (yet) reported
+    /// by the parent's `children()`. A refresh keeps such a child linked
+    /// instead of unlinking and eventually removing its whole subtree, since
+    /// hosts like Dock-style containers own these children outside the
+    /// widget's child vec. Cleared the moment the parent reports it.
+    manual: bool,
+}
+
+#[derive(Clone)]
+struct PathCacheEntry {
+    path: Vec<LiveId>,
+    matches: Vec<PathCacheMatch>,
+    /// Scope nodes the path enters, in walk order. The entry depends only on the structure
+    /// outside scopes (which invalidates this root's cache); what lies inside a scope is
+    /// asked of the scope's own cache at lookup time.
+    scopes: Vec<ScopeHit>,
+}
+
+/// A scope node the path names as segment `rest - 1`: `path[rest..]` is searched inside it.
+/// `after` is how many direct matches precede it in the walk's order.
+#[derive(Clone, Copy)]
+struct ScopeHit {
+    after: usize,
+    uid: WidgetUid,
+    rest: usize,
+}
+
+#[derive(Clone)]
+struct PathCacheMatch {
+    uid: WidgetUid,
+    widget: WidgetWeakRef,
+}
+
+impl Default for WidgetTree {
+    fn default() -> Self {
+        Self {
+            inner: RefCell::new(WidgetTreeInner::default()),
+        }
+    }
+}
+
+/// One step of the iterative graph walk the finders share.
+#[derive(Clone, Copy)]
+struct WalkFrame {
+    uid: WidgetUid,
+    next_child_idx: usize,
+    is_root: bool,
+}
+
+impl WidgetTree {
+    // Patch a property in-place in the dense index (no structural rebuild needed).
+    fn patch_name(inner: &mut WidgetTreeInner, uid: WidgetUid, name: LiveId) {
+        if let Some(&idx) = inner.uid_map.get(&uid) {
+            inner.names[idx as usize] = name;
+        }
+    }
+
+    fn patch_widget(inner: &mut WidgetTreeInner, uid: WidgetUid, widget: &WidgetRef) {
+        if let Some(&idx) = inner.uid_map.get(&uid) {
+            inner.nodes[idx as usize].widget = widget.downgrade();
+        }
+    }
+
+    fn patch_scope(inner: &mut WidgetTreeInner, uid: WidgetUid, scope: bool) {
+        if let Some(&idx) = inner.uid_map.get(&uid) {
+            inner.scope[idx as usize] = scope;
+        }
+    }
+
+    fn path_hash(path: &[LiveId]) -> u64 {
+        let mut hash = 0u64;
+        for segment in path {
+            hash ^= segment.0;
+        }
+        hash
+    }
+
+    fn cached_path_matches(
+        inner: &WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+    ) -> Option<(Vec<PathCacheMatch>, Vec<ScopeHit>)> {
+        let hash = Self::path_hash(path);
+        inner
+            .path_cache
+            .get(&root_uid)
+            .and_then(|root_cache| root_cache.get(&hash))
+            .and_then(|bucket| {
+                bucket
+                    .iter()
+                    .find(|entry| entry.path.as_slice() == path)
+                    .map(|entry| (entry.matches.clone(), entry.scopes.clone()))
+            })
+    }
+
+    /// The cached answer for `path` as live widgets, read in place without
+    /// cloning the cache entry. `None` when there is no entry or some matched
+    /// widget is gone (the caller then takes the stale-repair path).
+    fn cached_live_widgets(
+        inner: &WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+    ) -> Option<(Vec<WidgetRef>, Vec<ScopeHit>)> {
+        let hash = Self::path_hash(path);
+        let entry = inner
+            .path_cache
+            .get(&root_uid)
+            .and_then(|root_cache| root_cache.get(&hash))
+            .and_then(|bucket| bucket.iter().find(|entry| entry.path.as_slice() == path))?;
+        let mut widgets = Vec::with_capacity(entry.matches.len());
+        for cached in &entry.matches {
+            widgets.push(cached.widget.upgrade()?);
+        }
+        Some((widgets, entry.scopes.clone()))
+    }
+
+    /// Read the first answer without materializing all matches or copying scope lists.
+    /// Validate later matches too, so stale entries still take the repair path.
+    fn cached_first_widget(
+        inner: &WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+    ) -> Option<(Option<WidgetRef>, u64)> {
+        if path.is_empty() || root_uid == WidgetUid(0) {
+            return Some((None, 0));
+        }
+        let Some(node) = inner.graph.get(&root_uid) else {
+            return Some((None, 0));
+        };
+        if inner.dirty.contains(&root_uid)
+            || (!node.placeholder && node.widget.upgrade().is_none())
+        {
+            return None;
+        }
+        let entry = inner.path_cache.get(&root_uid)?
+            .get(&Self::path_hash(path))?
+            .iter().find(|entry| entry.path.as_slice() == path)?;
+        let mut direct = None;
+        for (index, cached) in entry.matches.iter().enumerate() {
+            let widget = cached.widget.upgrade()?;
+            if index == 0 {
+                direct = Some(widget);
+            }
+        }
+        let mut first = None;
+        let mut lookups = 1;
+        for hit in &entry.scopes {
+            let (widget, count) = Self::cached_first_widget(inner, hit.uid, &path[hit.rest..])?;
+            lookups += count;
+            if first.is_none() && hit.after == 0 {
+                first = widget;
+            }
+        }
+        if first.is_none() {
+            first = direct;
+        }
+        Some((first, lookups))
+    }
+
+    fn store_path_matches(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+        matches: Vec<PathCacheMatch>,
+        scopes: Vec<ScopeHit>,
+    ) {
+        // An EMPTY match list is stored, not dropped: "this path is not in
+        // this subtree" is the answer a UI asks for most often (every
+        // per-frame sync probing a control that lives on another page), and
+        // re-deriving it means walking the entire widget tree. Every
+        // mutation that could turn the answer into a hit invalidates the
+        // entry (`invalidate_path_cache*`, guarded by `path_cache_epoch`).
+        let hash = Self::path_hash(path);
+        let root_cache = inner.path_cache.entry(root_uid).or_default();
+        let bucket = root_cache.entry(hash).or_default();
+        if let Some(entry) = bucket
+            .iter_mut()
+            .find(|entry| entry.path.as_slice() == path)
+        {
+            entry.matches = matches;
+            entry.scopes = scopes;
+            return;
+        }
+        bucket.push(PathCacheEntry {
+            path: path.to_vec(),
+            matches,
+            scopes,
+        });
+    }
+
+    fn invalidate_path_cache(inner: &mut WidgetTreeInner, uid: WidgetUid) {
+        if uid != WidgetUid(0) {
+            inner.stats.invalidations += 1;
+            inner.path_cache_epoch = inner.path_cache_epoch.wrapping_add(1);
+            inner.path_cache.remove(&uid);
+        }
+    }
+
+    /// A change AT `start_uid`: created, removed, renamed, reparented, or its
+    /// skip flag flipped. Ancestors' cached lookups may mention the node, so
+    /// their maps are dropped — but only up to and including the first
+    /// skip-search ANCESTOR: the cached walk prunes at such a node (it can
+    /// match the node itself, never its descendants — see
+    /// `collect_within_graph_with_skip`), so entries rooted above that
+    /// barrier cannot mention `start_uid` and stay exact. The barrier node's
+    /// own map is still dropped (a lookup rooted AT it does descend: the
+    /// root frame ignores the flag), then the climb stops. `start_uid`'s own
+    /// flag is deliberately NOT a barrier — its rename or removal is exactly
+    /// what the ancestors below the barrier can still see.
+    fn invalidate_path_cache_upward(inner: &mut WidgetTreeInner, start_uid: WidgetUid) {
+        if start_uid == WidgetUid(0) {
+            return;
+        }
+        inner.stats.invalidations += 1;
+        inner.path_cache_epoch = inner.path_cache_epoch.wrapping_add(1);
+        inner.path_cache.remove(&start_uid);
+        let mut visited = HashSet::new();
+        visited.insert(start_uid);
+        let parent = inner.graph.get(&start_uid).and_then(|node| node.parent);
+        Self::invalidate_ancestor_chain(inner, parent, &mut visited);
+    }
+
+    /// The CHILD SET of `parent_uid` changed — rows recycled in or out, the
+    /// child vector reordered, an edge dropped — with no change to the
+    /// parent node itself. Same barrier climb as
+    /// `invalidate_path_cache_upward`, except the parent acts as its own
+    /// barrier: a skip-search list's rows are invisible to every search
+    /// rooted above the list, so their churn ends here. This is what keeps a
+    /// scrolling PortalList from wiping the app-level cache every frame.
+    fn invalidate_path_cache_from_child_change(
+        inner: &mut WidgetTreeInner,
+        parent_uid: WidgetUid,
+    ) {
+        if parent_uid == WidgetUid(0) {
+            return;
+        }
+        inner.stats.invalidations += 1;
+        inner.path_cache_epoch = inner.path_cache_epoch.wrapping_add(1);
+        inner.path_cache.remove(&parent_uid);
+        let next = match inner.graph.get(&parent_uid) {
+            Some(node) if !node.scope => node.parent,
+            _ => None,
+        };
+        let mut visited = HashSet::new();
+        visited.insert(parent_uid);
+        Self::invalidate_ancestor_chain(inner, next, &mut visited);
+    }
+
+    /// Drop cache maps up an ancestor chain, stopping after the first
+    /// skip-search node (its own map dropped, nothing above touched).
+    fn invalidate_ancestor_chain(
+        inner: &mut WidgetTreeInner,
+        mut current: Option<WidgetUid>,
+        visited: &mut HashSet<WidgetUid>,
+    ) {
+        while let Some(uid) = current {
+            if uid == WidgetUid(0) || !visited.insert(uid) {
+                break;
+            }
+            inner.path_cache.remove(&uid);
+            let Some(node) = inner.graph.get(&uid) else {
+                break;
+            };
+            if node.scope {
+                break;
+            }
+            current = node.parent;
+        }
+    }
+
+    pub fn observe_node(
+        &self,
+        uid: WidgetUid,
+        name: LiveId,
+        widget: WidgetRef,
+        parent: Option<WidgetUid>,
+    ) {
+        if uid == WidgetUid(0) || widget.is_empty() {
+            return;
+        }
+
+        let scope = widget.search_scope();
+        let mut inner = self.inner.borrow_mut();
+
+        let mut old_parent = None;
+        let mut node_is_new = false;
+        let mut widget_changed = false;
+        let mut name_changed = false;
+        let mut scope_changed = false;
+        let mut parent_changed = false;
+
+        match inner.graph.get_mut(&uid) {
+            Some(node) => {
+                old_parent = node.parent;
+                if node.name != name {
+                    node.name = name;
+                    name_changed = true;
+                }
+                if node.placeholder || node.widget != widget {
+                    node.widget = widget.downgrade();
+                    node.placeholder = false;
+                    widget_changed = true;
+                }
+                if node.scope != scope {
+                    node.scope = scope;
+                    scope_changed = true;
+                }
+                if node.parent != parent {
+                    node.parent = parent;
+                    parent_changed = true;
+                }
+            }
+            None => {
+                inner.graph.insert(
+                    uid,
+                    GraphNode {
+                        name,
+                        widget: widget.downgrade(),
+                        placeholder: false,
+                        scope,
+                        parent,
+                        children: Vec::new(),
+                    nesting_depth: 0,
+                    manual: false,
+                    },
+                );
+                node_is_new = true;
+            }
+        }
+        if node_is_new || name_changed {
+            Self::index_name(&mut inner, uid, name);
+        }
+
+        // Structural change: new node or parent changed → full rebuild needed
+        if node_is_new || parent_changed {
+            inner.structure_dirty = true;
+        } else {
+            // Property-only changes: patch in-place
+            if name_changed {
+                Self::patch_name(&mut inner, uid, name);
+            }
+            if scope_changed {
+                Self::patch_scope(&mut inner, uid, scope);
+            }
+            if widget_changed {
+                Self::patch_widget(&mut inner, uid, &widget);
+            }
+        }
+
+        if parent.is_none() && inner.root_uid == WidgetUid(0) {
+            inner.root_uid = uid;
+        }
+
+        if old_parent != parent {
+            if let Some(prev_parent_uid) = old_parent {
+                if let Some(prev_parent) = inner.graph.get_mut(&prev_parent_uid) {
+                    if let Some(pos) = prev_parent.children.iter().position(|child| *child == uid) {
+                        prev_parent.children.remove(pos);
+                        inner.structure_dirty = true;
+                    }
+                }
+            }
+        }
+
+        if let Some(parent_uid) = parent {
+            let mut replaced_same_name = Vec::new();
+            let num_children = inner
+                .graph
+                .get(&parent_uid)
+                .map(|p| p.children.len())
+                .unwrap_or(0);
+            if !allow_duplicate_sibling_names(name) {
+                for i in 0..num_children {
+                    let existing_uid = inner.graph.get(&parent_uid).unwrap().children[i];
+                    if existing_uid == uid {
+                        continue;
+                    }
+                    if let Some(existing_node) = inner.graph.get(&existing_uid) {
+                        if existing_node.name == name {
+                            replaced_same_name.push(existing_uid);
+                        }
+                    }
+                }
+            }
+            if let Some(parent_node) = inner.graph.get_mut(&parent_uid) {
+                if !parent_node.children.iter().any(|child| *child == uid) {
+                    parent_node.children.push(uid);
+                    inner.structure_dirty = true;
+                }
+                inner.dirty.insert(parent_uid);
+            }
+
+            if !replaced_same_name.is_empty() {
+                if let Some(parent_node) = inner.graph.get_mut(&parent_uid) {
+                    parent_node
+                        .children
+                        .retain(|child_uid| !replaced_same_name.contains(child_uid));
+                }
+                for old_uid in replaced_same_name {
+                    let should_remove = inner
+                        .graph
+                        .get(&old_uid)
+                        .map_or(false, |node| node.parent == Some(parent_uid));
+                    if should_remove {
+                        Self::remove_subtree(&mut inner, old_uid);
+                    }
+                }
+                inner.structure_dirty = true;
+            }
+        }
+
+        if node_is_new || widget_changed {
+            inner.dirty.insert(uid);
+        }
+
+        if node_is_new || widget_changed || name_changed || scope_changed || parent_changed {
+            Self::invalidate_path_cache_upward(&mut inner, uid);
+            if let Some(old_parent) = old_parent {
+                // The old parent merely lost an edge: its own barrier applies.
+                Self::invalidate_path_cache_from_child_change(&mut inner, old_parent);
+            }
+        }
+    }
+
+    pub fn insert_child(&self, parent_uid: WidgetUid, name: LiveId, widget: WidgetRef) {
+        if parent_uid == WidgetUid(0) || widget.is_empty() {
+            return;
+        }
+        let Some(child_uid) = widget.try_widget_uid() else {
+            return;
+        };
+        if child_uid == WidgetUid(0) {
+            return;
+        }
+        let child_scope = widget.search_scope();
+
+        let mut inner = self.inner.borrow_mut();
+
+        if !inner.graph.contains_key(&parent_uid) {
+            Self::note_placeholder_root(&mut inner, parent_uid);
+            inner.graph.insert(
+                parent_uid,
+                GraphNode {
+                    name: LiveId(0),
+                    widget: WidgetWeakRef::default(),
+                    placeholder: true,
+                    scope: false,
+                    parent: None,
+                    children: Vec::new(),
+                    nesting_depth: 0,
+                    manual: false,
+                },
+            );
+            if inner.root_uid == WidgetUid(0) {
+                inner.root_uid = parent_uid;
+            }
+            inner.structure_dirty = true;
+        }
+
+        let mut old_parent = None;
+        let mut child_is_new = false;
+        let mut widget_changed = false;
+        let mut name_changed = false;
+        let mut scope_changed = false;
+        let mut parent_changed = false;
+
+        match inner.graph.get_mut(&child_uid) {
+            Some(node) => {
+                old_parent = node.parent;
+                node.manual = true;
+                if node.name != name {
+                    node.name = name;
+                    name_changed = true;
+                }
+                if node.placeholder || node.widget != widget {
+                    node.widget = widget.downgrade();
+                    node.placeholder = false;
+                    widget_changed = true;
+                }
+                if node.scope != child_scope {
+                    node.scope = child_scope;
+                    scope_changed = true;
+                }
+                if node.parent != Some(parent_uid) {
+                    node.parent = Some(parent_uid);
+                    parent_changed = true;
+                }
+            }
+            None => {
+                inner.graph.insert(
+                    child_uid,
+                    GraphNode {
+                        name,
+                        widget: widget.downgrade(),
+                        placeholder: false,
+                        scope: child_scope,
+                        parent: Some(parent_uid),
+                        children: Vec::new(),
+                        nesting_depth: 0,
+                        manual: true,
+                    },
+                );
+                child_is_new = true;
+            }
+        }
+        if child_is_new || name_changed {
+            Self::index_name(&mut inner, child_uid, name);
+        }
+
+        // A child inserted again is linked, no longer a detached one (see `detached`).
+        if let Some(list) = inner.detached.get_mut(&parent_uid) {
+            list.retain(|detached_uid| *detached_uid != child_uid);
+            if list.is_empty() {
+                inner.detached.remove(&parent_uid);
+            }
+        }
+
+        // Structural: new node or parent changed
+        if child_is_new || parent_changed {
+            inner.structure_dirty = true;
+        } else {
+            // Property-only: patch in-place
+            if name_changed {
+                Self::patch_name(&mut inner, child_uid, name);
+            }
+            if scope_changed {
+                Self::patch_scope(&mut inner, child_uid, child_scope);
+            }
+            if widget_changed {
+                Self::patch_widget(&mut inner, child_uid, &widget);
+            }
+        }
+
+        if old_parent != Some(parent_uid) {
+            if let Some(prev_parent_uid) = old_parent {
+                if let Some(prev_parent) = inner.graph.get_mut(&prev_parent_uid) {
+                    if let Some(pos) = prev_parent
+                        .children
+                        .iter()
+                        .position(|entry| *entry == child_uid)
+                    {
+                        prev_parent.children.remove(pos);
+                        inner.structure_dirty = true;
+                    }
+                }
+            }
+        }
+
+        let mut replaced_same_name = Vec::new();
+        let num_children = inner
+            .graph
+            .get(&parent_uid)
+            .map(|p| p.children.len())
+            .unwrap_or(0);
+        if !allow_duplicate_sibling_names(name) {
+            for i in 0..num_children {
+                let existing_uid = inner.graph.get(&parent_uid).unwrap().children[i];
+                if existing_uid == child_uid {
+                    continue;
+                }
+                if let Some(existing_node) = inner.graph.get(&existing_uid) {
+                    if existing_node.name == name {
+                        replaced_same_name.push(existing_uid);
+                    }
+                }
+            }
+        }
+        if let Some(parent_node) = inner.graph.get_mut(&parent_uid) {
+            if !parent_node.children.iter().any(|entry| *entry == child_uid) {
+                parent_node.children.push(child_uid);
+                inner.structure_dirty = true;
+            }
+        }
+
+        if !replaced_same_name.is_empty() {
+            if let Some(parent_node) = inner.graph.get_mut(&parent_uid) {
+                parent_node
+                    .children
+                    .retain(|child_uid| !replaced_same_name.contains(child_uid));
+            }
+            for old_uid in replaced_same_name {
+                let should_remove = inner
+                    .graph
+                    .get(&old_uid)
+                    .map_or(false, |node| node.parent == Some(parent_uid));
+                if should_remove {
+                    Self::remove_subtree(&mut inner, old_uid);
+                }
+            }
+            inner.structure_dirty = true;
+        }
+
+        inner.dirty.insert(child_uid);
+
+        if child_is_new || name_changed || scope_changed || parent_changed {
+            // The parent gained/kept an edge — its own barrier applies (a
+            // skip-search list's new row is invisible above the list). The
+            // child's climb re-covers the parent chain, but starting AT the
+            // child, whose own flag is never a barrier.
+            Self::invalidate_path_cache_from_child_change(&mut inner, parent_uid);
+            Self::invalidate_path_cache_upward(&mut inner, child_uid);
+            if let Some(old_parent) = old_parent {
+                Self::invalidate_path_cache_from_child_change(&mut inner, old_parent);
+            }
+        }
+    }
+
+    /// Insert a child and recursively register all its descendants.
+    /// Call this when the subtree is not borrowed (e.g. right after creation).
+    pub fn insert_child_deep(&self, parent_uid: WidgetUid, name: LiveId, widget: WidgetRef) {
+        self.insert_child(parent_uid, name, widget.clone());
+        // Now recursively walk the subtree — widget was just created so not borrowed.
+        let mut stack: Vec<(WidgetUid, WidgetRef)> = Vec::new();
+        if let Some(uid) = widget.try_widget_uid() {
+            if uid != WidgetUid(0) {
+                stack.push((uid, widget));
+            }
+        }
+        let mut children: Vec<(LiveId, WidgetRef)> = Vec::new();
+        while let Some((current_uid, current_widget)) = stack.pop() {
+            children.clear();
+            if !current_widget.try_children(&mut |child_name, child| {
+                if !child.is_empty() {
+                    children.push((child_name, child));
+                }
+            }) {
+                continue;
+            }
+            for (child_name, child_widget) in children.drain(..) {
+                self.insert_child(current_uid, child_name, child_widget.clone());
+                if let Some(child_uid) = child_widget.try_widget_uid() {
+                    if child_uid != WidgetUid(0) {
+                        stack.push((child_uid, child_widget));
+                    }
+                }
+            }
+        }
+    }
+
+    /// "Re-read this node's children before answering anything." It is a
+    /// hint that the GRAPH may be behind the widget tree — not a statement
+    /// that anything actually changed, and widgets raise it every frame
+    /// (a `PortalList` does it on every draw that recycles a row).
+    ///
+    /// It deliberately does NOT drop cached lookups. Dropping them here
+    /// threw away every cached path under every ancestor — including the
+    /// window root — so one recycling list turned every other lookup in the
+    /// frame into a full tree walk. The dirty node is re-read before the
+    /// next lookup consults the cache (see `flush_dirty`), and if that
+    /// re-read finds a real change it invalidates precisely then.
+    pub fn mark_dirty(&self, uid: WidgetUid) {
+        if uid == WidgetUid(0) {
+            return;
+        }
+        let mut inner = self.inner.borrow_mut();
+        inner.dirty.insert(uid);
+    }
+
+    pub fn seed_from_widget(&self, widget: WidgetRef) {
+        if widget.is_empty() {
+            return;
+        }
+
+        let Some(uid) = widget.try_widget_uid() else {
+            return;
+        };
+        if uid == WidgetUid(0) {
+            return;
+        }
+        let scope = widget.search_scope();
+
+        let mut inner = self.inner.borrow_mut();
+        if let Some(node) = inner.graph.get_mut(&uid) {
+            let mut widget_changed = false;
+            let mut scope_changed = false;
+            if node.placeholder || node.widget != widget {
+                node.widget = widget.downgrade();
+                node.placeholder = false;
+                widget_changed = true;
+            }
+            if node.scope != scope {
+                node.scope = scope;
+                scope_changed = true;
+            }
+            // Property-only: patch in-place
+            if widget_changed {
+                inner.dirty.insert(uid);
+                Self::patch_widget(&mut inner, uid, &widget);
+            }
+            if scope_changed {
+                Self::patch_scope(&mut inner, uid, scope);
+                Self::invalidate_path_cache(&mut inner, uid);
+            }
+            if inner.root_uid == WidgetUid(0) {
+                inner.root_uid = uid;
+            }
+            return;
+        }
+
+        // New node → structural change
+        inner.graph.insert(
+            uid,
+            GraphNode {
+                name: LiveId(0),
+                widget: widget.downgrade(),
+                placeholder: false,
+                scope,
+                parent: None,
+                children: Vec::new(),
+                    nesting_depth: 0,
+                    manual: false,
+            },
+        );
+        if inner.root_uid == WidgetUid(0) {
+            inner.root_uid = uid;
+        }
+        inner.dirty.insert(uid);
+        inner.structure_dirty = true;
+        Self::invalidate_path_cache(&mut inner, uid);
+    }
+
+    pub fn set_root_widget(&self, widget: WidgetRef) {
+        if widget.is_empty() {
+            return;
+        }
+
+        let Some(uid) = widget.try_widget_uid() else {
+            return;
+        };
+        if uid == WidgetUid(0) {
+            return;
+        }
+        let scope = widget.search_scope();
+
+        let mut inner = self.inner.borrow_mut();
+        let mut old_parent = None;
+        let mut node_is_new = false;
+        let mut widget_changed = false;
+        let mut name_changed = false;
+        let mut scope_changed = false;
+        let mut parent_changed = false;
+
+        match inner.graph.get_mut(&uid) {
+            Some(node) => {
+                old_parent = node.parent;
+                if node.name != LiveId(0) {
+                    node.name = LiveId(0);
+                    name_changed = true;
+                }
+                if node.placeholder || node.widget != widget {
+                    node.widget = widget.downgrade();
+                    node.placeholder = false;
+                    widget_changed = true;
+                }
+                if node.scope != scope {
+                    node.scope = scope;
+                    scope_changed = true;
+                }
+                if node.parent.is_some() {
+                    node.parent = None;
+                    parent_changed = true;
+                }
+            }
+            None => {
+                inner.graph.insert(
+                    uid,
+                    GraphNode {
+                        name: LiveId(0),
+                        widget: widget.downgrade(),
+                        placeholder: false,
+                        scope,
+                        parent: None,
+                        children: Vec::new(),
+                    nesting_depth: 0,
+                    manual: false,
+                    },
+                );
+                node_is_new = true;
+            }
+        }
+
+        if old_parent.is_some() {
+            if let Some(prev_parent_uid) = old_parent {
+                if let Some(prev_parent) = inner.graph.get_mut(&prev_parent_uid) {
+                    if let Some(pos) = prev_parent.children.iter().position(|child| *child == uid) {
+                        prev_parent.children.remove(pos);
+                        inner.structure_dirty = true;
+                    }
+                }
+            }
+        }
+
+        // Root change or new node or parent change → structural
+        let root_changed = inner.root_uid != uid;
+        if root_changed {
+            inner.root_uid = uid;
+            inner.structure_dirty = true;
+        }
+
+        if node_is_new || parent_changed {
+            inner.structure_dirty = true;
+        } else {
+            // Property-only: patch in-place
+            if name_changed {
+                Self::patch_name(&mut inner, uid, LiveId(0));
+            }
+            if widget_changed {
+                Self::patch_widget(&mut inner, uid, &widget);
+            }
+            if scope_changed {
+                Self::patch_scope(&mut inner, uid, scope);
+            }
+        }
+
+        inner.dirty.insert(uid);
+        if node_is_new
+            || widget_changed
+            || name_changed
+            || scope_changed
+            || parent_changed
+            || root_changed
+        {
+            Self::invalidate_path_cache_upward(&mut inner, uid);
+            if let Some(old_parent) = old_parent {
+                Self::invalidate_path_cache_from_child_change(&mut inner, old_parent);
+            }
+        }
+    }
+
+    pub fn refresh_from_borrowed<F>(&self, uid: WidgetUid, mut visit: F)
+    where
+        F: FnMut(&mut dyn FnMut(LiveId, WidgetRef)),
+    {
+        self.refresh_from_borrowed_dyn(uid, &mut visit)
+    }
+
+    /// The body of [`Self::refresh_from_borrowed`], compiled once instead of
+    /// once per visitor closure (each widget type's lookups bring their own).
+    pub(crate) fn refresh_from_borrowed_dyn(
+        &self,
+        uid: WidgetUid,
+        visit: &mut dyn FnMut(&mut dyn FnMut(LiveId, WidgetRef)),
+    ) {
+        if uid == WidgetUid(0) {
+            return;
+        }
+
+        // Release the tree borrow while visiting: children may perform nested lookups.
+        let mut discovered_children =
+            self.inner.borrow_mut().discovery_buffers.pop().unwrap_or_default();
+        {
+            let mut collect = |name: LiveId, child: WidgetRef| {
+                if !child.is_empty() {
+                    discovered_children.push((name, child));
+                }
+            };
+            visit(&mut collect);
+        }
+
+        let mut inner = self.inner.borrow_mut();
+        if !inner.graph.contains_key(&uid) {
+            Self::note_placeholder_root(&mut inner, uid);
+            inner.graph.insert(
+                uid,
+                GraphNode {
+                    name: LiveId(0),
+                    widget: WidgetWeakRef::default(),
+                    placeholder: true,
+                    scope: false,
+                    parent: None,
+                    children: Vec::new(),
+                    nesting_depth: 0,
+                    manual: false,
+                },
+            );
+            if inner.root_uid == WidgetUid(0) {
+                inner.root_uid = uid;
+            }
+            inner.structure_dirty = true;
+        }
+
+        let mut pending = Vec::new();
+        if Self::refresh_node_children_from_discovered(
+            &mut inner,
+            uid,
+            &mut pending,
+            &mut discovered_children,
+            false,
+        ) {
+            inner.dirty.remove(&uid);
+            for child_uid in pending {
+                inner.dirty.insert(child_uid);
+            }
+        } else {
+            inner.dirty.insert(uid);
+        }
+        Self::return_discovered_children(&mut inner, discovered_children);
+    }
+
+    fn return_discovered_children(
+        inner: &mut WidgetTreeInner,
+        mut children: Vec<(LiveId, WidgetRef)>,
+    ) {
+        children.clear();
+        // Keep a buffer per nested visitor so each depth can reuse its storage.
+        inner.discovery_buffers.push(children);
+    }
+
+    fn sync_dirty(&self) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.dirty.is_empty() && !inner.structure_dirty && !inner.dense_stale {
+            return;
+        }
+        Self::flush_dirty(&mut inner, true);
+        if inner.structure_dirty || inner.dense_stale {
+            Self::rebuild_dense(&mut inner);
+        }
+    }
+
+    /// Re-read every node whose children were flagged stale, so the graph
+    /// matches the widget tree. Whatever this actually changes invalidates
+    /// the path cache from inside `refresh_node_children_from_discovered`;
+    /// what it does not change leaves the cache intact, which is the whole
+    /// point — a list recycling its rows must not cost every other lookup
+    /// in the frame a tree walk.
+    ///
+    /// Nodes that cannot be read right now (their widget is borrowed
+    /// mid-draw) stay dirty and are retried by the next caller.
+    fn flush_dirty(inner: &mut WidgetTreeInner, mark_structure_dirty: bool) {
+        let mut pending = std::mem::take(&mut inner.refresh_pending);
+        pending.extend(inner.dirty.drain());
+        let mut retry = std::mem::take(&mut inner.refresh_retry);
+        while let Some(uid) = pending.pop() {
+            if !Self::refresh_node_children(inner, uid, &mut pending, mark_structure_dirty) {
+                retry.push(uid);
+            }
+        }
+        inner.dirty.extend(retry.drain(..));
+        inner.refresh_pending = pending;
+        inner.refresh_retry = retry;
+    }
+
+    fn discard_stale_cache_item(inner: &mut WidgetTreeInner, uid: WidgetUid) {
+        if uid == WidgetUid(0) || !inner.graph.contains_key(&uid) {
+            return;
+        }
+
+        let parent_uid = inner.graph.get(&uid).and_then(|node| node.parent);
+        if let Some(parent_uid) = parent_uid {
+            if let Some(parent) = inner.graph.get_mut(&parent_uid) {
+                parent.children.retain(|child_uid| *child_uid != uid);
+            }
+            // Re-walk the live parent children on next query so the cache can self-heal.
+            inner.dirty.insert(parent_uid);
+        } else if inner.root_uid == uid {
+            inner.root_uid = WidgetUid(0);
+        }
+
+        Self::remove_subtree(inner, uid);
+    }
+
+    fn ensure_node_cached(inner: &mut WidgetTreeInner, uid: WidgetUid) -> bool {
+        if uid == WidgetUid(0) {
+            return false;
+        }
+        // One hash lookup, not three: this runs once per node of every tree
+        // walk, so `contains_key` + `get` + `dirty.contains` was the single
+        // hottest hashing site in the whole UI.
+        let Some(node) = inner.graph.get(&uid) else {
+            return false;
+        };
+        if !node.placeholder && node.widget.upgrade().is_none() {
+            Self::discard_stale_cache_item(inner, uid);
+            return false;
+        }
+
+        if inner.dirty.is_empty() || !inner.dirty.contains(&uid) {
+            return true;
+        }
+
+        let mut pending = Vec::new();
+        if !Self::refresh_node_children(inner, uid, &mut pending, false) {
+            return false;
+        }
+
+        inner.dirty.remove(&uid);
+        for child_uid in pending {
+            inner.dirty.insert(child_uid);
+        }
+
+        inner.graph.contains_key(&uid)
+    }
+
+    /// Leading path segments may match ancestors up to AND INCLUDING the
+    /// search root, never above it. The clamp is what lets the cache be
+    /// invalidated by subtree: an entry rooted at R depends only on R's own
+    /// name and R's subtree, so no mutation outside that subtree can go
+    /// unnoticed by it. (Unclamped, [above, target] rooted at R matched via
+    /// a node above R — and a rename of that node never invalidated R's
+    /// cache, a stale answer waiting to happen.)
+    fn verify_path_graph(
+        inner: &WidgetTreeInner,
+        remaining: &[LiveId],
+        mut current: Option<WidgetUid>,
+        root_uid: WidgetUid,
+    ) -> bool {
+        let mut above_root = false;
+        for &segment in remaining.iter().rev() {
+            if above_root {
+                return false;
+            }
+            loop {
+                let uid = match current {
+                    Some(uid) => uid,
+                    None => return false,
+                };
+                let Some(node) = inner.graph.get(&uid) else {
+                    return false;
+                };
+                let at_root = uid == root_uid;
+                if node.name == segment {
+                    current = node.parent;
+                    if at_root {
+                        above_root = true;
+                    }
+                    break;
+                }
+                if at_root {
+                    return false;
+                }
+                current = node.parent;
+            }
+        }
+        true
+    }
+
+    /// Discarding a stale node leaves its live parent dirty with a shorter
+    /// child list, while that parent's walk frame keeps iterating the OLD
+    /// indices — the replacement subtree would only be seen by the NEXT
+    /// query, and a subtree rebuilt several levels deep (the first draw
+    /// replacing a panel) needs one query per level to heal. Re-walk the
+    /// parent right away instead: its refresh reads the live children.
+    fn requeue_parent_after_stale(
+        inner: &WidgetTreeInner,
+        uid: WidgetUid,
+        parent: Option<WidgetUid>,
+        root_uid: WidgetUid,
+        visited: &mut HashSet<WidgetUid>,
+        stack: &mut Vec<WalkFrame>,
+    ) {
+        // Only a discard removes the node; a refresh that could not borrow
+        // leaves it in the graph (and dirty) for the next query.
+        if inner.graph.contains_key(&uid) {
+            return;
+        }
+        let Some(parent) = parent else {
+            return;
+        };
+        if !inner.graph.contains_key(&parent) {
+            return;
+        }
+        visited.remove(&parent);
+        stack.push(WalkFrame {
+            uid: parent,
+            next_child_idx: 0,
+            is_root: parent == root_uid,
+        });
+    }
+
+    fn find_within_graph(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+        exclude_subtree_root: Option<WidgetUid>,
+    ) -> WidgetRef {
+        Self::find_within_graph_with_skip(inner, root_uid, path, exclude_subtree_root, true)
+    }
+
+    fn find_within_graph_with_skip(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+        exclude_subtree_root: Option<WidgetUid>,
+        respect_scope: bool,
+    ) -> WidgetRef {
+        if path.is_empty() || root_uid == WidgetUid(0) || exclude_subtree_root == Some(root_uid) {
+            return WidgetRef::empty();
+        }
+        if !Self::ensure_node_cached(inner, root_uid) {
+            return WidgetRef::empty();
+        }
+
+        let target = path[path.len() - 1];
+        let mut visited = HashSet::new();
+        let mut stack = vec![WalkFrame {
+            uid: root_uid,
+            next_child_idx: 0,
+            is_root: true,
+        }];
+
+        while let Some(mut frame) = stack.pop() {
+            if frame.next_child_idx == 0 {
+                if !visited.insert(frame.uid) {
+                    continue;
+                }
+                inner.stats.walk_nodes += 1;
+                let parent_before = inner.graph.get(&frame.uid).and_then(|n| n.parent);
+                if !Self::ensure_node_cached(inner, frame.uid) {
+                    Self::requeue_parent_after_stale(
+                        inner,
+                        frame.uid,
+                        parent_before,
+                        root_uid,
+                        &mut visited,
+                        &mut stack,
+                    );
+                    continue;
+                }
+
+                let (name, parent_uid, scope) = match inner.graph.get(&frame.uid) {
+                    Some(node) => (node.name, node.parent, node.scope),
+                    None => continue,
+                };
+
+                // Skip matching the root node itself — find_within searches
+                // *within* the subtree, so the root should not match.
+                // Without this, if the root's name matches the target and
+                // verify_path_graph traverses above root_uid to find a
+                // matching ancestor, the root would be incorrectly returned.
+                if !frame.is_root
+                    && name == target
+                    && (path.len() == 1
+                        || Self::verify_path_graph(
+                            inner,
+                            &path[..path.len() - 1],
+                            parent_uid,
+                            root_uid,
+                        ))
+                {
+                    let upgraded = inner
+                        .graph
+                        .get(&frame.uid)
+                        .and_then(|node| node.widget.upgrade());
+                    if let Some(widget) = upgraded {
+                        return widget;
+                    } else {
+                        Self::discard_stale_cache_item(inner, frame.uid);
+                        continue;
+                    }
+                }
+
+                if respect_scope && !frame.is_root && scope {
+                    for i in 0..path.len() - 1 {
+                        if name == path[i]
+                            && Self::verify_path_graph(inner, &path[..i], parent_uid, root_uid)
+                        {
+                            let found = Self::find_within_graph_with_skip(
+                                inner,
+                                frame.uid,
+                                &path[i + 1..],
+                                None,
+                                true,
+                            );
+                            if !found.is_empty() {
+                                return found;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let next_child_uid = inner
+                .graph
+                .get(&frame.uid)
+                .and_then(|node| node.children.get(frame.next_child_idx).copied());
+
+            let Some(child_uid) = next_child_uid else {
+                continue;
+            };
+
+            frame.next_child_idx += 1;
+            stack.push(frame);
+            if exclude_subtree_root == Some(child_uid) {
+                continue;
+            }
+            stack.push(WalkFrame {
+                uid: child_uid,
+                next_child_idx: 0,
+                is_root: false,
+            });
+        }
+
+        WidgetRef::empty()
+    }
+
+    /// Node `uid` is in the graph under `name` now (by_name). Unnamed nodes are not indexed.
+    fn index_name(inner: &mut WidgetTreeInner, uid: WidgetUid, name: LiveId) {
+        if name == LiveId(0) {
+            return;
+        }
+        let uids = inner.by_name.entry(name).or_default();
+        if !uids.contains(&uid) {
+            uids.push(uid);
+        }
+    }
+
+    /// collect_within_graph's answer from the name index: the nodes named like the path's
+    /// last segment that the walk from `root_uid` would reach (below it, through children
+    /// lists, no non-root scope node above them) in the walk's (preorder) order, with the
+    /// path's leading segments verified as the walk does. None when only the walk can answer
+    /// exactly: a dirty node (the walk refreshes it), an unnamed target, or a node on a
+    /// candidate's way up whose widget is gone (the walk discards it and its subtree).
+    fn collect_within_indexed(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+    ) -> Option<(Vec<WidgetRef>, Vec<ScopeHit>)> {
+        let target = *path.last()?;
+        if target == LiveId(0) || !inner.dirty.is_empty() {
+            return None;
+        }
+        // a node listing children it did not adopt, at or below the root: only the walk follows it
+        for &l in &inner.foreign_listers {
+            let mut cur = Some(l);
+            for _ in 0..=inner.graph.len() {
+                let Some(c) = cur else { break };
+                if c == root_uid {
+                    return None;
+                }
+                cur = inner.graph.get(&c).and_then(|n| n.parent);
+            }
+        }
+        enum Found {
+            Match(WidgetRef),
+            Scope(WidgetUid, usize),
+        }
+        let mut found: Vec<(Vec<usize>, Found)> = Vec::new();
+        let mut visited = 0u64;
+        // candidates: the nodes named like the last segment, and the scope nodes named like
+        // an earlier one (the walk records those instead of descending into them)
+        let mut candidates: Vec<(WidgetUid, Option<usize>)> = inner
+            .by_name
+            .get(&target)
+            .map(|uids| uids.iter().map(|u| (*u, None)).collect())
+            .unwrap_or_default();
+        for (i, seg) in path[..path.len() - 1].iter().enumerate() {
+            if let Some(uids) = inner.by_name.get(seg) {
+                candidates.extend(uids.iter().map(|u| (*u, Some(i))));
+            }
+        }
+        for (uid, entered) in candidates {
+            if uid == root_uid {
+                continue;
+            }
+            let Some(node) = inner.graph.get(&uid) else { continue };
+            let want = match entered {
+                None => target,
+                Some(i) => path[i],
+            };
+            if node.name != want || (entered.is_some() && !node.scope) {
+                continue;
+            }
+            let parent_uid = node.parent;
+            // the way up to the root: child positions (the preorder rank), reachability
+            let mut order = Vec::new();
+            let mut cur = uid;
+            let mut reached = false;
+            for _ in 0..=inner.graph.len() {
+                let n = inner.graph.get(&cur)?;
+                visited += 1;
+                if !n.placeholder && n.widget.upgrade().is_none() {
+                    return None;
+                }
+                if cur == root_uid {
+                    reached = true;
+                    break;
+                }
+                let Some(p) = n.parent else { break };
+                let pn = inner.graph.get(&p)?;
+                let Some(idx) = pn.children.iter().position(|c| *c == cur) else { break };
+                if p != root_uid && pn.scope {
+                    break;
+                }
+                order.push(idx);
+                cur = p;
+            }
+            if !reached {
+                continue;
+            }
+            let ancestors = match entered {
+                None => &path[..path.len() - 1],
+                Some(i) => &path[..i],
+            };
+            if !ancestors.is_empty() && !Self::verify_path_graph(inner, ancestors, parent_uid, root_uid) {
+                continue;
+            }
+            order.reverse();
+            match entered {
+                None => {
+                    let Some(widget) = inner.graph.get(&uid).and_then(|n| n.widget.upgrade()) else { return None };
+                    found.push((order, Found::Match(widget)));
+                }
+                Some(i) => found.push((order, Found::Scope(uid, i + 1))),
+            }
+        }
+        inner.stats.walk_nodes += visited;
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut widgets = Vec::new();
+        let mut hits = Vec::new();
+        for (_, f) in found {
+            match f {
+                Found::Match(w) => widgets.push(w),
+                Found::Scope(uid, rest) => hits.push(ScopeHit { after: widgets.len(), uid, rest }),
+            }
+        }
+        Some((widgets, hits))
+    }
+
+    fn collect_within_graph(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+        exclude_subtree_root: Option<WidgetUid>,
+        results: &mut Vec<WidgetRef>,
+    ) {
+        Self::collect_within_graph_with_skip(
+            inner,
+            root_uid,
+            path,
+            exclude_subtree_root,
+            results,
+            true,
+            None,
+        )
+    }
+
+    fn collect_within_graph_with_skip(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+        exclude_subtree_root: Option<WidgetUid>,
+        results: &mut Vec<WidgetRef>,
+        respect_scope: bool,
+        mut record: Option<&mut Vec<ScopeHit>>,
+    ) {
+        if path.is_empty() || root_uid == WidgetUid(0) || exclude_subtree_root == Some(root_uid) {
+            return;
+        }
+        if !Self::ensure_node_cached(inner, root_uid) {
+            return;
+        }
+
+        let target = path[path.len() - 1];
+        let mut visited = HashSet::new();
+        let mut stack = vec![WalkFrame {
+            uid: root_uid,
+            next_child_idx: 0,
+            is_root: true,
+        }];
+
+        while let Some(mut frame) = stack.pop() {
+            if frame.next_child_idx == 0 {
+                if !visited.insert(frame.uid) {
+                    continue;
+                }
+                inner.stats.walk_nodes += 1;
+                let parent_before = inner.graph.get(&frame.uid).and_then(|n| n.parent);
+                if !Self::ensure_node_cached(inner, frame.uid) {
+                    Self::requeue_parent_after_stale(
+                        inner,
+                        frame.uid,
+                        parent_before,
+                        root_uid,
+                        &mut visited,
+                        &mut stack,
+                    );
+                    continue;
+                }
+
+                let (name, parent_uid, scope) = match inner.graph.get(&frame.uid) {
+                    Some(node) => (node.name, node.parent, node.scope),
+                    None => continue,
+                };
+
+                // Skip matching the root node itself — see find_within_graph.
+                if !frame.is_root
+                    && name == target
+                    && (path.len() == 1
+                        || Self::verify_path_graph(
+                            inner,
+                            &path[..path.len() - 1],
+                            parent_uid,
+                            root_uid,
+                        ))
+                {
+                    let upgraded = inner
+                        .graph
+                        .get(&frame.uid)
+                        .and_then(|node| node.widget.upgrade());
+                    if let Some(widget) = upgraded {
+                        results.push(widget);
+                    } else {
+                        Self::discard_stale_cache_item(inner, frame.uid);
+                        continue;
+                    }
+                }
+
+                if respect_scope && !frame.is_root && scope {
+                    for i in 0..path.len() - 1 {
+                        if name == path[i]
+                            && Self::verify_path_graph(inner, &path[..i], parent_uid, root_uid)
+                        {
+                            if let Some(hits) = record.as_mut() {
+                                hits.push(ScopeHit {
+                                    after: results.len(),
+                                    uid: frame.uid,
+                                    rest: i + 1,
+                                });
+                            } else {
+                                Self::collect_within_graph_with_skip(
+                                    inner,
+                                    frame.uid,
+                                    &path[i + 1..],
+                                    None,
+                                    results,
+                                    true,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let next_child_uid = inner
+                .graph
+                .get(&frame.uid)
+                .and_then(|node| node.children.get(frame.next_child_idx).copied());
+
+            let Some(child_uid) = next_child_uid else {
+                continue;
+            };
+
+            frame.next_child_idx += 1;
+            stack.push(frame);
+            if exclude_subtree_root == Some(child_uid) {
+                continue;
+            }
+            stack.push(WalkFrame {
+                uid: child_uid,
+                next_child_idx: 0,
+                is_root: false,
+            });
+        }
+    }
+
+    /// The matches of `path` under `root_uid`; a path that names a scope node continues
+    /// inside it, asked of the scope's own cache.
+    fn find_all_within_cached_graph(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+    ) -> Vec<WidgetRef> {
+        let (direct, hits) = Self::find_direct_cached_graph(inner, root_uid, path);
+        if hits.is_empty() {
+            return direct;
+        }
+        let mut out = Vec::with_capacity(direct.len());
+        let mut taken = 0;
+        for hit in hits {
+            out.extend_from_slice(&direct[taken..hit.after]);
+            taken = hit.after;
+            out.extend(Self::find_all_within_cached_graph(inner, hit.uid, &path[hit.rest..]));
+        }
+        out.extend_from_slice(&direct[taken..]);
+        out
+    }
+
+    /// The matches outside any scope node below `root_uid`, and the scope nodes the path
+    /// enters (their insides not searched here). Cached per root: it depends on structure
+    /// outside scopes only, which invalidates this root's cache.
+    fn find_direct_cached_graph(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+    ) -> (Vec<WidgetRef>, Vec<ScopeHit>) {
+        if path.is_empty() || root_uid == WidgetUid(0) || !inner.graph.contains_key(&root_uid) {
+            return (Vec::new(), Vec::new());
+        }
+        // The cache may only be trusted over a graph that is up to date
+        // with the widget tree, so settle the stale nodes first. This is
+        // bounded by what actually changed (the recycling list's own
+        // children), never by the size of the tree.
+        if !inner.dirty.is_empty() {
+            Self::flush_dirty(inner, false);
+        }
+        if !Self::ensure_node_cached(inner, root_uid) {
+            return (Vec::new(), Vec::new());
+        }
+
+        inner.stats.lookups += 1;
+        if let Some(live) = Self::cached_live_widgets(inner, root_uid, path) {
+            return live;
+        }
+        if let Some((cached_matches, cached_scopes)) = Self::cached_path_matches(inner, root_uid, path) {
+            if cached_matches.is_empty() && cached_scopes.is_empty() {
+                // A cached MISS. Nothing that could create a match has
+                // happened since it was stored (any such mutation removes
+                // the entry), so answering from it is exact — and it is the
+                // difference between one hash lookup and a full tree walk.
+                return (Vec::new(), Vec::new());
+            }
+            let mut stale_uids = Vec::new();
+            let mut live_matches = Vec::with_capacity(cached_matches.len());
+            let mut live_widgets = Vec::with_capacity(cached_matches.len());
+            // live matches before each old position, to move the scope hits with them
+            let mut live_before = Vec::with_capacity(cached_matches.len() + 1);
+            for cached in cached_matches {
+                live_before.push(live_widgets.len());
+                if let Some(widget) = cached.widget.upgrade() {
+                    live_widgets.push(widget.clone());
+                    live_matches.push(PathCacheMatch {
+                        uid: cached.uid,
+                        widget: widget.downgrade(),
+                    });
+                } else {
+                    stale_uids.push(cached.uid);
+                }
+            }
+            live_before.push(live_widgets.len());
+            let live_scopes: Vec<ScopeHit> = cached_scopes
+                .iter()
+                .map(|hit| ScopeHit { after: live_before[hit.after], ..*hit })
+                .collect();
+
+            if stale_uids.is_empty() {
+                return (live_widgets, live_scopes);
+            }
+
+            for stale_uid in stale_uids {
+                Self::discard_stale_cache_item(inner, stale_uid);
+            }
+            // Drop only stale cache items; re-query below to repopulate.
+            Self::store_path_matches(inner, root_uid, path, live_matches, live_scopes);
+        }
+
+        inner.stats.cache_misses += 1;
+        // The walk itself can teach the graph about nodes it had not seen
+        // (a dirty parent refreshed mid-walk). Those discoveries invalidate
+        // the cache; storing this result afterwards would then persist an
+        // answer derived from a graph that no longer matches the tree — for
+        // a MISS, forever. Snapshot the epoch and only store an unchallenged
+        // result.
+        let epoch = inner.path_cache_epoch;
+        let (results, hits) = match Self::collect_within_indexed(inner, root_uid, path) {
+            // tests: the walk agrees, in order
+            #[cfg(test)]
+            Some((results, hits)) => {
+                let mut walked = Vec::new();
+                let mut walked_hits = Vec::new();
+                Self::collect_within_graph_with_skip(
+                    inner, root_uid, path, None, &mut walked, true, Some(&mut walked_hits),
+                );
+                let uids = |v: &[WidgetRef]| v.iter().map(|w| w.try_widget_uid()).collect::<Vec<_>>();
+                assert_eq!(uids(&results), uids(&walked), "indexed lookup differs from the walk for {:?}", path);
+                let key = |v: &[ScopeHit]| v.iter().map(|h| (h.after, h.uid, h.rest)).collect::<Vec<_>>();
+                assert_eq!(key(&hits), key(&walked_hits), "indexed scope hits differ from the walk for {:?}", path);
+                (results, hits)
+            }
+            #[cfg(not(test))]
+            Some(found) => found,
+            None => {
+                let mut results = Vec::new();
+                let mut hits = Vec::new();
+                Self::collect_within_graph_with_skip(
+                    inner, root_uid, path, None, &mut results, true, Some(&mut hits),
+                );
+                (results, hits)
+            }
+        };
+        if inner.path_cache_epoch != epoch {
+            inner.stats.stores_skipped += 1;
+            return (results, hits);
+        }
+        let mut matches = Vec::with_capacity(results.len());
+        // stored matches before each result, to move the scope hits with them
+        let mut stored_before = Vec::with_capacity(results.len() + 1);
+        for widget in &results {
+            stored_before.push(matches.len());
+            // A match whose uid cannot be read right now (its widget is mutably borrowed: a
+            // lookup from inside that widget's own draw, e.g. a PortalList comparing itself
+            // with `self.portal_list(..)` while the step holds it) is still a match. Leaving
+            // it out would store a MISS (or a short list) that outlives the borrow: every
+            // later lookup answers from it until an unrelated invalidation (SBXPLAY's dead
+            // JOIN row). The answer is right, it just cannot be cached: store nothing.
+            match widget.try_widget_uid() {
+                Some(uid) if uid != WidgetUid(0) => matches.push(PathCacheMatch {
+                    uid,
+                    widget: widget.downgrade(),
+                }),
+                _ => {
+                    inner.stats.stores_skipped += 1;
+                    return (results, hits);
+                }
+            }
+        }
+        stored_before.push(matches.len());
+        let stored_hits = hits
+            .iter()
+            .map(|hit| ScopeHit { after: stored_before[hit.after], ..*hit })
+            .collect();
+        Self::store_path_matches(inner, root_uid, path, matches, stored_hits);
+        (results, hits)
+    }
+
+    fn refresh_node_children(
+        inner: &mut WidgetTreeInner,
+        uid: WidgetUid,
+        pending: &mut Vec<WidgetUid>,
+        mark_structure_dirty: bool,
+    ) -> bool {
+        let (parent_widget, parent_placeholder) = match inner.graph.get(&uid) {
+            Some(node) => (node.widget.upgrade(), node.placeholder),
+            None => return true,
+        };
+        if parent_placeholder {
+            // Placeholder node (seeded from borrowed context without a WidgetRef):
+            // keep existing child edges until a concrete WidgetRef is seeded.
+            return true;
+        }
+        let Some(parent_widget) = parent_widget else {
+            // Concrete widget no longer exists; remove stale subtree.
+            Self::remove_subtree(inner, uid);
+            return true;
+        };
+
+        let mut discovered_children = inner.discovery_buffers.pop().unwrap_or_default();
+        if !parent_widget.try_children(&mut |name, child| {
+            if !child.is_empty() {
+                discovered_children.push((name, child));
+            }
+        }) {
+            Self::return_discovered_children(inner, discovered_children);
+            inner.dirty.insert(uid);
+            return false;
+        }
+
+        let refreshed = Self::refresh_node_children_from_discovered(
+            inner,
+            uid,
+            pending,
+            &mut discovered_children,
+            mark_structure_dirty,
+        );
+        Self::return_discovered_children(inner, discovered_children);
+        if !refreshed {
+            inner.dirty.insert(uid);
+        }
+        refreshed
+    }
+
+    fn discovered_children_unchanged(
+        inner: &WidgetTreeInner,
+        uid: WidgetUid,
+        discovered: &[(LiveId, WidgetRef)],
+    ) -> bool {
+        let Some(parent) = inner.graph.get(&uid) else { return false };
+        let mut next = 0;
+        for (name, widget) in discovered {
+            let Some(child_uid) = widget.try_widget_uid() else { return false };
+            let Some(child) = inner.graph.get(&child_uid) else { return false };
+            if child.name != *name || child.placeholder || child.widget != *widget
+                || child.scope != widget.search_scope() || child.manual
+                || (child.parent != Some(uid)
+                    && !(parent.placeholder && child.parent.is_some()))
+            {
+                return false;
+            }
+            if parent.children.get(next) == Some(&child_uid) {
+                next += 1;
+            } else if !parent.children[..next].contains(&child_uid) {
+                return false;
+            }
+        }
+        // Unreported manual children remain linked after the reported children.
+        parent.children[next..].iter().all(|child_uid| {
+            inner.graph.get(child_uid).is_some_and(|child| {
+                child.manual && child.parent == Some(uid) && child.widget.upgrade().is_some()
+            })
+        })
+    }
+
+    fn refresh_node_children_from_discovered(
+        inner: &mut WidgetTreeInner,
+        uid: WidgetUid,
+        pending: &mut Vec<WidgetUid>,
+        discovered_children: &mut Vec<(LiveId, WidgetRef)>,
+        mark_structure_dirty: bool,
+    ) -> bool {
+        // Every child must report a uid before anything is touched; the
+        // uid-less (zero) ones are dropped in place.
+        for (_, child_widget) in discovered_children.iter() {
+            if child_widget.try_widget_uid().is_none() {
+                return false;
+            }
+        }
+        discovered_children
+            .retain(|(_, child_widget)| child_widget.try_widget_uid() != Some(WidgetUid(0)));
+
+        if Self::discovered_children_unchanged(inner, uid, discovered_children) {
+            return true;
+        }
+
+        let (old_children, parent_is_placeholder) = match inner.graph.get_mut(&uid) {
+            Some(node) => (std::mem::take(&mut node.children), node.placeholder),
+            None => return true,
+        };
+
+        let mut new_children: Vec<WidgetUid> = Vec::with_capacity(discovered_children.len());
+        let mut invalidate_uid_cache = false;
+
+        for (child_name, child_widget) in discovered_children.drain(..) {
+            let Some(child_uid) = child_widget.try_widget_uid() else {
+                continue;
+            };
+            if !new_children.iter().any(|entry| *entry == child_uid) {
+                new_children.push(child_uid);
+            }
+            let child_scope = child_widget.search_scope();
+
+            let mut old_parent = None;
+            let mut child_is_new = false;
+            let mut child_widget_changed = false;
+            let mut child_name_changed = false;
+            let mut lists_foreign = false;
+            let mut child_scope_changed = false;
+            let mut child_parent_changed = false;
+
+            match inner.graph.get_mut(&child_uid) {
+                Some(child_node) => {
+                    old_parent = child_node.parent;
+                    // The parent reports this child now, so it no longer needs
+                    // manual-insert protection.
+                    child_node.manual = false;
+                    if child_node.name != child_name {
+                        child_node.name = child_name;
+                        child_name_changed = true;
+                    }
+                    if child_node.placeholder || child_node.widget != child_widget {
+                        child_node.widget = child_widget.downgrade();
+                        child_node.placeholder = false;
+                        child_widget_changed = true;
+                    }
+                    if child_node.scope != child_scope {
+                        child_node.scope = child_scope;
+                        child_scope_changed = true;
+                    }
+                    // A placeholder root is a lookup anchored at a WidgetRef the
+                    // tree flattens away (a FoldHeader's `header` View: its
+                    // children are reported as the FoldHeader's own). It may
+                    // LIST those children so the anchored search reaches them,
+                    // but it must never adopt them: re-parenting them here
+                    // removed them from their real parent's child list, and
+                    // every later lookup from the root missed them.
+                    let keep_real_parent = parent_is_placeholder
+                        && child_node.parent.is_some_and(|p| p != uid);
+                    if child_node.parent != Some(uid) && !keep_real_parent {
+                        child_node.parent = Some(uid);
+                        child_parent_changed = true;
+                    }
+                    lists_foreign = keep_real_parent;
+                }
+                None => {
+                    inner.graph.insert(
+                        child_uid,
+                        GraphNode {
+                            name: child_name,
+                            widget: child_widget.downgrade(),
+                            placeholder: false,
+                            scope: child_scope,
+                            parent: Some(uid),
+                            children: Vec::new(),
+                    nesting_depth: 0,
+                    manual: false,
+                        },
+                    );
+                    child_is_new = true;
+                    invalidate_uid_cache = true;
+                    if mark_structure_dirty {
+                        inner.structure_dirty = true;
+                    } else {
+                        inner.dense_stale = true;
+                    }
+                }
+            }
+            if child_is_new || child_name_changed {
+                Self::index_name(inner, child_uid, child_name);
+            }
+            if lists_foreign {
+                inner.foreign_listers.insert(uid);
+            }
+
+            // Structural: new node or parent changed
+            if child_parent_changed {
+                invalidate_uid_cache = true;
+                if mark_structure_dirty {
+                    inner.structure_dirty = true;
+                } else {
+                    inner.dense_stale = true;
+                }
+            }
+
+            if !child_is_new && !child_parent_changed {
+                // Property-only: patch in-place. Lookups rooted AT the child
+                // can use its own name as their outermost segment, so its
+                // own map goes too, not only the ancestors'.
+                if child_name_changed {
+                    Self::patch_name(inner, child_uid, child_name);
+                    Self::invalidate_path_cache(inner, child_uid);
+                    invalidate_uid_cache = true;
+                }
+                if child_scope_changed {
+                    Self::patch_scope(inner, child_uid, child_scope);
+                    Self::invalidate_path_cache(inner, child_uid);
+                    invalidate_uid_cache = true;
+                }
+                if child_widget_changed {
+                    Self::patch_widget(inner, child_uid, &child_widget);
+                }
+            }
+
+            if old_parent != Some(uid) && child_parent_changed {
+                if let Some(prev_parent_uid) = old_parent {
+                    if let Some(prev_parent) = inner.graph.get_mut(&prev_parent_uid) {
+                        if let Some(pos) = prev_parent
+                            .children
+                            .iter()
+                            .position(|entry| *entry == child_uid)
+                        {
+                            prev_parent.children.remove(pos);
+                            if mark_structure_dirty {
+                                inner.structure_dirty = true;
+                            } else {
+                                inner.dense_stale = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if child_is_new || child_widget_changed {
+                inner.dirty.insert(child_uid);
+                pending.push(child_uid);
+            }
+        }
+
+        // Recheck the `detached` children: remove the ones with nothing alive left in them, and
+        // stop tracking any that got reported or inserted again, moved to another parent, or are already gone.
+        let detached = if inner.detached.is_empty() { Vec::new() } else { inner.detached.remove(&uid).unwrap_or_default() };
+        let mut still_detached = Vec::new();
+        for old_uid in detached {
+            if new_children.contains(&old_uid)
+                || old_children.contains(&old_uid)
+                || !inner.graph.get(&old_uid).is_some_and(|node| node.parent == Some(uid))
+            {
+                continue;
+            }
+            if !Self::remove_subtree_if_dead(inner, old_uid, mark_structure_dirty) {
+                still_detached.push(old_uid);
+            }
+        }
+
+        // A child inserted via insert_child_deep is owned outside the parent's
+        // child vec, so children() never reports it. Losing it here unlinked
+        // its whole subtree from every downward search (and the removal pass
+        // below then deleted it), which silently killed name lookups inside
+        // dynamically hosted subtrees. Keep the live ones linked.
+        let mut unlinked = Vec::new();
+        for old_uid in old_children.iter().copied() {
+            if new_children.iter().any(|entry| *entry == old_uid) {
+                continue;
+            }
+            let keep = inner.graph.get(&old_uid).map_or(false, |node| {
+                node.manual && node.parent == Some(uid) && node.widget.upgrade().is_some()
+            });
+            if keep {
+                new_children.push(old_uid);
+            } else {
+                unlinked.push(old_uid);
+            }
+        }
+
+        // Compare against old_children (the original list before std::mem::take),
+        // NOT node.children which is empty after the take.
+        let parent_children_changed = old_children != new_children;
+
+        if let Some(node) = inner.graph.get_mut(&uid) {
+            node.children = new_children;
+        }
+
+        if parent_children_changed {
+            invalidate_uid_cache = true;
+            if mark_structure_dirty {
+                inner.structure_dirty = true;
+            } else {
+                inner.dense_stale = true;
+            }
+        }
+
+        if invalidate_uid_cache {
+            // Everything folded into this flag happened at or below `uid`'s
+            // children, so `uid` is a barrier when it is itself skip-search:
+            // a recycling list's per-frame row churn ends here instead of
+            // wiping every ancestor's cache (the app-level probes included).
+            Self::invalidate_path_cache_from_child_change(inner, uid);
+        }
+
+        // Remove the children this widget stopped reporting (like dropped list rows), since nothing
+        // else would. Outside a full sync, keep any with something alive in them (see `detached`):
+        // a pooled row may come back, and lookups may still start at content held elsewhere.
+        for unlinked_uid in unlinked {
+            if !inner.graph.get(&unlinked_uid).is_some_and(|node| node.parent == Some(uid)) {
+                continue;
+            }
+            if mark_structure_dirty {
+                Self::remove_subtree(inner, unlinked_uid);
+            } else if !Self::remove_subtree_if_dead(inner, unlinked_uid, false) {
+                still_detached.push(unlinked_uid);
+            }
+        }
+        if !still_detached.is_empty() && inner.graph.contains_key(&uid) {
+            inner.detached.insert(uid, still_detached);
+        }
+
+        true
+    }
+
+    /// Removes the subtree at `uid` if nothing in it is alive, returning whether it's gone.
+    ///
+    /// That's one walk over the subtree, which checks each widget while collecting them.
+    /// Outside a full sync, removing it only marks the dense index as stale, like any other change a lookup makes.
+    fn remove_subtree_if_dead(inner: &mut WidgetTreeInner, uid: WidgetUid, mark_structure_dirty: bool) -> bool {
+        // Most often the subtree's own widget is still alive (like a pooled row), so check that before walking it.
+        if inner.graph.get(&uid).is_some_and(|node| node.widget.upgrade().is_some()) {
+            return false;
+        }
+        let mut subtree = vec![uid];
+        let mut next = 0;
+        while let Some(&node_uid) = subtree.get(next) {
+            next += 1;
+            let Some(node) = inner.graph.get(&node_uid) else {
+                continue;
+            };
+            if node.widget.upgrade().is_some() {
+                return false;
+            }
+            let detached = inner.detached.get(&node_uid).into_iter().flatten();
+            subtree.extend(node.children.iter().chain(detached).copied().filter(|child_uid| {
+                inner.graph.get(child_uid).is_some_and(|child| child.parent == Some(node_uid))
+            }));
+        }
+        for node_uid in subtree {
+            if inner.graph.remove(&node_uid).is_some() {
+                if !inner.dirty.is_empty() {
+                    inner.dirty.remove(&node_uid);
+                }
+                if !inner.detached.is_empty() {
+                    inner.detached.remove(&node_uid);
+                }
+                inner.path_cache.remove(&node_uid);
+            }
+        }
+        if mark_structure_dirty {
+            inner.structure_dirty = true;
+        } else {
+            inner.dense_stale = true;
+        }
+        true
+    }
+
+    /// Tracks a new parentless placeholder at `uid`, sweeping out the dead ones now and then.
+    ///
+    /// A sweep happens once there are twice as many as the last sweep kept (amortized O(1) per
+    /// placeholder), and removes the ones with nothing alive in them. A live but childless widget
+    /// loses its placeholder too, but its next lookup makes a new one.
+    fn note_placeholder_root(inner: &mut WidgetTreeInner, uid: WidgetUid) {
+        let sweep_at = (2 * inner.placeholder_roots_kept).max(MIN_PLACEHOLDER_ROOTS_TO_SWEEP);
+        if inner.placeholder_roots.len() >= sweep_at {
+            let mut roots = std::mem::take(&mut inner.placeholder_roots);
+            let mut seen = HashSet::new();
+            roots.retain(|&root| {
+                // Stop tracking duplicates and anything that's gone or not a parentless placeholder.
+                if !seen.insert(root) {
+                    return false;
+                }
+                let Some(node) = inner.graph.get(&root).filter(|node| node.placeholder && node.parent.is_none()) else {
+                    return false;
+                };
+                // A placeholder has no ref to its widget, but if any child it lists is still alive,
+                // that widget likely is too. This includes children parented elsewhere, like the
+                // fold_button that a FoldHeader's header lists.
+                let lists_live_child = node.children.iter().any(|child_uid| {
+                    inner.graph.get(child_uid).is_some_and(|child| child.widget.upgrade().is_some())
+                });
+                root == inner.root_uid || lists_live_child || !Self::remove_subtree_if_dead(inner, root, true)
+            });
+            inner.placeholder_roots_kept = roots.len();
+            inner.placeholder_roots = roots;
+        }
+        inner.placeholder_roots.push(uid);
+    }
+
+    fn remove_subtree(inner: &mut WidgetTreeInner, uid: WidgetUid) {
+        let Some(node) = inner.graph.remove(&uid) else {
+            return;
+        };
+        if let Some(uids) = inner.by_name.get_mut(&node.name) {
+            uids.retain(|u| *u != uid);
+        }
+        inner.foreign_listers.remove(&uid);
+
+        inner.dirty.remove(&uid);
+        inner.path_cache.remove(&uid);
+        inner.structure_dirty = true;
+        let detached = if inner.detached.is_empty() { Vec::new() } else { inner.detached.remove(&uid).unwrap_or_default() };
+
+        for child_uid in node.children.into_iter().chain(detached) {
+            let has_same_parent = inner
+                .graph
+                .get(&child_uid)
+                .map_or(false, |child| child.parent == Some(uid));
+            if has_same_parent {
+                Self::remove_subtree(inner, child_uid);
+            }
+        }
+    }
+
+    fn rebuild_dense(inner: &mut WidgetTreeInner) {
+        inner.names.clear();
+        inner.subtree_end.clear();
+        inner.scope.clear();
+        inner.nodes.clear();
+        inner.uid_map.clear();
+        inner.path_cache.clear();
+
+        if inner.graph.is_empty() {
+            inner.root_uid = WidgetUid(0);
+            inner.structure_dirty = false;
+            inner.dense_stale = false;
+            return;
+        }
+
+        if inner.root_uid == WidgetUid(0) || !inner.graph.contains_key(&inner.root_uid) {
+            inner.root_uid = inner
+                .graph
+                .iter()
+                .find_map(|(uid, node)| node.parent.is_none().then_some(*uid))
+                .or_else(|| inner.graph.keys().next().copied())
+                .unwrap_or(WidgetUid(0));
+        }
+
+        // Reserve capacity based on graph size to avoid repeated reallocation
+        let cap = inner.graph.len();
+        inner.names.reserve(cap);
+        inner.subtree_end.reserve(cap);
+        inner.scope.reserve(cap);
+        inner.nodes.reserve(cap);
+        inner.uid_map.reserve(cap);
+
+        if inner.root_uid != WidgetUid(0) {
+            Self::build_dense_from_iterative(inner, inner.root_uid, NONE);
+        }
+
+        // Handle orphan roots (nodes with no parent not yet visited)
+        let roots: Vec<WidgetUid> = inner
+            .graph
+            .iter()
+            .filter_map(|(uid, node)| {
+                if node.parent.is_none() && !inner.uid_map.contains_key(uid) {
+                    Some(*uid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for uid in roots {
+            Self::build_dense_from_iterative(inner, uid, NONE);
+        }
+        inner.structure_dirty = false;
+        inner.dense_stale = false;
+    }
+
+    /// Iterative DFS dense-index builder. Reads children by index directly from
+    /// the graph — no Vec cloning, no recursive stack frames.
+    fn build_dense_from_iterative(
+        inner: &mut WidgetTreeInner,
+        root_uid: WidgetUid,
+        root_parent_idx: u32,
+    ) {
+        #[derive(Clone, Copy)]
+        struct DenseFrame {
+            uid: WidgetUid,
+            dense_idx: u32,
+            child_pos: u32,
+            num_children: u32,
+        }
+
+        let mut frames: Vec<DenseFrame> = Vec::with_capacity(64);
+
+        // Emit root node
+        if inner.uid_map.contains_key(&root_uid) {
+            return; // Already visited (cycle guard)
+        }
+        let Some(root_node) = inner.graph.get(&root_uid) else {
+            return;
+        };
+
+        let root_dense_idx = inner.names.len() as u32;
+        inner.names.push(root_node.name);
+        inner.subtree_end.push(root_dense_idx + 1); // placeholder
+        inner.scope.push(root_node.scope);
+        inner.nodes.push(WidgetTreeNode {
+            uid: root_uid,
+            widget: root_node.widget.clone(),
+            parent: root_parent_idx,
+        });
+        inner.uid_map.insert(root_uid, root_dense_idx);
+
+        let root_num_children = root_node.children.len() as u32;
+        frames.push(DenseFrame {
+            uid: root_uid,
+            dense_idx: root_dense_idx,
+            child_pos: 0,
+            num_children: root_num_children,
+        });
+
+        while let Some(frame) = frames.last_mut() {
+            if frame.child_pos >= frame.num_children {
+                // All children processed — fixup subtree_end
+                let dense_idx = frame.dense_idx;
+                inner.subtree_end[dense_idx as usize] = inner.names.len() as u32;
+                frames.pop();
+                continue;
+            }
+
+            // Get next child uid from the graph (borrow graph, read child at position)
+            let child_pos = frame.child_pos as usize;
+            frame.child_pos += 1;
+            let parent_dense_idx = frame.dense_idx;
+            let parent_uid = frame.uid;
+
+            let child_uid = match inner.graph.get(&parent_uid) {
+                Some(parent_node) if child_pos < parent_node.children.len() => {
+                    parent_node.children[child_pos]
+                }
+                _ => continue, // parent removed or child index out of bounds
+            };
+
+            // Skip if already visited (cycle guard) or not in graph
+            if inner.uid_map.contains_key(&child_uid) {
+                continue;
+            }
+            let Some(child_node) = inner.graph.get(&child_uid) else {
+                continue;
+            };
+
+            // Emit child node
+            let child_dense_idx = inner.names.len() as u32;
+            inner.names.push(child_node.name);
+            inner.subtree_end.push(child_dense_idx + 1); // placeholder
+            inner.scope.push(child_node.scope);
+            inner.nodes.push(WidgetTreeNode {
+                uid: child_uid,
+                widget: child_node.widget.clone(),
+                parent: parent_dense_idx,
+            });
+            inner.uid_map.insert(child_uid, child_dense_idx);
+
+            let child_num_children = child_node.children.len() as u32;
+            if child_num_children > 0 {
+                frames.push(DenseFrame {
+                    uid: child_uid,
+                    dense_idx: child_dense_idx,
+                    child_pos: 0,
+                    num_children: child_num_children,
+                });
+            } else {
+                // Leaf node — subtree_end is already correct (idx + 1)
+            }
+        }
+    }
+
+    pub fn find_within_from_borrowed<F>(
+        &self,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+        mut visit: F,
+    ) -> WidgetRef
+    where
+        F: FnMut(&mut dyn FnMut(LiveId, WidgetRef)),
+    {
+        self.refresh_from_borrowed_dyn(root_uid, &mut visit);
+        self.find_within(root_uid, path)
+    }
+
+    pub fn find_all_within_from_borrowed<F>(
+        &self,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+        mut visit: F,
+    ) -> Vec<WidgetRef>
+    where
+        F: FnMut(&mut dyn FnMut(LiveId, WidgetRef)),
+    {
+        self.refresh_from_borrowed_dyn(root_uid, &mut visit);
+        self.find_all_within(root_uid, path)
+    }
+
+    pub fn find_flood_from_borrowed<F>(
+        &self,
+        origin_uid: WidgetUid,
+        path: &[LiveId],
+        mut visit: F,
+    ) -> WidgetRef
+    where
+        F: FnMut(&mut dyn FnMut(LiveId, WidgetRef)),
+    {
+        self.refresh_from_borrowed_dyn(origin_uid, &mut visit);
+        self.find_flood(origin_uid, path)
+    }
+
+    pub fn find_all_flood_from_borrowed<F>(
+        &self,
+        origin_uid: WidgetUid,
+        path: &[LiveId],
+        mut visit: F,
+    ) -> Vec<WidgetRef>
+    where
+        F: FnMut(&mut dyn FnMut(LiveId, WidgetRef)),
+    {
+        self.refresh_from_borrowed_dyn(origin_uid, &mut visit);
+        self.find_all_flood(origin_uid, path)
+    }
+
+    /// Find a widget within the subtree of `root_uid` by matching a path of LiveIds.
+    /// Returns the shallowest (first) match in the tree.
+    pub fn find_within(&self, root_uid: WidgetUid, path: &[LiveId]) -> WidgetRef {
+        let mut inner = self.inner.borrow_mut();
+        if path.is_empty() || root_uid == WidgetUid(0) || !inner.graph.contains_key(&root_uid) {
+            return WidgetRef::empty();
+        }
+        if !inner.dirty.is_empty() {
+            Self::flush_dirty(&mut inner, false);
+        }
+        if let Some((widget, lookups)) = Self::cached_first_widget(&inner, root_uid, path) {
+            inner.stats.lookups += lookups;
+            return widget.unwrap_or_else(WidgetRef::empty);
+        }
+        let results = Self::find_all_within_cached_graph(&mut inner, root_uid, path);
+        results.into_iter().next().unwrap_or_else(WidgetRef::empty)
+    }
+
+    /// Find all widgets matching path within the subtree of `root_uid`.
+    pub fn find_all_within(&self, root_uid: WidgetUid, path: &[LiveId]) -> Vec<WidgetRef> {
+        let mut inner = self.inner.borrow_mut();
+        Self::find_all_within_cached_graph(&mut inner, root_uid, path)
+    }
+
+    pub fn find_all_anywhere_including_skipped(&self, path: &[LiveId]) -> Vec<WidgetRef> {
+        let mut results = Vec::new();
+        if path.is_empty() {
+            return results;
+        }
+
+        self.sync_dirty();
+
+        let mut inner = self.inner.borrow_mut();
+        let mut roots = Vec::new();
+        if inner.root_uid != WidgetUid(0) && inner.graph.contains_key(&inner.root_uid) {
+            roots.push(inner.root_uid);
+        }
+        for (&uid, node) in inner.graph.iter() {
+            if node.parent.is_none() && !roots.iter().any(|entry| *entry == uid) {
+                roots.push(uid);
+            }
+        }
+
+        let mut seen = HashSet::new();
+        for root_uid in roots {
+            let mut root_results = Vec::new();
+            Self::collect_within_graph_with_skip(
+                &mut inner,
+                root_uid,
+                path,
+                None,
+                &mut root_results,
+                false,
+                None,
+            );
+            for widget in root_results {
+                let uid = widget.widget_uid();
+                if uid != WidgetUid(0) && seen.insert(uid) {
+                    results.push(widget);
+                }
+            }
+        }
+        results
+    }
+
+    /// Path-lookup counters since process start. `walk_nodes` staying flat
+    /// across repeated lookups is the property that keeps a per-frame UI
+    /// sync cheap: a warm cache answers with a hash probe, a cold one walks
+    /// every node under the entrypoint.
+    pub fn stats(&self) -> WidgetTreeStats {
+        self.inner.borrow().stats
+    }
+
+    /// Look up a widget by its UID.
+    pub fn widget(&self, uid: WidgetUid) -> WidgetRef {
+        let mut inner = self.inner.borrow_mut();
+        if !Self::ensure_node_cached(&mut inner, uid) {
+            return WidgetRef::empty();
+        }
+        let upgraded = inner.graph.get(&uid).and_then(|node| node.widget.upgrade());
+        if let Some(widget) = upgraded {
+            widget
+        } else {
+            Self::discard_stale_cache_item(&mut inner, uid);
+            WidgetRef::empty()
+        }
+    }
+
+    /// Build the path of LiveIds from root to the node with the given UID.
+    /// Stamp the plane a widget drew on (exploded view only — see
+    /// `WidgetRef::draw_walk`).
+    pub fn note_nesting_depth(&self, uid: WidgetUid, depth: usize) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(node) = inner.graph.get_mut(&uid) {
+            node.nesting_depth = depth as u32;
+        }
+    }
+
+    pub fn parent_of(&self, uid: WidgetUid) -> Option<WidgetUid> {
+        self.inner.borrow().graph.get(&uid).and_then(|n| n.parent)
+    }
+
+    pub fn name_of(&self, uid: WidgetUid) -> Option<LiveId> {
+        self.inner.borrow().graph.get(&uid).map(|n| n.name)
+    }
+
+    /// The names that write `uid` unambiguously: its own scope ancestors, outermost first,
+    /// then its own name ("show.chat" for `chat` inside scope `show`).
+    pub fn scope_path(&self, uid: WidgetUid) -> Vec<LiveId> {
+        let inner = self.inner.borrow();
+        let mut names = Vec::new();
+        let mut cur = Some(uid);
+        let mut first = true;
+        for _ in 0..=inner.graph.len() {
+            let Some(node) = cur.and_then(|c| inner.graph.get(&c)) else { break };
+            if first || node.scope {
+                names.push(node.name);
+            }
+            first = false;
+            cur = node.parent;
+        }
+        names.reverse();
+        names
+    }
+
+    /// The plane a widget last drew on while the exploded view was up.
+    pub fn nesting_depth(&self, uid: WidgetUid) -> Option<usize> {
+        let inner = self.inner.borrow();
+        inner
+            .graph
+            .get(&uid)
+            .filter(|n| n.nesting_depth > 0)
+            .map(|n| n.nesting_depth as usize)
+    }
+
+    pub fn path_to(&self, uid: WidgetUid) -> Vec<LiveId> {
+        self.sync_dirty();
+        let mut inner = self.inner.borrow_mut();
+        if !Self::ensure_node_cached(&mut inner, uid) {
+            return Vec::new();
+        }
+
+        let mut path = Vec::new();
+        let mut current = Some(uid);
+        while let Some(cur_uid) = current {
+            let Some(node) = inner.graph.get(&cur_uid) else {
+                break;
+            };
+            path.push(node.name);
+            current = node.parent;
+        }
+        path.reverse();
+        path
+    }
+
+    /// Flood-fill search: find a widget by path starting from `origin_uid`,
+    /// expanding outward through parent links.
+    pub fn find_flood(&self, origin_uid: WidgetUid, path: &[LiveId]) -> WidgetRef {
+        if path.is_empty() {
+            return WidgetRef::empty();
+        }
+
+        self.sync_dirty();
+
+        let mut inner = self.inner.borrow_mut();
+        let mut visited_roots = HashSet::new();
+
+        if inner.graph.contains_key(&origin_uid) {
+            let mut current_uid = origin_uid;
+            let mut exclude_subtree = None;
+            loop {
+                visited_roots.insert(current_uid);
+                let found = Self::find_within_graph(&mut inner, current_uid, path, exclude_subtree);
+                if !found.is_empty() {
+                    return found;
+                }
+
+                let parent_uid = inner.graph.get(&current_uid).and_then(|node| node.parent);
+                let Some(parent_uid) = parent_uid else {
+                    break;
+                };
+                exclude_subtree = Some(current_uid);
+                current_uid = parent_uid;
+            }
+        }
+
+        let mut roots = Vec::new();
+        if inner.root_uid != WidgetUid(0) && inner.graph.contains_key(&inner.root_uid) {
+            roots.push(inner.root_uid);
+        }
+        for (&uid, node) in inner.graph.iter() {
+            if node.parent.is_none() && !roots.iter().any(|entry| *entry == uid) {
+                roots.push(uid);
+            }
+        }
+
+        for root_uid in roots {
+            if visited_roots.contains(&root_uid) {
+                continue;
+            }
+            let found = Self::find_within_graph(&mut inner, root_uid, path, None);
+            if !found.is_empty() {
+                return found;
+            }
+        }
+
+        WidgetRef::empty()
+    }
+
+    /// Flood-fill search returning all matches, expanding outward from `origin_uid`.
+    pub fn find_all_flood(&self, origin_uid: WidgetUid, path: &[LiveId]) -> Vec<WidgetRef> {
+        let mut results = Vec::new();
+        if path.is_empty() {
+            return results;
+        }
+
+        self.sync_dirty();
+
+        let mut inner = self.inner.borrow_mut();
+        let mut visited_roots = HashSet::new();
+
+        if inner.graph.contains_key(&origin_uid) {
+            let mut current_uid = origin_uid;
+            let mut exclude_subtree = None;
+            loop {
+                visited_roots.insert(current_uid);
+                Self::collect_within_graph(
+                    &mut inner,
+                    current_uid,
+                    path,
+                    exclude_subtree,
+                    &mut results,
+                );
+
+                let parent_uid = inner.graph.get(&current_uid).and_then(|node| node.parent);
+                let Some(parent_uid) = parent_uid else {
+                    break;
+                };
+                exclude_subtree = Some(current_uid);
+                current_uid = parent_uid;
+            }
+        }
+
+        let mut roots = Vec::new();
+        if inner.root_uid != WidgetUid(0) && inner.graph.contains_key(&inner.root_uid) {
+            roots.push(inner.root_uid);
+        }
+        for (&uid, node) in inner.graph.iter() {
+            if node.parent.is_none() && !roots.iter().any(|entry| *entry == uid) {
+                roots.push(uid);
+            }
+        }
+
+        for root_uid in roots {
+            if visited_roots.contains(&root_uid) {
+                continue;
+            }
+            Self::collect_within_graph(&mut inner, root_uid, path, None, &mut results);
+        }
+
+        results
+    }
+
+    /// Check if the tree is empty (no indexed nodes yet).
+    pub fn is_empty(&self) -> bool {
+        self.sync_dirty();
+        self.inner.borrow().names.is_empty()
+    }
+
+    pub fn root_uid(&self) -> WidgetUid {
+        self.sync_dirty();
+        self.inner.borrow().root_uid
+    }
+
+
+
+    /// Named ancestor path without borrowing widgets that are currently drawing.
+    pub(crate) fn semantic_path(&self, uid: WidgetUid, window: WidgetUid) -> String {
+        let inner = self.inner.borrow();
+        let mut names = Vec::new();
+        let mut current = Some(uid);
+        while let Some(id) = current {
+            if id == window { break; }
+            let Some(node) = inner.graph.get(&id) else { break };
+            if node.name != LiveId(0) { names.push(node.name); }
+            current = node.parent;
+        }
+        names.into_iter().rev().map(live_id_token).collect::<Vec<_>>().join(".")
+    }
+
+
+
+    /// The window-relative id path (named widgets only) and
+    /// the type of each widget in `uids` (frame capture attribution).
+    pub fn uid_paths(&self, cx: &Cx, uids: &[u64]) -> Vec<(u64, String, String)> {
+        if uids.is_empty() {
+            return Vec::new();
+        }
+        self.sync_dirty();
+        let inner = self.inner.borrow();
+        let registry = cx.components.get::<WidgetRegistry>();
+        let mut paths: Vec<String> = Vec::with_capacity(inner.nodes.len());
+        let mut out = Vec::new();
+        for (index, node) in inner.nodes.iter().enumerate() {
+            let parent = if node.parent == NONE { String::new() } else { paths[node.parent as usize].clone() };
+            let widget = node.widget.upgrade();
+            let name = inner.names[index];
+            let path = if widget.as_ref().is_some_and(|w| w.borrow::<Window>().is_some()) {
+                String::new()
+            } else if name != LiveId(0) {
+                if parent.is_empty() { live_id_token(name) } else { format!("{parent}.{}", live_id_token(name)) }
+            } else {
+                parent
+            };
+            if uids.contains(&node.uid.0) {
+                let kind = widget
+                    .as_ref()
+                    .and_then(|w| w.widget_type_id())
+                    .and_then(|t| registry.map.get(&t).map(|(info, _)| live_id_token(info.name)))
+                    .unwrap_or_else(|| "-".into());
+                out.push((node.uid.0, path.clone(), kind));
+            }
+            paths.push(path);
+        }
+        out
+    }
+
+
+
+    /// The live widget hierarchy flattened depth-first for the tweaker's
+    /// tree tab: (uid, name, type, depth). Every alive node appears; depth
+    /// is the tree distance from its window root. A row whose widget is an
+    /// inspector says so, read from its type rather than its name, so the
+    /// tree tab can leave every inspector out without guessing.
+    pub fn flat_tree(&self, cx: &Cx) -> Vec<FlatTreeRow> {
+        self.sync_dirty();
+        let inner = self.inner.borrow();
+        let widget_type_names = widget_type_names(cx);
+        let n = inner.nodes.len();
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut roots: Vec<usize> = Vec::new();
+        for (index, node) in inner.nodes.iter().enumerate() {
+            let parent = node.parent as usize;
+            if parent < n && parent != index {
+                children[parent].push(index);
+            } else {
+                roots.push(index);
+            }
+        }
+        let mut out = Vec::new();
+        let mut stack: Vec<(usize, u32)> = roots.iter().rev().map(|r| (*r, 0)).collect();
+        while let Some((index, depth)) = stack.pop() {
+            let node = &inner.nodes[index];
+            let Some(widget) = node.widget.upgrade() else {
+                continue;
+            };
+            let name = inner.names[index];
+            let type_id = widget.widget_type_id();
+            let ty = type_id
+                .and_then(|type_id| widget_type_names.get(&type_id).copied())
+                .unwrap_or(LiveId(0));
+            out.push(FlatTreeRow {
+                uid: widget.widget_uid().0,
+                name: live_id_token(name),
+                ty: live_id_token(ty),
+                depth,
+                has_children: !children[index].is_empty(),
+                inspector: WidgetHooks::is_inspector(cx, type_id),
+            });
+            for child in children[index].iter().rev() {
+                stack.push((*child, depth + 1));
+            }
+        }
+        out
+    }
+
+
+}
+
+// ============================================================================
+// WidgetTreeState
+// ============================================================================
+
+#[derive(Default)]
+pub struct WidgetTreeState {
+    pub tree: WidgetTree,
+}
+
+impl WidgetTreeState {
+    fn get_or_init(cx: &mut Cx) -> &mut WidgetTreeState {
+        if cx.widget_tree_ptr.is_null() {
+            let boxed = Box::new(WidgetTreeState::default());
+            cx.widget_tree_ptr = Box::into_raw(boxed) as *mut ();
+        }
+        unsafe { &mut *(cx.widget_tree_ptr as *mut WidgetTreeState) }
+    }
+}
+
+// ============================================================================
+// CxWidgetExt: extension trait on Cx for widget tree operations
+// ============================================================================
+
+pub trait CxWidgetExt {
+    fn widget_tree(&self) -> &WidgetTree;
+    /// Inspect current branches eligible for interaction, including window focus.
+    /// Call outside widget dispatch/draw, while the UI root is unborrowed;
+    /// this does not use cached geometry or tree indices.
+    /// Repeated queries for the same widget reuse one weak path, checking current
+    /// eligibility and child membership at each ancestor. A new or changed path
+    /// falls back to a live search.
+    /// Warm queries enumerate only children along that path; worst-case searches
+    /// remain linear in the active hierarchy.
+    fn widget_is_active(&self, uid: WidgetUid) -> bool;
+    fn widget_tree_mark_dirty(&mut self, uid: WidgetUid);
+    fn widget_tree_insert_child(&mut self, parent_uid: WidgetUid, name: LiveId, widget: WidgetRef);
+    fn widget_tree_insert_child_deep(
+        &mut self,
+        parent_uid: WidgetUid,
+        name: LiveId,
+        widget: WidgetRef,
+    );
+}
+
+fn get_or_init_state(cx: &mut Cx) -> &mut WidgetTreeState {
+    WidgetTreeState::get_or_init(cx)
+}
+
+fn widget_uid_paths_callback(cx: &Cx, uids: &[u64]) -> Vec<(u64, String, String)> {
+    cx.widget_tree().uid_paths(cx, uids)
+}
+
+/// One row of the flattened widget hierarchy (`WidgetTree::flat_tree`).
+#[derive(Clone, Debug)]
+pub struct FlatTreeRow {
+    pub uid: u64,
+    pub name: String,
+    pub ty: String,
+    pub depth: u32,
+    pub has_children: bool,
+    /// The widget is an inspector (a `Tweaker`). False when its type could
+    /// not be read, which is the case while it is borrowed.
+    pub inspector: bool,
+}
+
+#[derive(Default)]
+struct UiRoot {
+    widget: WidgetWeakRef,
+    // Cache a route, never visibility: every query validates the live path.
+    active_path: RefCell<Vec<WidgetWeakRef>>,
+}
+
+/// Forget the root a previous case on a pooled test context drew
+/// (`test_cx`, which the family crates' tests use too).
+pub(crate) fn reset_for_test(cx: &mut Cx) {
+    // `set_global` keeps an existing global; this one must be replaced.
+    *cx.global::<UiRoot>() = UiRoot::default();
+}
+
+fn cancel_scope_resolver(cx: &Cx, candidate: &dyn Fn(u64) -> Option<u64>) -> Option<u64> {
+    cx.get_global_ref::<UiRoot>()?.widget.upgrade()?.resolve_cancel_scope(candidate)
+}
+
+pub fn set_ui_root(cx: &mut Cx, ui: &WidgetRef) {
+    let state = get_or_init_state(cx);
+    state.tree.set_root_widget(ui.clone());
+    *cx.global::<UiRoot>() = UiRoot { widget: ui.downgrade(), ..Default::default() };
+    cx.cancel_scope_resolver = Some(cancel_scope_resolver);
+    cx.widget_uid_paths_callback = Some(widget_uid_paths_callback);
+    if let Some(tweaker) = WidgetHooks::tweaker(cx) {
+        cx.tweak_callback = Some(tweaker.tweak_callback);
+    }
+    let root_uid = ui.widget_uid();
+    update_global_ui_handle(cx, root_uid);
+}
+
+impl CxWidgetExt for Cx {
+    fn widget_is_active(&self, uid: WidgetUid) -> bool {
+        let Some(ui) = self.get_global_ref::<UiRoot>() else { return false; };
+        let Some(root) = ui.widget.upgrade() else { return false; };
+        let mut uncached = Vec::new();
+        let mut cached = ui.active_path.try_borrow_mut().ok();
+        let path = cached.as_deref_mut().unwrap_or(&mut uncached);
+        if root.active_path_is_valid(uid, path) {
+            return true;
+        }
+        path.clear();
+        root.find_active_widget(uid, path)
+    }
+
+    fn widget_tree(&self) -> &WidgetTree {
+        if self.widget_tree_ptr.is_null() {
+            static EMPTY: std::sync::OnceLock<WidgetTree> = std::sync::OnceLock::new();
+            return EMPTY.get_or_init(WidgetTree::default);
+        }
+        let state = unsafe { &*(self.widget_tree_ptr as *const WidgetTreeState) };
+        &state.tree
+    }
+
+    fn widget_tree_mark_dirty(&mut self, uid: WidgetUid) {
+        let state = get_or_init_state(self);
+        state.tree.mark_dirty(uid);
+    }
+
+    fn widget_tree_insert_child(&mut self, parent_uid: WidgetUid, name: LiveId, widget: WidgetRef) {
+        let state = get_or_init_state(self);
+        state.tree.insert_child(parent_uid, name, widget);
+    }
+
+    fn widget_tree_insert_child_deep(
+        &mut self,
+        parent_uid: WidgetUid,
+        name: LiveId,
+        widget: WidgetRef,
+    ) {
+        let state = get_or_init_state(self);
+        state.tree.insert_child_deep(parent_uid, name, widget);
+    }
+}
+
+impl<'a, 'b> CxWidgetExt for Cx2d<'a, 'b> {
+    fn widget_is_active(&self, uid: WidgetUid) -> bool {
+        { let cx: &Cx = self; cx.widget_is_active(uid) }
+    }
+
+    fn widget_tree(&self) -> &WidgetTree {
+        let cx: &Cx = self;
+        if cx.widget_tree_ptr.is_null() {
+            static EMPTY: std::sync::OnceLock<WidgetTree> = std::sync::OnceLock::new();
+            return EMPTY.get_or_init(WidgetTree::default);
+        }
+        let state = unsafe { &*(cx.widget_tree_ptr as *const WidgetTreeState) };
+        &state.tree
+    }
+
+    fn widget_tree_mark_dirty(&mut self, uid: WidgetUid) {
+        let cx: &mut Cx = self;
+        let state = get_or_init_state(cx);
+        state.tree.mark_dirty(uid);
+    }
+
+    fn widget_tree_insert_child(&mut self, parent_uid: WidgetUid, name: LiveId, widget: WidgetRef) {
+        let cx: &mut Cx = self;
+        let state = get_or_init_state(cx);
+        state.tree.insert_child(parent_uid, name, widget);
+    }
+
+    fn widget_tree_insert_child_deep(
+        &mut self,
+        parent_uid: WidgetUid,
+        name: LiveId,
+        widget: WidgetRef,
+    ) {
+        let cx: &mut Cx = self;
+        let state = get_or_init_state(cx);
+        state.tree.insert_child_deep(parent_uid, name, widget);
+    }
+}
+
+impl<'a, 'b> CxWidgetExt for Cx3d<'a, 'b> {
+    fn widget_is_active(&self, uid: WidgetUid) -> bool {
+        { let cx: &Cx = self; cx.widget_is_active(uid) }
+    }
+
+    fn widget_tree(&self) -> &WidgetTree {
+        let cx: &Cx = self;
+        if cx.widget_tree_ptr.is_null() {
+            static EMPTY: std::sync::OnceLock<WidgetTree> = std::sync::OnceLock::new();
+            return EMPTY.get_or_init(WidgetTree::default);
+        }
+        let state = unsafe { &*(cx.widget_tree_ptr as *const WidgetTreeState) };
+        &state.tree
+    }
+
+    fn widget_tree_mark_dirty(&mut self, uid: WidgetUid) {
+        let cx: &mut Cx = self;
+        let state = get_or_init_state(cx);
+        state.tree.mark_dirty(uid);
+    }
+
+    fn widget_tree_insert_child(&mut self, parent_uid: WidgetUid, name: LiveId, widget: WidgetRef) {
+        let cx: &mut Cx = self;
+        let state = get_or_init_state(cx);
+        state.tree.insert_child(parent_uid, name, widget);
+    }
+
+    fn widget_tree_insert_child_deep(
+        &mut self,
+        parent_uid: WidgetUid,
+        name: LiveId,
+        widget: WidgetRef,
+    ) {
+        let cx: &mut Cx = self;
+        let state = get_or_init_state(cx);
+        state.tree.insert_child_deep(parent_uid, name, widget);
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widget::{DrawStepApi, WidgetRef, WidgetUid};
+    use crate::{DrawStep, Widget, WidgetNode};
+
+    fn snapshot_area(cx: &mut Cx) -> (DrawList, Area) {
+        let list = DrawList::new(cx);
+        let draw_list = &mut cx.draw_lists[list.id()];
+        draw_list.redraw_id = 1;
+        draw_list.rect_areas.push(CxRectArea {
+            rect: Rect { pos: dvec2(32768.0, 32768.0), size: dvec2(200.0, 100.0) },
+            draw_clip: (dvec2(32788.0, 32778.0), dvec2(32928.0, 32848.0)),
+        });
+        let area = Area::Rect(RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 1 });
+        (list, area)
+    }
+
+    fn snapshot_camera() -> Mat4f {
+        let mut matrix = Mat4f::identity();
+        matrix.v[0] = 2.0;
+        matrix.v[5] = 2.0;
+        matrix.v[12] = -65000.0;
+        matrix.v[13] = -64900.0;
+        matrix
+    }
+
+    #[test]
+    fn snapshot_rect_applies_zoom_and_translation_after_local_clipping() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (list, area) = snapshot_area(&mut cx);
+        list.set_view_transform_self_only(&mut cx, &snapshot_camera());
+        assert_eq!(widget_snapshot_rect(&area, &cx), Some(Rect {
+            pos: dvec2(576.0, 656.0), size: dvec2(280.0, 140.0),
+        }));
+        // Canvas hit-testing still receives the original local rectangle.
+        assert_eq!(area.clipped_rect(&cx), Rect {
+            pos: dvec2(32788.0, 32778.0), size: dvec2(140.0, 70.0),
+        });
+    }
+
+    #[test]
+    fn snapshot_rect_identity_preserves_clipping_and_stale_visibility() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (list, area) = snapshot_area(&mut cx);
+        assert_eq!(widget_snapshot_rect(&area, &cx), widget_screen_rect(&area, &cx));
+        cx.draw_lists[list.id()].redraw_id = 2;
+        assert_eq!(widget_snapshot_rect(&area, &cx), None);
+    }
+
+    #[test]
+    fn snapshot_rect_uses_final_child_uniform_without_composing_its_parent() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let parent = DrawList::new(&mut cx);
+        let (child, area) = snapshot_area(&mut cx);
+        cx.draw_lists[child.id()].codeflow_parent_id = Some(parent.id());
+        // Draw-list transforms are absolute. Traversing this parent and
+        // multiplying again would send the reported child off the window.
+        parent.set_view_transform_self_only(&mut cx, &snapshot_camera());
+        child.set_view_transform_self_only(&mut cx, &snapshot_camera());
+        assert_eq!(widget_snapshot_rect(&area, &cx), Some(Rect {
+            pos: dvec2(576.0, 656.0), size: dvec2(280.0, 140.0),
+        }));
+    }
+
+    // Minimal Widget impl for testing
+    struct TestWidget {
+        uid: WidgetUid,
+        children: Vec<(LiveId, WidgetRef)>,
+        scope: bool,
+    }
+
+    impl ScriptApply for TestWidget {
+        fn script_apply(
+            &mut self,
+            _vm: &mut ScriptVm,
+            _apply: &Apply,
+            _scope: &mut Scope,
+            _value: ScriptValue,
+        ) {
+        }
+    }
+
+    impl WidgetNode for TestWidget {
+        fn widget_uid(&self) -> WidgetUid {
+            self.uid
+        }
+        fn children(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
+            for (name, child) in &self.children {
+                visit(*name, child.clone());
+            }
+        }
+        fn search_scope(&self) -> bool {
+            self.scope
+        }
+        fn walk(&mut self, _cx: &mut Cx) -> Walk {
+            Walk::default()
+        }
+        fn area(&self) -> Area {
+            Area::Empty
+        }
+        fn redraw(&mut self, _cx: &mut Cx) {}
+    }
+
+    impl Widget for TestWidget {
+        fn draw_walk(&mut self, _cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
+            DrawStep::done()
+        }
+    }
+
+    fn make_widget(uid: WidgetUid, children: Vec<(LiveId, WidgetRef)>) -> WidgetRef {
+        WidgetRef::new_with_inner(Box::new(TestWidget {
+            uid,
+            children,
+            scope: false,
+        }))
+    }
+
+    fn make_widget_skip(uid: WidgetUid, children: Vec<(LiveId, WidgetRef)>) -> WidgetRef {
+        WidgetRef::new_with_inner(Box::new(TestWidget {
+            uid,
+            children,
+            scope: true,
+        }))
+    }
+
+    struct DynamicTestWidget {
+        uid: WidgetUid,
+        children: std::rc::Rc<std::cell::RefCell<Vec<(LiveId, WidgetRef)>>>,
+        scope: bool,
+    }
+
+    impl ScriptApply for DynamicTestWidget {
+        fn script_apply(
+            &mut self,
+            _vm: &mut ScriptVm,
+            _apply: &Apply,
+            _scope: &mut Scope,
+            _value: ScriptValue,
+        ) {
+        }
+    }
+
+    impl WidgetNode for DynamicTestWidget {
+        fn widget_uid(&self) -> WidgetUid {
+            self.uid
+        }
+
+        fn search_scope(&self) -> bool {
+            self.scope
+        }
+
+        fn children(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
+            for (name, child) in self.children.borrow().iter() {
+                visit(*name, child.clone());
+            }
+        }
+
+        fn walk(&mut self, _cx: &mut Cx) -> Walk {
+            Walk::default()
+        }
+
+        fn area(&self) -> Area {
+            Area::Empty
+        }
+
+        fn redraw(&mut self, _cx: &mut Cx) {}
+    }
+
+    impl Widget for DynamicTestWidget {
+        fn draw_walk(&mut self, _cx: &mut Cx2d, _scope: &mut Scope, _walk: Walk) -> DrawStep {
+            DrawStep::done()
+        }
+    }
+
+    fn make_dynamic_widget(
+        uid: WidgetUid,
+        children: std::rc::Rc<std::cell::RefCell<Vec<(LiveId, WidgetRef)>>>,
+    ) -> WidgetRef {
+        WidgetRef::new_with_inner(Box::new(DynamicTestWidget {
+            uid,
+            children,
+            scope: false,
+        }))
+    }
+
+    fn make_dynamic_widget_skip(
+        uid: WidgetUid,
+        children: std::rc::Rc<std::cell::RefCell<Vec<(LiveId, WidgetRef)>>>,
+    ) -> WidgetRef {
+        WidgetRef::new_with_inner(Box::new(DynamicTestWidget {
+            uid,
+            children,
+            scope: true,
+        }))
+    }
+
+    fn name(s: &str) -> LiveId {
+        LiveId::from_str_lc(s)
+    }
+
+    fn stabilize_graph_cache(tree: &WidgetTree) {
+        let mut inner = tree.inner.borrow_mut();
+        inner.dirty.clear();
+        inner.structure_dirty = false;
+        inner.names.clear();
+        inner.subtree_end.clear();
+        inner.scope.clear();
+        inner.nodes.clear();
+        inner.uid_map.clear();
+        inner.path_cache.clear();
+    }
+
+    fn cached_path_entry<'a>(
+        inner: &'a WidgetTreeInner,
+        root_uid: WidgetUid,
+        path: &[LiveId],
+    ) -> Option<&'a PathCacheEntry> {
+        let hash = WidgetTree::path_hash(path);
+        inner
+            .path_cache
+            .get(&root_uid)
+            .and_then(|root_cache| root_cache.get(&hash))
+            .and_then(|bucket| bucket.iter().find(|entry| entry.path.as_slice() == path))
+    }
+
+    // ------------------------------------------------------------------
+    // Basic tree construction and lookup
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_observe_and_find_single_node() {
+        // A search never matches its own root (`collect_within_graph_with_skip`
+        // skips the `is_root` frame), so the node is found from its parent.
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let uid = WidgetUid::new();
+        let w = make_widget(uid, vec![]);
+        let root = make_widget(root_uid, vec![(name("node"), w.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(uid, name("node"), w.clone(), Some(root_uid));
+
+        // find_within searches WITHIN a subtree, so a node never answers to
+        // its own name from inside itself - the walk skips the root it was
+        // handed. Asking the node for itself finds nothing.
+        assert!(tree.find_within(uid, &[name("node")]).is_empty());
+
+        // Asking its parent does.
+        let found = tree.find_within(root_uid, &[name("node")]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), uid);
+        assert!(tree.find_within(root_uid, &[name("root")]).is_empty());
+    }
+
+    /// A lookup made while its match is mutably borrowed (a list's draw step asking for
+    /// itself by name: `self.portal_list(cx, ids!(rooms))` under `item.borrow_mut::<PortalList>()`)
+    /// finds the widget but cannot read its uid. It must not leave a cached MISS behind:
+    /// SBXPLAY's JOIN row never fired because every later `portal_list(rooms)` answered empty.
+    #[test]
+    fn test_lookup_of_a_borrowed_widget_caches_no_miss() {
+        for scope in [true, false] {
+            let tree = WidgetTree::default();
+            let root_uid = WidgetUid::new();
+            let box_uid = WidgetUid::new();
+            let list_uid = WidgetUid::new();
+            let list = if scope { make_widget_skip(list_uid, vec![]) } else { make_widget(list_uid, vec![]) };
+            let boxed = make_widget(box_uid, vec![(name("rooms"), list.clone())]);
+            let root = make_widget(root_uid, vec![(name("rooms_box"), boxed.clone())]);
+            tree.observe_node(root_uid, name("root"), root.clone(), None);
+            tree.observe_node(box_uid, name("rooms_box"), boxed.clone(), Some(root_uid));
+            tree.observe_node(list_uid, name("rooms"), list.clone(), Some(box_uid));
+            stabilize_graph_cache(&tree);
+            {
+                let _drawing = list.borrow_mut::<TestWidget>().expect("the list is a TestWidget");
+                let found = tree.find_within(root_uid, &[name("rooms")]);
+                assert!(!found.is_empty(), "found while borrowed (scope {scope})");
+            }
+            let found = tree.find_within(root_uid, &[name("rooms")]);
+            assert_eq!(found.widget_uid(), list_uid, "found after the borrow ends (scope {scope})");
+            assert_eq!(tree.find_all_within(root_uid, &[name("rooms")]).len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_observe_parent_child() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+        let child = make_widget(child_uid, vec![]);
+        let parent = make_widget(parent_uid, vec![(name("child"), child.clone())]);
+
+        tree.observe_node(parent_uid, name("parent"), parent.clone(), None);
+        tree.observe_node(child_uid, name("child"), child.clone(), Some(parent_uid));
+
+        let found = tree.find_within(parent_uid, &[name("child")]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), child_uid);
+    }
+
+    #[test]
+    fn test_find_within_returns_empty_for_missing() {
+        let tree = WidgetTree::default();
+        let uid = WidgetUid::new();
+        let w = make_widget(uid, vec![]);
+        tree.observe_node(uid, name("root"), w, None);
+        let found = tree.find_within(uid, &[name("nonexistent")]);
+        assert!(found.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // insert_child
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_insert_child() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+        let parent = make_widget(parent_uid, vec![]);
+        let child = make_widget(child_uid, vec![]);
+
+        tree.observe_node(parent_uid, name("parent"), parent.clone(), None);
+        tree.insert_child(parent_uid, name("child"), child.clone());
+        stabilize_graph_cache(&tree);
+
+        let found = tree.find_within(parent_uid, &[name("child")]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), child_uid);
+    }
+
+    // ------------------------------------------------------------------
+    // Deep tree
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_deep_tree_path_lookup() {
+        let tree = WidgetTree::default();
+        let uids: Vec<WidgetUid> = (0..5).map(|_| WidgetUid::new()).collect();
+        let names_list = ["a", "b", "c", "d", "e"];
+
+        // Build chain: a -> b -> c -> d -> e
+        let widgets: Vec<WidgetRef> = uids.iter().map(|&uid| make_widget(uid, vec![])).collect();
+
+        tree.observe_node(uids[0], name(names_list[0]), widgets[0].clone(), None);
+        for i in 1..5 {
+            tree.observe_node(
+                uids[i],
+                name(names_list[i]),
+                widgets[i].clone(),
+                Some(uids[i - 1]),
+            );
+        }
+        stabilize_graph_cache(&tree);
+
+        // Should find "e" from root
+        let found = tree.find_within(uids[0], &[name("e")]);
+        assert_eq!(found.widget_uid(), uids[4]);
+
+        // Path verification: a.c.e
+        let found = tree.find_within(uids[0], &[name("a"), name("c"), name("e")]);
+        assert_eq!(found.widget_uid(), uids[4]);
+
+        // path_to
+        let path = tree.path_to(uids[4]);
+        assert_eq!(path.len(), 5);
+        assert_eq!(path[0], name("a"));
+        assert_eq!(path[4], name("e"));
+    }
+
+    // ------------------------------------------------------------------
+    // refresh_from_borrowed
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_refresh_from_borrowed_discovers_children() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+        let child = make_widget(child_uid, vec![]);
+        let parent = make_widget(parent_uid, vec![(name("child"), child.clone())]);
+
+        tree.observe_node(parent_uid, name("parent"), parent.clone(), None);
+        tree.refresh_from_borrowed(parent_uid, |visit| {
+            visit(name("child"), child.clone());
+        });
+
+        let found = tree.find_within(parent_uid, &[name("child")]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), child_uid);
+    }
+
+    // ------------------------------------------------------------------
+    // Property-only patches don't cause full rebuild
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_property_patch_no_structural_rebuild() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let uid = WidgetUid::new();
+        let w = make_widget(uid, vec![]);
+        // The parent's own child list is what a refresh reads names from, so
+        // it is shared with the test and renamed alongside the observation.
+        let children = std::rc::Rc::new(std::cell::RefCell::new(vec![(name("node"), w.clone())]));
+        let root = make_dynamic_widget(root_uid, children.clone());
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(uid, name("node"), w.clone(), Some(root_uid));
+        // A first lookup settles the root's children into the graph; the
+        // helper then clears every derived cache but keeps that graph.
+        assert!(!tree.find_within(root_uid, &[name("node")]).is_empty());
+        stabilize_graph_cache(&tree);
+
+        // Re-observe same node with different name (property change)
+        children.borrow_mut()[0].0 = name("renamed");
+        tree.observe_node(uid, name("renamed"), w.clone(), Some(root_uid));
+
+        {
+            let inner = tree.inner.borrow();
+            // structure_dirty should be false (just a name patch)
+            assert!(!inner.structure_dirty);
+        }
+
+        // Searched from the parent: a search never matches its own root.
+        let found = tree.find_within(root_uid, &[name("renamed")]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), uid);
+
+        // Old name should not find it
+        let old = tree.find_within(root_uid, &[name("node")]);
+        assert!(old.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Structural changes do trigger rebuild
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_structural_change_triggers_rebuild() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let child1_uid = WidgetUid::new();
+        let child2_uid = WidgetUid::new();
+        let parent = make_widget(parent_uid, vec![]);
+        let child1 = make_widget(child1_uid, vec![]);
+        let child2 = make_widget(child2_uid, vec![]);
+
+        tree.observe_node(parent_uid, name("parent"), parent.clone(), None);
+        tree.observe_node(child1_uid, name("c1"), child1.clone(), Some(parent_uid));
+        stabilize_graph_cache(&tree);
+
+        // Adding new child is structural
+        tree.observe_node(child2_uid, name("c2"), child2.clone(), Some(parent_uid));
+        {
+            let inner = tree.inner.borrow();
+            assert!(inner.structure_dirty);
+        }
+
+        stabilize_graph_cache(&tree);
+        let found = tree.find_within(parent_uid, &[name("c2")]);
+        assert!(!found.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // refresh_from_borrowed: stable children don't set structure_dirty
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn repeated_lookup_reuses_children_and_discovery_storage() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+        let child = make_widget(child_uid, vec![]);
+        let parent = make_widget(parent_uid, vec![(name("c"), child.clone())]);
+        tree.observe_node(parent_uid, name("p"), parent.clone(), None);
+        stabilize_graph_cache(&tree);
+        let lookup = || tree.find_within_from_borrowed(parent_uid, &[name("c")], |visit| {
+            visit(name("c"), child.clone());
+        });
+        assert_eq!(lookup().widget_uid(), child_uid);
+        let (children, discovered, epoch) = {
+            let inner = tree.inner.borrow();
+            (inner.graph[&parent_uid].children.as_ptr(),
+                inner.discovery_buffers.last().unwrap().as_ptr(), inner.path_cache_epoch)
+        };
+        for _ in 0..10 {
+            // Even a dirty hint must not rebuild unchanged children.
+            tree.mark_dirty(parent_uid);
+            assert_eq!(lookup().widget_uid(), child_uid);
+            let inner = tree.inner.borrow();
+            assert_eq!(inner.graph[&parent_uid].children.as_ptr(), children);
+            assert_eq!(inner.discovery_buffers.last().unwrap().as_ptr(), discovered);
+            assert_eq!(inner.path_cache_epoch, epoch);
+            assert!(inner.discovery_buffers.iter().all(Vec::is_empty));
+        }
+    }
+
+    #[test]
+    fn nested_lookup_reuses_discovery_storage() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let parent_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+        let child = make_widget(child_uid, vec![]);
+        let parent = make_widget(parent_uid, vec![(name("c"), child.clone())]);
+        let root = make_widget(root_uid, vec![(name("p"), parent.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        let lookup = || tree.find_within_from_borrowed(root_uid, &[name("p")], |visit| {
+            visit(name("p"), parent.clone());
+            assert_eq!(tree.find_within_from_borrowed(parent_uid, &[name("c")], |visit| {
+                visit(name("c"), child.clone());
+            }).widget_uid(), child_uid);
+        });
+        // Settle discovery and both path caches before inspecting their storage.
+        for _ in 0..3 {
+            assert_eq!(lookup().widget_uid(), parent_uid);
+        }
+        let buffers = || tree.inner.borrow().discovery_buffers.iter()
+            .map(Vec::as_ptr).collect::<Vec<_>>();
+        let storage = buffers();
+        assert_eq!(storage.len(), 2);
+        let epoch = tree.inner.borrow().path_cache_epoch;
+        for _ in 0..10 {
+            assert_eq!(lookup().widget_uid(), parent_uid);
+            assert_eq!(buffers(), storage);
+            assert_eq!(tree.inner.borrow().path_cache_epoch, epoch);
+        }
+    }
+
+    #[test]
+    fn test_refresh_stable_children_no_dirty() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+        let child = make_widget(child_uid, vec![]);
+        let parent = make_widget(parent_uid, vec![(name("c"), child.clone())]);
+
+        tree.observe_node(parent_uid, name("p"), parent.clone(), None);
+        stabilize_graph_cache(&tree);
+
+        // First refresh discovers children → structure_dirty
+        tree.refresh_from_borrowed(parent_uid, |visit| {
+            visit(name("c"), child.clone());
+        });
+        let _ = tree.find_within(parent_uid, &[name("c")]);
+
+        // Second refresh with same children → no structure_dirty
+        tree.refresh_from_borrowed(parent_uid, |visit| {
+            visit(name("c"), child.clone());
+        });
+        {
+            let inner = tree.inner.borrow();
+            assert!(
+                !inner.structure_dirty,
+                "structure_dirty should be false when children haven't changed"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Self-heal after a subtree is replaced under a cached path
+    // ------------------------------------------------------------------
+
+    /// An app looks a label up BEFORE the first draw (cached match), then
+    /// the first draw replaces the panel subtree (new WidgetRefs, new uids,
+    /// same names). Every later lookup from the root must still find the
+    /// label: the tree must heal within the query, not a query later.
+    #[test]
+    fn test_root_lookup_heals_after_subtree_replaced() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let panel_uid = WidgetUid::new();
+        let panel_children = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let panel = make_dynamic_widget(panel_uid, panel_children.clone());
+        let root = make_widget(root_uid, vec![(name("panel"), panel.clone())]);
+
+        // Old subtree: panel -> header -> [fold_button, games_title]
+        let build_header = || {
+            let button = make_widget(WidgetUid::new(), vec![]);
+            let title = make_widget(WidgetUid::new(), vec![]);
+            make_widget(
+                WidgetUid::new(),
+                vec![(name("fold_button"), button), (name("games_title"), title)],
+            )
+        };
+        panel_children
+            .borrow_mut()
+            .push((name("header"), build_header()));
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.refresh_from_borrowed(root_uid, |visit| root.children(visit));
+        let found = tree.find_within(root_uid, &[name("games_title")]);
+        assert!(!found.is_empty(), "pre-draw lookup");
+        drop(found);
+
+        // First draw: the panel's header is rebuilt (new refs + uids).
+        panel_children.borrow_mut().clear();
+        panel_children
+            .borrow_mut()
+            .push((name("header"), build_header()));
+
+        // Each later lookup goes through WidgetRef::widget → refresh root
+        // from its borrowed children, then find. All of them must succeed.
+        for attempt in 0..3 {
+            tree.refresh_from_borrowed(root_uid, |visit| root.children(visit));
+            let found = tree.find_within(root_uid, &[name("games_title")]);
+            assert!(
+                !found.is_empty(),
+                "lookup {attempt} after the subtree was replaced"
+            );
+            let sibling = tree.find_within(root_uid, &[name("fold_button")]);
+            assert!(!sibling.is_empty(), "sibling lookup {attempt}");
+        }
+    }
+
+    /// A FoldHeader reports its header View's children as its OWN (the
+    /// `#[find]` flattening), and every event it does
+    /// `self.header.widget(cx, ids!(fold_button))` — a lookup anchored at a
+    /// ref the tree has no node for. That anchored lookup must not steal the
+    /// children from their real parent: root lookups come next.
+    #[test]
+    fn test_lookup_anchored_at_flattened_ref_keeps_real_parent() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let fold_uid = WidgetUid::new();
+        let header_uid = WidgetUid::new();
+        let button_uid = WidgetUid::new();
+        let title_uid = WidgetUid::new();
+
+        let button = make_widget(button_uid, vec![]);
+        let title = make_widget(title_uid, vec![]);
+        let header = make_widget(
+            header_uid,
+            vec![(name("fold_button"), button.clone()), (name("games_title"), title.clone())],
+        );
+        // The fold's children() flattens the header: same pairs, no header node.
+        let fold = make_widget(
+            fold_uid,
+            vec![(name("fold_button"), button.clone()), (name("games_title"), title.clone())],
+        );
+        let root = make_widget(root_uid, vec![(name("games_fold"), fold.clone())]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.refresh_from_borrowed(root_uid, |visit| root.children(visit));
+        assert!(!tree.find_within(root_uid, &[name("games_title")]).is_empty());
+
+        // FoldHeader::handle_event: lookup anchored at the header ref.
+        for _ in 0..3 {
+            tree.refresh_from_borrowed(header_uid, |visit| header.children(visit));
+            let found = tree.find_within(header_uid, &[name("fold_button")]);
+            assert_eq!(found.widget_uid(), button_uid, "anchored lookup finds the button");
+
+            tree.refresh_from_borrowed(root_uid, |visit| root.children(visit));
+            let found = tree.find_within(root_uid, &[name("games_title")]);
+            assert_eq!(found.widget_uid(), title_uid, "root lookup still reaches the title");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // find_flood
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_find_flood_expands_outward() {
+        let tree = WidgetTree::default();
+        // Build: root -> [left, right]
+        // left -> [target]
+        // Search from right should flood up to root then into left and find target.
+        let root_uid = WidgetUid::new();
+        let left_uid = WidgetUid::new();
+        let right_uid = WidgetUid::new();
+        let target_uid = WidgetUid::new();
+
+        let target = make_widget(target_uid, vec![]);
+        let left = make_widget(left_uid, vec![(name("target"), target.clone())]);
+        let right = make_widget(right_uid, vec![]);
+        let root = make_widget(
+            root_uid,
+            vec![(name("left"), left.clone()), (name("right"), right.clone())],
+        );
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(left_uid, name("left"), left.clone(), Some(root_uid));
+        tree.observe_node(right_uid, name("right"), right.clone(), Some(root_uid));
+        tree.observe_node(target_uid, name("target"), target.clone(), Some(left_uid));
+
+        let found = tree.find_flood(right_uid, &[name("target")]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), target_uid);
+    }
+
+    #[test]
+    fn test_find_flood_syncs_dirty_origin_under_skipped_root_scan() {
+        let tree = WidgetTree::default();
+
+        let root_uid = WidgetUid::new();
+        let portal_uid = WidgetUid::new();
+        let item_uid = WidgetUid::new();
+        let splash_uid = WidgetUid::new();
+        let display_uid = WidgetUid::new();
+        let button_uid = WidgetUid::new();
+
+        let display = make_widget(display_uid, vec![]);
+        let button = make_widget(button_uid, vec![]);
+        let splash_children = std::rc::Rc::new(std::cell::RefCell::new(vec![
+            (name("display"), display.clone()),
+            (name("button"), button.clone()),
+        ]));
+        let splash = make_dynamic_widget(splash_uid, splash_children);
+        let item = make_widget(item_uid, vec![(name("splash"), splash.clone())]);
+        let portal = make_widget_skip(portal_uid, vec![(name("item"), item.clone())]);
+        let root = make_widget(root_uid, vec![(name("portal"), portal.clone())]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(portal_uid, name("portal"), portal.clone(), Some(root_uid));
+        tree.observe_node(item_uid, name("item"), item.clone(), Some(portal_uid));
+        tree.observe_node(splash_uid, name("splash"), splash.clone(), Some(item_uid));
+        stabilize_graph_cache(&tree);
+
+        // This mirrors a hotloaded Splash subtree inside a PortalList item:
+        // the list itself is skipped during root scans, while the callback
+        // target button exists in the live widget but not yet in the tree cache.
+        tree.mark_dirty(splash_uid);
+
+        let found = tree.find_flood(button_uid, &[name("display")]);
+        assert_eq!(found.widget_uid(), display_uid);
+    }
+
+    // ------------------------------------------------------------------
+    // find_all_within
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_find_all_within_multiple_matches() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let c1_uid = WidgetUid::new();
+        let c2_uid = WidgetUid::new();
+        let c3_uid = WidgetUid::new();
+
+        let c1 = make_widget(c1_uid, vec![]);
+        let c2 = make_widget(c2_uid, vec![]);
+        let c3 = make_widget(c3_uid, vec![]);
+        let root = make_widget(root_uid, vec![]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(c1_uid, name("item"), c1.clone(), Some(root_uid));
+        tree.observe_node(c2_uid, name("item"), c2.clone(), Some(root_uid));
+        tree.observe_node(c3_uid, name("other"), c3.clone(), Some(root_uid));
+        stabilize_graph_cache(&tree);
+
+        let results = tree.find_all_within(root_uid, &[name("item")]);
+        // c1 and c2 have the same name but c2 replaces c1 (same-name dedup in observe_node)
+        // Actually, observe_node replaces same-name children under same parent.
+        // So only c2 should remain. Let's verify.
+        assert!(results.len() >= 1);
+    }
+
+    // ------------------------------------------------------------------
+    // scope
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_scope_skips_subtree() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let skip_uid = WidgetUid::new();
+        let hidden_uid = WidgetUid::new();
+
+        let hidden = make_widget(hidden_uid, vec![]);
+        let skip_node = make_widget_skip(skip_uid, vec![(name("hidden"), hidden.clone())]);
+        let root = make_widget(root_uid, vec![]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(skip_uid, name("skip"), skip_node.clone(), Some(root_uid));
+        tree.observe_node(hidden_uid, name("hidden"), hidden.clone(), Some(skip_uid));
+        stabilize_graph_cache(&tree);
+
+        // Searching from root, "hidden" is under a scope node
+        let found = tree.find_within(root_uid, &[name("hidden")]);
+        assert!(found.is_empty(), "hidden widget should be skipped");
+
+        // But searching directly from skip_uid finds it (scope on root of search is ignored)
+        let found = tree.find_within(skip_uid, &[name("hidden")]);
+        assert!(!found.is_empty());
+    }
+
+    #[test]
+    fn test_path_enters_a_scope_by_naming_it() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let skip_uid = WidgetUid::new();
+        let hidden_uid = WidgetUid::new();
+        let late_uid = WidgetUid::new();
+
+        let hidden = make_widget(hidden_uid, vec![]);
+        let skip_node = make_widget_skip(skip_uid, vec![(name("hidden"), hidden.clone())]);
+        let root = make_widget(root_uid, vec![]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(skip_uid, name("skip"), skip_node.clone(), Some(root_uid));
+        tree.observe_node(hidden_uid, name("hidden"), hidden.clone(), Some(skip_uid));
+        stabilize_graph_cache(&tree);
+
+        let path = [name("skip"), name("hidden")];
+        assert!(tree.find_within(root_uid, &[name("hidden")]).is_empty());
+        for _ in 0..2 {
+            assert_eq!(tree.find_within(root_uid, &path).widget_uid(), hidden_uid);
+            assert_eq!(tree.find_all_within(root_uid, &path).len(), 1);
+        }
+        // warm: the outer root answers from its cache, the scope from its own
+        let walked = tree.stats().walk_nodes;
+        assert_eq!(tree.find_within(root_uid, &path).widget_uid(), hidden_uid);
+        assert_eq!(tree.stats().walk_nodes, walked, "a warm scoped lookup must not walk");
+        assert_eq!(tree.find_flood(root_uid, &path).widget_uid(), hidden_uid);
+        assert_eq!(tree.find_all_flood(root_uid, &path).len(), 1);
+        assert!(tree.find_within(root_uid, &[name("other"), name("hidden")]).is_empty());
+        assert_eq!(tree.scope_path(hidden_uid), vec![name("skip"), name("hidden")]);
+
+        // a second match appearing inside the scope after the lookup was warm is seen
+        assert!(tree.find_within(root_uid, &[name("skip"), name("late")]).is_empty());
+        let late = make_widget(late_uid, vec![]);
+        tree.insert_child(skip_uid, name("late"), late.clone());
+        assert!(tree.find_within(root_uid, &[name("skip"), name("late")]).widget_uid() == late_uid);
+        assert_eq!(tree.find_within(root_uid, &path).widget_uid(), hidden_uid);
+        let walked = tree.stats().walk_nodes;
+        assert!(tree.find_within(root_uid, &[name("skip"), name("late")]).widget_uid() == late_uid);
+        assert_eq!(tree.find_within(root_uid, &path).widget_uid(), hidden_uid);
+        assert_eq!(tree.stats().walk_nodes, walked);
+    }
+
+    #[test]
+    fn test_global_including_skipped_finds_unique_widget_under_skipped_subtree() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let skip_uid = WidgetUid::new();
+        let hidden_uid = WidgetUid::new();
+
+        let hidden = make_widget(hidden_uid, vec![]);
+        let skip_node = make_widget_skip(skip_uid, vec![(name("hidden"), hidden.clone())]);
+        let root = make_widget(root_uid, vec![(name("skip"), skip_node.clone())]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(skip_uid, name("skip"), skip_node.clone(), Some(root_uid));
+        tree.observe_node(hidden_uid, name("hidden"), hidden.clone(), Some(skip_uid));
+        stabilize_graph_cache(&tree);
+
+        assert!(tree.find_within(root_uid, &[name("hidden")]).is_empty());
+
+        let matches = tree.find_all_anywhere_including_skipped(&[name("hidden")]);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].widget_uid(), hidden_uid);
+    }
+
+    // ------------------------------------------------------------------
+    // Stress: wide tree
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_wide_tree_1000_children() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root = make_widget(root_uid, vec![]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+
+        let mut child_uids = Vec::new();
+        let mut keep_alive = Vec::new();
+        for i in 0..1000 {
+            let uid = WidgetUid::new();
+            // Use unique names to avoid same-name replacement
+            let n = LiveId(i as u64 + 1000);
+            let w = make_widget(uid, vec![]);
+            keep_alive.push(w.clone());
+            tree.insert_child(root_uid, n, w);
+            child_uids.push((uid, n));
+        }
+        stabilize_graph_cache(&tree);
+
+        // Lookup last child
+        let (last_uid, last_name) = child_uids.last().unwrap();
+        let found = tree.find_within(root_uid, &[*last_name]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), *last_uid);
+    }
+
+    // ------------------------------------------------------------------
+    // Stress: repeated refresh_from_borrowed (the hot path)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_repeated_refresh_no_spurious_rebuild() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let child_uids: Vec<WidgetUid> = (0..20).map(|_| WidgetUid::new()).collect();
+        let children: Vec<(LiveId, WidgetRef)> = child_uids
+            .iter()
+            .enumerate()
+            .map(|(i, &uid)| {
+                let n = LiveId(i as u64 + 100);
+                (n, make_widget(uid, vec![]))
+            })
+            .collect();
+
+        let root = make_widget(root_uid, vec![]);
+        tree.observe_node(root_uid, name("root"), root, None);
+
+        // First refresh → discovers children
+        let children_clone = children.clone();
+        tree.refresh_from_borrowed(root_uid, |visit| {
+            for (n, c) in &children_clone {
+                visit(*n, c.clone());
+            }
+        });
+        // Sync
+        let _ = tree.is_empty();
+
+        // Now pound it 1000 times with the same children
+        for _ in 0..1000 {
+            let cc = children.clone();
+            tree.refresh_from_borrowed(root_uid, |visit| {
+                for (n, c) in &cc {
+                    visit(*n, c.clone());
+                }
+            });
+            {
+                let inner = tree.inner.borrow();
+                assert!(
+                    !inner.structure_dirty,
+                    "structure_dirty should stay false on identical refreshes"
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Stress: deep tree (avoid stack overflow with iterative builder)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_deep_tree_500_levels() {
+        let tree = WidgetTree::default();
+        let mut uids = Vec::new();
+        let mut widgets = Vec::new();
+
+        for _ in 0..500 {
+            let uid = WidgetUid::new();
+            uids.push(uid);
+            widgets.push(make_widget(uid, vec![]));
+        }
+
+        tree.observe_node(uids[0], name("n"), widgets[0].clone(), None);
+        for i in 1..500 {
+            tree.observe_node(uids[i], name("n"), widgets[i].clone(), Some(uids[i - 1]));
+        }
+        stabilize_graph_cache(&tree);
+
+        // Find deepest node
+        let found = tree.widget(uids[499]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), uids[499]);
+
+        // Path should be 500 deep
+        let path = tree.path_to(uids[499]);
+        assert_eq!(path.len(), 500);
+    }
+
+    // ------------------------------------------------------------------
+    // Node removal
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_remove_subtree_on_parent_change() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let parent1_uid = WidgetUid::new();
+        let parent2_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+
+        let child = make_widget(child_uid, vec![]);
+        let p1 = make_widget(parent1_uid, vec![]);
+        let p2 = make_widget(parent2_uid, vec![]);
+        let root = make_widget(root_uid, vec![]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(parent1_uid, name("p1"), p1.clone(), Some(root_uid));
+        tree.observe_node(parent2_uid, name("p2"), p2.clone(), Some(root_uid));
+        tree.observe_node(child_uid, name("child"), child.clone(), Some(parent1_uid));
+        stabilize_graph_cache(&tree);
+
+        // Child is under p1
+        let found = tree.find_within(parent1_uid, &[name("child")]);
+        assert!(!found.is_empty());
+
+        // Move child to p2
+        tree.observe_node(child_uid, name("child"), child, Some(parent2_uid));
+        stabilize_graph_cache(&tree);
+
+        // Now it's under p2
+        let found = tree.find_within(parent2_uid, &[name("child")]);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), child_uid);
+    }
+
+    // ------------------------------------------------------------------
+    // Stress: interleaved insert + query (cache thrashing)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_interleaved_insert_query() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root = make_widget(root_uid, vec![]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        stabilize_graph_cache(&tree);
+
+        let mut keep_alive = Vec::new();
+        for i in 0..500 {
+            let uid = WidgetUid::new();
+            let n = LiveId(i as u64 + 5000);
+            let w = make_widget(uid, vec![]);
+            keep_alive.push(w.clone());
+            tree.insert_child(root_uid, n, w);
+
+            // Query after every insert
+            let found = tree.find_within(root_uid, &[n]);
+            assert!(
+                !found.is_empty(),
+                "should find child {} right after insert",
+                i
+            );
+            assert_eq!(found.widget_uid(), uid);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Stress: alternating structural + property changes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_alternating_structural_and_property_changes() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root = make_widget(root_uid, vec![]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+
+        let mut child_uids = Vec::new();
+        // Build initial tree of 50 children
+        for i in 0..50 {
+            let uid = WidgetUid::new();
+            let n = LiveId(i as u64 + 200);
+            let w = make_widget(uid, vec![]);
+            tree.insert_child(root_uid, n, w.clone());
+            child_uids.push((uid, n, w));
+        }
+        // Sync
+        let _ = tree.is_empty();
+
+        for round in 0..100 {
+            if round % 3 == 0 {
+                // Structural: add a new child
+                let uid = WidgetUid::new();
+                let n = LiveId(round as u64 + 10000);
+                let w = make_widget(uid, vec![]);
+                tree.insert_child(root_uid, n, w.clone());
+                child_uids.push((uid, n, w));
+            } else {
+                // Property: re-observe existing child with same parent (should patch)
+                let idx = round % child_uids.len();
+                let (uid, _, ref w) = child_uids[idx];
+                let new_name = LiveId(round as u64 + 20000);
+                tree.observe_node(uid, new_name, w.clone(), Some(root_uid));
+                child_uids[idx].1 = new_name;
+            }
+            // Query something each round to force sync
+            let idx = round % child_uids.len();
+            let (expected_uid, n, _) = &child_uids[idx];
+            let found = tree.find_within(root_uid, &[*n]);
+            if !found.is_empty() {
+                assert_eq!(found.widget_uid(), *expected_uid);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Empty tree edge cases
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_tree_operations() {
+        let tree = WidgetTree::default();
+        assert!(tree.is_empty());
+        let found = tree.find_within(WidgetUid(0), &[name("anything")]);
+        assert!(found.is_empty());
+        let found = tree.find_flood(WidgetUid(0), &[name("anything")]);
+        assert!(found.is_empty());
+        let path = tree.path_to(WidgetUid(999));
+        assert!(path.is_empty());
+    }
+
+    #[test]
+    fn test_zero_uid_ignored() {
+        let tree = WidgetTree::default();
+        let w = make_widget(WidgetUid(0), vec![]);
+        tree.observe_node(WidgetUid(0), name("x"), w, None);
+        assert!(tree.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Stress: build + tear down + rebuild cycle
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_build_teardown_rebuild_cycle() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root = make_widget(root_uid, vec![]);
+
+        for cycle in 0..10 {
+            tree.set_root_widget(root.clone());
+
+            // Add children
+            let mut children = Vec::new();
+            let mut keep_alive = Vec::new();
+            for i in 0..100 {
+                let uid = WidgetUid::new();
+                let n = LiveId((cycle * 1000 + i) as u64 + 50000);
+                let w = make_widget(uid, vec![]);
+                keep_alive.push(w.clone());
+                tree.insert_child(root_uid, n, w);
+                children.push((uid, n));
+            }
+            stabilize_graph_cache(&tree);
+
+            // Verify all findable
+            for (uid, n) in &children {
+                let found = tree.find_within(root_uid, &[*n]);
+                assert!(!found.is_empty(), "cycle {} should find child", cycle);
+                assert_eq!(found.widget_uid(), *uid);
+            }
+
+            // Remove via refresh with empty children
+            tree.refresh_from_borrowed(root_uid, |_visit| {
+                // No children reported → old ones get removed
+            });
+            stabilize_graph_cache(&tree);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Widget lookup by UID
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_widget_uid_lookup() {
+        let tree = WidgetTree::default();
+        let uid1 = WidgetUid::new();
+        let uid2 = WidgetUid::new();
+        let w1 = make_widget(uid1, vec![]);
+        let w2 = make_widget(uid2, vec![]);
+        tree.observe_node(uid1, name("a"), w1.clone(), None);
+        tree.observe_node(uid2, name("b"), w2.clone(), Some(uid1));
+        stabilize_graph_cache(&tree);
+
+        let found = tree.widget(uid2);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), uid2);
+
+        let not_found = tree.widget(WidgetUid(999999));
+        assert!(not_found.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Stress: rapid fire queries after single build
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_rapid_fire_queries() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root = make_widget(root_uid, vec![]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+
+        let mut child_data = Vec::new();
+        let mut keep_alive = Vec::new();
+        for i in 0..200 {
+            let uid = WidgetUid::new();
+            let n = LiveId(i as u64 + 30000);
+            let w = make_widget(uid, vec![]);
+            keep_alive.push(w.clone());
+            tree.insert_child(root_uid, n, w);
+            child_data.push((uid, n));
+        }
+        stabilize_graph_cache(&tree);
+
+        // 10000 queries with no mutations → should never rebuild
+        for i in 0..10000 {
+            let idx = i % child_data.len();
+            let (uid, n) = &child_data[idx];
+            let found = tree.find_within(root_uid, &[*n]);
+            assert!(!found.is_empty());
+            assert_eq!(found.widget_uid(), *uid);
+        }
+
+        // Confirm no rebuild happened
+        {
+            let inner = tree.inner.borrow();
+            assert!(!inner.structure_dirty);
+            assert!(inner.dirty.is_empty());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // seed_from_widget
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_seed_from_widget() {
+        let tree = WidgetTree::default();
+        let uid = WidgetUid::new();
+        let w = make_widget(uid, vec![]);
+        tree.seed_from_widget(w.clone());
+        let found = tree.widget(uid);
+        assert!(!found.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // mark_dirty + sync
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_mark_dirty_triggers_child_rediscovery() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+        let child = make_widget(child_uid, vec![]);
+        let parent = make_widget(parent_uid, vec![(name("c"), child.clone())]);
+
+        tree.observe_node(parent_uid, name("p"), parent.clone(), None);
+        // Don't manually add child, let sync discover it
+        tree.mark_dirty(parent_uid);
+        // Sync should try to call children() on parent via refresh_node_children
+        // The parent widget reports child, so child should appear
+        let _ = tree.is_empty(); // triggers sync
+        let found = tree.find_within(parent_uid, &[name("c")]);
+        assert!(!found.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // find_all_flood
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_find_all_flood() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let a_uid = WidgetUid::new();
+        let b_uid = WidgetUid::new();
+
+        let a = make_widget(a_uid, vec![]);
+        let b = make_widget(b_uid, vec![]);
+        let root = make_widget(root_uid, vec![]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(a_uid, name("item"), a.clone(), Some(root_uid));
+        tree.observe_node(b_uid, name("item"), b.clone(), Some(root_uid));
+        stabilize_graph_cache(&tree);
+
+        // Same-name dedup may occur, but find_all_flood should return whatever exists
+        let results = tree.find_all_flood(root_uid, &[name("item")]);
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_query_populates_only_portal_item_branch_without_dense_rebuild() {
+        let tree = WidgetTree::default();
+
+        let root_uid = WidgetUid::new();
+        let old_item_uid = WidgetUid::new();
+        let new_item_uid = WidgetUid::new();
+        let target_uid = WidgetUid::new();
+
+        let old_item = make_widget(old_item_uid, vec![]);
+        let new_item = make_widget(new_item_uid, vec![]);
+        let root = make_widget(
+            root_uid,
+            vec![
+                (name("old_item"), old_item.clone()),
+                (name("new_item"), new_item.clone()),
+            ],
+        );
+        let target = make_widget(target_uid, vec![]);
+
+        tree.observe_node(root_uid, name("root"), root, None);
+        tree.observe_node(old_item_uid, name("old_item"), old_item, Some(root_uid));
+        tree.observe_node(
+            new_item_uid,
+            name("new_item"),
+            new_item.clone(),
+            Some(root_uid),
+        );
+
+        // Baseline: clear prior global dirty state from initial graph seeding.
+        {
+            let mut inner = tree.inner.borrow_mut();
+            inner.dirty.clear();
+            inner.structure_dirty = false;
+            inner.uid_map.clear();
+            inner.names.clear();
+            inner.nodes.clear();
+            inner.subtree_end.clear();
+            inner.scope.clear();
+            inner.path_cache.clear();
+        }
+
+        // Query from only the new portal item; this should only populate that branch.
+        let found = tree.find_within_from_borrowed(new_item_uid, &[name("target")], |visit| {
+            visit(name("target"), target.clone());
+        });
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), target_uid);
+
+        let inner = tree.inner.borrow();
+        let root_children = inner
+            .graph
+            .get(&root_uid)
+            .map(|node| node.children.clone())
+            .unwrap_or_default();
+        let old_children = inner
+            .graph
+            .get(&old_item_uid)
+            .map(|node| node.children.clone())
+            .unwrap_or_default();
+        let new_children = inner
+            .graph
+            .get(&new_item_uid)
+            .map(|node| node.children.clone())
+            .unwrap_or_default();
+
+        assert!(root_children.iter().any(|uid| *uid == old_item_uid));
+        assert!(root_children.iter().any(|uid| *uid == new_item_uid));
+        assert!(
+            old_children.is_empty(),
+            "unqueried sibling branch should stay untouched"
+        );
+        assert_eq!(new_children, vec![target_uid]);
+        assert!(
+            !inner.dirty.contains(&root_uid),
+            "root should not be marked dirty by branch-local query"
+        );
+        assert!(
+            !inner.dirty.contains(&old_item_uid),
+            "sibling branch should not be marked dirty"
+        );
+        assert!(
+            !inner.structure_dirty,
+            "branch-local query should not set global structure_dirty"
+        );
+
+        // No global dense rebuild should happen on this query path.
+        assert!(inner.uid_map.is_empty());
+        assert!(inner.names.is_empty());
+        assert!(inner.nodes.is_empty());
+        assert!(inner.subtree_end.is_empty());
+        assert!(inner.scope.is_empty());
+    }
+
+    #[test]
+    fn test_stale_weakref_cache_item_is_evicted_then_rebuilt_from_parent_query() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let stale_uid = WidgetUid::new();
+
+        let parent = make_widget(parent_uid, vec![]);
+        tree.observe_node(parent_uid, name("parent"), parent, None);
+
+        // Insert a child by value only; weakref will become stale immediately.
+        tree.insert_child(parent_uid, name("tmp"), make_widget(stale_uid, vec![]));
+
+        // Lookup should evict stale cache item.
+        let first = tree.find_within(parent_uid, &[name("tmp")]);
+        assert!(first.is_empty());
+        {
+            let inner = tree.inner.borrow();
+            let parent_children = inner
+                .graph
+                .get(&parent_uid)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            assert!(
+                !parent_children.iter().any(|uid| *uid == stale_uid),
+                "stale child uid should be removed from parent cache"
+            );
+        }
+
+        // Parent query with live children should repopulate that exact cache entry.
+        let stable_child = make_widget(stale_uid, vec![]);
+        let rebuilt = tree.find_within_from_borrowed(parent_uid, &[name("tmp")], |visit| {
+            visit(name("tmp"), stable_child.clone());
+        });
+        assert!(!rebuilt.is_empty());
+        assert_eq!(rebuilt.widget_uid(), stale_uid);
+    }
+
+    #[test]
+    fn test_find_within_uses_xor_path_cache_per_entrypoint() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+
+        let child = make_widget(child_uid, vec![]);
+        let root = make_widget(root_uid, vec![(name("target"), child.clone())]);
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(child_uid, name("target"), child.clone(), Some(root_uid));
+        stabilize_graph_cache(&tree);
+
+        let path = [name("target")];
+        let found = tree.find_within(root_uid, &path);
+        assert!(!found.is_empty());
+        assert_eq!(found.widget_uid(), child_uid);
+
+        let inner = tree.inner.borrow();
+        let entry = cached_path_entry(&inner, root_uid, &path)
+            .expect("expected cached path entry for root/path");
+        assert_eq!(entry.matches.len(), 1);
+        assert_eq!(entry.matches[0].uid, child_uid);
+    }
+
+    /// The per-frame law: repeating the SAME lookups on an unchanged tree
+    /// must not walk it again — neither the ones that find something nor
+    /// the ones that do not. A miss that re-walks is the expensive case,
+    /// because a UI's per-frame sync probes controls that live on other
+    /// pages hundreds of times a second, and each of those probes used to
+    /// cost a visit to every node under the entrypoint.
+    #[test]
+    fn repeated_lookups_on_an_unchanged_tree_walk_nothing() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let a_uid = WidgetUid::new();
+        let b_uid = WidgetUid::new();
+
+        let b = make_widget(b_uid, vec![]);
+        let a_children =
+            std::rc::Rc::new(std::cell::RefCell::new(vec![(name("b"), b.clone())]));
+        let a = make_dynamic_widget(a_uid, a_children.clone());
+        let root_children =
+            std::rc::Rc::new(std::cell::RefCell::new(vec![(name("a"), a.clone())]));
+        let root = make_dynamic_widget(root_uid, root_children.clone());
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        stabilize_graph_cache(&tree);
+
+        let hit = [name("b")];
+        let miss = [name("nowhere")];
+
+        // Every `ui.widget(cx, ids!(..))` re-reports the entrypoint's live
+        // children first (`refresh_from_borrowed`) — the shape a per-frame
+        // sync actually has. Use it, not the bare finder.
+        let look = |path: &[LiveId]| {
+            tree.find_within_from_borrowed(root_uid, path, |visit| {
+                for (child_name, child) in root_children.borrow().iter() {
+                    visit(*child_name, child.clone());
+                }
+            })
+        };
+
+        // Cold: both answers have to be derived by walking, and the graph
+        // is still learning the tree's shape as it goes (a walk that
+        // discovers nodes does not cache its own result — see the epoch
+        // guard), so give it a few rounds to settle.
+        for _ in 0..3 {
+            assert_eq!(look(&hit).widget_uid(), b_uid);
+            assert!(look(&miss).is_empty());
+        }
+        let cold = tree.stats();
+        assert!(cold.walk_nodes > 0, "a cold lookup derives its answer by walking");
+
+        // Warm: the same two lookups, frame after frame, tree unchanged.
+        for _ in 0..50 {
+            assert_eq!(look(&hit).widget_uid(), b_uid);
+            assert!(look(&miss).is_empty());
+        }
+        let warm = tree.stats();
+        assert_eq!(warm.lookups, cold.lookups + 100);
+        assert_eq!(
+            warm.walk_nodes, cold.walk_nodes,
+            "a warm lookup must not visit a single node"
+        );
+        assert_eq!(
+            warm.cache_misses, cold.cache_misses,
+            "neither the hit nor the MISS may fall out of the cache"
+        );
+
+        // A real structural change is still seen — a cached MISS must never
+        // outlive the node it was missing.
+        let c_uid = WidgetUid::new();
+        let c = make_widget(c_uid, vec![]);
+        a_children.borrow_mut().push((name("nowhere"), c.clone()));
+        tree.mark_dirty(a_uid);
+        assert_eq!(look(&miss).widget_uid(), c_uid);
+        // ...and once the graph has settled again the new answer is cached
+        // just the same, so the steady state is still walk-free.
+        for _ in 0..3 {
+            assert_eq!(look(&miss).widget_uid(), c_uid);
+        }
+        let before = tree.stats().walk_nodes;
+        for _ in 0..10 {
+            assert_eq!(look(&miss).widget_uid(), c_uid);
+        }
+        assert_eq!(tree.stats().walk_nodes, before);
+    }
+
+    /// The barrier law: a skip-search node hides its descendants from every
+    /// search rooted above it, so churn below one (a recycling list's rows,
+    /// frame after frame) must not invalidate lookups rooted above it. This
+    /// is the difference between an app scrolling a list at 120 fps and the
+    /// same app re-walking its whole tree for every `ids!()` probe on every
+    /// frame of that scroll.
+    #[test]
+    fn churn_below_a_scope_list_leaves_root_lookups_warm() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let send_uid = WidgetUid::new();
+        let list_uid = WidgetUid::new();
+
+        let send = make_widget(send_uid, vec![]);
+        let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = make_dynamic_widget_skip(list_uid, rows.clone());
+        let root_children = std::rc::Rc::new(std::cell::RefCell::new(vec![
+            (name("send"), send.clone()),
+            (name("list"), list.clone()),
+        ]));
+        let root = make_dynamic_widget(root_uid, root_children.clone());
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        stabilize_graph_cache(&tree);
+
+        let hit = [name("send")];
+        let miss = [name("elsewhere")];
+        let look = |path: &[LiveId]| {
+            tree.find_within_from_borrowed(root_uid, path, |visit| {
+                for (child_name, child) in root_children.borrow().iter() {
+                    visit(*child_name, child.clone());
+                }
+            })
+        };
+        for _ in 0..3 {
+            assert_eq!(look(&hit).widget_uid(), send_uid);
+            assert!(look(&miss).is_empty());
+        }
+        let warm = tree.stats();
+
+        // Scroll: every round replaces the list's rows (fresh uids, shifted
+        // numeric names — exactly what PortalList recycling does).
+        for round in 0..50u64 {
+            let fresh: Vec<(LiveId, WidgetRef)> = (0..4)
+                .map(|i| (LiveId(round * 4 + i + 1), make_widget(WidgetUid::new(), vec![])))
+                .collect();
+            *rows.borrow_mut() = fresh;
+            tree.mark_dirty(list_uid);
+            assert_eq!(look(&hit).widget_uid(), send_uid);
+            assert!(look(&miss).is_empty());
+        }
+        let churned = tree.stats();
+        assert_eq!(
+            churned.walk_nodes, warm.walk_nodes,
+            "row churn below the skip barrier must not force a single re-walk above it"
+        );
+        assert_eq!(
+            churned.cache_misses, warm.cache_misses,
+            "the root-level hit and MISS must both survive the churn"
+        );
+    }
+
+    /// Rows a list drops leave the graph, along with their subtrees and cached lookups.
+    ///
+    /// Otherwise they'd pile up all session. A pooled row is still alive, so it stays.
+    #[test]
+    fn rows_dropped_by_a_list_leave_the_graph() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let list_uid = WidgetUid::new();
+        let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = make_dynamic_widget_skip(list_uid, rows.clone());
+        let root = make_widget(root_uid, vec![(name("list"), list.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        let make_row = || {
+            make_widget(WidgetUid::new(), vec![(name("label"), make_widget(WidgetUid::new(), vec![]))])
+        };
+        let pooled = make_row();
+
+        // Scroll: every round inserts fresh rows the way PortalList does and
+        // drops the previous ones. The pooled row is only shown in the first round.
+        for round in 0..50u64 {
+            let mut fresh: Vec<(LiveId, WidgetRef)> =
+                (0..4).map(|i| (LiveId(round * 4 + i + 1), make_row())).collect();
+            if round == 0 {
+                fresh.push((LiveId(1000), pooled.clone()));
+            }
+            for (id, row) in &fresh {
+                tree.insert_child(list_uid, *id, row.clone());
+            }
+            let first_row = fresh[0].1.widget_uid();
+            *rows.borrow_mut() = fresh;
+            tree.mark_dirty(list_uid);
+            // A lookup anchored at a row caches its answer under that row.
+            assert!(!tree.find_within(first_row, &[name("label")]).is_empty());
+        }
+
+        let inner = tree.inner.borrow();
+        assert!(inner.graph.contains_key(&pooled.widget_uid()), "a pooled row stays known");
+        assert_eq!(
+            inner.graph.len(),
+            2 + 4 * 2 + 2,
+            "only the root, the list, the live rows and the pooled row (each with its label) are left"
+        );
+        assert!(
+            inner.path_cache.keys().all(|uid| {
+                inner.graph.get(uid).is_some_and(|node| node.widget.upgrade().is_some())
+            }),
+            "no cached lookups rooted at dropped rows"
+        );
+    }
+
+    /// A dropped row stays while something in it is held, since lookups can still start there.
+    #[test]
+    fn a_dropped_row_stays_while_something_in_it_is_held() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let list_uid = WidgetUid::new();
+        let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = make_dynamic_widget_skip(list_uid, rows.clone());
+        let root = make_widget(root_uid, vec![(name("list"), list.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        let label_uid = WidgetUid::new();
+        let label = make_widget(label_uid, vec![]);
+        let content = make_widget(WidgetUid::new(), vec![(name("label"), label)]);
+        let row = make_widget(WidgetUid::new(), vec![(name("content"), content.clone())]);
+        tree.insert_child(list_uid, LiveId(1), row.clone());
+        *rows.borrow_mut() = vec![(LiveId(1), row.clone())];
+        tree.mark_dirty(list_uid);
+        assert_eq!(tree.find_within(row.widget_uid(), &[name("label")]).widget_uid(), label_uid);
+
+        // The list drops the row, but the app still holds its content.
+        drop(row);
+        rows.borrow_mut().clear();
+        tree.mark_dirty(list_uid);
+        assert_eq!(tree.find_within(content.widget_uid(), &[name("label")]).widget_uid(), label_uid);
+        assert_eq!(tree.widget(content.widget_uid()).widget_uid(), content.widget_uid());
+    }
+
+    /// Placeholders for widgets that are gone get swept out.
+    ///
+    /// A widget nothing reports as a child (like one made from a template) gets a placeholder
+    /// when a lookup starts at it.
+    #[test]
+    fn placeholders_for_dropped_widgets_get_swept() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root = make_widget(root_uid, vec![]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        // A widget that's still held keeps its placeholder (and working lookups) the whole time.
+        let label_uid = WidgetUid::new();
+        let held = make_widget(WidgetUid::new(), vec![(name("label"), make_widget(label_uid, vec![]))]);
+        tree.refresh_from_borrowed(held.widget_uid(), |visit| held.children(visit));
+        for round in 0..500 {
+            let avatar = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+            tree.refresh_from_borrowed(avatar.widget_uid(), |visit| avatar.children(visit));
+            assert!(!tree.find_within(avatar.widget_uid(), &[name("image")]).is_empty());
+            if round % 50 == 0 {
+                assert!(tree.inner.borrow().graph.contains_key(&held.widget_uid()), "round {round}");
+                tree.refresh_from_borrowed(held.widget_uid(), |visit| held.children(visit));
+                assert_eq!(tree.find_within(held.widget_uid(), &[name("label")]).widget_uid(), label_uid);
+            }
+        }
+        let inner = tree.inner.borrow();
+        let placeholders = inner.graph.values().filter(|node| node.placeholder).count();
+        assert!(placeholders <= MIN_PLACEHOLDER_ROOTS_TO_SWEEP, "{placeholders} placeholders left");
+        assert!(inner.graph.contains_key(&held.widget_uid()));
+    }
+
+    /// The placeholder for a FoldHeader's header survives sweeps until the FoldHeader is gone.
+    ///
+    /// A FoldHeader reports its header's children as its own, so a lookup starting at the header
+    /// makes a placeholder for the header.
+    #[test]
+    fn placeholders_for_flattened_refs_stay_while_their_widget_does() {
+        let tree = WidgetTree::default();
+        let root_children = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let root = make_dynamic_widget(WidgetUid::new(), root_children.clone());
+        let mut headers = Vec::new();
+        for i in 0..2 * MIN_PLACEHOLDER_ROOTS_TO_SWEEP {
+            let button = make_widget(WidgetUid::new(), vec![]);
+            headers.push(make_widget(WidgetUid::new(), vec![(name("fold_button"), button.clone())]));
+            let fold = make_widget(WidgetUid::new(), vec![(name("fold_button"), button)]);
+            root_children.borrow_mut().push((LiveId(i as u64 + 1), fold));
+        }
+        tree.observe_node(root.widget_uid(), name("root"), root.clone(), None);
+        tree.refresh_from_borrowed(root.widget_uid(), |visit| root.children(visit));
+        assert!(!tree.find_within(root.widget_uid(), &[name("fold_button")]).is_empty());
+
+        // What FoldHeader::handle_event does on every Actions event.
+        let look_up_buttons = |headers: &[WidgetRef]| {
+            for header in headers {
+                tree.refresh_from_borrowed(header.widget_uid(), |visit| header.children(visit));
+                assert!(!tree.find_within(header.widget_uid(), &[name("fold_button")]).is_empty());
+            }
+        };
+        look_up_buttons(&headers);
+        let misses = tree.stats().cache_misses;
+        look_up_buttons(&headers);
+        assert_eq!(tree.stats().cache_misses, misses, "warm lookups shouldn't miss");
+
+        let header_uids: Vec<_> = headers.iter().map(|header| header.widget_uid()).collect();
+        drop(headers);
+        root_children.borrow_mut().clear();
+        tree.refresh_from_borrowed(root.widget_uid(), |visit| root.children(visit));
+        for _ in 0..2 * MIN_PLACEHOLDER_ROOTS_TO_SWEEP {
+            let avatar = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+            tree.refresh_from_borrowed(avatar.widget_uid(), |visit| avatar.children(visit));
+        }
+        let inner = tree.inner.borrow();
+        assert!(header_uids.iter().all(|uid| !inner.graph.contains_key(uid)));
+    }
+
+    /// A child unlinked while it's alive (like a pooled row) stays, but goes once it's dead.
+    ///
+    /// Here it dies when the list it was pooled in goes away.
+    #[test]
+    fn children_unlinked_while_alive_go_once_they_die() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root_kids = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let root = make_dynamic_widget(root_uid, root_kids.clone());
+        let list_uid = WidgetUid::new();
+        let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = make_dynamic_widget_skip(list_uid, rows.clone());
+        root_kids.borrow_mut().push((name("list"), list.clone()));
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.refresh_from_borrowed(root_uid, |visit| root.children(visit));
+        tree.sync_dirty();
+
+        let mut pool = Vec::new();
+        for i in 0..20u64 {
+            let row = make_widget(WidgetUid::new(), vec![(name("label"), make_widget(WidgetUid::new(), vec![]))]);
+            tree.insert_child(list_uid, LiveId(i + 1), row.clone());
+            pool.push(row);
+        }
+        *rows.borrow_mut() = pool.iter().enumerate().map(|(i, row)| (LiveId(i as u64 + 1), row.clone())).collect();
+        tree.mark_dirty(list_uid);
+        // Sync the dirty nodes via a lookup, which (unlike `sync_dirty()`) keeps pooled rows.
+        let _ = tree.find_within(root_uid, &[name("nothing")]);
+        // Only 2 rows stay in use, and the rest sit in the list's pool, still alive.
+        rows.borrow_mut().truncate(2);
+        tree.mark_dirty(list_uid);
+        let _ = tree.find_within(root_uid, &[name("nothing")]);
+        assert!(pool.iter().all(|row| tree.inner.borrow().graph.contains_key(&row.widget_uid())));
+
+        // Then the list goes away, pool and all.
+        root_kids.borrow_mut().clear();
+        drop(list);
+        rows.borrow_mut().clear();
+        drop(pool);
+        tree.mark_dirty(root_uid);
+        let _ = tree.find_within(root_uid, &[name("nothing")]);
+        let inner = tree.inner.borrow();
+        let dead = inner.graph.values().filter(|node| !node.placeholder && node.widget.upgrade().is_none()).count();
+        assert_eq!(dead, 0, "{dead} dead nodes left behind");
+    }
+
+    /// A child swapped out while it's alive goes once it's dead, even under a placeholder.
+    ///
+    /// Here the parent is a widget nothing reports as a child, so the old child goes
+    /// when that widget's placeholder gets swept.
+    #[test]
+    fn a_swapped_out_child_goes_once_it_dies() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root = make_widget(root_uid, vec![]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        let kids = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let swapper = make_dynamic_widget(WidgetUid::new(), kids.clone());
+        let old_child = make_widget(WidgetUid::new(), vec![]);
+        *kids.borrow_mut() = vec![(name("child"), old_child.clone())];
+        tree.refresh_from_borrowed(swapper.widget_uid(), |visit| swapper.children(visit));
+        let new_child = make_widget(WidgetUid::new(), vec![]);
+        *kids.borrow_mut() = vec![(name("child"), new_child.clone())];
+        tree.refresh_from_borrowed(swapper.widget_uid(), |visit| swapper.children(visit));
+        let old_uid = old_child.widget_uid();
+        assert!(tree.inner.borrow().graph.contains_key(&old_uid));
+
+        // Then drop it all, and make enough throwaway placeholders to trigger a sweep.
+        drop((old_child, new_child, swapper));
+        kids.borrow_mut().clear();
+        for _ in 0..2 * MIN_PLACEHOLDER_ROOTS_TO_SWEEP {
+            let avatar = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+            tree.refresh_from_borrowed(avatar.widget_uid(), |visit| avatar.children(visit));
+        }
+        assert!(!tree.inner.borrow().graph.contains_key(&old_uid));
+    }
+
+    /// A child that was detached while alive and then inserted again is just linked, not detached too.
+    #[test]
+    fn a_detached_child_inserted_again_is_only_linked() {
+        let tree = WidgetTree::default();
+        let kids = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let parent = make_dynamic_widget(WidgetUid::new(), kids.clone());
+        let parent_uid = parent.widget_uid();
+        tree.observe_node(parent_uid, name("root"), parent.clone(), None);
+        let child = make_widget(WidgetUid::new(), vec![]);
+        *kids.borrow_mut() = vec![(name("child"), child.clone())];
+        tree.refresh_from_borrowed(parent_uid, |visit| parent.children(visit));
+        // The parent stops reporting the child while it's still alive, so it gets detached...
+        kids.borrow_mut().clear();
+        tree.refresh_from_borrowed(parent_uid, |visit| parent.children(visit));
+        assert_eq!(tree.inner.borrow().detached.get(&parent_uid), Some(&vec![child.widget_uid()]));
+        // ...until it gets inserted again.
+        tree.insert_child(parent_uid, name("child"), child.clone());
+        tree.refresh_from_borrowed(parent_uid, |visit| parent.children(visit));
+        let inner = tree.inner.borrow();
+        assert!(inner.graph[&parent_uid].children.contains(&child.widget_uid()));
+        assert_eq!(inner.detached.get(&parent_uid), None);
+    }
+
+    /// The tree's root stays put, even if it's a placeholder whose widget is gone.
+    #[test]
+    fn the_root_never_gets_swept() {
+        let tree = WidgetTree::default();
+        let first = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+        let first_uid = first.widget_uid();
+        tree.refresh_from_borrowed(first_uid, |visit| first.children(visit));
+        drop(first);
+        for _ in 0..200 {
+            let avatar = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+            tree.refresh_from_borrowed(avatar.widget_uid(), |visit| avatar.children(visit));
+        }
+        let inner = tree.inner.borrow();
+        assert_eq!(inner.root_uid, first_uid);
+        assert!(inner.graph.contains_key(&first_uid));
+    }
+
+    /// The barrier stops ABOVE the list, never at it: a lookup rooted at
+    /// the skip-search node itself descends into its children (the root
+    /// frame ignores the flag), so it must keep seeing the churn.
+    #[test]
+    fn lookup_rooted_at_the_skip_list_sees_its_churn() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let list_uid = WidgetUid::new();
+
+        let row_uid = WidgetUid::new();
+        let rows = std::rc::Rc::new(std::cell::RefCell::new(vec![(
+            name("row_a"),
+            make_widget(row_uid, vec![]),
+        )]));
+        let list = make_dynamic_widget_skip(list_uid, rows.clone());
+        let root = make_widget(root_uid, vec![(name("list"), list.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        assert_eq!(
+            tree.find_within(list_uid, &[name("row_a")]).widget_uid(),
+            row_uid
+        );
+
+        let row_b_uid = WidgetUid::new();
+        *rows.borrow_mut() = vec![(name("row_b"), make_widget(row_b_uid, vec![]))];
+        tree.mark_dirty(list_uid);
+
+        assert!(tree.find_within(list_uid, &[name("row_a")]).is_empty());
+        assert_eq!(
+            tree.find_within(list_uid, &[name("row_b")]).widget_uid(),
+            row_b_uid
+        );
+    }
+
+    /// A change to the barrier NODE ITSELF (here: its name) is visible from
+    /// above — the barrier applies to its descendants, never to it.
+    #[test]
+    fn renaming_the_barrier_node_invalidates_above_it() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let list_uid = WidgetUid::new();
+
+        let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = make_dynamic_widget_skip(list_uid, rows.clone());
+        let root_children =
+            std::rc::Rc::new(std::cell::RefCell::new(vec![(name("list"), list.clone())]));
+        let root = make_dynamic_widget(root_uid, root_children.clone());
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        // Warm both answers.
+        assert_eq!(
+            tree.find_within(root_uid, &[name("list")]).widget_uid(),
+            list_uid
+        );
+        assert!(tree.find_within(root_uid, &[name("list2")]).is_empty());
+
+        root_children.borrow_mut()[0].0 = name("list2");
+        tree.mark_dirty(root_uid);
+
+        assert!(tree.find_within(root_uid, &[name("list")]).is_empty());
+        assert_eq!(
+            tree.find_within(root_uid, &[name("list2")]).widget_uid(),
+            list_uid
+        );
+    }
+
+    /// Reordering same-named children changes which one `find_within`
+    /// returns; the reorder happens above any barrier here, so the cached
+    /// first-match must not survive it.
+    #[test]
+    fn reorder_above_the_barrier_still_invalidates() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let first_uid = WidgetUid::new();
+        let second_uid = WidgetUid::new();
+
+        let first = make_widget(first_uid, vec![]);
+        let second = make_widget(second_uid, vec![]);
+        let root_children = std::rc::Rc::new(std::cell::RefCell::new(vec![
+            (name("dup"), first.clone()),
+            (name("dup"), second.clone()),
+        ]));
+        let root = make_dynamic_widget(root_uid, root_children.clone());
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        assert_eq!(
+            tree.find_within(root_uid, &[name("dup")]).widget_uid(),
+            first_uid
+        );
+
+        root_children.borrow_mut().swap(0, 1);
+        tree.mark_dirty(root_uid);
+
+        assert_eq!(
+            tree.find_within(root_uid, &[name("dup")]).widget_uid(),
+            second_uid
+        );
+    }
+
+    /// The verification clamp: leading segments may match ancestors up to
+    /// and including the search root, never above it. An entry rooted at R
+    /// therefore depends only on R's subtree (plus R's own name), which is
+    /// what makes subtree-scoped invalidation exact.
+    #[test]
+    fn leading_segments_never_match_above_the_search_root() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let mid_uid = WidgetUid::new();
+        let target_uid = WidgetUid::new();
+
+        let target = make_widget(target_uid, vec![]);
+        let mid = make_widget(mid_uid, vec![(name("target"), target.clone())]);
+        let root = make_widget(root_uid, vec![(name("mid"), mid.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        // The root's own name may serve as the outermost segment...
+        assert_eq!(
+            tree.find_within(mid_uid, &[name("mid"), name("target")])
+                .widget_uid(),
+            target_uid
+        );
+        // ...but a segment naming a node ABOVE the search root must not.
+        assert!(tree
+            .find_within(mid_uid, &[name("root"), name("target")])
+            .is_empty());
+        // From the real root the full path still resolves.
+        assert_eq!(
+            tree.find_within(root_uid, &[name("mid"), name("target")])
+                .widget_uid(),
+            target_uid
+        );
+    }
+
+    #[test]
+    fn test_cached_path_stale_item_is_dropped_then_requeried() {
+        let tree = WidgetTree::default();
+        let parent_uid = WidgetUid::new();
+        let child_uid = WidgetUid::new();
+
+        let parent = make_widget(parent_uid, vec![]);
+        tree.observe_node(parent_uid, name("parent"), parent.clone(), None);
+        stabilize_graph_cache(&tree);
+
+        let path = [name("tmp")];
+
+        // Populate cache with a live child.
+        let first_child = make_widget(child_uid, vec![]);
+        let first = tree.find_within_from_borrowed(parent_uid, &path, |visit| {
+            visit(name("tmp"), first_child.clone());
+        });
+        assert!(!first.is_empty());
+        assert_eq!(first.widget_uid(), child_uid);
+        drop(first);
+        drop(first_child);
+
+        // Cached weakref is stale now; the query drops that item, re-runs
+        // the tree search, and caches the (now empty) answer — a MISS is a
+        // real answer, and re-deriving it costs a whole-tree walk.
+        let second = tree.find_within(parent_uid, &path);
+        assert!(second.is_empty());
+        {
+            let inner = tree.inner.borrow();
+            let entry = cached_path_entry(&inner, parent_uid, &path)
+                .expect("the miss itself is cached");
+            assert!(
+                entry.matches.is_empty(),
+                "the stale item must be gone from the cached match list"
+            );
+        }
+
+        // Re-query with a live child repopulates the same cache key.
+        let rebuilt_child = make_widget(child_uid, vec![]);
+        let rebuilt = tree.find_within_from_borrowed(parent_uid, &path, |visit| {
+            visit(name("tmp"), rebuilt_child.clone());
+        });
+        assert!(!rebuilt.is_empty());
+        assert_eq!(rebuilt.widget_uid(), child_uid);
+        {
+            let inner = tree.inner.borrow();
+            let entry = cached_path_entry(&inner, parent_uid, &path)
+                .expect("expected path cache entry after rebuild");
+            assert_eq!(entry.matches.len(), 1);
+            assert_eq!(entry.matches[0].uid, child_uid);
+        }
+    }
+
+    #[test]
+    fn test_cached_miss_does_not_block_future_branch_growth_from_same_root() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let branch_uid = WidgetUid::new();
+        let leaf_uid = WidgetUid::new();
+
+        let branch = make_widget(branch_uid, vec![]);
+        let root = make_widget(root_uid, vec![(name("branch"), branch.clone())]);
+
+        tree.observe_node(root_uid, name("root"), root, None);
+        tree.observe_node(branch_uid, name("branch"), branch.clone(), Some(root_uid));
+        stabilize_graph_cache(&tree);
+
+        // First query misses because branch has no leaf yet.
+        let path = [name("branch"), name("leaf")];
+        let first = tree.find_within(root_uid, &path);
+        assert!(first.is_empty());
+        {
+            let inner = tree.inner.borrow();
+            assert!(
+                cached_path_entry(&inner, root_uid, &path).is_none(),
+                "misses must not stick in cache without upward invalidation"
+            );
+        }
+
+        // Populate only that branch and query again from the same root.
+        let leaf = make_widget(leaf_uid, vec![]);
+        let second = tree.find_within_from_borrowed(root_uid, &path, |visit| {
+            visit(name("branch"), branch.clone());
+        });
+        assert!(
+            second.is_empty(),
+            "root refresh alone should not invent deep leaf"
+        );
+
+        let _ = tree.find_within_from_borrowed(branch_uid, &[name("leaf")], |visit| {
+            visit(name("leaf"), leaf.clone());
+        });
+        let third = tree.find_within(root_uid, &path);
+        assert!(!third.is_empty());
+        assert_eq!(third.widget_uid(), leaf_uid);
+    }
+
+    #[test]
+    fn test_cached_path_refreshes_when_parent_widget_changes() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let old_uid = WidgetUid::new();
+        let new_uid = WidgetUid::new();
+
+        let old_child = make_widget(old_uid, vec![]);
+        let root_v1 = make_widget(root_uid, vec![(name("running_button"), old_child.clone())]);
+        let mut keep_alive = vec![old_child.clone(), root_v1.clone()];
+
+        tree.observe_node(root_uid, name("root"), root_v1.clone(), None);
+        let first = tree.find_within(root_uid, &[name("running_button")]);
+        assert_eq!(first.widget_uid(), old_uid);
+
+        let new_child = make_widget(new_uid, vec![]);
+        let root_v2 = make_widget(root_uid, vec![(name("running_button"), new_child.clone())]);
+        keep_alive.push(new_child.clone());
+        keep_alive.push(root_v2.clone());
+        tree.observe_node(root_uid, name("root"), root_v2.clone(), None);
+
+        let second = tree.find_within(root_uid, &[name("running_button")]);
+        assert_eq!(
+            second.widget_uid(),
+            new_uid,
+            "cached lookup must refresh after parent widget instance changes"
+        );
+    }
+
+    #[test]
+    fn test_mark_dirty_invalidates_ancestor_path_cache() {
+        let tree = WidgetTree::default();
+
+        let root_uid = WidgetUid::new();
+        let content_uid = WidgetUid::new();
+        let old_label_uid = WidgetUid::new();
+        let new_label_uid = WidgetUid::new();
+
+        let old_label = make_widget(old_label_uid, vec![]);
+        let new_label = make_widget(new_label_uid, vec![]);
+
+        let content_children = std::rc::Rc::new(std::cell::RefCell::new(vec![(
+            name("name_label"),
+            old_label.clone(),
+        )]));
+        let content = make_dynamic_widget(content_uid, content_children.clone());
+
+        let root_children = std::rc::Rc::new(std::cell::RefCell::new(vec![(
+            name("content"),
+            content.clone(),
+        )]));
+        let root = make_dynamic_widget(root_uid, root_children.clone());
+
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        stabilize_graph_cache(&tree);
+
+        let path = [name("content"), name("name_label")];
+        let first = tree.find_within_from_borrowed(root_uid, &path, |visit| {
+            for (child_name, child) in root_children.borrow().iter() {
+                visit(*child_name, child.clone());
+            }
+        });
+        assert_eq!(first.widget_uid(), old_label_uid);
+
+        *content_children.borrow_mut() = vec![(name("name_label"), new_label.clone())];
+        tree.mark_dirty(content_uid);
+
+        let second = tree.find_within_from_borrowed(root_uid, &path, |visit| {
+            for (child_name, child) in root_children.borrow().iter() {
+                visit(*child_name, child.clone());
+            }
+        });
+        assert_eq!(
+            second.widget_uid(),
+            new_label_uid,
+            "dirty descendant must invalidate cached ancestor path hits"
+        );
+    }
+
+    #[test]
+    fn test_widget_ref_lookup_skips_zero_uid_siblings_in_borrowed_refresh() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+
+        let root_uid = WidgetUid::new();
+        let item_uid = WidgetUid::new();
+        let content_uid = WidgetUid::new();
+        let label_uid = WidgetUid::new();
+
+        let zero_uid_sibling = make_widget(WidgetUid(0), vec![]);
+        let label = make_widget(label_uid, vec![]);
+        let content = make_widget(content_uid, vec![(name("name_label"), label.clone())]);
+        let item = make_widget(
+            item_uid,
+            vec![
+                (name("tree_lines"), zero_uid_sibling),
+                (name("content"), content.clone()),
+            ],
+        );
+        let root = make_widget(root_uid, vec![(name("item"), item.clone())]);
+        set_ui_root(&mut cx, &root);
+
+        let path = [name("content"), name("name_label")];
+        let direct = item.child_by_path(&path);
+        let helper = item.widget(&cx, &path);
+
+        assert_eq!(direct.widget_uid(), label_uid);
+        assert_eq!(
+            helper.widget_uid(),
+            label_uid,
+            "borrowed refresh should skip zero-uid siblings instead of aborting the whole branch"
+        );
+    }
+
+    #[test]
+    fn test_widget_ref_helper_tracks_dynamic_nested_child_like_child_by_path() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+
+        let root_uid = WidgetUid::new();
+        let item_uid = WidgetUid::new();
+        let content_uid = WidgetUid::new();
+        let old_label_uid = WidgetUid::new();
+        let new_label_uid = WidgetUid::new();
+
+        let old_label = make_widget(old_label_uid, vec![]);
+        let new_label = make_widget(new_label_uid, vec![]);
+
+        let content_children = std::rc::Rc::new(std::cell::RefCell::new(vec![(
+            name("name_label"),
+            old_label.clone(),
+        )]));
+        let content = make_dynamic_widget(content_uid, content_children.clone());
+
+        let item_children = std::rc::Rc::new(std::cell::RefCell::new(vec![(
+            name("content"),
+            content.clone(),
+        )]));
+        let item = make_dynamic_widget(item_uid, item_children);
+
+        let root = make_widget(root_uid, vec![(name("item"), item.clone())]);
+        set_ui_root(&mut cx, &root);
+
+        let path = [name("content"), name("name_label")];
+        let first_helper = item.widget(&cx, &path);
+        let first_direct = item.child_by_path(&path);
+        assert_eq!(first_helper.widget_uid(), old_label_uid);
+        assert_eq!(first_direct.widget_uid(), old_label_uid);
+
+        *content_children.borrow_mut() = vec![(name("name_label"), new_label.clone())];
+        cx.widget_tree_mark_dirty(content_uid);
+
+        let second_helper = item.widget(&cx, &path);
+        let second_direct = item.child_by_path(&path);
+        assert_eq!(second_direct.widget_uid(), new_label_uid);
+        assert_eq!(
+            second_helper.widget_uid(),
+            new_label_uid,
+            "WidgetRef::widget should refresh the same dynamic branch that child_by_path sees"
+        );
+    }
+
+    // The former snapshot tests now exercise the one semantic tree and its parts.
+    fn semantic_parts(count: usize, hidden: bool) -> a11y_tree::mirror::Tree {
+        use a11y_tree::{Node, Role, States};
+        let mut builder = makepad_platform::a11y::CxA11y::default();
+        builder.set_consumers(a11y_tree::consumer::TEST);
+        builder.begin_frame();
+        let token = builder.begin_node(1, None);
+        builder.begin_window(WindowId(0, 1));
+        for i in 0..count {
+            builder.set_part(token, i as u64, None, Node { role: Role::MenuItem, name: format!("Item {i}"), value: i.to_string(), states: if i % 2 == 0 { States::SELECTED } else { States::empty() }, bounds: a11y_tree::Rect { x: i as f32, y: 20.0, w: 60.0, h: 24.0 }, ..Default::default() }, || WidgetUid::new().0);
+        }
+        builder.end_node(token, Node { role: Role::Window, states: if hidden { States::HIDDEN } else { States::empty() }, ..Default::default() }, Area::Empty);
+        builder.end_window();
+        let mut tree = a11y_tree::mirror::Tree::default();
+        builder.finish_frame(Area::Empty, |_| None, |_| None, |_, bytes| { tree.apply(a11y_tree::wire::decode_update(&bytes).unwrap()); });
+        tree
+    }
+
+    #[test]
+    fn semantics_reports_the_parts_a_widget_draws() {
+        let tree = semantic_parts(3, false);
+        assert_eq!(tree.nodes.len(), 4);
+        for i in 0..3 {
+            let node = &tree.nodes[&a11y_tree::NodeId::part(1, i + 1)];
+            assert_eq!(node.name, format!("Item {i}"));
+            assert_eq!(node.value, i.to_string());
+            assert_eq!(node.states.contains(a11y_tree::States::SELECTED), i % 2 == 0);
+            assert_eq!((node.bounds.x, node.bounds.w), (i as f32, 60.0));
+        }
+    }
+
+    #[test]
+    fn a_widget_not_drawn_this_frame_reports_no_parts() {
+        assert_eq!(semantic_parts(0, false).nodes.len(), 1);
+    }
+
+    #[test]
+    fn semantic_parts_take_their_window_and_visibility_from_the_widget() {
+        assert!(semantic_parts(3, true).nodes.is_empty());
+        let tree = semantic_parts(3, false);
+        assert_eq!(tree.nodes[&tree.root].children.len(), 3);
+    }
+
+    #[test]
+    fn semantics_has_one_state_description_without_downcasts() {
+        let mut cx = crate::test_cx::checkout_test_cx(crate::script_mod);
+        cx.with_vm(|vm| {
+            let checkbox = crate::check_box::CheckBox::script_new(vm);
+            let mut node = a11y_tree::Node::default();
+            checkbox.semantics(vm.cx_mut(), &mut node);
+            assert_eq!(node.role, a11y_tree::Role::CheckBox);
+            assert_eq!(node.toggle, a11y_tree::Toggle::Off);
+            assert!(node.actions.contains(a11y_tree::Actions::TOGGLE));
+        });
+    }
+
+    #[test]
+    fn every_control_describes_itself_without_tree_fallbacks() {
+        let mut cx = crate::test_cx::checkout_test_cx(crate::script_mod);
+        cx.with_vm(|vm| {
+            let button = crate::button::Button::script_new(vm);
+            let radio = crate::radio_button::RadioButton::script_new(vm);
+            for (widget, role) in [(&button as &dyn crate::widget::Widget, a11y_tree::Role::Button), (&radio, a11y_tree::Role::Radio)] {
+                let mut node = a11y_tree::Node::default();
+                widget.semantics(vm.cx_mut(), &mut node);
+                assert_eq!(node.role, role);
+                assert!(node.states.contains(a11y_tree::States::FOCUSABLE));
+            }
+        });
+    }
+
+    #[test]
+    fn semantics_text_input_reports_a_value_and_text_info() {
+        let mut cx = crate::test_cx::checkout_test_cx(crate::script_mod);
+        cx.with_vm(|vm| {
+            let mut input = crate::text_input::TextInput::script_new(vm);
+            input.set_text(vm.cx_mut(), "é🦀");
+            let mut node = a11y_tree::Node::default();
+            input.semantics(vm.cx_mut(), &mut node);
+            assert_eq!(node.value, "é🦀");
+            assert_eq!(node.text.unwrap().content, "é🦀");
+        });
+    }
+
+    #[test]
+    fn semantics_plain_widgets_report_text_only_when_they_have_some() {
+        let mut cx = crate::test_cx::checkout_test_cx(crate::script_mod);
+        cx.with_vm(|vm| {
+            let mut label = crate::label::Label::script_new(vm);
+            let mut node = a11y_tree::Node::default();
+            label.semantics(vm.cx_mut(), &mut node);
+            assert!(node.name.is_empty());
+            label.set_text(vm.cx_mut(), "hi");
+            label.semantics(vm.cx_mut(), &mut node);
+            assert_eq!(node.name, "hi");
+        });
+    }
+
+    #[test]
+    fn semantic_wide_tree_matches_each_declared_part() {
+        let tree = semantic_parts(1000, false);
+        assert_eq!(tree.nodes.len(), 1001);
+        for i in 0..1000 {
+            let node = &tree.nodes[&a11y_tree::NodeId::part(1, i + 1)];
+            assert_eq!(node.value, i.to_string());
+        }
+    }
+
+    #[test]
+    fn semantic_large_tree_keeps_all_parts() {
+        use a11y_tree::{Node, NodeId, Role, States};
+        let tree = semantic_parts(20_000, false);
+        assert_eq!(tree.nodes.len(), 20_001);
+        assert_eq!(tree.nodes[&tree.root].children.len(), 20_000);
+        // Several windows, deep nesting, hidden subtrees and recycled rows over redraws.
+        // Compare complete records against independently constructed expectations each time.
+        let mut builder = makepad_platform::a11y::CxA11y::default();
+        builder.set_consumers(a11y_tree::consumer::TEST);
+        let mut mirrors = HashMap::<usize, a11y_tree::mirror::Tree>::new();
+        for frame in 0..4 {
+            builder.begin_frame();
+            let mut expected = HashMap::<usize, HashMap<NodeId, Node>>::new();
+            for window in 0..3 {
+                let uid = 100_000 + window as u64 * 100_000;
+                let root = builder.begin_node(uid, None);
+                builder.begin_window(WindowId(window, 1));
+                let mut nodes = HashMap::new();
+                let mut parents = Vec::new();
+                for depth in 1..=8 {
+                    parents.push(builder.begin_node(uid + depth, None));
+                }
+                let mut children = Vec::new();
+                for row in 0..1000 {
+                    let row_id = NodeId::widget(uid + 100 + frame * 1000 + row);
+                    let token = builder.begin_node(row_id.uid(), None);
+                    let node = Node { id: row_id, role: Role::ListItem, name: format!("row {row}"), value: format!("frame {frame}"), pos_in_set: row as u32 + 1, set_size: 1000, ..Default::default() };
+                    builder.end_node(token, node.clone(), Area::Empty);
+                    children.push(row_id);
+                    if frame != 2 { nodes.insert(row_id, node); }
+                }
+                for depth in (1..=8).rev() {
+                    let hidden = frame == 2 && depth == 8;
+                    let node = Node { id: NodeId::widget(uid + depth), role: Role::Group, states: if hidden { States::HIDDEN } else { States::empty() }, children: children.clone(), ..Default::default() };
+                    builder.end_node(parents.pop().unwrap(), node.clone(), Area::Empty);
+                    children = if hidden { Vec::new() } else { vec![node.id] };
+                    if !hidden { nodes.insert(node.id, node); }
+                }
+                let node = Node { id: NodeId::widget(uid), role: Role::Window, children, ..Default::default() };
+                builder.end_node(root, node.clone(), Area::Empty);
+                builder.end_window();
+                nodes.insert(node.id, node);
+                expected.insert(window, nodes);
+            }
+            builder.finish_frame(Area::Empty, |_| None, |_| None, |window, bytes| {
+                mirrors.entry(window.0).or_default().apply(a11y_tree::wire::decode_update(&bytes).unwrap());
+            });
+            for (window, nodes) in expected { assert_eq!(mirrors[&window].nodes, nodes, "window {window}, frame {frame}"); }
+        }
+    }
+
+}

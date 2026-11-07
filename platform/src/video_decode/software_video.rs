@@ -61,6 +61,11 @@ impl PlaybackSessionHandle {
         self.inner.as_mut().and_then(|p| p.take_yuv_frame())
     }
 
+    #[cfg(target_os = "android")]
+    pub fn take_oes_frame(&mut self) -> Option<crate::gpu_texture::OesFrame> {
+        self.inner.as_mut().and_then(|p| p.take_oes_frame())
+    }
+
     pub fn check_eos(&mut self) -> bool {
         self.inner.as_mut().map(|p| p.check_eos()).unwrap_or(false)
     }

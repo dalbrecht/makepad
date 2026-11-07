@@ -1,0 +1,34 @@
+//! Turning an OpenStreetMap PBF extract into everything a map app needs to
+//! draw and navigate a region offline:
+//!
+//! * [`native::convert_detail`] — pass 1-4, the bounded-memory spool store:
+//!   every tagged element, every tag, clipped to z14 MVT tiles.
+//! * [`native::convert_base`] — the styled z0..=14 base archive (plus the
+//!   renderer-consumed detail layers at z14) written from that store; its
+//!   `full` option preserves the former all-tag archive profile.
+//! * [`nav_build::nav_build`] — `<basename>.graph` (routing) and
+//!   `<basename>.search` (places/POIs/streets) from one PBF scan.
+//! * [`testmap`] — the recipe that chains those into a runnable city-sized
+//!   test map, for a first run with no archives on disk at all.
+//!
+//! The passes are the same code whether the `makepad-map-tiles` CLI runs
+//! them from a shell or an app runs them on a worker thread; [`progress`]
+//! is how the latter gets the lines the former prints to stdout.
+
+#[cfg(all(feature = "faces", not(target_arch = "wasm32")))]
+pub mod faces;
+pub mod mkmap;
+pub mod nav_build;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod native;
+pub mod osm_pbf;
+pub mod progress;
+#[cfg(all(feature = "faces", not(target_arch = "wasm32")))]
+pub mod render_check;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod repack;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod repack_remote;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod testmap;
+pub mod versatiles;

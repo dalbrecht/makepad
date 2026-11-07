@@ -1,10 +1,11 @@
-pub use makepad_widgets;
-use makepad_widgets::*;
+pub use makepad_widgets_core;
+use makepad_widgets_core::*;
 
 pub mod char;
 pub mod code_editor;
 pub mod code_view;
 pub mod decoration;
+pub mod diff;
 pub mod document;
 pub mod draw_selection;
 pub mod history;

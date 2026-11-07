@@ -1,10 +1,16 @@
+use crate::app_open::AppOpenPosted;
 use crate::cx::Cx;
+use crate::cx_api::CxOsOp;
+use crate::event::{AppOpenSource, Event};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::file_dialogs::{load_virtual_files_action, FileDialogAction, FileDialogLoadAction};
 use crate::thread::SignalToUI;
 use std::any::TypeId;
 use std::fmt;
+use crate::makepad_network::mpsc::Sender;
 use std::fmt::Debug;
 
-use std::sync::{mpsc::Sender, Mutex};
+use std::sync::{Mutex};
 
 pub(crate) static ACTION_SENDER_GLOBAL: Mutex<Option<Sender<ActionSend>>> = Mutex::new(None);
 
@@ -103,25 +109,98 @@ impl<T: ActionTrait + ActionDefaultRef> ActionCastRef<T>
 
 impl Cx {
     pub fn handle_action_receiver(&mut self) {
+        let mut app_opens = Vec::new();
         while let Ok(action) = self.action_receiver.try_recv() {
+            if let Some(open) = (&*action as &dyn ActionTrait).downcast_ref::<AppOpenPosted>() {
+                app_opens.push(open.0.clone());
+                continue;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(completed) = (&*action as &dyn ActionTrait)
+                .downcast_ref::<FileDialogLoadAction>()
+                .cloned()
+            {
+                self.new_actions.push(Box::new(completed.0));
+                continue;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.handle_native_file_dialog_action(&action) {
+                continue;
+            }
             self.new_actions.push(action);
         }
+        for open in app_opens {
+            // A relaunch of a single-instance app means "show me the app".
+            if open.source == AppOpenSource::SecondInstance {
+                self.platform_ops.push_back(CxOsOp::ActivateApp);
+            }
+            self.call_event_handler(&Event::AppOpen(open));
+        }
         self.handle_actions();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handle_native_file_dialog_action(&mut self, action: &ActionSend) -> bool {
+        let Some(action) = (&**action as &dyn ActionTrait)
+            .downcast_ref::<FileDialogAction>()
+            .cloned()
+        else {
+            return false;
+        };
+        match action {
+            FileDialogAction::FileSelected { id, paths } => {
+                let Some(pending) = self.file_dialogs.finish(id) else {
+                    return false;
+                };
+                if !pending.want_bytes {
+                    return false;
+                }
+                match self.task_pool().submit_internal(crate::thread::Lane::Heavy, move || {
+                    Cx::post_action(FileDialogLoadAction(load_virtual_files_action(
+                        id,
+                        paths,
+                        pending.limits,
+                    )));
+                }) {
+                    Ok(task) => task.detach(),
+                    Err(error) => crate::error!("file dialog load refused by the task pool: {error}"),
+                }
+                true
+            }
+            FileDialogAction::FileCancelled { id } => {
+                self.file_dialogs.finish(id);
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Enqueues an action from a background thread context.
     ///
     /// This will produce a bare action, *not* a widget action,
     /// so you cannot use `as_widget_action()` when handling this action.
+    ///
+    /// If there is no live `Cx` to receive the action — because one has not
+    /// been created yet, or (commonly on mobile) because the app is shutting
+    /// down or being backgrounded and the `Cx` was already dropped — the
+    /// action is silently discarded. A background thread (a tokio task, a
+    /// `robius-*` crate callback, etc.) racing app teardown is normal and
+    /// must not panic the whole process.
     pub fn post_action(action: impl ActionTrait + Send) {
-        ACTION_SENDER_GLOBAL
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .send(Box::new(action))
-            .unwrap();
-        SignalToUI::set_action_signal();
+        let Ok(mut sender_guard) = ACTION_SENDER_GLOBAL.lock() else {
+            // The mutex is poisoned (a thread panicked while holding it).
+            // Nothing useful we can do — drop the action.
+            return;
+        };
+        let Some(sender) = sender_guard.as_mut() else {
+            // No `Cx` has installed an action sender (yet / anymore).
+            return;
+        };
+        // `send` fails once the `Cx`'s receiver has been dropped at shutdown.
+        // Only signal the UI when the action was actually enqueued.
+        if sender.send(Box::new(action)).is_ok() {
+            SignalToUI::set_action_signal();
+        }
     }
 
     pub fn action(&mut self, action: impl ActionTrait) {

@@ -13,8 +13,8 @@
 // or NONE if boundary. This gives O(1) access to the neighboring triangle
 // and the specific shared edge.
 
-use makepad_csg_math::{in_circle, orient2d};
-use std::collections::HashMap;
+use makepad_csg_math::{in_circle, orient2d, thread_pool};
+use makepad_csg_math::fast_hash::FastMap as HashMap;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Point2 {
@@ -83,7 +83,9 @@ impl CDT {
     pub fn insert_point(&mut self, x: f64, y: f64) -> u32 {
         let idx = self.points.len() as u32;
         self.points.push(Point2 { x, y });
-        self.bowyer_watson_insert(idx);
+        if !thread_pool::cancelled() {
+            self.bowyer_watson_insert(idx);
+        }
         idx
     }
 
@@ -108,6 +110,9 @@ impl CDT {
 
     pub fn finalize(&mut self) {
         for i in 0..self.constraints.len() {
+            if thread_pool::cancelled() {
+                return;
+            }
             let (a, b) = self.constraints[i];
             self.enforce_constraint(a, b);
         }
@@ -140,6 +145,9 @@ impl CDT {
         let mut stack = vec![start];
 
         while let Some(t) = stack.pop() {
+            if thread_pool::cancelled() {
+                return;
+            }
             if visited[t] {
                 continue;
             }
@@ -249,7 +257,7 @@ impl CDT {
         // Fix adjacency for internal edges between new triangles.
         // Build lookup: from_vertex → boundary index (O(n) instead of O(n^2)).
         // edge 0 of tri i (to_i -> p): twin is edge 1 of tri j where from_j == to_i
-        let mut from_to_idx: HashMap<u32, usize> = HashMap::with_capacity(n_new);
+        let mut from_to_idx: HashMap<u32, usize> = HashMap::with_capacity_and_hasher(n_new, Default::default());
         for i in 0..n_new {
             let from_i = boundary[i].0;
             from_to_idx.insert(from_i, i);
@@ -292,6 +300,9 @@ impl CDT {
 
         let max_steps = self.num_tris() * 2;
         for _ in 0..max_steps {
+            if thread_pool::cancelled() {
+                return None;
+            }
             if self.is_deleted(t) {
                 // Fallback to linear scan if walk hits deleted triangle
                 return self.find_containing_triangle_linear(p);
@@ -370,6 +381,9 @@ impl CDT {
 
         let max_iters = self.num_tris() * self.num_tris() + 100;
         for _ in 0..max_iters {
+            if thread_pool::cancelled() {
+                return;
+            }
             if self.mark_constraint(a, b) {
                 return;
             }

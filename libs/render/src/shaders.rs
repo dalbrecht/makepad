@@ -1,0 +1,1880 @@
+//! The game draw shaders, moved verbatim from gamemaker's game_view.rs.
+//! The composite into the host pane (DrawSceneTexture) is makepad-render-graph's; the
+//! cube/alpha/sky/terrain family renders the world itself.
+
+use makepad_draw::*;
+
+mod mixins;
+mod csm;
+mod cube;
+mod effects;
+mod sky_dome;
+mod skinned;
+mod pbr;
+mod city;
+mod grass;
+mod foliage;
+mod splat;
+mod impostor;
+mod skinned_gpu;
+mod world;
+mod water;
+mod lm_depth;
+mod lm_gather;
+mod lm_encode;
+
+/// Register every scene shader block, in the order the single block used to
+/// declare them (later blocks spread earlier `mod.draw` objects).
+pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+    mixins::script_mod(vm);
+    csm::script_mod(vm);
+    cube::script_mod(vm);
+    effects::script_mod(vm);
+    sky_dome::script_mod(vm);
+    skinned::script_mod(vm);
+    pbr::script_mod(vm);
+    city::script_mod(vm);
+    grass::script_mod(vm);
+    foliage::script_mod(vm);
+    splat::script_mod(vm);
+    impostor::script_mod(vm);
+    // The skin lane assigns render-material's IBL lookups by name
+    // (skinned_gpu.rs), so they exist before it is declared. Idempotent:
+    // custom_material.rs registers them again for the material programs.
+    makepad_render_material::builtin::register(vm);
+    skinned_gpu::script_mod(vm);
+    world::script_mod(vm);
+    water::script_mod(vm);
+    lm_depth::script_mod(vm);
+    lm_gather::script_mod(vm);
+    lm_encode::script_mod(vm)
+}
+
+/// The concatenated shader source, for the tests that pin shader text.
+#[cfg(test)]
+pub(crate) const SHADER_SOURCE: &str = concat!(
+    include_str!("shaders/mixins.rs"),
+    include_str!("shaders/csm.rs"),
+    include_str!("shaders/cube.rs"),
+    include_str!("shaders/effects.rs"),
+    include_str!("shaders/sky_dome.rs"),
+    include_str!("shaders/skinned.rs"),
+    include_str!("shaders/pbr.rs"),
+    include_str!("shaders/skinned_gpu.rs"),
+    include_str!("shaders/world.rs"),
+    include_str!("shaders/water.rs"),
+    include_str!("shaders/lm_depth.rs"),
+    include_str!("shaders/lm_gather.rs"),
+    include_str!("shaders/lm_encode.rs"),
+);
+
+/// DrawCube + per-instance emission (`glow`) and per-instance fog density.
+///
+/// Instance-field rule: only #[live] instance fields after the deref chain —
+/// `DrawVars::as_slice` reads them contiguously. The sun terms and fog colour
+/// are deliberately NOT here: they are shader uniforms (see the script block
+/// above) set once per frame through [`crate::sun::SunLight::write_uniforms`],
+/// which keeps 48 bytes of identical data out of every instance.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneCube {
+    #[deref]
+    pub cube: DrawCube,
+    #[live(0.0)]
+    pub glow: f32,
+    #[live(0.0)]
+    pub fog_density: f32,
+    /// x = hue degrees, y = saturation, z = value, w reserved.
+    #[live(vec4(0.0, 1.0, 1.0, 0.0))]
+    pub color_adjust_ctl: Vec4f,
+}
+
+/// Alpha-blended variant: water, sensor ghosts, blob shadows.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneAlpha {
+    #[deref]
+    pub cube: DrawSceneCube,
+}
+
+/// One firework shell. Every field is an instance: the GPU derives all
+/// `SPARKS_PER_SHELL` sparks from these numbers alone.
+///
+/// Packed into `vec4`s ON PURPOSE. A `Vec3f` instance is tightly packed on the
+/// Rust side but a `vec3` obeys 16-byte alignment in the shader ABI, so the
+/// three floats are read back misaligned and every field after them shifts —
+/// which presents as the whole burst rendering at the world origin, on the
+/// ground, instead of where it was placed. The other shaders here get away
+/// with `Vec3f` because theirs are declared `uniform`, not instance.
+///
+/// Four floats at a time is the shape the hardware wants anyway; the packing
+/// costs nothing and removes the class of bug entirely.
+///
+/// # Why this derefs DrawVars and not DrawCube
+///
+/// It used to deref `DrawCube`, and every instance field read back garbage —
+/// the burst rendered at the world origin and the spark size ignored whatever
+/// Rust wrote. Encoding the instance values as colour on a fixed clip-space
+/// quad settled it: the decoded numbers CHANGED WHEN THE CAMERA ROTATED.
+/// Instance data cannot depend on the view, so the shader was reading view
+/// memory — the fields were bound at the wrong offsets, not merely wrong.
+///
+/// Inheriting `DrawCube` brings its own instance fields along, and appending
+/// more after them puts these at offsets the script-side layout does not
+/// account for. `DrawSceneShadow` — the one shader here that instances
+/// correctly — derefs `DrawVars` and declares its uniform buffers, vertex
+/// buffer and varyings explicitly, so its instance fields are the only ones
+/// and the layout is unambiguous. This now follows that pattern.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneFirework {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    /// xyz = burst point, w = seconds since the burst (negative = climbing).
+    #[live(vec4(0.0, 30.0, 0.0, 0.0))]
+    pub origin_age: Vec4f,
+    /// xyz = launch point, w = spark lifetime.
+    #[live(vec4(0.0, 0.0, 0.0, 2.0))]
+    pub launch_life: Vec4f,
+    /// x = spark speed, y = seed, z = spark size, w unused.
+    #[live(vec4(12.0, 0.0, 0.6, 0.0))]
+    pub params: Vec4f,
+    #[live(vec4(1.0, 0.8, 0.4, 1.0))]
+    pub color: Vec4f,
+    #[live(vec4(1.0, 0.3, 0.1, 1.0))]
+    pub color_tail: Vec4f,
+}
+
+/// Sky dome, authored-gradient mode: scripts that set their own sky
+/// colours keep this four-colour dome. Default-sky worlds draw
+/// [`DrawSceneSkyAnalytic`] instead (the split is deliberate — one combined
+/// pixel fn sat exactly at a script-shader capacity limit).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneSky {
+    #[deref]
+    pub cube: DrawCube,
+    #[live(vec3(0.32, 0.58, 0.9))]
+    pub sky_top: Vec3f,
+    #[live(vec3(0.75, 0.87, 0.96))]
+    pub sky_horizon: Vec3f,
+    #[live(vec3(0.68, 0.75, 0.66))]
+    pub sky_ground: Vec3f,
+    #[live(vec3(0.3, 0.4, 0.3))]
+    pub sky_bottom: Vec3f,
+}
+
+/// Sky dome, analytic mode: the Preetham daylight model whose
+/// sun-dependent halves arrive from [`crate::sky`], plus the setting sun
+/// disc and the rotating night star dome. Drawn for worlds that keep the
+/// DEFAULT sky colours; authored gradients use [`DrawSceneSky`].
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneSkyAnalytic {
+    #[deref]
+    pub cube: DrawCube,
+    /// Perez A,B,C,D per channel (E rides in `pz_e`).
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub pz_y: Vec4f,
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub pz_x: Vec4f,
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub pz_yc: Vec4f,
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub pz_e: Vec4f,
+    /// 1 / F(0, theta_s) per channel.
+    #[live(vec4(1.0, 1.0, 1.0, 0.0))]
+    pub pz_f0: Vec4f,
+    /// Zenith Yxy + night blend in w.
+    #[live(vec4(1.0, 0.31, 0.32, 0.0))]
+    pub zenith: Vec4f,
+    /// MODEL sun direction (clamped ~2 deg for Perez) + exposure in w.
+    #[live(vec4(0.0, 1.0, 0.0, 0.12))]
+    pub sun_e: Vec4f,
+    /// TRUE sun direction, unclamped — the disc/Mie/afterglow ride it
+    /// below the horizon.
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub sun_true: Vec4f,
+    /// Celestial rotation rows (world dir -> star map dir); row 0's w is
+    /// the star gain (0 = no map bound).
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub star_r0: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub star_r1: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 0.0))]
+    pub star_r2: Vec4f,
+    /// Additive shared-model lanes. The legacy fields above remain part of
+    /// this public draw type for existing hosts.
+    #[live(vec4(0.0, 1.0, 0.0, 0.025))]
+    pub sun_model: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.999989))]
+    pub sun_dir: Vec4f,
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub sun_radiance: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 1.0))]
+    pub world_up: Vec4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub star_east: Vec4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub blend: Vec4f,
+    #[live(1.0)]
+    pub exposure: f32,
+}
+
+/// A map's own sky surfaces, shaded by view direction
+/// ([`crate::model::SkyPart`]). Packed model vertex stream, no lighting.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneSkyMap {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    /// TRUE world camera position (w unused). The ray each fragment samples
+    /// by is `world_position - eye`, so this must be the physical camera,
+    /// not a stage-transformed one.
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub eye: Vec4f,
+    /// x = projection code ([`crate::model::SkyProjection::code`]),
+    /// y = horizontal repeats per 360 degrees, z = layer-0 scroll offset,
+    /// w = layer-1 scroll offset (both in texture units).
+    #[live(vec4(1.0, 1.0, 0.0, 0.0))]
+    pub sky_p: Vec4f,
+    /// x = vertical span as a fraction of a half turn (Doom's sky stretch),
+    /// y = second-layer alpha gain, zw spare.
+    #[live(vec4(0.5, 1.0, 0.0, 0.0))]
+    pub sky_q: Vec4f,
+    /// Flat multiplier on the sampled colour. 1.0 is the image as authored,
+    /// which is what "unlit, full brightness" means.
+    #[live(1.0)]
+    pub brightness: f32,
+}
+
+/// Skinned character mesh (PbrVertex layout, uv in ny_nz_uv.zw, textured).
+///
+/// The instance payload below is deliberately short. D3D11's `vs_5_0` accepts
+/// 32 vertex inputs and no more, two of them the system values, and this
+/// family spends two more on its geometry, so everything that is CONSTANT
+/// across one draw item -- the sun, the fog, the debug switches, the fur
+/// recipe and morph source, the layer's material and detail lanes -- is a
+/// uniform declared in the script block (`shaders/skinned.rs`,
+/// `shaders/pbr.rs`) instead. What is left here is what genuinely differs
+/// between two instances that share geometry and textures; a uniform
+/// difference opens a new draw item, so moving any of it off the stream
+/// would silently split batches or hand one instance another's value.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneSkinned {
+    #[deref]
+    pub draw_vars: DrawVars,
+    // Keep this base's instance payload a multiple of eight bytes so
+    // derived material fields follow it without Rust tail padding.
+    #[live(vec2(0.0,0.0))] pub fur_layer: Vec2f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights0:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights1:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights2:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights3:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights4:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights5:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights6:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights7:Vec4f,
+    #[live]
+    pub transform: Mat4f,
+    /// Per-character wash over the vertex tint. One rig serves a whole village,
+    /// so without this every passer-by is the same knight in the same colours —
+    /// the identical-clones failure the prop variety work just fixed. Costs one
+    /// vec4 on an instance stream that carries a handful of characters, and one
+    /// multiply in the vertex stage.
+    #[live(vec4(1.0, 1.0, 1.0, 1.0))]
+    pub tint: Vec4f,
+    /// x = hue degrees, y = saturation, z = value, w reserved.
+    #[live(vec4(0.0, 1.0, 1.0, 0.0))]
+    pub color_adjust_ctl: Vec4f,
+    /// This instance's window into the baked light atlas (offset uv, scale
+    /// uv). Zero scale = no lightmap: full analytic sun, no lamp light —
+    /// dynamics and unbaked models render exactly as before.
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub lm_rect: Vec4f,
+    /// Dynamic-light gate: 1.0 for dynamic instances (sum every light slot),
+    /// 0.0 for statics (sum only the transient prefix — their lamp light is
+    /// already baked into the atlas, and statics and dynamics of one model
+    /// share a draw item, so this must ride the instance stream).
+    #[live(0.0)]
+    pub dl_apply: f32,
+    /// Ground height under a DYNAMIC instance: the baked-shadow sample is
+    /// projected along the sun ray down to this plane. Unused by statics.
+    #[live(0.0)]
+    pub ground_y: f32,
+    /// Depth-tie breaker for coplanar stacked statics. The vertex stage
+    /// scales the view-space position by (1 - depth_bias), which the
+    /// perspective divide cancels — the on-screen image is EXACTLY the
+    /// flush geometry, only the depth-buffer value moves toward the
+    /// camera. Placement order feeds it (renderer: depth_order * 1e-3),
+    /// so a prop resting on a floor plate wins the z-tie against it
+    /// deterministically instead of being physically lifted off it.
+    #[live(0.0)]
+    pub depth_bias: f32,
+    /// 1 = vertex COLOR_0 is baked lighting (do not multiply the sun).
+    #[live(0.0)]
+    pub prelit: f32,
+    /// x = 1: the base-colour texture's glTF sampler asks for NEAREST
+    /// magnification, so a texel larger than a pixel draws as a hard square
+    /// (the classic games' look); minified texels stay filtered. y unused
+    /// (keeps the payload a multiple of eight bytes). Set per draw from the
+    /// layer's material; 0 everywhere else draws exactly as before.
+    /// y = the PBR lane's shading terms (`makepadShading`), packed as
+    /// rim * 255 * 65536 + clearcoat * 255 * 256 + flake * 255 (0 = plain;
+    /// `MaterialSurface::packed_shading`).
+    #[live(vec2(0.0, 0.0))]
+    pub tex_mag: Vec2f,
+}
+
+impl DrawSceneSkinned {
+    /// Up to four lanes of one of this draw's uniforms as last written (the
+    /// declared default before that); zeros for a uniform its shader lacks.
+    /// The values that left the instance stream are read back through this.
+    pub fn uniform_value(&self, cx: &Cx, id: LiveId) -> [f32; 4] {
+        let mut out = [0.0; 4];
+        if let Some((offset, slots)) = self.draw_vars.uniform_range(cx, id) {
+            for (lane, value) in out.iter_mut().enumerate().take(slots) {
+                *value = self.draw_vars.dyn_uniforms.get(offset + lane).copied().unwrap_or(0.0);
+            }
+        }
+        out
+    }
+}
+
+/// [`DrawSceneSkinned`] plus a Cook-Torrance specular lobe, for static props
+/// whose glTF material carries real shininess
+/// ([`crate::model::PbrMaterial::is_shiny`]).
+///
+/// The deref chain is what makes the two lanes one code path: everything the
+/// renderer sets on a model draw — transform, lightmap window, dynamic-light
+/// gate, sun terms — is set through the inherited [`DrawSceneSkinned`], and
+/// the material values the lobe adds are uniforms in its script block
+/// (`shaders/pbr.rs`). Nothing is appended to the instance stream here: the
+/// base already fills most of what `vs_5_0` allows a vertex stage, and every
+/// material value is fixed for the one layer a draw item covers.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawScenePbr {
+    #[deref]
+    pub skinned: DrawSceneSkinned,
+}
+
+// DrawVars reads inherited instance fields as one contiguous float slice.
+// Tail padding in the base would shift any field a lane appended after it
+// (AO became red emission once). No lane built on it appends one now: what
+// they add is uniforms.
+const _: () = {
+    let end = std::mem::offset_of!(DrawSceneSkinned, tex_mag) + std::mem::size_of::<Vec2f>();
+    assert!(std::mem::size_of::<DrawSceneSkinned>() == end);
+    assert!(std::mem::size_of::<DrawScenePbr>() == end);
+    assert!(std::mem::size_of::<DrawSceneCity>() == end);
+};
+
+/// The streamed world's surface shader (`renderer/stream_draw.rs`):
+/// [`DrawScenePbr`]'s lighting with the city's materials — curtain-wall and
+/// window glass with a sky-and-skyline reflection and a room behind each
+/// pane, clear-coated paint, emissive lamps, and the lit-window hours. A
+/// layer's `metallic` slot carries its [`crate::stream::StreamSurface`]
+/// code; the ORM map's channels are read per that kind.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneCity {
+    #[deref]
+    pub pbr: DrawScenePbr,
+}
+
+/// GPU grass blades (`crate::grass`): DrawScenePbr's lane with its own
+/// vertex stage (blades placed on the grass field) and pixel. One instance
+/// per patch. It adds NO instance lanes (the PBR stream is at the vertex-
+/// attribute limit) and no uniforms (the PBR block is full): the blades
+/// never morph, so the field rides the morph weight lanes, see
+/// `renderer/grass_draw.rs` for the layout.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneGrass {
+    #[deref]
+    pub pbr: DrawScenePbr,
+}
+
+/// The swaying-foliage lane (`shaders/foliage.rs`): DrawScenePbr's vertex
+/// stage and binding with a pixel made for leaves. No instance lanes of its
+/// own (the PBR stream is at the vertex-attribute limit).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneFoliageLit {
+    #[deref]
+    pub pbr: DrawScenePbr,
+}
+
+/// A generated terrain tile's paint lane (`shaders/splat.rs`): DrawScenePbr's
+/// vertex stage, binding and lighting with a pixel that blends the tile's
+/// layers. No instance lanes of its own.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneSplat {
+    #[deref]
+    pub pbr: DrawScenePbr,
+}
+
+/// A model's far stand-in (`shaders/impostor.rs`, `crate::impostor`): the
+/// foliage lane's layout (the lane switches only the shader id for the
+/// stand-in layer) with a vertex stage that turns one quad toward the camera
+/// and a pixel that blends the three nearest baked views.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneImpostor {
+    #[deref]
+    pub pbr: DrawScenePbr,
+}
+
+/// Camera-space held-model shader: per-pixel PBR (normal map, metallic-
+/// roughness, sun lobe, sky reflection) without any world-lighting state.
+/// The transform and the layer material are the instance lanes; daylight is
+/// uniform per view.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneViewModel {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(vec3(0.35, 0.8, 0.45))]
+    pub light_dir: Vec3f,
+    #[live(vec3(0.72, 0.72, 0.72))]
+    pub sun_color: Vec3f,
+    #[live(vec3(0.28, 0.28, 0.28))]
+    pub sun_sky: Vec3f,
+    #[live(vec3(0.28, 0.28, 0.28))]
+    pub sun_ground: Vec3f,
+    /// 1 in the HDR lane: texels and vertex colours are sRGB-encoded and
+    /// must be linearised like every world shader does (`to_scene`), or
+    /// the held model renders washed out next to the world.
+    #[live(0.0)]
+    pub lin: f32,
+    /// Sun reaching the camera (0 in shadow): the held model has no shadow
+    /// map, so the host tells it whether the eye stands in shade.
+    #[live(1.0)]
+    pub sun_vis: f32,
+    /// The horizon radiance the sky reflection fades to (the world's fog).
+    #[live(vec3(0.6, 0.65, 0.7))]
+    pub fog_color: Vec3f,
+    /// Per layer: the glTF metallic/roughness factors (x the ORM map when
+    /// `orm_on`), normal-map strength (0 = none), mask cutout, emission.
+    #[live(0.0)]
+    pub metallic: f32,
+    #[live(1.0)]
+    pub roughness: f32,
+    #[live(0.0)]
+    pub orm_on: f32,
+    #[live(0.0)]
+    pub normal_scale: f32,
+    #[live(0.0)]
+    pub alpha_mode: f32,
+    #[live(0.5)]
+    pub alpha_cutoff: f32,
+    #[live(vec3(0.0, 0.0, 0.0))]
+    pub emissive: Vec3f,
+}
+
+/// Old-school lamp lens flare: one additive billboard per visible light.
+/// Instance fields are vec4-packed for the same shader-ABI reason as
+/// [`DrawSceneFirework`] (a vec3 instance reads back misaligned).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneFlare {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    /// xyz = world position of the glow, w = billboard size in world units.
+    #[live(vec4(0.0, 0.0, 0.0, 1.0))]
+    pub flare_pos: Vec4f,
+    /// rgb = glow colour, w = intensity multiplier.
+    #[live(vec4(1.0, 0.9, 0.6, 1.0))]
+    pub flare_col: Vec4f,
+}
+
+/// Surface-aligned procedural bullet-hole plane. Both instance payloads are
+/// vec4-packed to keep the shader ABI aligned.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneDecal {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    /// xyz = lifted world centre, w = full diameter.
+    #[live(vec4(0.0, 0.0, 0.0, 0.08))]
+    pub decal_pos: Vec4f,
+    /// xyz = surface normal, w = in-plane rotation.
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub decal_normal: Vec4f,
+    /// rgb = energy tint, w = procedural family (bullet/scorch/energy).
+    #[live(vec4(0.105, 0.075, 0.045, 0.0))]
+    pub decal_color: Vec4f,
+}
+
+/// In-world video screen: one upright textured quad, texture updated per
+/// frame by the host. Instance fields are vec4-packed for the same
+/// shader-ABI reason as [`DrawSceneFlare`].
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneScreen {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    /// xyz = world position of the screen centre, w = yaw in radians
+    /// (yaw == camera orbit yaw faces that camera squarely).
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub screen_pos: Vec4f,
+    /// x = width, y = height in world units; zw may carry source sheet size.
+    /// A NEGATIVE `w` asks for a floor-aligned card and a NEGATIVE `z` for a
+    /// ground-anchored, depth-flattened billboard (see the vertex shader).
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub screen_size: Vec4f,
+    /// 1 = alpha-cut-out sprite artwork (transparent pixels discard), 0 = an
+    /// opaque screen. Sprite billboards are cut-outs by nature; a video
+    /// frame is not, and must never depend on what its decoder wrote into
+    /// the alpha byte.
+    #[live(0.0)]
+    pub cutout: f32,
+    /// 1 = exact level-0 nearest sampling for pixel-art sheets, 0 = ordinary
+    /// smooth sampling for the in-world video lane sharing this shader.
+    #[live(0.0)]
+    pub pixelated: f32,
+    #[live(vec4(1.0, 1.0, 1.0, 1.0))]
+    pub tint: Vec4f,
+    /// x = hue degrees, y = saturation, z = value, w reserved.
+    #[live(vec4(0.0, 1.0, 1.0, 0.0))]
+    pub color_adjust_ctl: Vec4f,
+    /// Sub-rectangle of the texture this quad shows, `(u0, v0, u1, v1)`.
+    /// A packed sprite sheet is ONE texture with many windows into it, which
+    /// is what keeps a level's actor set at a dozen textures instead of five
+    /// hundred. `u0 > u1` draws the X-mirrored pair the source stores once.
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub uv_rect: Vec4f,
+}
+
+/// GPU-skinned character mesh: rest geometry + joint-palette texture.
+///
+/// A sibling of [`DrawSceneSkinned`] (the DrawSceneFoliage pattern): props keep
+/// the cheap fetch-free path, characters opt in to the palette blend. Field
+/// order mirrors DrawSceneSkinned — every `#[live]` after the deref is an
+/// instance field read contiguously by `DrawVars::as_slice`, and characters
+/// of one rig batch into a single draw item, so the whole crowd's state
+/// rides this stream. `joint_base` is the instance's first texel in the
+/// frame's palette texture.
+///
+/// "The whole crowd's state" is the point and also the limit: `vs_5_0` gives
+/// a vertex stage 32 inputs, and the sun, the fog and the per-part material
+/// lanes took it past that, so the shader did not compile on D3D11 and the
+/// characters disappeared. Those values are uniforms in the script block
+/// (`shaders/skinned_gpu.rs`). They are written per CALL (sun, fog, eye) or
+/// per material PART, beside that part's own geometry and textures, so
+/// nothing that varies between two batched characters left the stream.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneSkinnedGpu {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub fur: Vec4f,
+    // Keep this base's instance payload a multiple of eight bytes so
+    // derived material fields follow it without Rust tail padding.
+    #[live(vec2(0.0,0.0))] pub fur_layer: Vec2f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_ctl:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights0:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights1:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights2:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights3:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights4:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights5:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights6:Vec4f,
+    #[live(vec4(0.0,0.0,0.0,0.0))] pub morph_weights7:Vec4f,
+    #[live]
+    pub transform: Mat4f,
+    /// Per-character wash over the atlas colours (see DrawSceneSkinned::tint).
+    #[live(vec4(1.0, 1.0, 1.0, 1.0))]
+    pub tint: Vec4f,
+    /// x = hue degrees, y = saturation, z = value, w reserved.
+    #[live(vec4(0.0, 1.0, 1.0, 0.0))]
+    pub color_adjust_ctl: Vec4f,
+    /// First texel of this character's palette in the joint texture.
+    #[live(0.0)]
+    pub joint_base: f32,
+    /// Ground height under this character: the baked-shadow sample is
+    /// projected along the sun ray down to this plane (OnChange only — the
+    /// Realtime cascades need no ground plane).
+    #[live(0.0)]
+    pub ground_y: f32,
+}
+
+/// Generated foliage: vertex-coloured mesh with growth reveal and wind sway.
+///
+/// A sibling of [`DrawSceneSkinned`] rather than a mode inside it — the shared
+/// shaders draw most of the world and must not carry wind ALU they never use.
+/// Both animation weights ride in the packed vertex's existing alpha lane, so
+/// opting in costs vertex instructions but zero extra vertex bytes.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneFoliage {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    #[live(vec3(0.35, 0.8, 0.45))]
+    pub light_dir: Vec3f,
+    #[live(vec3(0.75, 0.87, 0.96))]
+    pub fog_color: Vec3f,
+    #[live(0.0)]
+    pub fog_density: f32,
+    #[live(vec3(0.72, 0.72, 0.72))]
+    pub sun_color: Vec3f,
+    #[live(vec3(0.28, 0.28, 0.28))]
+    pub sun_sky: Vec3f,
+    #[live(vec3(0.28, 0.28, 0.28))]
+    pub sun_ground: Vec3f,
+    /// Reveal threshold in [0, 1]. 1 = fully grown; defaults so a plant that
+    /// nobody animates is simply present.
+    #[live(1.0)]
+    pub growth: f32,
+    /// Width of the smoothstep band that hides growth_t's 16-level
+    /// quantisation and makes tips unfurl instead of popping.
+    #[live(0.12)]
+    pub growth_band: f32,
+    #[live(vec3(1.0, 0.0, 0.0))]
+    pub wind_dir: Vec3f,
+    #[live(0.0)]
+    pub wind_strength: f32,
+    #[live(0.0)]
+    pub wind_gust: f32,
+    #[live(0.0)]
+    pub wind_time: f32,
+}
+
+/// Silhouette shadow mesh: all casters' hulls in one geometry, one draw call.
+/// Position and per-vertex alpha only — no lighting, no fog (a shadow lies on
+/// ground that is already fogged; fogging it again mixes it toward the bright
+/// horizon and a distant shadow comes out lighter than what it darkens).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneShadow {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    /// Global dimmer, so a device can soften shadows without a rebuild.
+    #[live(1.0)]
+    pub shadow_scale: f32,
+    /// Debug overlay: magenta at boosted alpha (the host's shadow debug setting).
+    #[live(0.0)]
+    pub shadow_debug: f32,
+}
+
+/// SDF silhouette shadow — the dynamic shadow quad every character and
+/// driven car draws, shaded in the pixel stage from the caster's baked
+/// silhouette-SDF atlas (shadow_sdf.rs,
+/// [`crate::shadow_sdf::SDF_CELL`]-square cells — the shader's cell math
+/// hardcodes 32 to match). Instance fields are vec4-packed for the
+/// shader-ABI reason documented on [`DrawSceneFirework`], and the layout is
+/// asserted below.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneShadowSdf {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    /// Global dimmer, mirroring [`DrawSceneShadow::shadow_scale`].
+    #[live(1.0)]
+    pub shadow_scale: f32,
+    /// Magenta debug overlay (the host's shadow debug setting).
+    #[live(0.0)]
+    pub shadow_debug: f32,
+    /// xyz = quad anchor (y at the receiver), w = receiver lift.
+    #[live(vec4(0.0, 0.0, 0.0, 0.012))]
+    pub sdf_a: Vec4f,
+    /// xy = the owning light's horizontal direction (unit, toward the
+    /// light — the sprite's local +x axis in world), z = sprite scale
+    /// (footprint x anchor compression), w = final alpha.
+    #[live(vec4(1.0, 0.0, 1.0, 0.3))]
+    pub sdf_b: Vec4f,
+    /// x = relative yaw (character yaw - light azimuth, radians), y = gait
+    /// phase 0..1, z = idle-to-walk blend, w = atlas pose rows.
+    #[live(vec4(0.0, 0.0, 0.0, 1.0))]
+    pub sdf_c: Vec4f,
+    /// The atlas window in sprite units: xy = (min_along, min_across),
+    /// zw = (size_along, size_across) — every cell shares it.
+    #[live(vec4(-1.0, -1.0, 2.0, 2.0))]
+    pub sdf_d: Vec4f,
+    /// x = base edge half-width in encoded-d units, y = widening per sprite
+    /// unit toward the shadow tip (contact hardening), zw unused.
+    #[live(vec4(0.06, 0.05, 0.0, 0.0))]
+    pub sdf_e: Vec4f,
+}
+
+/// The firework ABI lesson, enforced at compile time: everything after
+/// `DrawVars` must be exactly the instance lanes the script shader reads —
+/// 3 floats + 5 vec4s, contiguous. Any accidental field among them (a bool,
+/// an Option, a #[rust]) shifts these offsets and corrupts the GPU instance
+/// stream, which presents as shadows at garbage positions. (The struct's
+/// total size is NOT asserted: DrawVars aligns to 8, so tail padding could
+/// hide a stray trailing f32 — the offsets can't.)
+const _: () = {
+    let base = std::mem::size_of::<DrawVars>();
+    assert!(std::mem::offset_of!(DrawSceneShadowSdf, depth_clip) == base);
+    assert!(std::mem::offset_of!(DrawSceneShadowSdf, sdf_a) == base + 3 * 4);
+    assert!(std::mem::offset_of!(DrawSceneShadowSdf, sdf_c) == base + 3 * 4 + 2 * 16);
+    assert!(std::mem::offset_of!(DrawSceneShadowSdf, sdf_e) == base + 3 * 4 + 4 * 16);
+};
+
+/// The smooth terrain mesh (PbrVertex layout: per-vertex color).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneTerrain {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    #[live(vec3(0.35, 0.8, 0.45))]
+    pub light_dir: Vec3f,
+    #[live(vec3(0.75, 0.87, 0.96))]
+    pub fog_color: Vec3f,
+    #[live(0.0)]
+    pub fog_density: f32,
+    /// Sun terms, written every frame from one [`crate::sun::SunLight`].
+    #[live(vec3(0.72, 0.72, 0.72))]
+    pub sun_color: Vec3f,
+    #[live(vec3(0.28, 0.28, 0.28))]
+    pub sun_sky: Vec3f,
+    #[live(vec3(0.28, 0.28, 0.28))]
+    pub sun_ground: Vec3f,
+    /// The terrain's window into the baked light atlas; zero = none.
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub lm_rect: Vec4f,
+    /// World xz rect that window covers: (x0, z0, width, depth).
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub lm_world: Vec4f,
+    /// 1.0 = show the baked light alone (`HostSettings::lm_debug`).
+    #[live(0.0)]
+    pub lm_debug: f32,
+}
+
+/// The water sheet (W1): a per-volume grid displaced in the vertex stage by
+/// the sim's own wave sum. Wave coefficients ride as UNIFORMS (per draw
+/// item, one per volume — a coefficient change starts a new item), so the
+/// instance stream stays as small as the terrain's.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawSceneWater {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(1.0)]
+    pub depth_clip: f32,
+    #[live(vec3(0.35, 0.8, 0.45))]
+    pub light_dir: Vec3f,
+    #[live(vec3(0.75, 0.87, 0.96))]
+    pub fog_color: Vec3f,
+    #[live(0.0)]
+    pub fog_density: f32,
+    /// Sun terms, written every frame from one [`crate::sun::SunLight`].
+    #[live(vec3(0.72, 0.72, 0.72))]
+    pub sun_color: Vec3f,
+    #[live(vec3(0.28, 0.28, 0.28))]
+    pub sun_sky: Vec3f,
+    #[live(vec3(0.28, 0.28, 0.28))]
+    pub sun_ground: Vec3f,
+}
+
+// ---------------------------------------------------------------------------
+// GPU lightmap baker draw structs (gpu_lightmap.rs). Instance-field rule
+// applies throughout: ONLY #[live] instance lanes after the DrawVars deref,
+// vec4/mat4-packed (the DrawSceneFirework ABI lesson).
+// ---------------------------------------------------------------------------
+
+/// Sun-view depth pass: geometry from a region's fitted ortho sun camera.
+/// `sun_r*` are the camera rows: dot(row.xyz, world) + row.w = ndc x/y/z01.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmSunDepth {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub sun_rx: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub sun_ry: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 0.0))]
+    pub sun_rz: Vec4f,
+    /// x = 1: flipped depth test (far map for the shadow-top plane).
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub flip_a: Vec4f,
+    /// (sx, sy, ox, oy) clip-space tile mapping: the cascade pass renders
+    /// CSM_CASCADES tiles of one strip through this same shader; (1,1,0,0)
+    /// = the whole target (every atlas pass).
+    #[live(vec4(1.0, 1.0, 0.0, 0.0))]
+    pub tile_a: Vec4f,
+    #[live]
+    pub morph_ctl: Vec4f,
+    #[live]
+    pub morph_weights0: Vec4f,
+    #[live]
+    pub morph_weights1: Vec4f,
+    #[live]
+    pub morph_weights2: Vec4f,
+    #[live]
+    pub morph_weights3: Vec4f,
+    #[live]
+    pub morph_weights4: Vec4f,
+    #[live]
+    pub morph_weights5: Vec4f,
+    #[live]
+    pub morph_weights6: Vec4f,
+    #[live]
+    pub morph_weights7: Vec4f,
+
+}
+
+/// [`DrawLmSunDepth`] for cut-out casters (leaf cards, fences): the same
+/// projection, plus the layer's base-colour alpha tested per fragment, so a
+/// card casts its leaves and not its rectangle. Only cut-out layers draw
+/// through it; every other caster keeps the discard-free-by-texture lane.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmSunDepthCutout {
+    #[deref]
+    pub depth: DrawLmSunDepth,
+}
+
+/// [`DrawLmSunDepthCutout`] for a far stand-in's quad (shaders/lm_depth.rs):
+/// turned to the sun, cut by the baked view nearest to the sun's direction.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmSunDepthImpostor {
+    #[deref]
+    pub cutout: DrawLmSunDepthCutout,
+}
+
+/// [`DrawLmSunDepth`] for casters wholly inside their cascade's tile: the
+/// same projection with no tile clip, so its pipeline has no `discard` and
+/// keeps the GPU's hidden-surface removal.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmSunDepthInside {
+    #[deref]
+    pub depth: DrawLmSunDepth,
+}
+
+/// Lamp-view depth pass: six 90-degree faces tiled 3x2. `face_r*` are the
+/// face view rows; `tile_a` = (sx, sy, ox, oy) clip-space tile mapping;
+/// `lamp_range` = (near, far).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmLampDepth {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub face_rx: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub face_ry: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 0.0))]
+    pub face_rz: Vec4f,
+    #[live(vec4(1.0, 1.0, 0.0, 0.0))]
+    pub tile_a: Vec4f,
+    #[live(vec4(0.25, 8.0, 0.0, 0.0))]
+    pub lamp_range: Vec4f,
+    #[live]
+    pub morph_ctl: Vec4f,
+    #[live]
+    pub morph_weights0: Vec4f,
+    #[live]
+    pub morph_weights1: Vec4f,
+    #[live]
+    pub morph_weights2: Vec4f,
+    #[live]
+    pub morph_weights3: Vec4f,
+    #[live]
+    pub morph_weights4: Vec4f,
+    #[live]
+    pub morph_weights5: Vec4f,
+    #[live]
+    pub morph_weights6: Vec4f,
+    #[live]
+    pub morph_weights7: Vec4f,
+
+}
+
+/// [`DrawLmLampDepth`] with no face clip, for draws scissored to their
+/// face's tile: its pipeline has no `discard`.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmLampDepthInside {
+    #[deref]
+    pub depth: DrawLmLampDepth,
+}
+
+/// Skinned sun-view depth pass (Realtime characters in the bake): the
+/// DrawLmSunDepth projection over a rig's rest mesh, position-skinned
+/// against the frame's joint-palette texture. `skin_a.x` = joint_base.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmSunDepthSkinned {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub sun_rx: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub sun_ry: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 0.0))]
+    pub sun_rz: Vec4f,
+    /// x = 1: flipped depth test (far map for the shadow-top plane).
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub flip_a: Vec4f,
+    /// x = first palette texel of this caster (joint_base); yzw unused
+    /// (vec4-packed per this block's instance-lane rule).
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub skin_a: Vec4f,
+    /// (sx, sy, ox, oy) clip-space tile mapping — see [`DrawLmSunDepth`].
+    #[live(vec4(1.0, 1.0, 0.0, 0.0))]
+    pub tile_a: Vec4f,
+    #[live]
+    pub morph_ctl: Vec4f,
+    #[live]
+    pub morph_weights0: Vec4f,
+    #[live]
+    pub morph_weights1: Vec4f,
+    #[live]
+    pub morph_weights2: Vec4f,
+    #[live]
+    pub morph_weights3: Vec4f,
+    #[live]
+    pub morph_weights4: Vec4f,
+    #[live]
+    pub morph_weights5: Vec4f,
+    #[live]
+    pub morph_weights6: Vec4f,
+    #[live]
+    pub morph_weights7: Vec4f,
+
+}
+
+/// Sun gather over a mesh region's chart, at 4x. `target_a` maps chart uv
+/// into the mask scratch; `sun_dir_p` = (sun dir, RAY_OFFSET); `params_a` =
+/// (depth bias in z01 units, sun-up flag).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmSunGatherMesh {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub sun_rx: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub sun_ry: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 0.0))]
+    pub sun_rz: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub target_a: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.02))]
+    pub sun_dir_p: Vec4f,
+    #[live(vec4(0.001, 1.0, 0.0, 0.0))]
+    pub params_a: Vec4f,
+}
+
+/// Sun gather over the ground heightfield. `quad_a` places the region quad
+/// in the target; `ground_a` = world rect (x0, z0, sx, sz); `hf_a` =
+/// (origin_x, origin_z, cell, n).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmSunGatherGround {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub sun_rx: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub sun_ry: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 0.0))]
+    pub sun_rz: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.02))]
+    pub sun_dir_p: Vec4f,
+    #[live(vec4(0.001, 1.0, 0.0, 0.0))]
+    pub params_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub ground_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 2.0))]
+    pub hf_a: Vec4f,
+}
+
+/// 3x3 despeckle vote. `src_a` = (inv_w, inv_h, area_w, area_h).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmDespeckle {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(1.0, 1.0, 1.0, 1.0))]
+    pub src_a: Vec4f,
+}
+
+/// 4x -> 1x coverage downsample. `rect_a` = dest rect (x, y, w, h) texels.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmDownsample {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(1.0, 1.0, 0.0, 0.0))]
+    pub src_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub rect_a: Vec4f,
+}
+
+/// Chamfer distance-transform pass. `rect_px` = region rect in atlas
+/// texels; `misc_a` = (1/atlas_size, mode).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmChamfer {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub rect_px: Vec4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub misc_a: Vec4f,
+}
+
+/// Region-scoped hard zero of a persistent bake target. `quad_a` = the
+/// region's padded rect in atlas uv, `fill_a` = the value every texel of it
+/// becomes.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmZero {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 0.0, 0.0))]
+    pub fill_a: Vec4f,
+}
+
+/// Lamp gather over a mesh region's chart at 1x. `lamp_a` = (pos, radius),
+/// `lamp_b` = (color, spot), `lamp_c` = (dir, mode: 0 coverage / 1 lamp),
+/// `lamp_d` = (near, far, bias, RAY_OFFSET).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmLampGatherMesh {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub transform: Mat4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub target_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 0.0, 8.0))]
+    pub lamp_a: Vec4f,
+    #[live(vec4(1.0, 1.0, 1.0, 0.0))]
+    pub lamp_b: Vec4f,
+    #[live(vec4(0.0, -1.0, 0.0, 1.0))]
+    pub lamp_c: Vec4f,
+    #[live(vec4(0.25, 8.0, 0.05, 0.02))]
+    pub lamp_d: Vec4f,
+}
+
+/// Lamp gather over the ground heightfield at 1x.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmLampGatherGround {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub ground_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 2.0))]
+    pub hf_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 0.0, 8.0))]
+    pub lamp_a: Vec4f,
+    #[live(vec4(1.0, 1.0, 1.0, 0.0))]
+    pub lamp_b: Vec4f,
+    #[live(vec4(0.0, -1.0, 0.0, 1.0))]
+    pub lamp_c: Vec4f,
+    #[live(vec4(0.25, 8.0, 0.05, 0.02))]
+    pub lamp_d: Vec4f,
+}
+
+/// Lamp rim fill / smooth. `misc_a` = (1/atlas_size, mode 0|1 ring, 2 smooth).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmLampDilate {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub rect_px: Vec4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub misc_a: Vec4f,
+}
+
+/// Final atlas encode. `rect_px` = the EXPANDED rect in atlas texels.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmEncode {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub rect_px: Vec4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub misc_a: Vec4f,
+}
+
+/// Shadow-top plane conversion. `top_a` = (zr, sun_dir.y, base, range);
+/// `params_a` = (sun_up, depth bias z01, RAY_OFFSET).
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmTop {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub sun_rx: Vec4f,
+    #[live(vec4(0.0, 1.0, 0.0, 0.0))]
+    pub sun_ry: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 0.0))]
+    pub sun_rz: Vec4f,
+    #[live(vec4(1.0, 1.0, 0.0, 8.0))]
+    pub top_a: Vec4f,
+    #[live(vec4(1.0, 0.001, 0.02, 0.0))]
+    pub params_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub ground_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 2.0))]
+    pub hf_a: Vec4f,
+}
+
+/// One ring of min-dilation of the shadow-top plane.
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawLmTopDilate {
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub quad_a: Vec4f,
+    #[live(vec4(0.0, 0.0, 1.0, 1.0))]
+    pub rect_px: Vec4f,
+    #[live(vec4(1.0, 0.0, 0.0, 0.0))]
+    pub misc_a: Vec4f,
+}
+
+/// THE baked-shadow penumbra: the smoothstep window every material shader
+/// decodes the light atlas's signed-distance A channel through (128 = the
+/// silhouette edge; the encode keeps a ±4-texel band, so the window is a
+/// pure runtime knob — no re-bake to change it). This pair reads ±2.4
+/// texels of the band: on the village ground region (~11.4 texels/unit)
+/// that is a ~42 cm penumbra, on model charts (32 texels/unit) ~15 cm —
+/// the (0.33, 0.67) window before it measured 24 cm / 8 cm and the user
+/// still read the edges as hard. Widening the WINDOW is the whole lever
+/// while it stays inside the encoded ±4: the band itself only needs to
+/// grow (encode + chamfer step count + this window's world math) if a
+/// future look wants penumbras past ±4 texels. Both modes share the atlas
+/// encode, so both get it.
+///
+/// The macro'd shader text cannot interpolate a Rust const, so the pair is
+/// written INLINE at every sampler; the test below holds the sites in
+/// lockstep with this constant — edit the constant, then the sites it
+/// flags. DrawLmTop's lit gate (`lm_a >=`) rides the TOP edge: every texel
+/// the window would darken at all must carry a blocker height.
+pub const LM_SUN_SOFT: (f32, f32) = (0.2, 0.8);
+
+/// The body of the function `name` in a lowered shader source a compile
+/// test emitted (GLSL and HLSL both define it as `io_<name>(`): the lines
+/// between its opening line and its closing brace.
+#[cfg(test)]
+pub(crate) fn lowered_fn_body(source: &str, name: &str) -> Option<String> {
+    let def = format!("io_{name}(");
+    // `<type> <name>(..){` at the start of a line: the definition, not a call.
+    let mut lines = source.lines().skip_while(|l| {
+        !(l.trim_end().ends_with('{') && l.split_whitespace().nth(1).is_some_and(|w| w.starts_with(&def)))
+    });
+    lines.next()?;
+    let (mut depth, mut body) = (1i32, String::new());
+    for line in lines {
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if depth <= 0 {
+            return Some(body);
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    None
+}
+
+/// A lowered shader source as the source-text tests read it: each line
+/// trimmed, and each user local named `l_<name>`. The shader IR writes a
+/// local `l<index>_<name>` (platform/shader, `local_name`), its index in
+/// its function, which moves whenever the function gains or loses a local;
+/// the tests pin statements, not that numbering or the indentation.
+#[cfg(test)]
+pub(crate) fn test_source(source: &str) -> String {
+    let mut out = Vec::with_capacity(source.len());
+    for line in source.lines() {
+        let b = line.trim().as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let in_word = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+            if b[i] == b'l' && !in_word {
+                let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+                if digits > 0 && b.get(i + 1 + digits) == Some(&b'_') {
+                    out.extend_from_slice(b"l_");
+                    i += digits + 2;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out.push(b'\n');
+    }
+    // Only ASCII runs were replaced, so the bytes are still UTF-8.
+    String::from_utf8(out).expect("UTF-8 source")
+}
+
+#[cfg(test)]
+mod lowered_source_tests {
+    use super::test_source;
+
+    #[test]
+    fn a_local_reads_by_its_name_and_a_line_without_its_indent() {
+        let lowered = "    float l14_dither = (((l13_hash - 0.5) * 0.008) * (1.0 - l6_hdr));\n        if ((uni_ibl_ctl.x > 0.5)) {\n    return p_a;";
+        assert_eq!(test_source(lowered), "float l_dither = (((l_hash - 0.5) * 0.008) * (1.0 - l_hdr));\nif ((uni_ibl_ctl.x > 0.5)) {\nreturn p_a;\n");
+        // Not a local: a name with `l<digits>_` inside it, or no `_` after the digits.
+        assert_eq!(test_source("cell2_x + bl3_y + l7 + l_x"), "cell2_x + bl3_y + l7 + l_x\n");
+    }
+}
+
+#[cfg(test)]
+mod shader_registration_tests {
+    use super::*;
+    use makepad_draw::makepad_platform::makepad_script::script_eval;
+
+    /// The hard budget the scene lanes sit against, pinned so that adding
+    /// one `#[live]` field cannot silently cross it again.
+    ///
+    /// D3D11's `vs_5_0` accepts 32 vertex inputs and no more. An input is
+    /// one instance element (a Mat4f is four) plus the geometry's own vec4
+    /// lanes, and fxc adds SV_VertexID and SV_InstanceID on top -- which is
+    /// how the model shaders reached 38 to 51, failed to compile, and took
+    /// every model off the screen on Windows. 30 leaves room for those two.
+    #[test]
+    fn scene_shaders_stay_inside_the_vertex_input_budget() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            makepad_draw::script_mod(vm);
+            vm.heap_mut().new_module(id!(prelude));
+            script_eval!(vm, {
+                mod.prelude.widgets_internal = {
+                    ..mod.std, ..mod.pod, ..mod.math, ..mod.sdf, ..mod.shader, draw:mod.draw,
+                }
+            });
+            vm.heap_mut().new_module(id!(widgets));
+            makepad_render_graph::pass_stdlib(vm);
+            crate::local_shadows::sampling::script_mod(vm);
+            crate::clustered::script_mod(vm);
+            crate::fast_gi::script_mod(vm);
+            super::script_mod(vm);
+            crate::local_shadows::script_mod(vm);
+            crate::custom_material::register(vm);
+            let custom = crate::custom_material::DrawSceneCustom::script_new_with_default(vm);
+            let shaders = [
+                ("DrawSceneSkinned", DrawSceneSkinned::script_new_with_default(vm).draw_vars),
+                ("DrawScenePbr", DrawScenePbr::script_new_with_default(vm).skinned.draw_vars),
+                ("DrawSceneCity", DrawSceneCity::script_new_with_default(vm).pbr.skinned.draw_vars),
+                ("DrawSceneGrass", DrawSceneGrass::script_new_with_default(vm).pbr.skinned.draw_vars),
+                ("DrawSceneFoliageLit", DrawSceneFoliageLit::script_new_with_default(vm).pbr.skinned.draw_vars),
+                ("DrawSceneSplat", DrawSceneSplat::script_new_with_default(vm).pbr.skinned.draw_vars),
+                ("DrawSceneImpostor", DrawSceneImpostor::script_new_with_default(vm).pbr.skinned.draw_vars),
+                ("DrawSceneCustom", custom.pbr.skinned.draw_vars),
+                ("DrawSceneSkinnedGpu", DrawSceneSkinnedGpu::script_new_with_default(vm).draw_vars),
+            ];
+            for (name, vars) in shaders {
+                let id = vars.draw_shader_id.unwrap_or_else(|| panic!("{name} registered"));
+                let mapping = &vm.cx().draw_shaders[id.index].mapping;
+                // One input register per element, and a matrix is one
+                // element per row: what the vertex declaration spends.
+                let instance_elements: usize = mapping
+                    .instances
+                    .inputs
+                    .iter()
+                    .chain(mapping.dyn_instances.inputs.iter())
+                    .map(|input| if input.slots > 4 { input.slots.div_ceil(4) } else { 1 })
+                    .sum();
+                let geometry_elements = mapping.geometries.total_slots.div_ceil(4);
+                assert!(
+                    instance_elements + geometry_elements <= 30,
+                    "{name}: {instance_elements} instance + {geometry_elements} geometry vertex inputs, \
+                     and fxc adds two system values on top of a vs_5_0 limit of 32"
+                );
+            }
+        });
+    }
+
+    /// Cut-out casters inherit `morph_map` from DrawLmSunDepth, so their
+    /// alpha texture `tex` sits in a LATER slot. The cascades bind it by
+    /// name (gpu_lightmap::cutout_slot): bound at slot 0 it went to the
+    /// morph lane, and the alpha test read a stale slot — tree stand-ins
+    /// cast nothing, or whole rectangles that a low sun stretched into
+    /// long straight-edged bands across the ground.
+    #[test]
+    fn cutout_casters_bind_their_alpha_texture_by_name() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            makepad_draw::script_mod(vm);
+            vm.heap_mut().new_module(id!(prelude));
+            script_eval!(vm, {
+                mod.prelude.widgets_internal = { ..mod.std, ..mod.pod, ..mod.math, ..mod.sdf, ..mod.shader, draw: mod.draw, }
+            });
+            vm.heap_mut().new_module(id!(widgets));
+            makepad_render_graph::pass_stdlib(vm);
+            crate::local_shadows::sampling::script_mod(vm);
+            crate::clustered::script_mod(vm);
+            crate::fast_gi::script_mod(vm);
+            super::script_mod(vm);
+            crate::local_shadows::script_mod(vm);
+            crate::custom_material::register(vm);
+            let stock = DrawLmSunDepthCutout::script_new_with_default(vm).depth.draw_vars;
+            let material = crate::custom_material::DrawMaterialShadow::script_new_with_default(vm).depth.depth.draw_vars;
+            for (name, vars) in [("stock cut-out", stock), ("material caster", material)] {
+                let cx = vm.cx();
+                let textures = &cx.draw_shaders[vars.draw_shader_id.expect("registered").index].mapping.textures;
+                let tex = textures.iter().position(|t| t.id == live_id!(tex)).expect("alpha texture");
+                let morph = textures.iter().position(|t| t.id == live_id!(morph_map)).expect("morph lane");
+                assert_ne!(tex, morph, "{name}");
+                assert_eq!(crate::gpu_lightmap::cutout_slot(cx, &vars), Some(tex), "{name}: the alpha binds where the shader reads it");
+            }
+        });
+    }
+
+    /// The environment background reads both float textures on every
+    /// backend: the atlas through render-material's lookups and the
+    /// full-resolution dome through its own. Shared by the standalone
+    /// test below and the cube family's.
+    fn assert_env_background_sources(vm: &mut ScriptVm) {
+        for (name, result) in [
+            ("env background GLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawEnvBackground, "glsl", false)})),
+            ("env background HLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawEnvBackground, "hlsl", false)})),
+        ] {
+            let source = test_source(&vm.heap().string_with(result, |_heap, value| value.to_string()).unwrap());
+            assert!(!source.starts_with("ERRORS:"), "{name}: {source}");
+            assert!(source.contains("env_tex") && source.contains("detail_map"), "{name}: both textures are sampled");
+            // The dome's texel addressing works in its logical size
+            // (bg2.zw), the instance field the lookup reads.
+            assert!(source.contains("bg2"), "{name}: the dome lookup reads its logical size");
+            // K2: the hash dither is the legacy lane's (its 8-bit output
+            // bands); the HDR lane writes linear radiance, which the
+            // composite dithers after its tone map, and a fixed +-0.004
+            // there would swamp a dim map. One factor: (1 - hdr).
+            let dither = source.lines().find(|l| l.contains("0.008")).unwrap_or_else(|| panic!("{name}: the dither"));
+            assert!(dither.contains("(1.0 - l_hdr)"), "{name}: the HDR lane adds no dither: {dither}");
+        }
+    }
+
+    /// The environment background compiles and emits on its own. The cube
+    /// family's test registers every lane (the GI relight among them) and
+    /// stops at the first one that fails, so this one holds the
+    /// background's own contract whatever state the others are in.
+    #[test]
+    fn the_environment_background_shader_compiles_and_samples_both_textures() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            vm.capture_errors();
+            makepad_draw::script_mod(vm);
+            vm.heap_mut().new_module(id!(prelude));
+            script_eval!(vm, {
+                mod.prelude.widgets_internal = { ..mod.std, ..mod.pod, ..mod.math, ..mod.sdf, ..mod.shader, draw: mod.draw, }
+            });
+            vm.heap_mut().new_module(id!(widgets));
+            makepad_render_material::builtin::register(vm);
+            crate::renderer::ibl::script_mod(vm);
+            let errors = script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawEnvBackground)});
+            let errors = vm.heap().string_with(errors, |_heap, value| value.to_string()).expect("compile result should be a string");
+            let setup_errors = vm.take_errors();
+            assert!(setup_errors.is_empty(), "script setup errors: {setup_errors:#?}");
+            assert!(errors.is_empty(), "env background: {errors}");
+            assert_env_background_sources(vm);
+        });
+    }
+
+    /// The water surface compiles on every backend, and its texture
+    /// bindings fit the WebGL2 fragment budget with room to spare.
+    #[test]
+    fn water_shader_compiles_on_every_backend() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            vm.capture_errors();
+            makepad_draw::script_mod(vm);
+            vm.heap_mut().new_module(id!(prelude));
+            script_eval!(vm, {
+                mod.prelude.widgets_internal = { ..mod.std, ..mod.pod, ..mod.math, ..mod.sdf, ..mod.shader, draw: mod.draw, }
+            });
+            vm.heap_mut().new_module(id!(widgets));
+            makepad_render_graph::pass_stdlib(vm);
+            crate::local_shadows::sampling::script_mod(vm);
+            crate::clustered::script_mod(vm);
+            crate::fast_gi::script_mod(vm);
+            super::script_mod(vm);
+            crate::local_shadows::script_mod(vm);
+            crate::custom_material::register(vm);
+            let setup_errors = vm.take_errors();
+            assert!(setup_errors.is_empty(), "script setup errors: {setup_errors:#?}");
+            // The water itself, and every lit lane that now sees through it
+            // (`scene_fogged`).
+            for (name, result) in [
+                ("water", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneWater)})),
+                ("cube", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneCube)})),
+                ("alpha", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneAlpha)})),
+                ("terrain", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneTerrain)})),
+                ("model", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneSkinned)})),
+                ("pbr", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawScenePbr)})),
+                ("skin", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneSkinnedGpu)})),
+                ("city", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneCity)})),
+                ("grass", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneGrass)})),
+                ("foliage", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneFoliageLit)})),
+                ("splat", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneSplat)})),
+                ("impostor", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneImpostor)})),
+            ] {
+                let errors = vm.heap().string_with(result, |_heap, value| value.to_string()).unwrap();
+                assert!(errors.is_empty(), "{name}: {errors}");
+            }
+            for (name,result) in [
+                ("water GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawSceneWater,"glsl",false)})),
+                ("water HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawSceneWater,"hlsl",false)})),
+                ("water Metal",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawSceneWater,"metal",false)})),
+            ] {
+                let source=vm.heap().string_with(result,|_heap,value|value.to_string()).unwrap();
+                assert!(!source.starts_with("ERRORS:"),"{name}: {source}");
+                assert!(source.contains("detail_tex"),"{name}: missing ripple map");
+            }
+            let water = DrawSceneWater::script_new_with_default(vm);
+            let id = water.draw_vars.draw_shader_id.expect("registered water shader");
+            let textures = &vm.cx().draw_shaders[id.index].mapping.textures;
+            assert_eq!(textures.len(), 3, "sky, ripples, seabed");
+        });
+    }
+
+    #[test]
+    fn cube_family_script_shaders_compile_without_errors() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            vm.capture_errors();
+            makepad_draw::script_mod(vm);
+            vm.heap_mut().new_module(id!(prelude));
+            script_eval!(vm, {
+                mod.prelude.widgets_internal = {
+                    ..mod.std,
+                    ..mod.pod,
+                    ..mod.math,
+                    ..mod.sdf,
+                    ..mod.shader,
+                    draw:mod.draw,
+                }
+            });
+            vm.heap_mut().new_module(id!(widgets));
+            makepad_render_graph::pass_stdlib(vm);
+            crate::local_shadows::sampling::script_mod(vm);
+            crate::clustered::script_mod(vm);
+            crate::fast_gi::script_mod(vm);
+            super::script_mod(vm);
+            crate::local_shadows::script_mod(vm);
+            crate::custom_material::register(vm);
+            // The environment background registers itself on first draw;
+            // here it is registered explicitly (builtin's mat_ibl_* are in
+            // by custom_material::register).
+            crate::renderer::ibl::script_mod(vm);
+
+            // These shaders write numeric payloads (including negatives and
+            // triangle ids), not display colors. A successful shader compile
+            // alone does not detect an 8-bit pipeline / float-target mismatch.
+            // Trace/relight carry exact payloads (Rgba32F); the gathered
+            // field is the filtered receiver atlas (Rgba16F).
+            for (vars, format) in [
+                (crate::fast_gi::DrawGiTrace::script_new_with_default(vm).quad.draw_vars, "Rgba32F"),
+                (crate::fast_gi::DrawGiRelight::script_new_with_default(vm).quad.draw_vars, "Rgba32F"),
+                (crate::fast_gi::DrawGiGather::script_new_with_default(vm).quad.draw_vars, "Rgba16F"),
+            ] {
+                let id=vars.draw_shader_id.expect("GI shader registered");
+                assert_eq!(format!("{:?}",vm.cx().draw_shaders[id.index].mapping.color_format),format);
+                assert!(!vars.options.alpha_blend,"GI payloads must overwrite, not blend");
+            }
+
+            let cube_errors = script_eval!(vm, {
+                mod.shader.test_compile_draw_errors(mod.draw.DrawSceneCube)
+            });
+            let alpha_errors = script_eval!(vm, {
+                mod.shader.test_compile_draw_errors(mod.draw.DrawSceneAlpha)
+            });
+            let cube_errors = vm.heap()
+                .string_with(cube_errors, |_heap, value| value.to_string())
+                .expect("cube compile result should be a string");
+            let alpha_errors = vm.heap()
+                .string_with(alpha_errors, |_heap, value| value.to_string())
+                .expect("alpha compile result should be a string");
+            let setup_errors = vm.take_errors();
+
+            assert!(setup_errors.is_empty(), "script setup errors: {setup_errors:#?}");
+            assert!(cube_errors.is_empty(), "DrawSceneCube: {cube_errors}");
+            assert!(alpha_errors.is_empty(), "DrawSceneAlpha: {alpha_errors}");
+            for (name, result) in [
+                ("GI trace", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawGiTrace)})),
+                ("GI relight", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawGiRelight)})),
+                ("GI gather", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawGiGather)})),
+                ("terrain", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneTerrain)})),
+                ("model", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneSkinned)})),
+                ("pbr", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawScenePbr)})),
+                ("skin", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneSkinnedGpu)})),
+                ("custom", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneCustom)})),
+                ("env background", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawEnvBackground)})),
+                ("city", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneCity)})),
+                ("grass", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneGrass)})),
+                ("foliage", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneFoliageLit)})),
+                ("impostor", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawSceneImpostor)})),
+                ("local shadow skin", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawLocalShadowSkinned)})),
+                ("sun depth", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawLmSunDepth)})),
+                ("sun impostor depth", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawLmSunDepthImpostor)})),
+                ("sun skin depth", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawLmSunDepthSkinned)})),
+                ("lamp depth", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawLmLampDepth)})),
+                ("lamp depth inside", script_eval!(vm, {mod.shader.test_compile_draw_errors(mod.draw.DrawLmLampDepthInside)})),
+            ] {
+                let errors = vm.heap().string_with(result, |_heap, value| value.to_string()).unwrap();
+                assert!(errors.is_empty(), "{name}: {errors}");
+            }
+            // Cross-target Rust checks do not compile runtime Splash
+            // shaders. Exercise GLSL and HLSL emission explicitly too.
+            for (name, result) in [
+                ("cube GLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawSceneCube, "glsl", false)})),
+                ("PBR GLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawScenePbr, "glsl", false)})),
+                ("skin GLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawSceneSkinnedGpu, "glsl", false)})),
+                ("cube HLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawSceneCube, "hlsl", false)})),
+                ("PBR HLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawScenePbr, "hlsl", false)})),
+                ("city GLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawSceneCity, "glsl", false)})),
+                ("city HLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawSceneCity, "hlsl", false)})),
+                ("skin HLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawSceneSkinnedGpu, "hlsl", false)})),
+            ] {
+                let source = vm.heap().string_with(result, |_heap, value| value.to_string()).unwrap();
+                assert!(!source.starts_with("ERRORS:"), "{name}: {source}");
+                assert!(source.contains("cluster_lights"), "{name}: missing clustered shader");
+            }
+            for (name,result) in [
+                ("GI trace GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawGiTrace,"glsl",false)})),
+                ("GI relight GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawGiRelight,"glsl",false)})),
+                ("GI gather GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawGiGather,"glsl",false)})),
+                ("GI trace HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawGiTrace,"hlsl",false)})),
+                ("GI relight HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawGiRelight,"hlsl",false)})),
+                ("GI gather HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawGiGather,"hlsl",false)})),
+                // Grass reads GI ambient but no clustered lights (blades are sun-lit).
+                ("grass GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawSceneGrass,"glsl",false)})),
+                ("grass HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawSceneGrass,"hlsl",false)})),
+            ] {
+                let source=vm.heap().string_with(result,|_heap,value|value.to_string()).unwrap();
+                assert!(!source.starts_with("ERRORS:"),"{name}: {source}");
+                assert!(source.contains("gi_"),"{name}: missing GI code");
+            }
+            for (name,result) in [
+                ("sun depth GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawLmSunDepth,"glsl",false)})),
+                ("skin depth GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawLmSunDepthSkinned,"glsl",false)})),
+                ("lamp depth HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawLmLampDepth,"hlsl",false)})),
+                ("local skin depth HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawLocalShadowSkinned,"hlsl",false)})),
+            ] {
+                let source=vm.heap().string_with(result,|_heap,value|value.to_string()).unwrap();
+                assert!(!source.starts_with("ERRORS:"),"{name}: {source}");
+                assert!(source.contains("morph_map"),"{name}: missing morph deformation");
+            }
+            assert_env_background_sources(vm);
+            let pbr = DrawScenePbr::script_new_with_default(vm);
+            let id = pbr.skinned.draw_vars.draw_shader_id.expect("registered PBR shader");
+            let cx = vm.cx();
+            let textures = &cx.draw_shaders[id.index].mapping.textures;
+            assert!(textures.len()<=pbr.skinned.draw_vars.texture_slots.len(),"PBR exceeds available combined texture bindings");
+            // morph_map is sampled by vertex deformation only. All remaining
+            // bindings conservatively count against WebGL2's 16-fragment-unit
+            // floor, even when a material disables a branch at runtime.
+            assert!(textures.iter().filter(|t|t.id!=live_id!(morph_map)).count()<=16,"PBR exceeds WebGL2 fragment texture budget");
+            assert!(!textures.iter().any(|t|t.id==live_id!(gi_positions)||t.id==live_id!(gi_movers)),"GI preparation textures leaked into the scene shader");
+            assert!(textures.iter().any(|texture|texture.id==live_id!(gi_field)));
+            assert_eq!(textures[8].id, live_id!(cluster_data));
+            assert_eq!(textures[9].id, live_id!(local_shadow_data));
+            assert_eq!(textures[10].id, live_id!(local_shadow_map));
+            assert!(textures.iter().any(|texture|texture.id==live_id!(orm_map)));
+            assert!(textures.iter().any(|texture|texture.id==live_id!(morph_map)));
+            // The grass lane instantiates (its field rides the instance
+            // stream: the PBR uniform block has no room) and keeps the
+            // rasters on the PBR lane's slots 0 and 1.
+            let grass = DrawSceneGrass::script_new_with_default(vm);
+            let id = grass.pbr.skinned.draw_vars.draw_shader_id.expect("registered grass shader");
+            let cx = vm.cx();
+            let mapping = &cx.draw_shaders[id.index].mapping;
+            assert_eq!(mapping.textures[0].id, live_id!(tex));
+            assert_eq!(mapping.textures[1].id, live_id!(ao_map));
+            // The splat lane retypes PBR slots in place (tex and normal_map
+            // become arrays): the same slots, so the lane's generic slot-0
+            // binding and the name lookups keep working, and no slot more.
+            let splat = DrawSceneSplat::script_new_with_default(vm);
+            let id = splat.pbr.skinned.draw_vars.draw_shader_id.expect("registered splat shader");
+            let cx = vm.cx();
+            let splat_textures = &cx.draw_shaders[id.index].mapping.textures;
+            let pbr_textures = &cx.draw_shaders[pbr.skinned.draw_vars.draw_shader_id.unwrap().index].mapping.textures;
+            assert_eq!(splat_textures.iter().map(|t| t.id).collect::<Vec<_>>(), pbr_textures.iter().map(|t| t.id).collect::<Vec<_>>());
+            assert_eq!(splat_textures[0].id, live_id!(tex));
+            // Vertex attributes: only the geometry is fetched as vertex
+            // attributes (vec4 chunks); the backends read instance records
+            // from the instance buffer by instance index (GL ES and WebGL 2
+            // read what does not fit their attributes from a texture), so a
+            // record has no attribute limit.
+            let lanes = [
+                ("model", DrawSceneSkinned::script_new_with_default(vm).draw_vars.draw_shader_id),
+                ("pbr", DrawScenePbr::script_new_with_default(vm).skinned.draw_vars.draw_shader_id),
+                ("custom", crate::custom_material::DrawSceneCustom::script_new_with_default(vm).pbr.skinned.draw_vars.draw_shader_id),
+                ("city", DrawSceneCity::script_new_with_default(vm).pbr.skinned.draw_vars.draw_shader_id),
+                ("grass", DrawSceneGrass::script_new_with_default(vm).pbr.skinned.draw_vars.draw_shader_id),
+                ("foliage", DrawSceneFoliageLit::script_new_with_default(vm).pbr.skinned.draw_vars.draw_shader_id),
+                ("splat", DrawSceneSplat::script_new_with_default(vm).pbr.skinned.draw_vars.draw_shader_id),
+                ("impostor", DrawSceneImpostor::script_new_with_default(vm).pbr.skinned.draw_vars.draw_shader_id),
+            ];
+            for (name, id) in lanes {
+                let m = &vm.cx().draw_shaders[id.expect("registered").index].mapping;
+                let n = m.geometries.total_slots.div_ceil(4);
+                let limit = makepad_draw::makepad_platform::draw_shader_layout::MAX_VERTEX_ATTRIBUTES;
+                assert!(n <= limit, "{name}: {n} geometry vertex attributes (the limit is {limit})");
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod skin_ibl_tests {
+    use super::*;
+    use makepad_draw::makepad_platform::makepad_script::script_eval;
+
+    /// The scene shaders as the crate registers them (`crate::script_mod`,
+    /// what `custom_material::register` and a running renderer run), then
+    /// `f`. The compile list's hand-made registration also has the shared
+    /// Splash stdlib now (`mod.shared`, `makepad_render_graph::pass_stdlib`,
+    /// whose `srgb_to_linear` the skin lane's surface path calls), but the
+    /// crate's own list is the one whose order D2 changes (render-material's
+    /// built-ins before the skin block), so that is the one under test.
+    fn with_vm(f: impl FnOnce(&mut ScriptVm)) {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            vm.capture_errors();
+            makepad_draw::script_mod(vm);
+            vm.heap_mut().new_module(id!(prelude));
+            script_eval!(vm, { mod.prelude.widgets_internal = { ..mod.std, ..mod.pod, ..mod.math, ..mod.sdf, ..mod.shader, draw:mod.draw } });
+            vm.heap_mut().new_module(id!(widgets));
+            crate::script_mod(vm);
+            f(vm);
+            let errors = vm.take_errors();
+            assert!(errors.is_empty(), "script errors: {errors:#?}");
+        });
+    }
+
+    /// The skin lane declares the IBL atlas on a named slot past every
+    /// numbered binding, inside the budgets the PBR lane is held to, with
+    /// the flag off until the renderer binds an environment.
+    #[test]
+    fn the_skin_lane_carries_the_ibl_slot_inside_its_budgets_and_off_by_default() {
+        with_vm(|vm| {
+            let skin = DrawSceneSkinnedGpu::script_new_with_default(vm);
+            let id = skin.draw_vars.draw_shader_id.expect("registered skin shader");
+            let cx = vm.cx();
+            let mapping = &cx.draw_shaders[id.index].mapping;
+            let textures = &mapping.textures;
+            assert!(textures.len() <= skin.draw_vars.texture_slots.len(), "skin exceeds the combined texture bindings");
+            assert!(textures.iter().filter(|t| t.id != live_id!(morph_map)).count() <= 16, "skin exceeds the WebGL2 fragment texture budget");
+            // The numbered bindings draw_skinned_inner writes keep their slots.
+            assert_eq!(textures[0].id, live_id!(tex));
+            assert_eq!(textures[1].id, live_id!(joint_tex));
+            assert_eq!(textures[2].id, live_id!(ao_map));
+            assert_eq!(textures[3].id, live_id!(light_map));
+            assert_eq!(textures[4].id, live_id!(top_map));
+            assert_eq!(textures[5].id, live_id!(csm_map));
+            let detail = textures.iter().position(|t| t.id == live_id!(detail_map)).expect("the IBL atlas slot");
+            assert!(detail > 5, "the atlas binds by name, past the numbered slots");
+            assert_eq!(textures.last().map(|t| t.id), Some(live_id!(morph_map)), "morph_map stays the last texture");
+            let flag = mapping.dyn_uniforms.inputs.iter().find(|i| i.id == live_id!(ibl_ctl)).expect("the ibl_ctl uniform");
+            assert!(skin.draw_vars.dyn_uniforms[flag.offset..flag.offset + flag.slots].iter().all(|v| *v == 0.0), "IBL is off until the renderer binds an environment");
+            // The flag's four floats lie inside the draw's uniform block,
+            // which is as big as the shader's uniforms (DrawVars::dyn_uniforms
+            // is sized to mapping.dyn_uniforms.total_slots when the shader
+            // binds), and the block stays under the most a GL / WebGL 2
+            // uniform block is guaranteed (DRAW_CALL_MAX_UNIFORM_FLOATS).
+            assert!(flag.offset + flag.slots <= skin.draw_vars.dyn_uniforms.len(), "ibl_ctl lies outside the draw call's uniform block");
+            assert!(mapping.dyn_uniforms.total_slots <= DRAW_CALL_MAX_UNIFORM_FLOATS, "skin exceeds the draw call's uniform budget: {} of {}", mapping.dyn_uniforms.total_slots, DRAW_CALL_MAX_UNIFORM_FLOATS);
+        });
+    }
+
+    /// The surface path lowers with the IBL lookups on the backends the
+    /// compile list emits source for, and takes them only under the lane's
+    /// switch: along its reflection and along its normal, the coat along
+    /// its own reflection.
+    #[test]
+    fn the_skin_lane_lowers_with_the_ibl_lookups() {
+        with_vm(|vm| {
+            for (name, result) in [
+                ("skin GLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawSceneSkinnedGpu, "glsl", false)})),
+                ("skin HLSL", script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.DrawSceneSkinnedGpu, "hlsl", false)})),
+            ] {
+                let source = test_source(&vm.heap().string_with(result, |_heap, value| value.to_string()).unwrap());
+                assert!(!source.starts_with("ERRORS:"), "{name}: {source}");
+                assert!(source.contains("mat_ibl_sky_env") && source.contains("mat_ibl_ambient"), "{name}: the IBL lookups are in the surface path");
+                assert!(source.contains("detail_map"), "{name}: the atlas is sampled");
+                assert!(source.contains("cluster_lights"), "{name}: the clustered lights stay");
+                // The lane takes both lookups through render-material's
+                // lane functions, which carry its control (ibl_ctl): the
+                // lane's scale on the reflection and on the fill (y), and
+                // the fill from the map only while the switch is set (z),
+                // else the fill the lane had (an authored ambient, the
+                // gathered GI).
+                let reflection = lowered_fn_body(&source, "mat_ibl_lane_sky_env").unwrap_or_else(|| panic!("{name}: no lane reflection lookup"));
+                assert!(reflection.contains("mat_ibl_sky_env(p_r, p_rough) * ") && reflection.contains("ibl_ctl.y"), "{name}: the reflection lookup carries the lane's scale: {reflection}");
+                let fill = lowered_fn_body(&source, "mat_ibl_lane_ambient").unwrap_or_else(|| panic!("{name}: no lane fill lookup"));
+                assert!(fill.contains("mat_ibl_ambient(p_n, p_a) * ") && fill.contains("ibl_ctl.y"), "{name}: the fill lookup carries the lane's scale: {fill}");
+                assert!(fill.contains("ibl_ctl.z > 0.5") && fill.contains("return p_a;"), "{name}: the fill is the map's only while the switch is set, else the lane's own: {fill}");
+                // The surface path and the toy coat take them under the
+                // lane's switch, pinned as text: no test draws a skinned
+                // batch. The lookups are on while ibl_ctl.x is set, in the
+                // surface path and in the coat and nowhere else (the lane
+                // functions test z). Under it the surface path reflects the
+                // map along its reflection at its roughness, then fills
+                // along its normal over the fill it had, and the block
+                // ends; the coat reflects the map along its own reflection
+                // as a lacquer (0.03), and nothing else.
+                let pixel = lowered_fn_body(&source, "pixel").unwrap_or_else(|| panic!("{name}: no pixel function"));
+                let coat = lowered_fn_body(&source, "toy_coat").unwrap_or_else(|| panic!("{name}: no toy coat"));
+                // GLSL and HLSL name a uniform and a function alike
+                // (`uni_<name>`, `io_<name>`).
+                let (switch, f) = ("if ((uni_ibl_ctl.x > 0.5)) {", "io_");
+                assert_eq!(source.matches("ibl_ctl.x > 0.5").count(), 2, "{name}: the switch set turns the lookups on, once in the surface path and once in the coat");
+                assert!(pixel.contains(&format!("{switch}\nl_environment = {f}mat_ibl_lane_sky_env(normalize(l_reflection), l_rough);\n")), "{name}: under the switch the surface reflects the map along its reflection, at its roughness: {pixel}");
+                assert!(pixel.contains(&format!("\nl_fill = {f}mat_ibl_lane_ambient(l_n, l_fill);\n}}\n")), "{name}: under the switch the surface fills from the map along its normal, over the fill it had, and the block ends: {pixel}");
+                assert!(coat.contains(&format!("{switch}\nl_env = {f}mat_ibl_lane_sky_env(normalize(l_r), 0.03);\n}}\n")), "{name}: under the switch the coat reflects the map along its own reflection, as a lacquer: {coat}");
+                // Nothing in the lane's pixel stage takes a raw lookup.
+                for (stage, body) in [("pixel", &pixel), ("toy_coat", &coat)] {
+                    assert!(!body.contains("io_mat_ibl_sky_env(") && !body.contains("io_mat_ibl_ambient("), "{name}: {stage} takes a lookup at the map's raw scale");
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod lm_soft_tests {
+    use super::LM_SUN_SOFT;
+
+    /// Every atlas sampler must decode the sun SDF through the SAME window,
+    /// or the penumbra differs per material (a cube's shadow edge softer
+    /// than the terrain's beside it). Scans the shader source for the
+    /// decode idiom and pins each site to [`LM_SUN_SOFT`].
+    #[test]
+    fn every_sampler_decodes_the_same_penumbra_window() {
+        let src = crate::shaders::SHADER_SOURCE;
+        let expect = format!("smoothstep({}, {}, ", LM_SUN_SOFT.0, LM_SUN_SOFT.1);
+        let mut sites = 0;
+        for line in src.lines() {
+            // The decode idiom: a smoothstep whose LAST argument is the
+            // atlas A channel (`, lm.w)` / `, lmg.w)`) — the shadow-top
+            // height compares also smoothstep near `v_lmg.w` but take it
+            // as the edge argument, not the sample.
+            if line.contains("smoothstep(")
+                && (line.contains(", lm.w)") || line.contains(", lmg.w)"))
+            {
+                assert!(
+                    line.contains(&expect),
+                    "atlas decode window drifted from LM_SUN_SOFT {:?}: {}",
+                    LM_SUN_SOFT,
+                    line.trim()
+                );
+                sites += 1;
+            }
+        }
+        assert!(
+            sites >= 5,
+            "expected the cube/skinned/skinned-gpu/terrain samplers, found {sites}"
+        );
+    }
+
+    /// DrawLmTop's lit gate must sit at the decode window's TOP edge: a
+    /// texel the window darkens AT ALL (outer penumbra included) needs a
+    /// blocker height in the top plane, or that fringe shadows dynamics at
+    /// any altitude (the Realtime "road shadows the villagers" mechanism).
+    #[test]
+    fn top_plane_lit_gate_matches_the_window_edge() {
+        let src = crate::shaders::SHADER_SOURCE;
+        // Needle assembled in two halves so this test's own source lines
+        // never match the scan (the first test dodges the same trap by
+        // splitting its needle across lines).
+        let gate = format!("if lm_a{}", " >= ");
+        let expect = format!("{}{} {{", gate, LM_SUN_SOFT.1);
+        let mut sites = 0;
+        for line in src.lines() {
+            if line.contains(&gate) {
+                assert!(
+                    line.contains(&expect),
+                    "DrawLmTop lit gate drifted from LM_SUN_SOFT.1 {}: {}",
+                    LM_SUN_SOFT.1,
+                    line.trim()
+                );
+                sites += 1;
+            }
+        }
+        assert_eq!(sites, 1, "expected exactly the DrawLmTop gate");
+    }
+}
+
+macro_rules! depth_morph_binding {
+    ($kind:ty) => { impl $kind {
+        pub(crate) fn set_morph(&mut self,cx:&Cx,morph:Option<&crate::asset_morph::DepthMorph>) {
+            self.morph_ctl=morph.map_or(Vec4f::default(),|m|m.control);
+            if let Some(morph)=morph {
+                self.morph_weights0=morph.weights[0];
+                self.morph_weights1=morph.weights[1];
+                self.morph_weights2=morph.weights[2];
+                self.morph_weights3=morph.weights[3];
+                self.morph_weights4=morph.weights[4];
+                self.morph_weights5=morph.weights[5];
+                self.morph_weights6=morph.weights[6];
+                self.morph_weights7=morph.weights[7];
+                if let Some(shader)=self.draw_vars.draw_shader_id {
+                    if let Some(slot)=cx.draw_shaders[shader.index].mapping.textures.iter().position(|texture|texture.id==live_id!(morph_map)) {self.draw_vars.set_texture(slot,&morph.texture);}
+                }
+            }
+        }
+    }};
+}
+depth_morph_binding!(DrawLmSunDepth);
+depth_morph_binding!(DrawLmSunDepthSkinned);
+depth_morph_binding!(DrawLmLampDepth);

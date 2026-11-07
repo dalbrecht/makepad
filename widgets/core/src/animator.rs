@@ -1,0 +1,1772 @@
+use crate::{
+    makepad_platform::*,
+    widget_async::{CxSplashVmExt, SplashVmId},
+};
+use makepad_math::Vec4f;
+
+pub fn script_mod(vm: &mut ScriptVm) {
+    let animator = vm.new_module(id!(animator));
+
+    // Register the native apply_transform function that computes the snap value
+    // This function receives the snap object and returns the stored value
+    let snap_transform_id = vm.add_apply_transform_fn(|vm, object| {
+        // The snap object stores the value to return
+        script_value!(vm, object.value)
+    });
+
+    // Register the 'snap' function on animator module
+    // It returns an object with apply_transform set, so when applied to a field
+    // it will return the stored value
+    vm.add_method(
+        animator,
+        id!(snap),
+        script_args!(value = NIL),
+        move |vm, args| {
+            let value = script_value!(vm, args.value);
+            let snap_obj = vm.new_object();
+            vm.set_value_def(snap_obj, id!(value), value);
+            vm.heap_mut()
+                .set_object_apply_transform(snap_obj, snap_transform_id);
+            snap_obj.into()
+        },
+    );
+
+    // Register the native timeline apply_transform function
+    // Timeline objects need special handling during interpolation - just return self
+    let timeline_transform_id = vm.add_apply_transform_fn(|_vm, object| {
+        // Timeline objects are handled specially in interpolate_value
+        object.into()
+    });
+
+    // Register the 'timeline' function on animator module
+    // Usage: timeline(t0 v0 t1 v1 ...) where each pair is (time, value)
+    // Times should be in range 0-1 (representing animation progress)
+    vm.add_method(animator, id!(timeline), script_args!(), move |vm, args| {
+        // Get positional args from the vec part
+        let len = vm.heap().vec_len(args);
+
+        // Error if not mod 2 (must be pairs of time/value)
+        if len % 2 != 0 {
+            log!(
+                "timeline: expected even number of arguments (time/value pairs), got {}",
+                len
+            );
+            return ScriptValue::NIL;
+        }
+
+        if len == 0 {
+            log!("timeline: expected at least one time/value pair");
+            return ScriptValue::NIL;
+        }
+
+        // Create timeline object
+        let timeline_obj = vm.new_object();
+
+        // Create a keyframes array to store the time/value pairs
+        let keyframes = vm.new_object();
+
+        // Copy keyframes from args
+        for i in 0..len {
+            let value = vm.vec_value(args, i);
+            vm.vec_push(keyframes, ScriptValue::NIL, value);
+        }
+
+        // Store keyframes on timeline object
+        vm.set_value_def(timeline_obj, id!(keyframes), keyframes);
+        vm.heap_mut()
+            .set_object_apply_transform(timeline_obj, timeline_transform_id);
+
+        timeline_obj.into()
+    });
+
+    script_mod! {
+        use mod.animator;
+        use mod.std.*;
+        animator.Animator = set_type_default() do #(Animator::script_ext(vm)){}
+        animator.AnimatorGroup = #(AnimatorGroup::script_ext(vm)){}
+        animator.AnimatorState =  #(AnimatorState::script_api(vm)){}
+        animator.Play =  #(Play::script_api(vm))
+        animator.Ease = #(Ease::script_api(vm))
+    };
+    script_mod(vm);
+}
+
+pub trait AnimatorImpl: ScriptApply + Sized {
+    fn animator_cut(&mut self, cx: &mut Cx, state: &[LiveId; 2]) {
+        self.animator_cut_scoped(cx, state, &mut Scope::empty())
+    }
+    fn animator_play(&mut self, cx: &mut Cx, state: &[LiveId; 2]) {
+        self.animator_play_scoped(cx, state, None, &mut Scope::empty())
+    }
+
+    fn animator_play_with(&mut self, cx: &mut Cx, state: &[LiveId; 2], play: Play) {
+        self.animator_play_scoped(cx, state, Some(play), &mut Scope::empty())
+    }
+
+    fn animator_toggle_scoped(
+        &mut self,
+        cx: &mut Cx,
+        is_state_1: bool,
+        animate: Animate,
+        state1: &[LiveId; 2],
+        state2: &[LiveId; 2],
+        scope: &mut Scope,
+    ) {
+        if is_state_1 {
+            if let Animate::Yes = animate {
+                self.animator_play_scoped(cx, state1, None, scope)
+            } else {
+                self.animator_cut_scoped(cx, state1, scope)
+            }
+        } else {
+            if let Animate::Yes = animate {
+                self.animator_play_scoped(cx, state2, None, scope)
+            } else {
+                self.animator_cut_scoped(cx, state2, scope)
+            }
+        }
+    }
+    fn animator_toggle(
+        &mut self,
+        cx: &mut Cx,
+        is_state_1: bool,
+        animate: Animate,
+        state1: &[LiveId; 2],
+        state2: &[LiveId; 2],
+    ) {
+        self.animator_toggle_scoped(cx, is_state_1, animate, state1, state2, &mut Scope::empty())
+    }
+
+    fn animator_handle_event(&mut self, cx: &mut Cx, event: &Event) -> AnimatorAction {
+        self.animator_handle_event_scoped(cx, event, &mut Scope::empty())
+    }
+
+    // implemented by `#[derive(Animator)]`: the `animator` field
+    fn animator_field(&self) -> &Animator;
+    fn animator_field_mut(&mut self) -> &mut Animator;
+
+    fn animator_cut_scoped(&mut self, cx: &mut Cx, state: &[LiveId; 2], scope: &mut Scope) {
+        // If the VM is already held (we're inside an apply walk's cx.with_vm),
+        // cut() -> cx.with_vm would re-enter and panic; defer instead.
+        if cx.is_script_vm_held() {
+            self.animator_field_mut().defer_cut(cx, state);
+            return;
+        }
+        if let Some(value) = self.animator_field_mut().cut(cx, state) {
+            // The value lives on the animator's heap, which for a widget inside
+            // a Splash is an isolate VM, not the app VM. Apply it there.
+            let vm_id = self.animator_field().vm_id();
+            Animator::apply_value(cx, vm_id, self, scope, value);
+        }
+    }
+    fn animator_play_scoped(
+        &mut self,
+        cx: &mut Cx,
+        state: &[LiveId; 2],
+        play: Option<Play>,
+        scope: &mut Scope,
+    ) {
+        if cx.is_script_vm_held() {
+            self.animator_field_mut().defer_play(cx, state, play);
+            return;
+        }
+        if let Some(value) = self.animator_field_mut().play(cx, state, play) {
+            let vm_id = self.animator_field().vm_id();
+            Animator::apply_value(cx, vm_id, self, scope, value);
+        }
+    }
+    fn animator_in_state(&self, cx: &Cx, check_state_pair: &[LiveId; 2]) -> bool {
+        self.animator_field().in_state(cx, check_state_pair)
+    }
+    fn animator_handle_event_scoped(
+        &mut self,
+        cx: &mut Cx,
+        event: &Event,
+        scope: &mut Scope,
+    ) -> AnimatorAction {
+        let mut act = AnimatorAction::None;
+        // Replay any cut/play deferred while the VM was held (it's free during event handling).
+        if self.animator_field().has_deferred() {
+            let vm_id = self.animator_field().vm_id();
+            for value in self.animator_field_mut().flush_deferred(cx) {
+                Animator::apply_value(cx, vm_id, self, scope, value);
+            }
+        }
+        if let Some(value) = self.animator_field_mut().handle_event(cx, event, &mut act) {
+            let vm_id = self.animator_field().vm_id();
+            Animator::apply_value(cx, vm_id, self, scope, value);
+        }
+        act
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Animate {
+    Yes,
+    No,
+}
+
+/// Container for all states within a state group (e.g., hover: {off, on, drag})
+#[derive(Default, Script)]
+pub struct AnimatorGroup {
+    #[live]
+    default: LiveId,
+    #[rust]
+    states: LiveIdMap<LiveId, AnimatorState>,
+}
+
+impl ScriptHook for AnimatorGroup {
+    fn on_custom_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        apply: &Apply,
+        _scope: &mut Scope,
+        value: ScriptValue,
+    ) -> bool {
+        let Some(obj) = value.as_object() else {
+            return false;
+        };
+
+        let mut process_map = |vm: &mut ScriptVm, entries: &[ScriptMapEntry]| {
+            for map_value in entries {
+                let key = map_value.key;
+                if let Some(key_id) = key.as_id() {
+                    if key_id == id!(default) {
+                        if let Some(default_id) = map_value.value.as_id() {
+                            self.default = default_id;
+                        }
+                    } else {
+                        // Reuse existing state if present, otherwise create new
+                        if let Some(existing) = self.states.get_mut(&key_id) {
+                            existing.script_apply(vm, apply, &mut Scope::empty(), map_value.value);
+                        } else {
+                            let state = AnimatorState::script_from_value(vm, map_value.value);
+                            self.states.insert(key_id, state);
+                        }
+                    }
+                }
+            }
+        };
+
+        if apply.is_eval() {
+            // For eval, only process the object's own map (no prototype chain)
+            let entries = vm.heap().map_entries(obj);
+            process_map(vm, &entries);
+        } else {
+            // Walk prototype chain from root to leaf, so child properties override parent
+            let entries = vm.heap().proto_map_entries(obj);
+            process_map(vm, &entries);
+        }
+
+        true
+    }
+}
+
+/// A single animation state (e.g., off, on, drag)
+#[derive(Default, Script)]
+pub struct AnimatorState {
+    #[live]
+    pub cursor: Option<MouseCursor>,
+    #[live]
+    pub ease: Option<Ease>,
+    #[live]
+    pub from: LiveIdMap<LiveId, Play>,
+    /// The state's target values. Held as a rooted ref, never a raw
+    /// `ScriptObject`: a runtime `script_apply_eval!` (an app resizing its
+    /// page slide distance, say) hands the animator objects from a temporary
+    /// eval tree that nothing else keeps alive. The next GC of that heap —
+    /// the app VM's after paint, an isolate's on any task pump — would free
+    /// them under a still-referencing state, and the next `play` would walk
+    /// a dead slot.
+    #[live]
+    pub apply: Option<ScriptObjectRef>,
+    #[live]
+    pub redraw: bool,
+}
+
+impl ScriptHook for AnimatorState {
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, _apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        // Fix: mark the apply object as static so GC doesn't free it.
+        // AnimatorState stores a raw ScriptObject (not ScriptObjectRef) in `apply`,
+        // which lives outside the GC's reach. Without this, GC can free the object
+        // and subsequent render frames trigger use-after-free panics.
+        if let Some(obj) = &self.apply {
+            vm.bx.heap.set_static(obj.clone().into());
+        }
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    use crate::widget_async::MAIN_SPLASH_VM_ID;
+
+    /// A state applied as a widget's default reaches the shader's slots as
+    /// written, `snap(..)` and all: the button's `hover.on` and `hover.down`
+    /// are both written with one, and a slot that skipped it left a button
+    /// built pressed showing rest.
+    #[test]
+    fn a_snap_in_a_default_state_is_written_to_a_shader_slot() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            script_mod(vm);
+            let animator = vm.module(id!(animator));
+            let snap = vm.value(animator, id!(snap));
+            let snapped = vm.call(snap, &[1.0.into()]);
+            assert!(vm.heap().has_apply_transform(snapped), "snap() made no snap object");
+            let mut slots = [0.0f32; 2];
+            DrawVars::write_value_to_f32_slots(vm.heap(), snapped, &mut slots, 1, 1, DrawShaderAttrFormat::Float);
+            assert_eq!(slots, [0.0, 1.0]);
+        });
+    }
+
+    #[test]
+    fn running_animation_survives_collection_of_replaced_stylesheet() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (group, old_template) = cx.with_vm(|vm| {
+            let off = vm.new_object();
+            vm.set_value_def(off, id!(opacity), 0.0);
+            let on = vm.new_object();
+            vm.set_value_def(on, id!(opacity), 1.0);
+            let template = vm.new_object();
+            vm.set_value_def(template, id!(off), off);
+            vm.set_value_def(template, id!(on), on);
+            let mut group = AnimatorGroup { default: id!(off), ..Default::default() };
+            let off_ref = vm.new_object_ref(off);
+            let on_ref = vm.new_object_ref(on);
+            group.states.insert(id!(off), AnimatorState { apply: Some(off_ref), ..Default::default() });
+            group.states.insert(id!(on), AnimatorState { apply: Some(on_ref), ..Default::default() });
+            (group, vm.new_object_ref(template))
+        });
+        let mut animator = Animator { vm_id: MAIN_SPLASH_VM_ID, ..Default::default() };
+        animator.groups.insert(id!(hover), group);
+        animator.play(&mut cx, &[id!(hover), id!(on)], Some(Play::Forward { duration: 1.0 })).unwrap();
+
+        // A stylesheet reload replaces the groups and releases the old source.
+        // The in-flight track must keep its target alive until it finishes.
+        animator.groups.clear();
+        drop(old_template);
+        cx.with_vm(|vm| vm.gc());
+
+        for (frame, time, expected) in [(0, 0.0, 0.0), (1, 0.5, 0.5), (2, 1.1, 1.0)] {
+            let event = Event::NextFrame(NextFrameEvent {
+                frame,
+                time,
+                set: [animator.next_frame].into_iter().collect(),
+            });
+            let result = animator.handle_event(&mut cx, &event, &mut AnimatorAction::None).unwrap();
+            let value = cx.with_vm(|vm| {
+                vm.value(result.as_object().unwrap(), id!(opacity)).as_f64()
+            });
+            assert_eq!(value, Some(expected));
+        }
+        assert!(!animator.is_animating());
+    }
+
+    /// `{slide: {hide: {apply: {offset}}}}` as a widget stylesheet or a
+    /// runtime `script_apply_eval!` would hand it to the animator.
+    fn slide_tree(vm: &mut ScriptVm, offset: f64) -> ScriptObject {
+        let apply = vm.new_object();
+        vm.set_value_def(apply, id!(offset), offset);
+        let hide = vm.new_object();
+        vm.set_value_def(hide, id!(apply), apply);
+        let slide = vm.new_object();
+        vm.set_value_def(slide, id!(hide), hide);
+        let tree = vm.new_object();
+        vm.set_value_def(tree, id!(slide), slide);
+        tree
+    }
+
+    #[test]
+    fn eval_applied_state_survives_gc_before_play() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut animator = Animator { vm_id: MAIN_SPLASH_VM_ID, ..Default::default() };
+        // The stylesheet apply. The widget's source keeps this tree rooted.
+        let stylesheet = cx.with_vm(|vm| {
+            let tree = slide_tree(vm, 100.0);
+            animator.script_apply(vm, &Apply::New, &mut Scope::empty(), tree.into());
+            vm.new_object_ref(tree)
+        });
+        // A runtime re-target (an app resizing its page slide to the live
+        // width). The eval tree is temporary: after the apply nothing but the
+        // animator's state refers to it.
+        cx.with_vm(|vm| {
+            let tree = slide_tree(vm, 402.0);
+            animator.script_apply(vm, &Apply::Eval, &mut Scope::empty(), tree.into());
+        });
+        // The app VM collects after paint; an isolate on any task pump. Both
+        // happen between the re-target and the user's next tap.
+        cx.with_vm(|vm| vm.gc());
+
+        animator
+            .play(&mut cx, &[id!(slide), id!(hide)], Some(Play::Forward { duration: 1.0 }))
+            .expect("hide state still playable after gc");
+        let mut last = None;
+        for (frame, time) in [(0, 0.0), (1, 0.5), (2, 1.1)] {
+            let event = Event::NextFrame(NextFrameEvent {
+                frame,
+                time,
+                set: [animator.next_frame].into_iter().collect(),
+            });
+            let result = animator.handle_event(&mut cx, &event, &mut AnimatorAction::None).unwrap();
+            last = cx.with_vm(|vm| {
+                vm.value(result.as_object().unwrap(), id!(offset)).as_f64()
+            });
+        }
+        assert_eq!(last, Some(402.0));
+        assert!(!animator.is_animating());
+        drop(stylesheet);
+    }
+}
+
+/// Runtime state for a single animation track
+struct AnimatorTrack {
+    /// The state group this track belongs to (e.g., "hover")
+    group_id: LiveId,
+    /// The current state id (e.g., "off", "on", "drag")
+    state_id: LiveId,
+    /// When the animation started
+    start_time: f64,
+    /// The Play mode for this animation
+    play: Play,
+    /// The ease function
+    ease: Ease,
+    /// The target apply object (what we're animating to).
+    /// Held as a `ScriptObjectRef` so a stylesheet reapply or a `script_mod`
+    /// re-run (safe-area inset change, hot reload) cannot dangle it while
+    /// `interpolate_object` walks it every frame.
+    target_apply: ScriptObjectRef,
+    /// The starting values SNAPSHOT (captured/copied when animation begins)
+    /// This is a SEPARATE object from state_object - it must not be mutated during animation
+    /// Uses ScriptObjectRef to prevent GC from freeing it
+    from_snapshot: ScriptObjectRef,
+    /// Whether this track needs redraw
+    redraw: bool,
+}
+
+/// A `cut`/`play` requested while the script VM was held — e.g. from a widget's
+/// `on_after_apply` during a `ScriptReapply`/`Reload` walk, which runs inside
+/// the app's `cx.with_vm`. Calling `cut`/`play` then would re-enter `cx.with_vm`
+/// and panic ("Script VM swapped off"). Instead we queue the op here and replay
+/// it from `animator_handle_event_scoped` on the next frame, when the VM is free.
+struct DeferredImmediate {
+    state: [LiveId; 2],
+    kind: DeferredKind,
+}
+
+enum DeferredKind {
+    Cut,
+    Play(Option<Play>),
+}
+
+#[derive(Default, Script)]
+pub struct Animator {
+    #[rust]
+    pub is_defined: bool,
+    #[rust]
+    pub next_frame: NextFrame,
+    #[rust]
+    pub groups: LiveIdMap<LiveId, AnimatorGroup>,
+    #[rust]
+    vm_id: SplashVmId,
+    /// Runtime: Current state for each state group
+    #[rust]
+    current_states: LiveIdMap<LiveId, LiveId>,
+    /// Runtime: Active animation tracks (one per state group that's animating)
+    #[rust]
+    tracks: Vec<AnimatorTrack>,
+    /// Runtime: The shared state object containing current values from ALL animation groups
+    /// This is the source of truth for "from" values when starting new animations
+    /// Uses ScriptObjectRef to prevent GC from freeing it
+    #[rust]
+    state_object: Option<ScriptObjectRef>,
+    /// Cut/play ops deferred because the script VM was held when they were
+    /// requested (see `DeferredImmediate`); replayed by `flush_deferred` once
+    /// the VM is free.
+    #[rust]
+    deferred: Vec<DeferredImmediate>,
+}
+
+impl ScriptHook for Animator {
+    fn on_custom_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        apply: &Apply,
+        _scope: &mut Scope,
+        value: ScriptValue,
+    ) -> bool {
+        let Some(obj) = value.as_object() else {
+            return false;
+        };
+        // A `script_mod` re-run replaces every template object an in-flight
+        // track is animating against. The track's refs keep those objects
+        // alive, so walking them is safe, but they now describe the previous
+        // template — and a `Play::Loop` track would pin them for good. Drop
+        // the tracks instead. `current_states` is kept: the logical state is
+        // still meaningful, and the next `cut`/`play` re-resolves its objects
+        // from the new heap.
+        if apply.follows_script_rerun() {
+            self.tracks.clear();
+        }
+        let obj_ref = vm.new_object_ref(obj);
+        // Minted from the VM we are running in, so this always resolves; the
+        // fallback only exists because the lookup is fallible in general.
+        self.vm_id = vm
+            .cx_mut()
+            .script_ref_vm_id(&obj_ref)
+            .unwrap_or(crate::widget_async::MAIN_SPLASH_VM_ID);
+
+        if apply.is_reload() {
+            // A reload hands every state a fresh `apply` object and leaves the
+            // old ones to the collector. A track that was mid-flight keeps a
+            // raw handle to its old target, so the next frame would read a
+            // freed object (a use-after-free on the second reload, when the
+            // collector has caught up). Drop the tracks and re-cut every group
+            // to the state it was in once the VM is free again: we are inside
+            // the apply walk's `with_vm` here, so `cut` itself cannot run yet.
+            self.tracks.clear();
+            for (group_id, state_id) in self.current_states.iter() {
+                self.deferred.push(DeferredImmediate {
+                    state: [*group_id, *state_id],
+                    kind: DeferredKind::Cut,
+                });
+            }
+            if !self.deferred.is_empty() {
+                vm.cx_mut().new_next_frame();
+            }
+        }
+
+        let mut process_map = |vm: &mut ScriptVm, entries: &[ScriptMapEntry]| {
+            for map_value in entries {
+                let key = map_value.key;
+                if let Some(group_id) = key.as_id() {
+                    // Reuse existing group if present, otherwise create new
+                    if let Some(existing) = self.groups.get_mut(&group_id) {
+                        existing.script_apply(vm, apply, &mut Scope::empty(), map_value.value);
+                    } else {
+                        let group = AnimatorGroup::script_from_value(vm, map_value.value);
+                        self.groups.insert(group_id, group);
+                    }
+                }
+            }
+        };
+
+        if apply.is_eval() {
+            // For eval, only process the object's own map (no prototype chain)
+            let entries = vm.heap().map_entries(obj);
+            process_map(vm, &entries);
+        } else {
+            // Walk prototype chain from root to leaf, so child properties override parent
+            let entries = vm.heap().proto_map_entries(obj);
+            process_map(vm, &entries);
+        }
+
+        // Only mark as defined if we actually have animator groups
+        self.is_defined = !self.groups.is_empty();
+        true
+    }
+}
+
+impl ScriptApplyDefault for Animator {
+    fn script_apply_default(
+        &mut self,
+        _vm: &mut ScriptVm,
+        apply: &Apply,
+        _scope: &mut Scope,
+        _value: ScriptValue,
+    ) -> Option<ScriptValue> {
+        // `follows_script_rerun` rather than `is_live_edit_reload`: what makes
+        // injecting the current state unsafe is not that the DSL changed, it
+        // is that `script_mod` re-ran and freed the objects `state_object` and
+        // `groups` point at. Both `Reload` and `Rebake` re-run it.
+        if apply.follows_script_rerun() || apply.is_animate() || apply.is_eval() {
+            return None;
+        }
+
+        if let Some(state_obj_ref) = self.state_object.as_ref() {
+            if apply.as_default().is_none() {
+                return Some(state_obj_ref.as_object().into());
+            }
+            return None;
+        }
+
+        let index = apply.as_default().map_or(0, |x| x + 1);
+        let (group_id, group) = self.groups.iter().nth(index)?;
+        let state_id = self
+            .current_states
+            .get(group_id)
+            .copied()
+            .unwrap_or(group.default);
+        let state = group.states.get(&state_id)?;
+        Some(state.apply.as_ref()?.as_object().into())
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum AnimatorAction {
+    Animating { redraw: bool },
+    None,
+}
+
+impl AnimatorAction {
+    pub fn must_redraw(&self) -> bool {
+        match self {
+            Self::Animating { redraw } => *redraw,
+            Self::None => false,
+        }
+    }
+}
+
+/// How the Animator would move a state group into a state: the duration and
+/// ease of the `Play` it picks, and whether the state asks for a redraw.
+/// Read with [`Animator::state_motion`] so a tween can move the same way
+/// (GSAP: the `duration` and `ease` of a tween built from a CSS transition).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StateMotion {
+    /// Seconds: the `Forward` duration, 0 for `Snap`.
+    pub secs: f64,
+    /// The state's `ease` (`Ease::Linear` when unset, as the Animator uses).
+    pub ease: Ease,
+    /// The state's `redraw` flag.
+    pub redraw: bool,
+}
+
+impl Animator {
+    /// The VM that owns this animator's script objects: the isolate VM of the
+    /// `Splash` the widget was built in, or `MAIN_SPLASH_VM_ID` for the app VM.
+    /// Captured from the animator's own object ref in `on_custom_apply`.
+    pub fn vm_id(&self) -> SplashVmId {
+        self.vm_id
+    }
+
+    /// Apply an animator-produced value to `target` in the VM that owns it.
+    ///
+    /// `cut`/`play`/`handle_event`/`flush_deferred` build their apply object on
+    /// the animator's own heap. Applying it under the plain `cx.with_vm` would
+    /// resolve isolate object pointers against the *app* heap — an out-of-bounds
+    /// index at best, silent cross-VM corruption at worst. So the apply has to
+    /// run under the same VM that produced the value. Called by the `Animator`
+    /// derive; for `MAIN_SPLASH_VM_ID` this is exactly `cx.with_vm`.
+    pub fn apply_value<T: ScriptApply>(
+        cx: &mut Cx,
+        vm_id: SplashVmId,
+        target: &mut T,
+        scope: &mut Scope,
+        value: ScriptValue,
+    ) {
+        cx.with_script_vm_id(vm_id, |vm| {
+            target.script_apply(vm, &Apply::Animate, scope, value);
+        });
+    }
+
+    /// Returns the apply `ScriptObject` for the current state of the given
+    /// state group, falling back to the group's default state if no current
+    /// state is set yet.
+    ///
+    /// Useful from a widget's `on_after_apply` hook on `Apply::ScriptReapply`
+    /// to re-snap animator-driven fields (`walk.height`, `View.visible`,
+    /// shader uniforms, etc.) after a `request_script_reapply` walk has
+    /// clobbered them with the template defaults — the caller can apply
+    /// the returned object via `self.script_apply(vm, &Apply::Animate, ...)`
+    /// directly, without going through `animator_cut` (which calls
+    /// `cx.with_vm` and would panic if the VM is already held by the
+    /// surrounding apply chain).
+    pub fn current_state_apply(&self, group_id: LiveId) -> Option<ScriptObject> {
+        let group = self.groups.get(&group_id)?;
+        let state_id = self
+            .current_states
+            .get(&group_id)
+            .copied()
+            .unwrap_or(group.default);
+        let state = group.states.get(&state_id)?;
+        state.apply.as_ref().map(|apply| apply.as_object())
+    }
+
+    /// The motion the Animator would play for `group.state` coming from
+    /// `from_state` (read only; nothing starts). The `Play` is picked the way
+    /// [`Animator::play`] picks it: the state's `from[from_state]`, else
+    /// `from[all]`, else `Forward { duration: 0.3 }`. `from_state` `None`
+    /// means where the group is now (its running track's state, else its
+    /// current state, else its default).
+    ///
+    /// `Forward` gives its duration and `Snap` gives 0. `None` wherever
+    /// `play` would not run a plain forward motion to `state`: an unknown
+    /// group or state, a state with no `apply`, the group already resting in
+    /// `state` (with `from_state` `None`: `play` then does nothing), a
+    /// `Reverse` (it runs the mix from `end` back toward the start values,
+    /// the opposite of a tween to `state`) and the loops (which never end).
+    ///
+    /// ```text
+    /// if let Some(m) = self.animator.state_motion(id!(hover), id!(on), None) {
+    ///     let o = TweenOpts::new().duration(m.secs).ease(m.ease.into());
+    /// }
+    /// ```
+    pub fn state_motion(
+        &self,
+        group: LiveId,
+        state: LiveId,
+        from_state: Option<LiveId>,
+    ) -> Option<StateMotion> {
+        let g = self.groups.get(&group)?;
+        let target = g.states.get(&state)?;
+        target.apply.as_ref()?;
+        let current = self.current_states.get(&group).copied().unwrap_or(g.default);
+        let track = self.tracks.iter().find(|t| t.group_id == group);
+        let from = match from_state {
+            Some(f) => f,
+            // Mirrors `play`: resting in `state` already means no motion.
+            None if current == state && track.is_none() => return None,
+            None => track.map(|t| t.state_id).unwrap_or(current),
+        };
+        let play = target
+            .from
+            .get(&from)
+            .or_else(|| target.from.get(&id!(all)))
+            .copied()
+            .unwrap_or(Play::Forward { duration: 0.3 });
+        let secs = match play {
+            Play::Forward { duration } => duration,
+            Play::Snap => 0.0,
+            Play::Reverse { .. }
+            | Play::Loop { .. }
+            | Play::ReverseLoop { .. }
+            | Play::BounceLoop { .. } => return None,
+        };
+        Some(StateMotion {
+            secs,
+            ease: target.ease.unwrap_or(Ease::Linear),
+            redraw: target.redraw,
+        })
+    }
+
+    /// Start animating to a new state
+    pub fn play(
+        &mut self,
+        cx: &mut Cx,
+        state: &[LiveId; 2],
+        play_override: Option<Play>,
+    ) -> Option<ScriptValue> {
+        let group_id = state[0];
+        let target_state_id = state[1];
+
+        // Get the state group
+        let group = self.groups.get(&group_id)?;
+
+        // Get the target state
+        let target_state = group.states.get(&target_state_id)?;
+
+        // Get the apply object
+        let target_apply = target_state.apply.as_ref()?.as_object();
+
+        // Find existing track for this group (if any)
+        let existing_track_idx = self.tracks.iter().position(|t| t.group_id == group_id);
+
+        // Get the current state for this group (from current_states or default)
+        let current_state_id = self
+            .current_states
+            .get(&group_id)
+            .copied()
+            .unwrap_or(group.default);
+
+        // Determine from_state_id for Play mode lookup:
+        // If there's an active track, we're coming from that track's target state
+        let from_state_id = existing_track_idx
+            .map(|idx| self.tracks[idx].state_id)
+            .unwrap_or(current_state_id);
+
+        // Already animating to this very state: asking again must not restart
+        // the track (a widget that re-asserts its state every frame would
+        // otherwise never reach it and keep the frame loop running forever).
+        if existing_track_idx.is_some_and(|idx| self.tracks[idx].state_id == target_state_id) {
+            return None;
+        }
+
+        // If we're already in this state and not animating, do nothing
+        if current_state_id == target_state_id && existing_track_idx.is_none() {
+            return None;
+        }
+
+        // Determine the Play mode from the target state's `from` map
+        let play = target_state
+            .from
+            .get(&from_state_id)
+            .or_else(|| target_state.from.get(&id!(all)))
+            .copied()
+            .unwrap_or(Play::Forward { duration: 0.3 });
+        let play = play_override.unwrap_or(play);
+
+        // Get the ease from the target state, default to Linear
+        let ease = target_state.ease.unwrap_or(Ease::Linear);
+
+        // Set cursor if specified
+        if let Some(cursor) = target_state.cursor {
+            cx.set_cursor(cursor);
+        }
+
+        // For snap, we don't animate - just apply immediately
+        if matches!(play, Play::Snap) {
+            // Remove any existing track for this group
+            self.tracks.retain(|t| t.group_id != group_id);
+            // Update current state
+            self.current_states.insert(group_id, target_state_id);
+            // Merge target values into state_object
+            let vm_id = self.vm_id;
+            cx.with_script_vm_id(vm_id, |vm| {
+                let state_obj = if let Some(ref obj_ref) = self.state_object {
+                    obj_ref.as_object()
+                } else {
+                    let new_obj = vm.new_object();
+                    let obj_ref = vm.new_object_ref(new_obj);
+                    self.state_object = Some(obj_ref);
+                    new_obj
+                };
+                Self::merge_object(vm, state_obj, target_apply);
+            });
+            // Request next frame so the apply gets processed
+            self.next_frame = cx.new_next_frame();
+            // Return the apply object directly
+            return Some(target_apply.into());
+        }
+
+        // Remove any existing track for this group
+        self.tracks.retain(|t| t.group_id != group_id);
+
+        // Create a SNAPSHOT of the current "from" values at animation START.
+        // This is the only place we allocate objects for from_snapshot - it happens
+        // once per play() call, NOT during animation frames.
+        // The snapshot must be a separate object that won't be mutated during animation.
+        // We sample from state_object (current animated values) or fall back to static state apply.
+        let vm_id = self.vm_id;
+        let (from_snapshot, target_apply_ref) = cx.with_script_vm_id(vm_id, |vm| {
+            let snapshot = vm.new_object();
+
+            // Get the default state's apply for fallback values
+            let default_state_id = group.default;
+            let default_apply = group
+                .states
+                .get(&default_state_id)
+                .and_then(|s| s.apply.as_ref().map(|apply| apply.as_object()));
+
+            // For each key in target_apply (including prototype chain), get the "from" value:
+            // 1. First try state_object (current animated values)
+            // 2. Fall back to default state's apply if not in state_object
+            for entry in vm.heap().proto_map_entries(target_apply) {
+                let key = entry.key;
+
+                // Try state_object first, fall back to default_apply
+                let from_val = if let Some(ref state_obj_ref) = self.state_object {
+                    let v = vm.value(state_obj_ref.as_object(), key);
+                    if !v.is_nil() && !v.is_err() {
+                        v
+                    } else if let Some(default_obj) = default_apply {
+                        vm.value(default_obj, key)
+                    } else {
+                        ScriptValue::NIL
+                    }
+                } else if let Some(default_obj) = default_apply {
+                    vm.value(default_obj, key)
+                } else {
+                    ScriptValue::NIL
+                };
+
+                if !from_val.is_nil() && !from_val.is_err() {
+                    // Deep copy if it's an object
+                    if let Some(from_obj) = from_val.as_object() {
+                        let new_obj = vm.new_object();
+                        Self::deep_copy_object(vm, new_obj, from_obj);
+                        vm.set_value_def(snapshot, key, new_obj);
+                    } else {
+                        vm.set_value_def(snapshot, key, from_val);
+                    }
+                }
+            }
+
+            // Both inputs must outlive the stylesheet that started the track,
+            // and any later `script_mod` re-run, so GC cannot free them under
+            // the running animation.
+            (
+                vm.new_object_ref(snapshot),
+                vm.new_object_ref(target_apply),
+            )
+        });
+
+        // Get the object before moving into track (for return value)
+        let snapshot_obj = from_snapshot.as_object();
+
+        // Create new track
+        // Use NEG_INFINITY as marker - will be set to actual time on first NextFrame
+        let track = AnimatorTrack {
+            group_id,
+            state_id: target_state_id,
+            start_time: f64::NEG_INFINITY,
+            play,
+            ease,
+            target_apply: target_apply_ref,
+            from_snapshot,
+            redraw: target_state.redraw,
+        };
+
+        self.tracks.push(track);
+
+        // Request next frame
+        self.next_frame = cx.new_next_frame();
+
+        // Return the snapshot (from values at t=0)
+        Some(snapshot_obj.into())
+    }
+
+    /// Immediately cut to a state without animation
+    pub fn cut(&mut self, cx: &mut Cx, state: &[LiveId; 2]) -> Option<ScriptValue> {
+        let group_id = state[0];
+        let target_state_id = state[1];
+
+        // Get the state group
+        let group = self.groups.get(&group_id)?;
+
+        // Get the target state
+        let target_state = group.states.get(&target_state_id)?;
+
+        // Get the apply object
+        let target_apply = target_state.apply.as_ref()?.as_object();
+
+        // Set cursor if specified
+        if let Some(cursor) = target_state.cursor {
+            cx.set_cursor(cursor);
+        }
+
+        // Remove any existing track for this group
+        self.tracks.retain(|t| t.group_id != group_id);
+
+        // Update current state
+        self.current_states.insert(group_id, target_state_id);
+
+        // Merge target values into state_object
+        let vm_id = self.vm_id;
+        cx.with_script_vm_id(vm_id, |vm| {
+            let state_obj = if let Some(ref obj_ref) = self.state_object {
+                obj_ref.as_object()
+            } else {
+                let new_obj = vm.new_object();
+                let obj_ref = vm.new_object_ref(new_obj);
+                self.state_object = Some(obj_ref);
+                new_obj
+            };
+            Self::merge_object(vm, state_obj, target_apply);
+        });
+
+        // Return the apply object directly
+        Some(target_apply.into())
+    }
+
+    /// Queue a `cut` that couldn't run now because the script VM is held (we're
+    /// inside an apply walk's `cx.with_vm`). Schedules a frame so the queued op
+    /// is replayed by `flush_deferred` once the VM is free. See [`DeferredImmediate`].
+    pub fn defer_cut(&mut self, cx: &mut Cx, state: &[LiveId; 2]) {
+        self.deferred.push(DeferredImmediate {
+            state: *state,
+            kind: DeferredKind::Cut,
+        });
+        cx.new_next_frame();
+    }
+
+    /// Like [`Self::defer_cut`], but for a deferred `play`.
+    pub fn defer_play(&mut self, cx: &mut Cx, state: &[LiveId; 2], play: Option<Play>) {
+        self.deferred.push(DeferredImmediate {
+            state: *state,
+            kind: DeferredKind::Play(play),
+        });
+        cx.new_next_frame();
+    }
+
+    #[inline]
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
+    /// Replay any cut/play ops deferred while the VM was held, now that it's
+    /// free, returning their apply values for the caller to `script_apply`.
+    /// Returns empty (a no-op) when nothing is queued; if the VM is somehow
+    /// still held it keeps the queue and re-arms a frame to retry.
+    pub fn flush_deferred(&mut self, cx: &mut Cx) -> Vec<ScriptValue> {
+        if self.deferred.is_empty() {
+            return Vec::new();
+        }
+        if cx.is_script_vm_held() {
+            cx.new_next_frame();
+            return Vec::new();
+        }
+        let deferred = std::mem::take(&mut self.deferred);
+        let mut values = Vec::with_capacity(deferred.len());
+        for d in deferred {
+            let value = match d.kind {
+                DeferredKind::Cut => self.cut(cx, &d.state),
+                DeferredKind::Play(play) => self.play(cx, &d.state, play),
+            };
+            if let Some(value) = value {
+                values.push(value);
+            }
+        }
+        values
+    }
+
+    /// Check if the animator is in a specific state
+    pub fn in_state(&self, _cx: &Cx, state: &[LiveId; 2]) -> bool {
+        self.current_state_matches(state)
+    }
+
+    /// Returns the cursor that `state` sets when it is played, if any.
+    pub fn state_cursor(&self, state: &[LiveId; 2]) -> Option<MouseCursor> {
+        self.groups.get(&state[0])?.states.get(&state[1])?.cursor
+    }
+
+    /// Inspect the requested state without a draw context. Cancel visibility must
+    /// follow a pending open/close even before its animation has drawn a frame.
+    pub(crate) fn in_state_id(&self, state: &[LiveId; 2]) -> bool {
+        if let Some(deferred) = self.deferred.iter().rev().find(|op| op.state[0] == state[0]) {
+            return deferred.state[1] == state[1];
+        }
+        self.current_state_matches(state)
+    }
+
+    fn current_state_matches(&self, state: &[LiveId; 2]) -> bool {
+        let group_id = state[0];
+        let state_id = state[1];
+
+        // If there's an active track for this group, check its target state
+        // This matches the old animator behavior where in_state returns true
+        // for the state we're animating TO, not the state we came FROM
+        if let Some(track) = self.tracks.iter().find(|t| t.group_id == group_id) {
+            return track.state_id == state_id;
+        }
+
+        // Check current state (only set after animation completes)
+        if let Some(current) = self.current_states.get(&group_id) {
+            return *current == state_id;
+        }
+
+        // Fall back to default
+        if let Some(group) = self.groups.get(&group_id) {
+            return group.default == state_id;
+        }
+
+        false
+    }
+
+    /// Debug dump of animator state for diagnosing flickering issues
+    pub fn debug_dump(&self, heap: &ScriptHeap) -> String {
+        let mut out = String::new();
+        // Current states
+        out.push_str("states:{");
+        for (i, (group_id, state_id)) in self.current_states.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            group_id.as_string(|s| {
+                out.push_str(s.unwrap_or("?"));
+            });
+            out.push(':');
+            state_id.as_string(|s| {
+                out.push_str(s.unwrap_or("?"));
+            });
+        }
+        out.push_str("} ");
+        // Active tracks
+        if !self.tracks.is_empty() {
+            out.push_str("tracks:[");
+            for (i, track) in self.tracks.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                track.group_id.as_string(|s| {
+                    out.push_str(s.unwrap_or("?"));
+                });
+                out.push_str("->");
+                track.state_id.as_string(|s| {
+                    out.push_str(s.unwrap_or("?"));
+                });
+            }
+            out.push_str("] ");
+        }
+        // State object
+        if let Some(ref state_obj) = self.state_object {
+            out.push_str("state_obj:");
+            let mut recur = Vec::new();
+            heap.to_debug_string(
+                ScriptValue::from(state_obj.clone()),
+                &mut recur,
+                &mut out,
+                false,
+                0,
+            );
+        } else {
+            out.push_str("state_obj:None");
+        }
+        out
+    }
+
+    /// Check if any animation tracks are currently active
+    pub fn is_animating(&self) -> bool {
+        !self.tracks.is_empty()
+    }
+
+    /// Check if a specific track (state group) is currently animating
+    pub fn is_track_animating(&self, track_id: LiveId) -> bool {
+        self.tracks.iter().any(|t| t.group_id == track_id)
+    }
+
+    /// Handle animation events (NextFrame)
+    pub fn handle_event(
+        &mut self,
+        cx: &mut Cx,
+        event: &Event,
+        act: &mut AnimatorAction,
+    ) -> Option<ScriptValue> {
+        if let Event::NextFrame(nf) = event {
+            if self.tracks.is_empty() {
+                return None;
+            }
+            // We may have missed the frame we asked for, so any later one counts too.
+            if !nf.set.contains(&self.next_frame)
+                && !nf.set.iter().any(|frame| frame.0 > self.next_frame.0)
+            {
+                return None;
+            }
+
+            let current_time = nf.time;
+
+            // Initialize start_time for tracks that just started
+            for track in &mut self.tracks {
+                if track.start_time == f64::NEG_INFINITY {
+                    track.start_time = current_time;
+                }
+            }
+
+            let mut any_animating = false;
+            let mut any_redraw = false;
+
+            // Process tracks and interpolate into the shared state_object.
+            // NOTE: After the first frame, no new objects should be allocated here.
+            // The state_object structure is populated on first frame and reused thereafter.
+            let vm_id = self.vm_id;
+            let result = cx.with_script_vm_id(vm_id, |vm| {
+                // Get or create the shared state object (created once, reused forever)
+                let state_obj = if let Some(ref obj_ref) = self.state_object {
+                    obj_ref.as_object()
+                } else {
+                    let new_obj = vm.new_object();
+                    let obj_ref = vm.new_object_ref(new_obj);
+                    self.state_object = Some(obj_ref);
+                    new_obj
+                };
+
+                for track in &self.tracks {
+                    let elapsed = current_time - track.start_time;
+                    let (ended, time) = track.play.get_ended_time(elapsed);
+                    let mix = if ended { 1.0 } else { track.ease.map(time) };
+
+                    if !ended {
+                        any_animating = true;
+                    }
+                    if track.redraw {
+                        any_redraw = true;
+                    }
+
+                    // Interpolate from the snapshot (frozen, read-only) to target (read-only),
+                    // writing results into state_obj. Reuses nested objects in state_obj.
+                    Self::interpolate_object(
+                        vm,
+                        state_obj,
+                        track.from_snapshot.as_object(),
+                        track.target_apply.as_object(),
+                        mix,
+                    );
+                }
+                state_obj
+            });
+
+            // Update state and remove ended tracks
+            self.tracks.retain(|track| {
+                let elapsed = current_time - track.start_time;
+                let (ended, _) = track.play.get_ended_time(elapsed);
+                if ended {
+                    self.current_states.insert(track.group_id, track.state_id);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Request next frame if still animating
+            if any_animating {
+                self.next_frame = cx.new_next_frame();
+            }
+
+            *act = AnimatorAction::Animating { redraw: any_redraw };
+
+            return Some(result.into());
+        }
+        None
+    }
+
+    /// Recursively interpolate between two objects, writing results into `result`.
+    ///
+    /// IMPORTANT: This function reuses nested objects from `result` (state_object) to avoid
+    /// allocating new objects on every animation frame. After the first frame populates
+    /// the structure, subsequent frames reuse the same nested objects.
+    ///
+    /// - `result`: The state_object we write interpolated values into (reuses nested objects)
+    /// - `from`: The from_snapshot (read-only, frozen at animation start)
+    /// - `to`: The target_apply template (read-only, never mutated)
+    fn interpolate_object(
+        vm: &mut ScriptVm,
+        result: ScriptObject,
+        from: ScriptObject,
+        to: ScriptObject,
+        mix: f64,
+    ) {
+        // Iterate over the 'to' object's properties INCLUDING prototype chain
+        // This ensures we don't miss inherited properties
+        for entry in vm.heap().proto_map_entries(to) {
+            let key = entry.key;
+            let to_val = entry.value;
+
+            // Read from 'from' snapshot (never mutated)
+            let from_val = vm.value(from, key);
+
+            // Get existing value at this key in result's OWN map only (not prototype)
+            // This is critical: we must not reuse objects from prototypes as they
+            // might be shared with template objects
+            let existing = vm.heap().map_own_value(result, key).unwrap_or(ScriptValue::NIL);
+
+            // Interpolate values (creates new objects for nested structures to avoid aliasing)
+            let interpolated = Self::interpolate_value(vm, from_val, to_val, mix, existing);
+
+            // Write to result (state_object)
+            vm.set_value_def(result, key, interpolated);
+        }
+    }
+
+    /// Merge source object's values into target object (used for snap/cut operations)
+    /// IMPORTANT: This deep-copies objects from source to avoid mutating templates
+    /// Uses proto_map_entries to include inherited properties from prototypes
+    fn merge_object(vm: &mut ScriptVm, target: ScriptObject, source: ScriptObject) {
+        for entry in vm.heap().proto_map_entries(source) {
+            let key = entry.key;
+            let source_val = entry.value;
+
+            // Get existing value at this key in target's OWN map only
+            let existing = vm.heap().map_own_value(target, key).unwrap_or(ScriptValue::NIL);
+
+            if let Some(source_obj) = source_val.as_object() {
+                // Source is an object - we need to handle it carefully
+                if let Some(existing_obj) = existing.as_object() {
+                    // Both exist as objects in own map - recursively merge into existing
+                    Self::merge_object(vm, existing_obj, source_obj);
+                } else {
+                    // Target doesn't have this in own map yet - create a COPY, don't reference
+                    let new_obj = vm.new_object();
+                    Self::deep_copy_object(vm, new_obj, source_obj);
+                    vm.set_value_def(target, key, new_obj);
+                }
+            } else {
+                // Primitive value - just copy it directly (primitives are value types)
+                vm.set_value_def(target, key, source_val);
+            }
+        }
+    }
+
+    /// Deep copy all values from source object to dest object
+    /// This ensures we never share object references with templates
+    /// IMPORTANT: Flattens the prototype chain to avoid shared prototype issues
+    fn deep_copy_object(vm: &mut ScriptVm, dest: ScriptObject, source: ScriptObject) {
+        // Use proto_map_entries to walk the prototype chain and flatten all values
+        for entry in vm.heap().proto_map_entries(source) {
+            let key = entry.key;
+            let source_val = entry.value;
+
+            if let Some(source_obj) = source_val.as_object() {
+                // Recursively copy nested objects (also flattening their prototypes)
+                let new_obj = vm.new_object();
+                Self::deep_copy_object(vm, new_obj, source_obj);
+                vm.set_value_def(dest, key, new_obj);
+            } else {
+                // Primitive - copy directly
+                vm.set_value_def(dest, key, source_val);
+            }
+        }
+    }
+
+    /// Interpolate between two ScriptValues
+    /// `existing` is the current value at this key in the result object's OWN map (for reusing nested objects)
+    fn interpolate_value(
+        vm: &mut ScriptVm,
+        from: ScriptValue,
+        to: ScriptValue,
+        mix: f64,
+        existing: ScriptValue,
+    ) -> ScriptValue {
+        // If from is NIL or error (no starting value), we need to handle objects specially
+        // to avoid returning template objects directly (which would cause aliasing bugs)
+        if from.is_nil() || from.is_err() {
+            // For objects, we must create a COPY, not return the template directly!
+            if let Some(to_obj) = to.as_object() {
+                // Check if it's an apply_transform (snap/timeline) - handle those specially
+                if vm.heap().has_apply_transform(to) {
+                    let keyframes = vm.value(to_obj, id!(keyframes));
+                    if keyframes.as_object().is_some() {
+                        // Timeline - just return to value for now (the timeline itself, not interpolated)
+                        return to;
+                    }
+                    // Snap - return the stored value
+                    return vm.value(to_obj, id!(value));
+                }
+                // Regular object - create a COPY to avoid aliasing with template
+                let new_obj = vm.new_object();
+                Self::deep_copy_object(vm, new_obj, to_obj);
+                return new_obj.into();
+            }
+            // Primitives are fine to return directly
+            return to;
+        }
+
+        // Handle apply_transform objects (snap and timeline)
+        if let Some(to_obj) = to.as_object() {
+            if vm.heap().has_apply_transform(to) {
+                // Check if it's a timeline object (has keyframes property)
+                let keyframes = vm.value(to_obj, id!(keyframes));
+                if let Some(kf_obj) = keyframes.as_object() {
+                    return Self::interpolate_timeline(vm, from, kf_obj, mix, existing);
+                }
+                // Otherwise it's a snap object - return the stored value
+                return vm.value(to_obj, id!(value));
+            }
+
+            // If it's an object, recursively interpolate
+            if let Some(from_obj) = from.as_object() {
+                // Reuse existing nested object from state_object's OWN map if available.
+                // Only creates new object on first frame when state_object structure is empty.
+                // After first frame, we reuse the same object and just update its keys.
+                let result_obj = existing
+                    .as_object()
+                    .unwrap_or_else(|| vm.new_object());
+                Self::interpolate_object(vm, result_obj, from_obj, to_obj, mix);
+                return result_obj.into();
+            } else {
+                // Can't interpolate different types, return 'to' at mix >= 0.5
+                return if mix >= 0.5 { to } else { from };
+            }
+        }
+
+        // Numbers (f64)
+        if let (Some(from_f), Some(to_f)) = (from.as_number(), to.as_number()) {
+            let result = from_f + (to_f - from_f) * mix;
+            return ScriptValue::from_f64(result);
+        }
+
+        // Colors
+        if let (Some(from_c), Some(to_c)) = (from.as_color(), to.as_color()) {
+            let from_vec = Vec4f::from_u32(from_c);
+            let to_vec = Vec4f::from_u32(to_c);
+            let mix_f = mix as f32;
+            let result = Vec4f {
+                x: from_vec.x + (to_vec.x - from_vec.x) * mix_f,
+                y: from_vec.y + (to_vec.y - from_vec.y) * mix_f,
+                z: from_vec.z + (to_vec.z - from_vec.z) * mix_f,
+                w: from_vec.w + (to_vec.w - from_vec.w) * mix_f,
+            };
+            return ScriptValue::from_color(result.to_u32());
+        }
+
+        // Pods (vectors)
+        if let (Some(from_pod), Some(to_pod)) = (from.as_pod(), to.as_pod()) {
+            return Self::interpolate_pod(vm, from_pod, to_pod, mix);
+        }
+
+        // Booleans - snap at 0.5
+        if from.is_bool() || to.is_bool() {
+            return if mix >= 0.5 { to } else { from };
+        }
+
+        // IDs - snap at 0.5
+        if from.is_id() || to.is_id() {
+            return if mix >= 0.5 { to } else { from };
+        }
+
+        // Default: return 'to' at mix >= 0.5
+        if mix >= 0.5 {
+            to
+        } else {
+            from
+        }
+    }
+
+    /// Interpolate between two pod values (vectors)
+    /// For now, pods snap at mix >= 0.5 since creating interpolated pods requires
+    /// internal APIs. Most animation use cases are for f32/f64/colors which are handled above.
+    fn interpolate_pod(
+        _vm: &mut ScriptVm,
+        from: ScriptPod,
+        to: ScriptPod,
+        mix: f64,
+    ) -> ScriptValue {
+        // Pods (vectors, matrices, etc) snap at 0.5
+        // The common animation case is f32/f64 numbers and colors, which are handled separately
+        if mix >= 0.5 {
+            to.into()
+        } else {
+            from.into()
+        }
+    }
+
+    /// Interpolate using a timeline of keyframes
+    /// keyframes is an object with vec storage containing pairs [t0, v0, t1, v1, ...]
+    /// `from` is the current value to use if timeline doesn't start at time 0
+    /// Assumes keyframes are already sorted by time
+    fn interpolate_timeline(
+        vm: &mut ScriptVm,
+        from: ScriptValue,
+        keyframes: ScriptObject,
+        mix: f64,
+        existing: ScriptValue,
+    ) -> ScriptValue {
+        let len = vm.heap().vec_len(keyframes);
+        let num_pairs = len / 2;
+
+        if num_pairs == 0 {
+            return from;
+        }
+
+        // Get first keyframe
+        let first_time = vm.vec_value(keyframes, 0)
+            .as_f64()
+            .unwrap_or(0.0);
+        let first_value = vm.vec_value(keyframes, 1);
+
+        // If mix is before first keyframe, interpolate from `from` to first keyframe value
+        if mix <= first_time {
+            if first_time <= 0.0 {
+                return first_value;
+            }
+            let local_mix = mix / first_time;
+            return Self::interpolate_value(vm, from, first_value, local_mix, existing);
+        }
+
+        // Get last keyframe
+        let last_time = vm.vec_value(keyframes, (num_pairs - 1) * 2)
+            .as_f64()
+            .unwrap_or(1.0);
+        let last_value = vm.vec_value(keyframes, (num_pairs - 1) * 2 + 1);
+
+        // If mix is at or after last keyframe, return last value
+        if mix >= last_time {
+            return last_value;
+        }
+
+        // Find the two keyframes that bracket mix
+        let mut t0 = first_time;
+        let mut v0 = first_value;
+
+        for i in 1..num_pairs {
+            let t1 = vm.vec_value(keyframes, i * 2)
+                .as_f64()
+                .unwrap_or(1.0);
+            let v1 = vm.vec_value(keyframes, i * 2 + 1);
+
+            if mix <= t1 {
+                // Interpolate between t0,v0 and t1,v1
+                let segment_duration = t1 - t0;
+                if segment_duration <= 0.0 {
+                    return v1;
+                }
+                let local_mix = (mix - t0) / segment_duration;
+                return Self::interpolate_value(vm, v0, v1, local_mix, existing);
+            }
+
+            t0 = t1;
+            v0 = v1;
+        }
+
+        // Fallback
+        last_value
+    }
+}
+
+// deserialisable DSL structure
+#[derive(Debug, Clone, Script, ScriptHook)]
+pub struct KeyFrame {
+    #[live(Ease::Linear)]
+    pub ease: Ease,
+
+    #[live(1.0)]
+    pub time: f64,
+
+    #[live(NIL)]
+    pub value: ScriptValue,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Script, ScriptHook)]
+pub enum Play {
+    #[pick {duration: 1.0}]
+    Forward {
+        duration: f64,
+    },
+
+    Snap,
+
+    #[live {duration: 1.0, end: 1.0}]
+    Reverse {
+        duration: f64,
+        end: f64,
+    },
+
+    #[live {duration: 1.0, end: 1.0}]
+    Loop {
+        duration: f64,
+        end: f64,
+    },
+
+    #[live {duration: 1.0, end: 1.0}]
+    ReverseLoop {
+        duration: f64,
+        end: f64,
+    },
+
+    #[live {duration: 1.0, end: 1.0}]
+    BounceLoop {
+        duration: f64,
+        end: f64,
+    },
+}
+
+impl Play {
+    /*
+    pub fn duration(&self) -> f64 {
+        match self {
+            Self::Forward {duration, ..} => *duration,
+            Self::Reverse {duration, ..} => *duration,
+            Self::Loop {duration, ..} => *duration,
+            Self::ReverseLoop {duration, ..} => *duration,
+            Self::BounceLoop {duration, ..} => *duration,
+        }
+    }*/
+
+    pub fn get_ended_time(&self, time: f64) -> (bool, f64) {
+        match self {
+            Self::Snap => (true, 1.0),
+            Self::Forward { duration } => {
+                if *duration == 0.0 {
+                    return (true, 1.0);
+                }
+                (time > *duration, time.min(*duration) / duration)
+            }
+            Self::Reverse { duration, end } => {
+                if *duration == 0.0 {
+                    return (true, 1.0);
+                }
+                (time > *duration, end - (time.min(*duration) / duration))
+            }
+            Self::Loop { duration, end } => {
+                if *duration == 0.0 {
+                    return (true, 1.0);
+                }
+                (false, (time / duration) % end)
+            }
+            Self::ReverseLoop { end, duration } => {
+                if *duration == 0.0 {
+                    return (true, 1.0);
+                }
+                (false, end - (time / duration) % end)
+            }
+            Self::BounceLoop { end, duration } => {
+                if *duration == 0.0 {
+                    return (true, 1.0);
+                }
+                let mut local_time = (time / duration) % (end * 2.0);
+                if local_time > *end {
+                    local_time = 2.0 * end - local_time;
+                };
+                (false, local_time)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Script, ScriptHook)]
+pub enum Ease {
+    #[pick]
+    Linear,
+    #[live]
+    None,
+    #[live(1.0)]
+    Constant(f64),
+    #[live]
+    InQuad,
+    #[live]
+    OutQuad,
+    #[live]
+    InOutQuad,
+    #[live]
+    InCubic,
+    #[live]
+    OutCubic,
+    #[live]
+    InOutCubic,
+    #[live]
+    InQuart,
+    #[live]
+    OutQuart,
+    #[live]
+    InOutQuart,
+    #[live]
+    InQuint,
+    #[live]
+    OutQuint,
+    #[live]
+    InOutQuint,
+    #[live]
+    InSine,
+    #[live]
+    OutSine,
+    #[live]
+    InOutSine,
+    #[live]
+    InExp,
+    #[live]
+    OutExp,
+    #[live]
+    InOutExp,
+    #[live]
+    InCirc,
+    #[live]
+    OutCirc,
+    #[live]
+    InOutCirc,
+    #[live]
+    InElastic,
+    #[live]
+    OutElastic,
+    #[live]
+    InOutElastic,
+    #[live]
+    InBack,
+    #[live]
+    OutBack,
+    #[live]
+    InOutBack,
+    #[live]
+    InBounce,
+    #[live]
+    OutBounce,
+    #[live]
+    InOutBounce,
+    #[live {d1: 0.82, d2: 0.97, max: 100}]
+    ExpDecay { d1: f64, d2: f64, max: usize },
+
+    #[live {begin: 0.0, end: 1.0}]
+    Pow { begin: f64, end: f64 },
+    #[live {cp0: 0.0, cp1: 0.0, cp2: 1.0, cp3: 1.0}]
+    Bezier {
+        cp0: f64,
+        cp1: f64,
+        cp2: f64,
+        cp3: f64,
+    },
+    /// Material's emphasized easing, i.e., Android's `fast_out_extra_slow_in`,
+    /// which Android uses for its activity transitions.
+    #[live]
+    Emphasized,
+}
+
+impl Ease {
+    /// The ease curve at `t`. The math lives in one place, `makepad_tween::Easing`
+    /// (its parity family reproduces this enum bit for bit).
+    pub fn map(&self, t: f64) -> f64 {
+        crate::tween::Easing::from(self).map(t)
+    }
+}
+
+/// The tween engine's ease for an Animator ease, bit for bit: `Easing::from(&e).map(t)`
+/// equals `e.map(t)` for every `t` (the parity family of `makepad_tween::Easing`).
+/// This is how theme motion tokens (`theme.motion_ease_*`, read into an
+/// `#[live] ease: Ease` field) reach a tween (GSAP `ease`):
+///
+/// ```text
+/// TweenOpts::new().duration(self.open_secs).ease((&self.open_ease).into())
+/// ```
+impl From<&Ease> for crate::tween::Easing {
+    fn from(e: &Ease) -> Self {
+        use crate::tween::Easing as E;
+        match *e {
+            Ease::Linear => E::Linear,
+            Ease::None => E::Instant,
+            Ease::Constant(c) => E::Constant(c),
+            Ease::InQuad => E::InQuad,
+            Ease::OutQuad => E::OutQuad,
+            Ease::InOutQuad => E::InOutQuad,
+            Ease::InCubic => E::InCubic,
+            Ease::OutCubic => E::OutCubic,
+            Ease::InOutCubic => E::InOutCubic,
+            Ease::InQuart => E::InQuart,
+            Ease::OutQuart => E::OutQuart,
+            Ease::InOutQuart => E::InOutQuart,
+            Ease::InQuint => E::InQuint,
+            Ease::OutQuint => E::OutQuint,
+            Ease::InOutQuint => E::InOutQuint,
+            Ease::InSine => E::InSine,
+            Ease::OutSine => E::OutSine,
+            Ease::InOutSine => E::InOutSine,
+            Ease::InExp => E::InExp,
+            Ease::OutExp => E::OutExp,
+            Ease::InOutExp => E::InOutExp,
+            Ease::InCirc => E::InCirc,
+            Ease::OutCirc => E::OutCirc,
+            Ease::InOutCirc => E::InOutCirc,
+            Ease::InElastic => E::InElastic,
+            Ease::OutElastic => E::OutElastic,
+            Ease::InOutElastic => E::InOutElastic,
+            Ease::InBack => E::InBack,
+            Ease::OutBack => E::OutBack,
+            Ease::InOutBack => E::InOutBack,
+            Ease::InBounce => E::InBounce,
+            Ease::OutBounce => E::OutBounce,
+            Ease::InOutBounce => E::InOutBounce,
+            Ease::ExpDecay { d1, d2, max } => E::exp_decay(d1, d2, max),
+            Ease::Pow { begin, end } => E::pow(begin, end),
+            Ease::Bezier { cp0, cp1, cp2, cp3 } => E::Bezier {
+                x1: cp0,
+                y1: cp1,
+                x2: cp2,
+                y2: cp3,
+            },
+            Ease::Emphasized => E::Emphasized,
+        }
+    }
+}
+
+/// The same conversion as `From<&Ease>`, by value.
+impl From<Ease> for crate::tween::Easing {
+    fn from(e: Ease) -> Self {
+        Self::from(&e)
+    }
+}
+
+#[cfg(test)]
+mod ease_tests {
+    use super::*;
+
+    #[test]
+    fn emphasized_matches_androids_fast_out_extra_slow_in() {
+        // Sampled from the path data of Android's `fast_out_extra_slow_in` interpolator.
+        let samples = [(0.1, 0.0935), (1.0 / 6.0, 0.4), (0.25, 0.7728), (0.5, 0.9506), (0.75, 0.9914)];
+        for (t, expected) in samples {
+            assert!((Ease::Emphasized.map(t) - expected).abs() < 1e-4, "t = {t}");
+        }
+        let mut prev = 0.0;
+        for i in 0..=1000 {
+            let t = i as f64 / 1000.0;
+            let mix = Ease::Emphasized.map(t);
+            assert!(mix >= prev, "steps backwards at t = {t}");
+            prev = mix;
+        }
+    }
+}

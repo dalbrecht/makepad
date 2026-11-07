@@ -1,0 +1,20 @@
+[package]
+name = "makepad-ai-common"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-family internals shared by the AI model family crates: DiffusionError, sharded safetensors, the gpu_* / try_* exec surface, progress hooks, host .pth / Metal-GEMM helpers."
+license = "MIT"
+
+[dependencies]
+makepad-ai-loader = { path = "../../loader" }
+# metal-precompile bakes the metallib at build time so the first Metal
+# dispatch is not a 13k-line shader compile.
+makepad-ai-metal = { path = "../../metal", features = ["metal-precompile"] }
+makepad-ai-llm = { path = "../../llm" }
+
+# The CUDA store is Linux/Windows-only: gpu.rs / backend.rs reach it only
+# under that target, and a macOS/iOS build never compiles it. The
+# `links = "makepad_ai_cuda"` handshake (DEP_MAKEPAD_AI_CUDA_KERNELS, read
+# in build.rs) arrives exactly on the targets that have the dependency.
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+makepad-ai-cuda = { path = "../../cuda" }

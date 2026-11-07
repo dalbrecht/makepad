@@ -101,10 +101,17 @@ pub fn tri_tri_intersection_indexed(
     b_vi: [u32; 3],
     b_ti: u32,
 ) -> TriTriResult {
-    // Step 1-2: Classify A vertices against B's plane
-    let db0 = orient3d(b0, b1, b2, a0);
-    let db1 = orient3d(b0, b1, b2, a1);
-    let db2 = orient3d(b0, b1, b2, a2);
+    // Step 1-2: Classify A vertices against B's plane. A vertex within
+    // `plane_tolerance` of the plane counts as on it: faces that coincide in
+    // the model (a rounded edge shared by two rounded boxes, faces of shapes
+    // turned or moved by different transforms) are coplanar only up to
+    // rounding, and splitting one along a near-parallel "intersection" line
+    // tears the seam open.
+    let tol = plane_tolerance(a0, a1, a2, b0, b1, b2);
+    let nb_len = (b1 - b0).cross(b2 - b0).length();
+    let db0 = snap_to_plane(orient3d(b0, b1, b2, a0), nb_len, tol);
+    let db1 = snap_to_plane(orient3d(b0, b1, b2, a1), nb_len, tol);
+    let db2 = snap_to_plane(orient3d(b0, b1, b2, a2), nb_len, tol);
 
     // All on same side? No intersection.
     if db0 > 0.0 && db1 > 0.0 && db2 > 0.0 {
@@ -115,9 +122,10 @@ pub fn tri_tri_intersection_indexed(
     }
 
     // Step 3-4: Classify B vertices against A's plane
-    let da0 = orient3d(a0, a1, a2, b0);
-    let da1 = orient3d(a0, a1, a2, b1);
-    let da2 = orient3d(a0, a1, a2, b2);
+    let na_len = (a1 - a0).cross(a2 - a0).length();
+    let da0 = snap_to_plane(orient3d(a0, a1, a2, b0), na_len, tol);
+    let da1 = snap_to_plane(orient3d(a0, a1, a2, b1), na_len, tol);
+    let da2 = snap_to_plane(orient3d(a0, a1, a2, b2), na_len, tol);
 
     // All on same side? No intersection.
     if da0 > 0.0 && da1 > 0.0 && da2 > 0.0 {
@@ -253,15 +261,38 @@ fn isolate_vertex_indexed(
     let s1 = sign(d1);
     let s2 = sign(d2);
 
-    // If d0 is isolated (different sign from d1 and d2)
+    // Prefer isolating a vertex with NONZERO sign that differs from both
+    // others. Isolating an exactly-on-plane vertex (sign 0) while the other
+    // two straddle collapses the interval to a point (both edge parameters
+    // become t=0) and a real crossing is silently dropped — the chord must
+    // run from the on-plane vertex to the opposite edge's crossing. With a
+    // nonzero isolated vertex, an on-plane neighbor falls out naturally at
+    // t=1. This only changes behavior for the {0,+,-} sign patterns; all
+    // generic patterns take exactly the branches they always took.
+    if s0 != 0 && s0 != s1 && s0 != s2 {
+        return (v0, d0, v1, d1, v2, d2, vi[0], vi[1], vi[2]);
+    }
+    if s1 != 0 && s1 != s0 && s1 != s2 {
+        return (v1, d1, v0, d0, v2, d2, vi[1], vi[0], vi[2]);
+    }
+    if s2 != 0 && s2 != s0 && s2 != s1 {
+        return (v2, d2, v0, d0, v1, d1, vi[2], vi[0], vi[1]);
+    }
+    // One vertex exactly on the plane while the other two straddle. Zero at
+    // v1/v2 was already handled above (v0 was isolated); only zero-at-v0
+    // reaches here: isolate v1 so the interval is [v0 (t=1), crossing(v1,v2)].
+    if s0 == 0 && s1 != 0 && s2 != 0 && s1 != s2 {
+        return (v1, d1, v0, d0, v2, d2, vi[1], vi[0], vi[2]);
+    }
+
+    // Remaining degenerate patterns (vertex touch {0,+,+}, edge in plane
+    // handled above, etc.): keep the historical behavior.
     if s0 != s1 && s0 != s2 {
         return (v0, d0, v1, d1, v2, d2, vi[0], vi[1], vi[2]);
     }
-    // If d1 is isolated
     if s1 != s0 && s1 != s2 {
         return (v1, d1, v0, d0, v2, d2, vi[1], vi[0], vi[2]);
     }
-    // d2 is isolated (or degenerate case)
     (v2, d2, v0, d0, v1, d1, vi[2], vi[0], vi[1])
 }
 
@@ -292,6 +323,26 @@ fn project_onto(p: Vec3d, _dir: Vec3d, axis: usize) -> f64 {
         0 => p.x,
         1 => p.y,
         _ => p.z,
+    }
+}
+
+/// The distance (model units) within which a vertex counts as lying on the
+/// other triangle's plane: far below any feature a mesh models, far above the
+/// rounding of coordinates that went through different transforms.
+fn plane_tolerance(a0: Vec3d, a1: Vec3d, a2: Vec3d, b0: Vec3d, b1: Vec3d, b2: Vec3d) -> f64 {
+    let scale = [a0, a1, a2, b0, b1, b2]
+        .iter()
+        .fold(1.0f64, |m, v| m.max(v.x.abs()).max(v.y.abs()).max(v.z.abs()));
+    scale * 1e-9
+}
+
+/// `orient3d` is the plane normal's length times the signed distance: zero
+/// when the distance is within `tol`.
+fn snap_to_plane(d: f64, normal_len: f64, tol: f64) -> f64 {
+    if d.abs() <= tol * normal_len {
+        0.0
+    } else {
+        d
     }
 }
 

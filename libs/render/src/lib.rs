@@ -1,0 +1,119 @@
+//! 3D forward renderer: GLB/skin, stage, lighting, sky, terrain.
+//!
+//! [`Renderer`] owns the GPU-side caches (geometries, slabs). Draw structs
+//! stay `#[live]` fields on the host widget so script-side theming keeps
+//! working — the widget lends them per frame via [`SceneDraws`]. Camera
+//! state is per-view ([`CameraRig`]).
+//!
+//! Asset UI / VJ use [`PreviewLook`] + [`Renderer::draw_preview`]. Arcade
+//! still draws a full world through [`Renderer::draw_scene_full`].
+
+// Shader/live literals intentionally use their source-language spelling.
+#![allow(clippy::approx_constant)]
+
+pub mod asset_lights;
+pub mod asset_morph;
+pub mod asset_rigid;
+pub mod asset_animation;
+pub mod asset_sockets;
+pub mod asset_metadata;
+pub mod asset_lod;
+pub mod ao;
+pub mod custom_material;
+pub mod clustered;
+pub mod fast_gi;
+pub mod entity_lights;
+pub mod local_shadows;
+pub mod ao_atlas;
+pub mod ao_lightmapper;
+pub mod aobaker_port;
+pub mod bakerboy;
+pub mod bake;
+pub mod firework;
+pub mod geometry;
+pub mod grass;
+pub mod impostor;
+pub mod gpu_lightmap;
+pub mod light_grid;
+pub mod lightmap;
+pub mod model;
+pub mod material_surface;
+pub mod texture_pack;
+pub use makepad_texcomp;
+pub mod renderer;
+pub mod scene;
+pub mod shaders;
+pub mod skin;
+pub mod stage;
+pub mod particles;
+pub mod quality_tier;
+pub mod play;
+pub mod preview;
+pub mod shadow;
+pub mod shadow_mesh;
+pub mod shadow_csm;
+pub mod shadow_sdf;
+// Procedural HDRI environments (outdoor sky, studio lights) as the engine's
+// linear equirect `EnvMap`s.
+pub mod hdri;
+pub mod sky;
+pub mod smoke;
+pub mod vfx;
+pub mod ssao;
+pub mod stream;
+pub mod sun;
+pub mod thermometer;
+pub mod world_lights;
+
+pub use bake::*;
+pub use custom_material::{DrawSceneCustom, DrawMaterialShadow};
+pub use makepad_render_material;
+pub use clustered::{ClusterConfig, ClusterStats};
+pub use fast_gi::{GiMode, GiConfig, GiStats, GiDebug};
+pub use local_shadows::{LocalShadowConfig, LocalShadowStats};
+pub use gpu_lightmap::{
+    dynamic_shadow_tiers, CsmConfig, DynamicShadowTiers, GpuLightmapMode, GpuLmMover,
+    GpuLmSkin, DEFAULT_CSM_CONFIG,
+};
+pub use geometry::*;
+pub use model::*;
+pub use renderer::*;
+pub use scene::*;
+pub use shaders::*;
+pub use stage::*;
+pub use particles::*;
+pub use play::*;
+pub use preview::*;
+pub use shadow::*;
+pub use shadow_mesh::*;
+pub use ssao::*;
+pub use smoke::SmokeVolume;
+pub use sun::*;
+// `sun::solar_dir` (axis-mapped game-space wrapper) and
+// `makepad_draw::solar_dir` (the underlying shared solar model, pulled in
+// by the glob import below) share a name; this crate's own wrapper is the
+// intended public `makepad_render::solar_dir` — an explicit re-export wins
+// over both globs and resolves the ambiguity.
+pub use sun::solar_dir;
+
+use makepad_draw::*;
+
+/// Register the scene draw shaders into the script VM. Call after
+/// `makepad_widgets::script_mod` (the shader block uses the widgets prelude)
+/// and before any widget that declares these draw types.
+pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+    // The shared Splash stdlib (`mod.shared`: sRGB, hashes) the shaders use.
+    makepad_render_graph::pass_stdlib(vm);
+    local_shadows::sampling::script_mod(vm);
+    if local_shadows::hardware_shadow_maps() {
+        local_shadows::hardware_sampling::script_mod(vm);
+    }
+    clustered::script_mod(vm);
+    fast_gi::script_mod(vm);
+    ssao::script_mod(vm);
+    makepad_render_graph::script_mod(vm);
+    smoke::script_mod(vm);
+    vfx::shader::script_mod(vm);
+    shaders::script_mod(vm);
+    local_shadows::script_mod(vm)
+}

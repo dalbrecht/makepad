@@ -1,5 +1,5 @@
 use {
-    crate::{area::Area, event::finger::KeyModifiers},
+    crate::{area::Area, event::finger::KeyModifiers, window::WindowId},
     std::cell::RefCell,
     std::rc::Rc,
 };
@@ -13,12 +13,21 @@ pub struct CxKeyboard {
     pub(crate) prev_key_focus: Area,
     pub(crate) next_key_focus: Area,
     pub(crate) key_focus: Area,
+    /// The key focus of each window that lost the keyboard, restored when it gets it back. Kept
+    /// here, not in the window widget, so a redraw while it is away moves it like the live focus
+    /// (update_area): a stale copy would never match the widget's area again.
+    pub(crate) parked_key_focus: Vec<(WindowId, Area)>,
     #[allow(dead_code)]
     pub(crate) keys_down: Vec<KeyEvent>,
     pub(crate) text_ime_dismissed: bool,
+    pub(crate) has_physical_keyboard: bool,
 }
 
 impl CxKeyboard {
+    pub fn has_physical_keyboard(&self) -> bool {
+        self.has_physical_keyboard
+    }
+
     pub fn modifiers(&self) -> KeyModifiers {
         if let Some(key) = self.keys_down.first() {
             key.modifiers
@@ -52,7 +61,25 @@ impl CxKeyboard {
         self.text_ime_dismissed = false;
     }
 
+    pub fn park_key_focus(&mut self, window: WindowId) {
+        self.parked_key_focus.retain(|(w, _)| *w != window);
+        self.parked_key_focus.push((window, self.key_focus));
+        self.set_key_focus(Area::Empty);
+    }
+
+    pub fn unpark_key_focus(&mut self, window: WindowId) {
+        if let Some(i) = self.parked_key_focus.iter().position(|(w, _)| *w == window) {
+            let (_, area) = self.parked_key_focus.remove(i);
+            self.set_key_focus(area);
+        }
+    }
+
     pub(crate) fn update_area(&mut self, old_area: Area, new_area: Area) {
+        for (_, parked) in self.parked_key_focus.iter_mut() {
+            if *parked == old_area {
+                *parked = new_area;
+            }
+        }
         if self.key_focus == old_area {
             self.key_focus = new_area
         }
@@ -100,6 +127,23 @@ impl CxKeyboard {
             self.keys_down.remove(pos);
         }
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_physical_keyboard_state(&mut self, connected: bool) {
+        self.has_physical_keyboard = connected;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn update_physical_keyboard_state(
+        &mut self,
+        connected: bool,
+    ) -> Option<PhysicalKeyboardEvent> {
+        if self.has_physical_keyboard == connected {
+            return None;
+        }
+        self.has_physical_keyboard = connected;
+        Some(PhysicalKeyboardEvent { connected })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +157,11 @@ pub struct TextClipboardEvent {
     pub response: Rc<RefCell<Option<String>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalKeyboardEvent {
+    pub connected: bool,
+}
+
 /// Event for replacing a specific range of text
 #[derive(Clone, Debug)]
 pub struct TextRangeReplaceEvent {
@@ -122,4 +171,10 @@ pub struct TextRangeReplaceEvent {
     pub end: usize,
     /// Text to insert at the range
     pub text: String,
+    /// Text that the platform saw in the replaced range before editing.
+    ///
+    /// Used to reject or re-anchor stale autocorrection ranges.
+    pub replaced_text: Option<String>,
+    /// If the range no longer matches, treat this as ordinary text input.
+    pub fallback_to_insert: bool,
 }

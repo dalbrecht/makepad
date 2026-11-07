@@ -1,6 +1,6 @@
 use {
     crate::{
-        decode::{Decode, DecodeError, Decoder},
+        
         downcast::{DowncastMut, DowncastRef},
         extern_ref::UnguardedExternRef,
         func_ref::UnguardedFuncRef,
@@ -168,14 +168,6 @@ pub struct GlobalType {
     pub val: ValType,
 }
 
-impl Decode for GlobalType {
-    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        let val = decoder.decode()?;
-        let mut_ = decoder.decode()?;
-        Ok(Self { val, mut_ })
-    }
-}
-
 /// The mutability of a `Global`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Mut {
@@ -183,16 +175,6 @@ pub enum Mut {
     Const,
     /// The global is a variable.
     Var,
-}
-
-impl Decode for Mut {
-    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        match decoder.read_byte()? {
-            0x00 => Ok(Self::Const),
-            0x01 => Ok(Self::Var),
-            _ => Err(DecodeError::new("malformed mutability")),
-        }
-    }
 }
 
 /// An error which can occur when operating on a [`Global`].

@@ -131,9 +131,11 @@ script_mod! {
             }
 
             hsv2rgb: fn(c: vec4) -> vec4 { //http://gamedev.stackexchange.com/questions/59797/glsl-shader-change-hue-saturation-brightness
+                // clamp/mix take matching vector args here: the script
+                // shader's builtins (and WGSL) do not splat scalar bounds.
                 let K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
                 let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-                return vec4(c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y), c.w);
+                return vec4(c.z * mix(K.xxx, clamp(p - K.xxx, vec3(0.0), vec3(1.0)), c.y), c.w);
             }
 
             rgb2hsv: fn(c: vec4) -> vec4 {
@@ -158,6 +160,10 @@ script_mod! {
             old_shape: float
             blur: float
             aa: float
+            // The coverage of a pixel whose centre is on the edge: 0 (the
+            // default) puts the whole ramp outside of it, 0.5 centres the
+            // ramp on it (viewport_px).
+            edge: float
             scale_factor: float
             dist: float
 
@@ -177,6 +183,34 @@ script_mod! {
                     old_shape: 1e+20
                     blur: 0.00001
                     aa: antialias(pos)
+                    edge: 0.0
+                    scale_factor: 1.0
+                    dist: 0.0
+                );
+            }
+
+            // A viewport whose edges are centred on the pixel: coverage is
+            // 0.5 - d * px, so a pixel straddling the edge is half covered
+            // and a box on whole pixels fills exactly its pixels. `px` is
+            // pixels per unit of `pos` (0: read from the screen-space
+            // derivatives, for a host under a view transform it does not know).
+            viewport_px: fn(pos: vec2, px: float) -> Self {
+                var aa = px;
+                if px <= 0.0 {
+                    aa = antialias(pos);
+                }
+                return self (
+                    pos: pos
+                    result: vec4(0.)
+                    last_pos: vec2(0.)
+                    start_pos: vec2(0.)
+                    shape: 1e+20
+                    clip: -1e+20
+                    has_clip: 0.0
+                    old_shape: 1e+20
+                    blur: 0.00001
+                    aa: aa
+                    edge: 0.5
                     scale_factor: 1.0
                     dist: 0.0
                 );
@@ -204,7 +238,7 @@ script_mod! {
             }
 
             calc_blur: fn(w: float) -> float {
-                let wa = clamp(-w * self.aa, 0.0, 1.0);
+                let wa = clamp(self.edge - w * self.aa, 0.0, 1.0);
                 var wb = 1.0;
                 if self.blur > 0.001 {
                     wb = clamp(-w / self.blur, 0.0, 1.0);
@@ -368,17 +402,27 @@ script_mod! {
                 self.shape = min(self.shape, self.dist);
             }
 
-            arc2: fn(x: float, y: float, r: float, s:float, e:float)->vec4{
+            // A circular arc segment of the current path. Unlike arc_round_caps/
+            // arc_flat_caps, this adds the distance to the bare arc centerline
+            // (no baked thickness), so it chains after move_to/line_to and is
+            // covered by a single stroke. Angles are in radians, 0 = +x axis;
+            // end_angle may be less than start_angle (sweep follows the sign) and
+            // last_pos advances to the arc end so a following line_to connects.
+            arc_to: fn(x: float, y: float, r: float, start_angle: float, end_angle: float) {
                 let c = self.pos - vec2(x, y);
-                let pi = 3.141592653589793; // FIX THIS BUG
-
-                //let circle = (sqrt(c.x * c.x + c.y * c.y) - r)*ang;
-
-                // ok lets do atan2
-                let ang = (atan(c.y,c.x)+pi)/(2.0*pi);
-                let ces = (e-s)*0.5;
-                let ang2 = 1.0 - abs(ang - ces)+ces
-                return mix(vec4(0.,0.,0.,1.0),vec4(1.0),ang2);
+                let ring = abs(length(c) - r);
+                let ang = atan2(c.y, c.x);
+                let sweep = end_angle - start_angle;
+                // rel = angular distance from start_angle along the sweep, 0..TAU
+                let rel = fract((ang - start_angle) * sign(sweep) / TAU) * TAU;
+                let on = step(rel, abs(sweep));
+                let ps = vec2(x, y) + r * vec2(cos(start_angle), sin(start_angle));
+                let pe = vec2(x, y) + r * vec2(cos(end_angle), sin(end_angle));
+                let ends = min(length(self.pos - ps), length(self.pos - pe));
+                self.dist = mix(ends, ring, on) / self.scale_factor;
+                self.old_shape = self.shape;
+                self.shape = min(self.shape, self.dist);
+                self.last_pos = pe;
             }
 
 
@@ -392,8 +436,16 @@ script_mod! {
             box: fn(x: float, y: float, w: float, h: float, r: float) {
                 let p = self.pos - vec2(x, y);
                 let size = vec2(0.5 * w, 0.5 * h);
-                let bp = max(abs(p - size.xy) - (size.xy - vec2(2. * r, 2. * r).xy), vec2(0., 0.));
-                self.dist = (length(bp) - 2. * r) / self.scale_factor;
+                // The effective visual radius is 2*r. Clamp it to the half-size:
+                // past that the SDF used to degenerate into a rotated diamond
+                // (e.g. a 22px disc with r=11), instead of saturating at a circle.
+                let k = min(2. * r, min(size.x, size.y));
+                let q = abs(p - size.xy) - (size.xy - vec2(k, k).xy);
+                // A square still has a negative interior distance. Omitting this
+                // term made a zero-radius box all boundary: its stroke covered
+                // the entire face, instead of just its edges.
+                let bp = max(q, vec2(0., 0.));
+                self.dist = (min(max(q.x, q.y), 0.) + length(bp) - k) / self.scale_factor;
                 self.old_shape = self.shape;
                 self.shape = min(self.shape, self.dist);
             }
@@ -403,14 +455,19 @@ script_mod! {
                 let p_r = self.pos - vec2(x, y);
                 let p = abs(p_r - size.xy) - size.xy;
 
-                let bp_top = max(p + vec2(2. * r_top, 2. * r_top).xy, vec2(0., 0.));
-                let bp_bottom = max(p + vec2(2. * r_bottom, 2. * r_bottom).xy, vec2(0., 0.));
+                // Clamp each (doubled) radius to the half-size so oversized radii
+                // saturate at a capsule instead of degenerating into a diamond.
+                let k_top = min(2. * r_top, min(size.x, size.y));
+                let k_bottom = min(2. * r_bottom, min(size.x, size.y));
+                let q_top = p + vec2(k_top, k_top).xy;
+                let q_bottom = p + vec2(k_bottom, k_bottom).xy;
 
-                self.dist = mix(
-                    (length(bp_top) - 2. * r_top),
-                    (length(bp_bottom) - 2. * r_bottom),
-                    step(0.5 * h, p_r.y)
-                ) / self.scale_factor;
+                // The min(max(q.x,q.y),0) interior term keeps the field continuous; without it
+                // the interior dist was -2r, so switching radius at the midpoint left a coverage seam.
+                let dist_top = min(max(q_top.x, q_top.y), 0.) + length(max(q_top, vec2(0., 0.))) - k_top;
+                let dist_bottom = min(max(q_bottom.x, q_bottom.y), 0.) + length(max(q_bottom, vec2(0., 0.))) - k_bottom;
+
+                self.dist = mix(dist_top, dist_bottom, step(0.5 * h, p_r.y)) / self.scale_factor;
 
                 self.old_shape = self.shape;
                 self.shape = min(self.shape, self.dist);
@@ -421,14 +478,22 @@ script_mod! {
                 let p_r = self.pos - vec2(x, y);
                 let p = abs(p_r - size.xy) - size.xy;
 
-                let bp_left = max(p + vec2(2. * r_left, 2. * r_left).xy, vec2(0., 0.));
-                let bp_right = max(p + vec2(2. * r_right, 2. * r_right).xy, vec2(0., 0.));
+                // Clamp each (doubled) radius to the half-size so oversized radii
+                // saturate at a capsule instead of degenerating into a diamond.
+                let k_left = min(2. * r_left, min(size.x, size.y));
+                let k_right = min(2. * r_right, min(size.x, size.y));
+                let q_left = p + vec2(k_left, k_left).xy;
+                let q_right = p + vec2(k_right, k_right).xy;
 
-                self.dist = mix(
-                    (length(bp_left) - 2. * r_left),
-                    (length(bp_right) - 2. * r_right),
-                    step(0.5 * w, p_r.x)
-                ) / self.scale_factor;
+                // The min(max(q.x,q.y),0) interior term, as in box_y: without it the
+                // interior distance is -2r, which is ZERO for a square corner, so the
+                // stroke's abs(dist) test passes everywhere inside and paints that half
+                // of the shape with the bevel. A row of joined buttons then looks cut
+                // in half down the middle.
+                let dist_left = min(max(q_left.x, q_left.y), 0.) + length(max(q_left, vec2(0., 0.))) - k_left;
+                let dist_right = min(max(q_right.x, q_right.y), 0.) + length(max(q_right, vec2(0., 0.))) - k_right;
+
+                self.dist = mix(dist_left, dist_right, step(0.5 * w, p_r.x)) / self.scale_factor;
 
                 self.old_shape = self.shape;
                 self.shape = min(self.shape, self.dist);
@@ -448,22 +513,30 @@ script_mod! {
                 let p_r = self.pos - vec2(x, y);
                 let p = abs(p_r - size.xy) - size.xy;
 
-                let bp_lt = max(p + vec2(2. * r_left_top, 2. * r_left_top).xy, vec2(0., 0.));
-                let bp_rt = max(p + vec2(2. * r_right_top, 2. * r_right_top).xy, vec2(0., 0.));
-                let bp_rb = max(p + vec2(2. * r_right_bottom, 2. * r_right_bottom).xy, vec2(0., 0.));
-                let bp_lb = max(p + vec2(2. * r_left_bottom, 2. * r_left_bottom).xy, vec2(0., 0.));
+                // Clamp each (doubled) radius to the half-size so oversized radii
+                // saturate instead of degenerating into a diamond.
+                let k_lt = min(2. * r_left_top, min(size.x, size.y));
+                let k_rt = min(2. * r_right_top, min(size.x, size.y));
+                let k_rb = min(2. * r_right_bottom, min(size.x, size.y));
+                let k_lb = min(2. * r_left_bottom, min(size.x, size.y));
+                let q_lt = p + vec2(k_lt, k_lt).xy;
+                let q_rt = p + vec2(k_rt, k_rt).xy;
+                let q_rb = p + vec2(k_rb, k_rb).xy;
+                let q_lb = p + vec2(k_lb, k_lb).xy;
+
+                // The min(max(q.x,q.y),0) interior term, as in box_y: without it the
+                // interior distance is -2r, which is ZERO for a square corner, so the
+                // stroke's abs(dist) test passes everywhere inside and paints that
+                // quadrant with the bevel. A row of joined buttons, where the outer
+                // ends are round and the joints square, then looks cut in half.
+                let d_lt = min(max(q_lt.x, q_lt.y), 0.) + length(max(q_lt, vec2(0., 0.))) - k_lt;
+                let d_rt = min(max(q_rt.x, q_rt.y), 0.) + length(max(q_rt, vec2(0., 0.))) - k_rt;
+                let d_rb = min(max(q_rb.x, q_rb.y), 0.) + length(max(q_rb, vec2(0., 0.))) - k_rb;
+                let d_lb = min(max(q_lb.x, q_lb.y), 0.) + length(max(q_lb, vec2(0., 0.))) - k_lb;
 
                 self.dist = mix(
-                    mix(
-                        (length(bp_lt) - 2. * r_left_top),
-                        (length(bp_lb) - 2. * r_left_bottom),
-                        step(0.5 * h, p_r.y)
-                    ),
-                    mix(
-                        (length(bp_rt) - 2. * r_right_top),
-                        (length(bp_rb) - 2. * r_right_bottom),
-                        step(0.5 * h, p_r.y)
-                    ),
+                    mix(d_lt, d_lb, step(0.5 * h, p_r.y)),
+                    mix(d_rt, d_rb, step(0.5 * h, p_r.y)),
                     step(0.5 * w, p_r.x)
                 ) / self.scale_factor;
 
@@ -472,6 +545,39 @@ script_mod! {
             }
 
 
+            // A box at (x, y) of w by h with each corner cut on the chamfer:
+            // the cut of the left-top, right-top, right-bottom and
+            // left-bottom corner along each side (clamped to the half size).
+            chamfer_box: fn(x: float, y: float, w: float, h: float, c_lt: float, c_rt: float, c_rb: float, c_lb: float) {
+                let half = vec2(0.5 * w, 0.5 * h);
+                let p = self.pos - vec2(x, y) - half;
+                let q = abs(p) - half;
+                var k = c_lt;
+                if p.x >= 0.0 && p.y < 0.0 {
+                    k = c_rt;
+                }
+                if p.x >= 0.0 && p.y >= 0.0 {
+                    k = c_rb;
+                }
+                if p.x < 0.0 && p.y >= 0.0 {
+                    k = c_lb;
+                }
+                k = min(k, min(half.x, half.y));
+                self.dist = max(max(q.x, q.y), (q.x + q.y + k) * 0.70710678) / self.scale_factor;
+                self.old_shape = self.shape;
+                self.shape = min(self.shape, self.dist);
+            }
+
+            // An ellipse centred on (x, y) with radii rx, ry. The distance is
+            // the scaled unit-circle one (exact on the axes, close elsewhere).
+            ellipse: fn(x: float, y: float, rx: float, ry: float) {
+                let r = max(vec2(rx, ry), vec2(0.0001, 0.0001));
+                let k = (self.pos - vec2(x, y)) / r;
+                self.dist = (length(k) - 1.0) * min(r.x, r.y) / self.scale_factor;
+                self.old_shape = self.shape;
+                self.shape = min(self.shape, self.dist);
+            }
+
             rect: fn(x: float, y: float, w: float, h: float) {
                 let s = vec2(w, h) * 0.5;
                 let d = abs(vec2(x, y) - self.pos + s) - s;
@@ -479,6 +585,34 @@ script_mod! {
                 self.dist = max(dm.x, dm.y) + length(max(d, vec2(0., 0.)));
                 self.old_shape = self.shape;
                 self.shape = min(self.shape, self.dist);
+            }
+
+            // A pointer: a square turned an eighth of a turn, centred on
+            // (x, y) with one corner on (tip_x, tip_y). Put the centre on the
+            // edge of the shape it hangs off and the half outside that edge is
+            // a right-angled triangle whose base is twice its height, while
+            // the half inside overlaps the shape. The overlap is the point:
+            // the union has no distance of zero along the base, so a stroke
+            // after it runs up one flank and down the other with no line
+            // across, and a fill or a shadow taken from it is one shape. A
+            // triangle that merely touched the edge would leave the base on
+            // the outline of both. A pointer of no length adds nothing, and
+            // says so without a branch, so every caller can draw one whether
+            // it has a pointer or not.
+            pointer: fn(x: float, y: float, tip_x: float, tip_y: float) {
+                let axis = vec2(tip_x - x, tip_y - y)
+                let reach = length(axis)
+                let n = axis / max(reach, 0.00001)
+                let q = self.pos - vec2(x, y)
+                let u = dot(q, n)
+                let v = q.x * n.y - q.y * n.x
+                let d = abs(vec2(u + v, u - v)) * 0.70710678 - vec2(reach * 0.70710678, reach * 0.70710678)
+                let square = min(max(d.x, d.y), 0.) + length(max(d, vec2(0., 0.)))
+                // Added, not mixed: a GPU lerp from 1e20 loses the distance
+                // to rounding and leaves zero, which strokes everything.
+                self.dist = square / self.scale_factor + (1.0 - step(0.00001, reach)) * 1e+20
+                self.old_shape = self.shape
+                self.shape = min(self.shape, self.dist)
             }
 
             hexagon: fn(x: float, y: float, r: float) {

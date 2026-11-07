@@ -7,7 +7,6 @@ enum BuildTy {
     Binary,
     BinaryBuildStd,
     Lib,
-    LinuxDirect,
 }
 
 impl BuildTy {
@@ -16,7 +15,6 @@ impl BuildTy {
             Self::Binary => false,
             Self::BinaryBuildStd => true,
             Self::Lib => false,
-            Self::LinuxDirect => false,
         }
     }
 }
@@ -26,21 +24,15 @@ enum Platform {
     Web,
     Mobile,
     Desktop,
-    Embedded,
 }
 
-const TOOLCHAINS: [(&'static str, BuildTy, Platform); 16] = [
+const TOOLCHAINS: [(&'static str, BuildTy, Platform); 15] = [
     ("aarch64-apple-darwin", BuildTy::Binary, Platform::Desktop),
     ("x86_64-pc-windows-msvc", BuildTy::Binary, Platform::Desktop),
     (
         "x86_64-unknown-linux-gnu",
         BuildTy::Binary,
         Platform::Desktop,
-    ),
-    (
-        "x86_64-unknown-linux-gnu",
-        BuildTy::LinuxDirect,
-        Platform::Embedded,
     ),
     ("wasm32-unknown-unknown", BuildTy::Lib, Platform::Web),
     ("aarch64-linux-android", BuildTy::Lib, Platform::Mobile),
@@ -81,13 +73,13 @@ fn check_crate(
         std::fs::read_to_string(&crate_dir.join("Cargo.toml")).expect("Cant find cargo.toml");
     let toml = makepad_toml_parser::parse_toml(&cargo_str).expect("Cant parse Cargo.toml");
     let platforms =
-        if let Some(Toml::Str(ver, _)) = toml.get("package.metadata.makepad-check-platform") {
+        if let Some(Toml::Str(ver, _)) = toml.get_path(&["package", "metadata", "makepad-check-platform"]) {
             ver.to_string()
         } else {
             "desktop,web,mobile".to_string()
         };
     let nightly_only =
-        if let Some(Toml::Bool(ver, _)) = toml.get("package.metadata.makepad-check-nightly-only") {
+        if let Some(Toml::Bool(ver, _)) = toml.get_path(&["package", "metadata", "makepad-check-nightly-only"]) {
             *ver
         } else {
             false
@@ -99,7 +91,6 @@ fn check_crate(
             "desktop" => platform_filter.push(Platform::Desktop),
             "mobile" => platform_filter.push(Platform::Mobile),
             "web" => platform_filter.push(Platform::Web),
-            "embedded" => platform_filter.push(Platform::Embedded),
             e => return Err(format!("Unexpected platform in makepad-check-platform {e}")),
         }
     }
@@ -221,7 +212,7 @@ fn check(
     let target_dir = format!("--target-dir=target/check_all/check{}", par);
     args_out.push(&target_dir);
     let run = |makepad: &str, args_out: &[&str]| {
-        let mut envs = vec![("MAKEPAD", makepad)];
+        let mut envs = vec![("MAKEPAD_BUILD", makepad)];
         if let Some(icon) = icon_env.as_ref() {
             for (var, value) in APP_ICON_ENV_VARS.iter().zip(icon.iter()) {
                 envs.push((var, value.as_str()));
@@ -253,13 +244,6 @@ fn check(
                 run(" ", &args_out)
             } else {
                 run("lines", &args_out)
-            }
-        }
-        BuildTy::LinuxDirect => {
-            if branch == "stable" {
-                run("linux_direct", &args_out)
-            } else {
-                run("lines,linux_direct", &args_out)
             }
         }
     }

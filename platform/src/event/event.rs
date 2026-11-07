@@ -8,14 +8,16 @@ use {
         draw_list::DrawListId,
         //midi::{Midi1InputData, MidiInputInfo},
         event::{
-            drag_drop::*, finger::*, game_input::*, keyboard::*, network::*, video_playback::*,
-            window::*, xr::*,
+            app_open::*, domain::*, drag_drop::*, finger::*, game_input::*, keyboard::*, location::*, network::*,
+            video_playback::*, window::*, xr::*,
         },
         //makepad_live_compiler::LiveEditEvent,
         makepad_live_id::LiveId,
+        makepad_math::Vec2Index,
         makepad_script::*,
         midi::MidiPortsEvent,
         permission::PermissionResult,
+        storage::StorageResponsesEvent,
         video::VideoInputsEvent,
         window::WindowId,
     },
@@ -43,6 +45,8 @@ pub enum Event {
     ///
     /// [`onCreate`]: https://developer.android.com/reference/android/app/Activity#onCreate(android.os.Bundle)
     Startup,
+    /// A semantic request addressed to one widget uid.
+    A11yAction(makepad_a11y::ActionRequest),
     /// The application is being shut down is about to close and be destroyed.
     ///
     /// * This event may not be sent at all, so you should not rely on it.
@@ -57,6 +61,14 @@ pub enum Event {
     ///
     /// [`onDestroy`]: https://developer.android.com/reference/android/app/Activity#onDestroy()
     Shutdown,
+
+    /// The application has been asked to quit.
+    ///
+    /// This is sent before [`Event::Shutdown`] for graceful quit requests such
+    /// as application-menu Quit and polite process termination signals.
+    /// Handlers may set `handled` to `true` to defer or cancel the quit, for
+    /// example while showing a confirmation dialog.
+    QuitRequested(QuitRequestedEvent),
 
     /// The application has been started in the foreground and is now visible to the user,
     /// but is not yet actively receiving user input.
@@ -124,6 +136,20 @@ pub enum Event {
 
     Draw(DrawEvent),
     LiveEdit,
+    /// Request from `Cx::request_script_reapply()` to re-apply the widget
+    /// tree via `Apply::ScriptReapply` *without* re-running `script_mod!`.
+    ///
+    /// This is useful when something like a Splash-level script object
+    /// has been modified at runtime (e.g., `script_eval!`) and the application
+    /// wants every widget in the widget tree to pick up that new modified object value.
+    ///
+    /// Unlike `Event::LiveEdit`, this preserves any heap object values that have
+    /// already been modified at runtime. It also walks the tree with
+    /// `Apply::ScriptReapply` (rather than `Apply::Reload`) so that field
+    /// types whose canonical mutation path is an imperative setter
+    /// (e.g. `Label::set_text`) can early-return and keep their runtime
+    /// value instead of being clobbered by the stale DSL literal.
+    ScriptReapply,
     /// A window has gained focus and is now the active window receiving user input.
     WindowGotFocus(WindowId),
     /// A window has lost focus and is no longer the active window receiving user input.
@@ -140,6 +166,20 @@ pub enum Event {
     WindowGeomChange(WindowGeomChangeEvent),
     VirtualKeyboard(VirtualKeyboardEvent),
     ClearAtlasses,
+    /// The GPU device was lost and has been replaced (a WebGL context the
+    /// browser took away and gave back; the HAL's DeviceReset after the
+    /// driver's VK_ERROR_DEVICE_LOST or a device removal). Every GPU object
+    /// was recreated from what the CPU side keeps: vec textures, geometries,
+    /// instance data and shaders are uploaded again and every pass is
+    /// repainted. Contents only the GPU held are gone (a render target drawn
+    /// once and not redrawn, data whose CPU copy was dropped after upload,
+    /// results of GPU work read back later, shared images a host lent its
+    /// child): handle this to redo that work. Delivered once per reset, after
+    /// the uploads were queued and before the repaint.
+    GpuReset,
+    /// Clear all hover/pressed visual state, e.g. after an overlay that
+    /// swallowed the hover-outs (a context menu) has closed.
+    ClearHover,
 
     /// The raw event that occurs when the user presses a mouse button down.
     ///
@@ -169,6 +209,13 @@ pub enum Event {
     /// Do not match upon or handle this event directly; instead, use the family of
     /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit`].
     TouchUpdate(TouchUpdateEvent),
+    /// A press taken away before it lifted (see [`FingerCancelEvent`]):
+    /// dispatched by the owner of a claimed gesture to its children, or by
+    /// a host that cancels a finger (for a touch, right after the `TouchUpdate`
+    /// that shows it as `TouchState::Cancel`). Handle it through `hits()`, which
+    /// turns it into the capture's terminal `Hit::FingerUp` with
+    /// `cancelled: true`.
+    FingerCancel(FingerCancelEvent),
     /// The raw event that occurs when the user finishes a long press touch/click.
     ///
     /// Do not match upon or handle this event directly; instead, use the family of
@@ -180,9 +227,18 @@ pub enum Event {
     /// Do not match upon or handle this event directly; instead use the family of
     /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit::FingerScroll`].
     Scroll(ScrollEvent), // this is the MouseWheel / touch scroll event sent by the OS
+    /// The raw event of a trackpad pinch (macOS magnify, Wayland pointer gestures).
+    ///
+    /// Do not match upon or handle this event directly; instead use the family of
+    /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit::FingerPinch`].
+    Pinch(PinchEvent),
 
     Timer(TimerEvent),
 
+    /// An app-facing channel has something for the UI thread: a `ToUISender`
+    /// sent, a task-pool job finished, a texture readback completed. This is a
+    /// broadcast to every widget with no payload, so each handler polls its
+    /// own queue. Makepad's own machinery never raises it.
     Signal,
     Trigger(TriggerEvent),
     MacosMenuCommand(LiveId),
@@ -190,7 +246,13 @@ pub enum Event {
     KeyFocusLost(KeyFocusEvent),
     KeyDown(KeyEvent),
     KeyUp(KeyEvent),
+    PhysicalKeyboard(PhysicalKeyboardEvent),
     TextInput(TextInputEvent),
+    /// A reply to `Cx::read_clipboard`, routed by its request id.
+    Clipboard(crate::clipboard_read::ClipboardEvent),
+    /// Acceptance/error from a queued direct-display control request.
+    #[cfg(target_os = "linux")]
+    LinuxDisplayResult(crate::linux_display::LinuxDisplayResultEvent),
     TextRangeReplace(TextRangeReplaceEvent),
     TextCopy(TextClipboardEvent),
     TextCut(TextClipboardEvent),
@@ -201,6 +263,11 @@ pub enum Event {
     Drop(DropEvent),
     DragEnd,
 
+    /// The app is asked to open files or URLs: its launch arguments, a
+    /// second launch of a single-instance app, or an OS open request.
+    /// See [`AppOpenEvent`].
+    AppOpen(AppOpenEvent),
+
     /// Application-defined event sent via the studio/debug control protocol.
     /// Respond with `Cx::send_studio_message(AppToStudio::Custom(..))`.
     Custom(String),
@@ -209,7 +276,10 @@ pub enum Event {
     AudioDevices(AudioDevicesEvent),
     MidiPorts(MidiPortsEvent),
     VideoInputs(VideoInputsEvent),
+    NativeLayer(crate::native_layer::NativeLayerEvent),
     NetworkResponses(NetworkResponsesEvent),
+    /// Results of asynchronous operations submitted through [`Cx::storage`].
+    Storage(StorageResponsesEvent),
 
     VideoPlaybackPrepared(VideoPlaybackPreparedEvent),
     VideoTextureUpdated(VideoTextureUpdatedEvent),
@@ -220,10 +290,11 @@ pub enum Event {
     VideoYuvTexturesReady(VideoYuvTexturesReady),
     VideoSeekableRanges(VideoSeekableRangesEvent),
     VideoBufferedRanges(VideoBufferedRangesEvent),
+    VideoTracksChanged(VideoTracksChangedEvent),
 
     /// The "go back" navigational button or gesture was performed.
     ///
-    /// Tip: use the [`Event::consume_back_pressed()`] method to handle this event
+    /// Tip: use the [`Event::back_pressed()`] method to handle this event
     /// instead of matching on it directly.
     ///
     /// Once a widget has handled this event, it should set the `handled` flag to `true`
@@ -231,12 +302,58 @@ pub enum Event {
     BackPressed {
         handled: Cell<bool>,
     },
+    /// The system back gesture while the user is still making it (Android's predictive back, API 34+).
+    /// If they complete it, an `Event::BackPressed` follows; otherwise it ends with a `Cancel`.
+    BackGesture(BackGestureEvent),
 
     /// Permission check or request result
     PermissionResult(PermissionResult),
 
+    /// A position fix from the platform location service
+    /// (see [`Cx::start_location_updates`]).
+    LocationUpdate(LocationUpdateEvent),
+    /// Location updates cannot be delivered (permission denied / no service).
+    LocationError(LocationErrorEvent),
+
+    /// A collect run's scan (`MAKEPAD_RUN=collect-web`, see
+    /// [`crate::collect`]): sent once. Every widget forwards it to its
+    /// children and emits what it needs on the web through it; widgets that
+    /// create children from data spawn their variants and forward into them.
+    Scan(crate::collect::ScanEvent),
+
+    /// A child domain's window is there or changed (see [`ChildWindowEvent`]). HAL client only.
+    ChildWindow(ChildWindowEvent),
+    ChildWindowClosed(ChildWindowClosedEvent),
+    /// A domain this app started changed state. HAL client only.
+    DomainState(DomainStateEvent),
+    DomainList(DomainListEvent),
+    ChildFrame(ChildFrameEvent),
+    ChildWindowAction(ChildWindowActionEvent),
+    ChildMessage { child: u32, message: String },
+    /// The GPU is short of memory (see [`GpuPressureEvent`]); the session that owns the
+    /// desktop frees what other GPU users hold for the UI. HAL client only.
+    GpuPressure(GpuPressureEvent),
+    /// An item of one of the app's tray menus was chosen (see [`crate::tray`]).
+    TrayMenu(crate::tray::TrayMenuEvent),
+    /// A primary click on one of the app's tray icons (Windows; macOS opens the menu).
+    TrayClick(crate::tray::TrayClickEvent),
+
     #[cfg(target_arch = "wasm32")]
     ToWasmMsg(ToWasmMsgEvent),
+}
+
+/// The device's free memory fell under the UI's reserve, or a GPU allocation failed for
+/// lack of room (`failed`). `wanted_mb` is how much would bring the free memory back to
+/// the reserve (plus the failed allocation); 0 means the shortage is over. `free_mb` and
+/// `budget_mb` are the device's numbers when it was raised; `reserve_mb` is what the UI
+/// keeps free. All in MiB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuPressureEvent {
+    pub wanted_mb: u32,
+    pub free_mb: u32,
+    pub budget_mb: u32,
+    pub reserve_mb: u32,
+    pub failed: bool,
 }
 
 impl Event {
@@ -246,8 +363,10 @@ impl Event {
 
     pub fn name_from_u32(v: u32) -> &'static str {
         match v {
+            94 => "A11yAction",
             1 => "Startup",
             2 => "Shutdown",
+            67 => "QuitRequested",
 
             3 => "Foreground",
             4 => "Background",
@@ -269,14 +388,18 @@ impl Event {
             17 => "WindowGeomChange",
             18 => "VirtualKeyboard",
             19 => "ClearAtlasses",
+            78 => "GpuReset",
+            72 => "ClearHover",
 
             20 => "MouseDown",
             21 => "MouseMove",
             59 => "TweakRay",
             22 => "MouseUp",
             23 => "TouchUpdate",
+            75 => "FingerCancel",
             24 => "LongPress",
             25 => "Scroll",
+            74 => "Pinch",
 
             26 => "Timer",
 
@@ -287,7 +410,10 @@ impl Event {
             31 => "KeyFocusLost",
             32 => "KeyDown",
             33 => "KeyUp",
+            68 => "PhysicalKeyboard",
             34 => "TextInput",
+            85 => "Clipboard",
+            86 => "LinuxDisplayResult",
             35 => "TextRangeReplace",
             36 => "TextCopy",
             37 => "TextCut",
@@ -295,11 +421,13 @@ impl Event {
             38 => "Drag",
             39 => "Drop",
             40 => "DragEnd",
+            76 => "AppOpen",
 
             41 => "AudioDevices",
             42 => "MidiPorts",
             43 => "VideoInputs",
             44 => "NetworkResponses",
+            73 => "Storage",
 
             45 => "VideoPlaybackPrepared",
             46 => "VideoTextureUpdated",
@@ -310,9 +438,11 @@ impl Event {
             63 => "VideoSeekableRanges",
             64 => "VideoBufferedRanges",
             65 => "VideoYuvTexturesReady",
+            71 => "VideoTracksChanged",
             51 => "MouseLeave",
             52 => "Actions",
             53 => "BackPressed",
+            87 => "BackGesture",
             54 => "PermissionResult",
 
             #[cfg(target_arch = "wasm32")]
@@ -323,14 +453,31 @@ impl Event {
             60 => "Custom",
             61 => "PopupDismissed",
             62 => "SelectionHandleDrag",
+            66 => "ScriptReapply",
+            69 => "LocationUpdate",
+            70 => "LocationError",
+            77 => "Scan",
+            80 => "ChildWindow",
+            81 => "ChildWindowClosed",
+            82 => "DomainState",
+            83 => "DomainList",
+            84 => "ChildFrame",
+            88 => "ChildWindowAction",
+            89 => "ChildMessage",
+            90 => "GpuPressure",
+            91 => "TrayMenu",
+            92 => "TrayClick",
+            93 => "NativeLayer",
             _ => panic!(),
         }
     }
 
     pub fn to_u32(&self) -> u32 {
         match self {
+            Self::A11yAction(_) => 94,
             Self::Startup => 1,
             Self::Shutdown => 2,
+            Self::QuitRequested(_) => 67,
 
             Self::Foreground => 3,
             Self::Background => 4,
@@ -352,6 +499,8 @@ impl Event {
             Self::WindowGeomChange(_) => 17,
             Self::VirtualKeyboard(_) => 18,
             Self::ClearAtlasses => 19,
+            Self::GpuReset => 78,
+            Self::ClearHover => 72,
             Self::PopupDismissed(_) => 61,
 
             Self::MouseDown(_) => 20,
@@ -359,8 +508,10 @@ impl Event {
             Self::TweakRay(_) => 59,
             Self::MouseUp(_) => 22,
             Self::TouchUpdate(_) => 23,
+            Self::FingerCancel(_) => 75,
             Self::LongPress(_) => 24,
             Self::Scroll(_) => 25,
+            Self::Pinch(_) => 74,
 
             Self::Timer(_) => 26,
 
@@ -371,7 +522,11 @@ impl Event {
             Self::KeyFocusLost(_) => 31,
             Self::KeyDown(_) => 32,
             Self::KeyUp(_) => 33,
+            Self::PhysicalKeyboard(_) => 68,
             Self::TextInput(_) => 34,
+            Self::Clipboard(_) => 85,
+            #[cfg(target_os = "linux")]
+            Self::LinuxDisplayResult(_) => 86,
             Self::TextRangeReplace(_) => 35,
             Self::TextCopy(_) => 36,
             Self::TextCut(_) => 37,
@@ -381,11 +536,13 @@ impl Event {
             Self::Drag(_) => 38,
             Self::Drop(_) => 39,
             Self::DragEnd => 40,
+            Self::AppOpen(_) => 76,
 
             Self::AudioDevices(_) => 41,
             Self::MidiPorts(_) => 42,
             Self::VideoInputs(_) => 43,
             Self::NetworkResponses(_) => 44,
+            Self::Storage(_) => 73,
 
             Self::VideoPlaybackPrepared(_) => 45,
             Self::VideoTextureUpdated(_) => 46,
@@ -396,16 +553,33 @@ impl Event {
             Self::VideoSeekableRanges(_) => 63,
             Self::VideoBufferedRanges(_) => 64,
             Self::VideoYuvTexturesReady(_) => 65,
+            Self::VideoTracksChanged(_) => 71,
             Self::MouseLeave(_) => 51,
             Self::Actions(_) => 52,
             Self::BackPressed { .. } => 53,
+            Self::BackGesture(_) => 87,
             Self::PermissionResult(_) => 54,
+            Self::LocationUpdate(_) => 69,
+            Self::LocationError(_) => 70,
+            Self::Scan(_) => 77,
+            Self::ChildWindow(_) => 80,
+            Self::ChildWindowClosed(_) => 81,
+            Self::DomainState(_) => 82,
+            Self::DomainList(_) => 83,
+            Self::ChildFrame(_) => 84,
+            Self::ChildWindowAction(_) => 88,
+            Self::ChildMessage { .. } => 89,
+            Self::GpuPressure(_) => 90,
+            Self::TrayMenu(_) => 91,
+            Self::TrayClick(_) => 92,
+            Self::NativeLayer(_) => 93,
 
             #[cfg(target_arch = "wasm32")]
             Self::ToWasmMsg(_) => 55,
 
             Self::XrLocal(_) => 57,
             Self::Custom(_) => 60,
+            Self::ScriptReapply => 66,
         }
     }
 
@@ -422,6 +596,94 @@ impl Event {
         }
         false
     }
+
+    /// Whether a scroll view already moved by this [`Scroll`](Self::Scroll)
+    /// event's delta along `axis`. Always `false` for any other event.
+    ///
+    /// A scroll event reaches the widgets nearest the pointer first and the
+    /// scroll views around them after, so a scroll view that checks this
+    /// before applying a delta leaves alone a wheel an inner one has used.
+    pub fn scroll_handled(&self, axis: Vec2Index) -> bool {
+        match self {
+            Self::Scroll(e) => match axis {
+                Vec2Index::X => e.handled_x.get(),
+                Vec2Index::Y => e.handled_y.get(),
+            },
+            _ => false,
+        }
+    }
+
+    /// Marks this [`Scroll`](Self::Scroll) event's delta along `axis` as used,
+    /// so the scroll views around the caller leave it alone.
+    ///
+    /// Call it only after moving by the delta. A scroll view pinned at the
+    /// edge the delta points past leaves the delta for the views around it,
+    /// the way a `ScrollBar` at its limit does. Does nothing for any other
+    /// event.
+    pub fn set_scroll_handled(&self, axis: Vec2Index) {
+        if let Self::Scroll(e) = self {
+            match axis {
+                Vec2Index::X => e.handled_x.set(true),
+                Vec2Index::Y => e.handled_y.set(true),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuitReason {
+    /// The app requested a quit programmatically.
+    App,
+    /// The user chose a native/application menu Quit command.
+    Menu,
+    /// The process received a polite termination signal, such as Ctrl+C or SIGTERM.
+    Signal,
+}
+
+#[derive(Debug)]
+pub struct QuitRequestedEvent {
+    pub reason: QuitReason,
+    pub handled: Cell<bool>,
+}
+
+impl QuitRequestedEvent {
+    pub fn new(reason: QuitReason) -> Self {
+        Self {
+            reason,
+            handled: Cell::new(false),
+        }
+    }
+
+    pub fn handle(&self) {
+        self.handled.set(true);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BackGestureEvent {
+    pub state: BackGestureState,
+    /// Where the finger is, or `None` if this gesture doesn't come from a touch (e.g. a held back button).
+    pub abs: Option<crate::makepad_math::Vec2d>,
+    /// How far along the system thinks the gesture is, from 0 to 1.
+    pub progress: f64,
+    /// Which screen edge the gesture started from.
+    pub edge: BackGestureEdge,
+    /// Seconds, on the same clock as this platform's touch times.
+    pub time: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackGestureState {
+    Start,
+    Move,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackGestureEdge {
+    Left,
+    Right,
+    None,
 }
 
 #[derive(Debug)]
@@ -438,6 +700,7 @@ pub enum Hit {
     ImeAction(ImeActionEvent),
 
     FingerScroll(FingerScrollEvent),
+    FingerPinch(FingerPinchEvent),
     FingerDown(FingerDownEvent),
     FingerMove(FingerMoveEvent),
     FingerHoverIn(FingerHoverEvent),
@@ -465,7 +728,11 @@ impl Event {
             | Self::MouseMove(_)
             | Self::TweakRay(_)
             | Self::TouchUpdate(_)
-            | Self::Scroll(_) => true,
+            | Self::Scroll(_)
+            | Self::Pinch(_)
+            | Self::BackPressed { .. }
+            | Self::BackGesture(_) => true,
+            Self::KeyDown(key) | Self::KeyUp(key) if key.key_code == KeyCode::Escape => true,
             _ => false,
         }
     }
@@ -945,18 +1212,21 @@ impl Ease {
 pub enum VirtualKeyboardEvent {
     WillShow {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
         duration: f64,
         ease: Ease,
     },
     WillHide {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
         duration: f64,
         ease: Ease,
     },
     DidShow {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
     },
     DidHide {
@@ -1003,6 +1273,10 @@ pub struct NextFrame(pub u64);
 
 impl NextFrame {
     pub fn is_event(&self, event: &Event) -> Option<NextFrameEvent> {
+        // Ids start at 1, so the default id never fires.
+        if self.0 == 0 {
+            return None;
+        }
         if let Event::NextFrame(ne) = event {
             if ne.set.contains(&self) {
                 return Some(ne.clone());

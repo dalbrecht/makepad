@@ -92,9 +92,15 @@ impl TriMesh {
     /// Reindexes all triangles. Removes degenerate triangles.
     /// Uses a spatial hash grid for O(n) average-case performance.
     pub fn weld_vertices(&mut self, tolerance: f64) {
+        let _ = self.weld_vertices_remap(tolerance);
+    }
+
+    /// Same as `weld_vertices`, but returns the old-index -> new-index remap
+    /// so callers can translate per-vertex data across the weld.
+    pub fn weld_vertices_remap(&mut self, tolerance: f64) -> Vec<u32> {
         let n = self.vertices.len();
         if n == 0 {
-            return;
+            return Vec::new();
         }
         let tol_sq = tolerance * tolerance;
         // Cell size slightly larger than tolerance so that any two points within
@@ -103,8 +109,7 @@ impl TriMesh {
         let inv_cell = 1.0 / cell;
 
         // Spatial hash grid: maps cell coordinate to list of (new_vert_index, position).
-        let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<(u32, Vec3d)>> =
-            std::collections::HashMap::new();
+        let mut grid: makepad_csg_math::fast_hash::FastMap<(i64, i64, i64), Vec<(u32, Vec3d)>> = Default::default();
         let mut remap = vec![0u32; n];
         let mut new_verts: Vec<Vec3d> = Vec::new();
 
@@ -152,6 +157,7 @@ impl TriMesh {
                 self.triangles.push([ra, rb, rc]);
             }
         }
+        remap
     }
 
     /// Get the three vertex positions of a triangle.

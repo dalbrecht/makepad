@@ -1,0 +1,348 @@
+//! Grapheme to phoneme: English text in, Kokoro phoneme tokens out.
+//!
+//! Kokoro's ONNX graph takes `input_ids`, not text, so this stage is a hard
+//! prerequisite rather than a convenience. Upstream uses `misaki`, which falls
+//! back to espeak-ng — a C dependency with its own licence. Instead we use
+//! misaki's own 90k-entry IPA lexicon (Apache-2.0, already in Kokoro's symbol
+//! set; downloaded with the model, see [`data`]) and hand-write letter-to-sound
+//! rules for the rest.
+
+pub mod data;
+pub mod lexicon;
+pub mod packed;
+pub mod lts;
+pub mod zh;
+pub mod morph;
+pub mod vocab;
+pub mod vocab_v11;
+
+/// Pronounce one word: the lexicon, then regular morphology, then guesswork.
+pub fn pronounce(word: &str) -> String {
+    if let Some(ipa) = lexicon::lookup(word) {
+        return ipa.to_string();
+    }
+    if let Some(ipa) = morph::inflected(word) {
+        return ipa;
+    }
+    lts::phonemize(word)
+}
+
+/// The phoneme symbol of a token id (the inverse of `vocab::token`).
+pub fn symbol(id: u16) -> Option<char> {
+    vocab::VOCAB.iter().find(|(_, token)| *token == id).map(|(symbol, _)| *symbol)
+}
+
+/// Kokoro accepts at most 510 phoneme tokens, plus a zero at each end.
+pub const MAX_TOKENS: usize = 510;
+
+enum Token {
+    /// A word to pronounce and the byte offset in the input text where it
+    /// came from (every word of a spelled-out number shares its digits').
+    Word(String, usize),
+    Punct(char),
+}
+
+const ONES: [&str; 20] = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+    "nineteen",
+];
+const TENS: [&str; 10] = [
+    "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+];
+
+/// Spell a number so the lexicon can pronounce it. Beyond a million, read the
+/// digits — nobody says "four hundred billion" about a game score.
+pub fn spell_number(value: u64) -> String {
+    match value {
+        0..=19 => ONES[value as usize].to_string(),
+        20..=99 => {
+            let (tens, ones) = (value / 10, value % 10);
+            if ones == 0 {
+                TENS[tens as usize].to_string()
+            } else {
+                format!("{} {}", TENS[tens as usize], ONES[ones as usize])
+            }
+        }
+        100..=999 => {
+            let (hundreds, rest) = (value / 100, value % 100);
+            if rest == 0 {
+                format!("{} hundred", ONES[hundreds as usize])
+            } else {
+                format!("{} hundred {}", ONES[hundreds as usize], spell_number(rest))
+            }
+        }
+        1_000..=999_999 => {
+            let (thousands, rest) = (value / 1000, value % 1000);
+            if rest == 0 {
+                format!("{} thousand", spell_number(thousands))
+            } else {
+                format!("{} thousand {}", spell_number(thousands), spell_number(rest))
+            }
+        }
+        _ => value
+            .to_string()
+            .chars()
+            .map(|digit| ONES[digit.to_digit(10).unwrap_or(0) as usize])
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn tokenize(text: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut word_at = 0;
+    let mut digits = String::new();
+    let mut digits_at = 0;
+
+    let flush_word = |word: &mut String, at: usize, tokens: &mut Vec<Token>| {
+        if !word.is_empty() {
+            tokens.push(Token::Word(std::mem::take(word), at));
+        }
+    };
+    let flush_digits = |digits: &mut String, at: usize, tokens: &mut Vec<Token>| {
+        if digits.is_empty() {
+            return;
+        }
+        let spelled = digits
+            .parse::<u64>()
+            .map(spell_number)
+            .unwrap_or_else(|_| std::mem::take(digits));
+        digits.clear();
+        for part in spelled.split_whitespace() {
+            tokens.push(Token::Word(part.to_string(), at));
+        }
+    };
+
+    for (at, ch) in text.char_indices() {
+        if ch.is_ascii_digit() {
+            flush_word(&mut word, word_at, &mut tokens);
+            if digits.is_empty() {
+                digits_at = at;
+            }
+            digits.push(ch);
+            continue;
+        }
+        flush_digits(&mut digits, digits_at, &mut tokens);
+
+        if ch.is_alphabetic() || ch == '\'' {
+            if word.is_empty() {
+                word_at = at;
+            }
+            word.push(ch);
+            continue;
+        }
+        flush_word(&mut word, word_at, &mut tokens);
+
+        // Keep only punctuation the model actually has a token for.
+        if vocab::token(ch).is_some() && ch != ' ' {
+            tokens.push(Token::Punct(ch));
+        }
+    }
+    flush_digits(&mut digits, digits_at, &mut tokens);
+    flush_word(&mut word, word_at, &mut tokens);
+    tokens
+}
+
+const VOWEL_PHONEMES: &str = "aæɑɐɒɔəɚɛɜeiɪɨoʊuʌyøœɯɤAIOWYᵊᵻ";
+
+fn is_vowel_phoneme(sound: char) -> bool {
+    VOWEL_PHONEMES.contains(sound)
+}
+
+fn first_sound(ipa: &str) -> Option<char> {
+    ipa.chars().find(|c| !matches!(c, 'ˈ' | 'ˌ' | 'ː'))
+}
+
+/// A few function words are pronounced by context, not by dictionary.
+///
+/// The gold lexicon stores the citation forms — `a` as `A` (the letter `eɪ`) and
+/// `the` as `ði` — because misaki overrides them at runtime. Left alone, "a
+/// squishy blob" comes out as "eɪ squishy blob".
+fn function_word(word: &str, next_sound: Option<char>) -> Option<&'static str> {
+    let followed_by_vowel = next_sound.is_some_and(is_vowel_phoneme);
+    match word {
+        "a" => Some("ɐ"),
+        "the" => Some(if followed_by_vowel { "ði" } else { "ðə" }),
+        "to" => Some(if followed_by_vowel { "tu" } else { "tə" }),
+        _ => None,
+    }
+}
+
+/// English text to a Kokoro phoneme string.
+pub fn phonemize(text: &str) -> String {
+    phonemize_with_sources(text).into_iter().map(|(sound, _)| sound).collect()
+}
+
+/// [`phonemize`], one symbol at a time, each with the byte offset in `text`
+/// of the word it was pronounced for (`None` for spaces and punctuation).
+/// This is the phoneme→word map Kokoro's word timings are read through.
+pub fn phonemize_with_sources(text: &str) -> Vec<(char, Option<usize>)> {
+    let tokens = tokenize(text);
+
+    let mut sounds: Vec<Option<String>> = tokens
+        .iter()
+        .map(|token| match token {
+            Token::Word(word, _) => Some(pronounce(word)),
+            Token::Punct(_) => None,
+        })
+        .collect();
+
+    // Second pass: some words depend on the sound that follows them.
+    for index in 0..tokens.len() {
+        let Token::Word(word, _) = &tokens[index] else {
+            continue;
+        };
+        let next_sound = sounds[index + 1..]
+            .iter()
+            .flatten()
+            .next()
+            .and_then(|ipa| first_sound(ipa));
+        if let Some(replacement) = function_word(&word.to_lowercase(), next_sound) {
+            sounds[index] = Some(replacement.to_string());
+        }
+    }
+
+    let mut out: Vec<(char, Option<usize>)> = Vec::new();
+    for (token, sound) in tokens.iter().zip(&sounds) {
+        match (token, sound) {
+            (Token::Word(_, at), Some(ipa)) => {
+                if out.last().is_some_and(|(last, _)| *last != ' ') {
+                    out.push((' ', None));
+                }
+                out.extend(ipa.chars().map(|sound| (sound, Some(*at))));
+            }
+            (Token::Punct(ch), _) => out.push((*ch, None)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Which text front end and symbol table a Kokoro model wants. v1.0 and
+/// v1.1-zh were trained on different symbol sets (ids differ; v1.1-zh writes
+/// Mandarin in bopomofo, v1.0 in IPA with tone arrows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frontend {
+    /// English, v1.0 symbol table (the default model).
+    English,
+    /// English, v1.1-zh symbol table.
+    EnglishV11,
+    /// Mandarin (and the English words in it), v1.0.
+    MandarinV10,
+    /// Mandarin (and the English words in it), v1.1-zh.
+    MandarinV11,
+}
+
+impl Frontend {
+    fn token(self, symbol: char) -> Option<u16> {
+        match self {
+            Frontend::English | Frontend::MandarinV10 => vocab::token(symbol),
+            Frontend::EnglishV11 | Frontend::MandarinV11 => vocab_v11::token(symbol),
+        }
+    }
+
+    fn phonemes(self, text: &str) -> Vec<(char, Option<usize>)> {
+        match self {
+            Frontend::English | Frontend::EnglishV11 => phonemize_with_sources(text),
+            Frontend::MandarinV10 => zh::phonemize_with_sources(text, zh::Variant::V10),
+            Frontend::MandarinV11 => zh::phonemize_with_sources(text, zh::Variant::V11),
+        }
+    }
+}
+
+/// Phoneme token ids, zero-padded at both ends the way Kokoro expects.
+pub fn tokens(text: &str) -> Vec<u16> {
+    tokens_with_sources(text).0
+}
+
+/// [`tokens`] plus, per token id, the byte offset in `text` of the word it
+/// sounds (`None` for the pads, spaces and punctuation).
+pub fn tokens_with_sources(text: &str) -> (Vec<u16>, Vec<Option<usize>>) {
+    tokens_with_sources_for(text, Frontend::English)
+}
+
+/// [`tokens_with_sources`] for another front end / symbol table.
+pub fn tokens_with_sources_for(text: &str, frontend: Frontend) -> (Vec<u16>, Vec<Option<usize>>) {
+    let phonemes = frontend.phonemes(text);
+    let mut ids = Vec::with_capacity(phonemes.len() + 2);
+    let mut sources = Vec::with_capacity(phonemes.len() + 2);
+    ids.push(0);
+    sources.push(None);
+    for (symbol, source) in phonemes {
+        if ids.len() > MAX_TOKENS {
+            break;
+        }
+        if let Some(id) = frontend.token(symbol) {
+            ids.push(id);
+            sources.push(source);
+        }
+    }
+    ids.push(0);
+    sources.push(None);
+    (ids, sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{phonemize, phonemize_with_sources, tokens, tokens_with_sources, vocab, MAX_TOKENS};
+
+    #[test]
+    fn every_emitted_symbol_is_in_vocab() {
+        let text = "Hi! I make games with you. Escape the Gummer, 42 times?";
+        for symbol in phonemize(text).chars() {
+            assert!(vocab::token(symbol).is_some(), "stray symbol {symbol:?}");
+        }
+    }
+
+    #[test]
+    fn tokens_are_padded_and_bounded() {
+        let ids = tokens("hello");
+        assert_eq!(ids.first(), Some(&0));
+        assert_eq!(ids.last(), Some(&0));
+
+        let long = "hello ".repeat(500);
+        assert!(tokens(&long).len() <= MAX_TOKENS + 2);
+    }
+
+    #[test]
+    fn numbers_are_spoken_not_spelled() {
+        assert!(phonemize("42").len() > 3);
+    }
+
+    #[test]
+    fn function_words_follow_context() {
+        // The article, not the letter `eɪ`.
+        assert!(phonemize("a blob").starts_with('ɐ'));
+        // `ðə` before a consonant, `ði` before a vowel.
+        assert!(phonemize("the game").starts_with("ðə"));
+        assert!(phonemize("the apple").starts_with("ði"));
+    }
+
+    #[test]
+    fn sources_point_at_the_words_they_sound() {
+        let text = "Hi, the apple 42.";
+        let sounds = phonemize_with_sources(text);
+        // The symbols are exactly `phonemize`'s.
+        assert_eq!(sounds.iter().map(|(c, _)| *c).collect::<String>(), phonemize(text));
+        let mut words: Vec<usize> = Vec::new();
+        for (sound, source) in &sounds {
+            match source {
+                Some(at) => {
+                    if words.last() != Some(at) {
+                        words.push(*at);
+                    }
+                }
+                // Spaces and punctuation belong to no word.
+                None => assert!(!sound.is_alphabetic() || *sound == ' ', "{sound:?}"),
+            }
+        }
+        // "Hi" at 0, "the" at 4, "apple" at 8, "forty two" both at 14.
+        assert_eq!(words, vec![0, 4, 8, 14]);
+        let (ids, sources) = tokens_with_sources(text);
+        assert_eq!(ids, tokens(text));
+        assert_eq!(ids.len(), sources.len());
+        assert_eq!((sources[0], *sources.last().unwrap()), (None, None));
+    }
+}

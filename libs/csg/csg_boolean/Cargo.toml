@@ -2,8 +2,7 @@
 name = "makepad-csg-boolean"
 version = "0.1.0"
 edition = "2021"
-
-[workspace]
+license = "MIT OR Apache-2.0"
 
 [features]
 default = ["threads"]

@@ -23,6 +23,28 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+mod distribution;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod malloc_compat;
+
+/// Version from the installed distribution's header, or `unknown` when headers
+/// are unavailable (for example, a packaged app containing only the framework).
+pub fn cef_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VERSION.get_or_init(distribution::version).as_deref().unwrap_or("unknown")
+}
+
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+mod subprocess;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+pub use subprocess::run_helper_if_subprocess;
+
+/// Call first in main, before application or allocator initialization.
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn run_helper_if_subprocess() -> Option<i32> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapResult {
     Continue,
@@ -34,6 +56,154 @@ pub struct Frame {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
+}
+
+/// Times sampled inside a capture callback, before its payload is copied.
+///
+/// `callback_unix_ms` has the same epoch and units as [`AudioPacket::pts_ms`],
+/// but is the callback's time, not an audio presentation timestamp. The
+/// monotonic value is elapsed time since this browser was created; it is a
+/// separate clock useful for detecting wall-clock jumps, not a Unix time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureTimestamp {
+    pub callback_unix_ms: i64,
+    pub callback_elapsed_ns: u64,
+    /// Committed main-frame document navigation. Same-document history and
+    /// fragment changes do not advance this epoch.
+    pub navigation_epoch: u64,
+}
+
+/// A software paint together with its capture-callback identity.
+///
+/// The timestamp describes painting, not a decoded video's media PTS. A
+/// consumer must measure AV synchronization rather than assume those are
+/// interchangeable. Accelerated paints do not produce this CPU payload.
+#[derive(Debug)]
+pub struct CapturedFrame {
+    pub frame: Frame,
+    pub sequence: u64,
+    pub timestamp: CaptureTimestamp,
+}
+
+/// A slot of an external frame sink to copy an accelerated frame into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SinkTarget {
+    pub slot: usize,
+    /// The platform's shared-texture handle (an IOSurface id on macOS).
+    pub handle: u64,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// Where a browser's accelerated frames go instead of its one target: a
+/// ring of shared textures (another process's, `makepad_app_host::
+/// frame_ring`). Called on the thread CEF paints on, inside its paint
+/// callback: `acquire` may wait (a lossless consumer's back-pressure, which
+/// slows the page down), and the frame is published once the GPU copy is
+/// done. The callback's timestamp and the `probes`' luminance (read from
+/// the frame, one byte per point) travel with it.
+pub trait FrameSink: Send + Sync {
+    fn acquire(&self, width: usize, height: usize) -> Option<SinkTarget>;
+    /// Pixels of the frame (`[x, y]`) to read back with it.
+    fn probes(&self) -> Vec<[u32; 2]>;
+    fn publish(&self, slot: usize, copied: (usize, usize), timestamp: CaptureTimestamp, probes: &[u8]);
+    /// The slot was not filled after all.
+    fn abandon(&self, slot: usize);
+}
+
+/// What a page's audio is captured as. Chromium mixes and resamples the
+/// page's output to this before the first packet, so the embedder names the
+/// format its own audio path wants and never converts a rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioCaptureConfig {
+    pub sample_rate: u32,
+    /// One or two; anything else captures stereo.
+    pub channels: u32,
+    /// Frames per packet. Small is low latency and more packets.
+    pub frames_per_buffer: u32,
+}
+
+impl Default for AudioCaptureConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000,
+            channels: 2,
+            frames_per_buffer: 1024,
+        }
+    }
+}
+
+/// The format of one capture stream, as Chromium reported it when the stream
+/// started. `epoch` numbers the streams of one browser: a page that goes
+/// quiet and sounds again is a new stream with the next epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioFormat {
+    pub epoch: u32,
+    pub sample_rate: u32,
+    pub channels: u32,
+    /// Chromium's channel layout number (`2` mono, `3` stereo).
+    pub channel_layout: i32,
+    pub frames_per_buffer: u32,
+}
+
+/// One packet of captured audio: interleaved f32, `frames * channels` long.
+#[derive(Debug)]
+pub struct AudioPacket {
+    pub epoch: u32,
+    pub channels: u32,
+    pub frames: usize,
+    /// Presentation time, milliseconds since the Unix epoch. A gap between
+    /// one packet's end and the next one's `pts_ms` is audio that was dropped.
+    pub pts_ms: i64,
+    /// Callback clocks and the document epoch captured when this audio
+    /// stream started. A late packet from an old stream keeps its old epoch.
+    pub capture: CaptureTimestamp,
+    pub samples: Vec<f32>,
+}
+
+#[derive(Debug)]
+pub enum AudioEvent {
+    Started(AudioFormat),
+    Packet(AudioPacket),
+    /// The page went quiet for a few seconds, navigated away or closed. The
+    /// same browser may start again.
+    Stopped,
+    Error(String),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioCaptureStats {
+    pub enabled: bool,
+    pub streaming: bool,
+    pub streams: u32,
+    pub packets: u64,
+    /// Packets that found the queue to the embedder full and were dropped
+    /// rather than block Chromium's capture thread.
+    pub dropped_packets: u64,
+    pub dropped_frames: u64,
+    /// Packets that found no recycled buffer and allocated one.
+    pub pool_misses: u64,
+}
+
+/// One line a page wrote to its console: `console.log` and its siblings,
+/// and what Chromium reports there (a script error, a blocked request).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleMessage {
+    /// Chromium's severity: 0 default, 1 verbose, 2 info, 3 warning, 4 error.
+    pub level: i32,
+    pub message: String,
+    /// The script the line came from, and the line in it; empty and zero
+    /// for a line with no script behind it.
+    pub source: String,
+    pub line: i32,
+}
+
+/// The answer to one `Browser::evaluate_javascript`: the expression's
+/// value as JSON, or the text of the exception it threw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evaluation {
+    pub number: u64,
+    pub result: std::result::Result<String, String>,
 }
 
 pub const EVENTFLAG_NONE: u32 = 0;
@@ -61,29 +231,94 @@ pub const MOUSE_BUTTON_RIGHT: i32 = 2;
 
 pub const TEXT_INPUT_MODE_NONE: i32 = 1;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 mod ffi;
-#[cfg(target_os = "macos")]
-mod macos;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+mod native;
 
-#[cfg(target_os = "macos")]
-pub use macos::{
-    bootstrap, do_message_loop_work, initialize, reexec_into_app_bundle_if_needed, shutdown,
-    Browser,
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+pub use native::{
+    accelerated_paint_requested, background_color, bootstrap, do_message_loop_work, initialize,
+    is_initialized, initialization_error, prepare, set_application_dark_mode,
+    set_background_color, shutdown, flush_profile, AcceleratedStats, Browser,
+    BrowserOptions, RenderMode,
 };
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderMode {
+    None,
+    Software,
+    Accelerated,
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AcceleratedStats {
+    pub frames: u64,
+    pub last_width: usize,
+    pub last_height: usize,
+    pub last_format: i32,
+    pub last_blit_micros: u64,
+    pub total_blit_micros: u64,
+    pub dropped_no_target: u64,
+    pub target_frames: u64,
+    pub last_copy_width: usize,
+    pub last_copy_height: usize,
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn accelerated_paint_requested() -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn set_background_color(_argb: u32) {}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn set_application_dark_mode(_dark: bool) {}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn background_color() -> u32 {
+    0
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrowserOptions {
+    pub software_frames: bool,
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub struct Browser;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 impl Browser {
+    pub fn set_dark_mode(&mut self, _dark: bool) -> Result<()> {
+        Ok(())
+    }
+
     pub fn new(_url: &str, _width: usize, _height: usize, _scale_factor: f32) -> Result<Self> {
         Err(Error::new(
-            "makepad-cef is only wired up for macOS right now",
+            "makepad-cef is supported on macOS, Windows and desktop Linux",
         ))
     }
 
+    pub fn new_with_options(
+        url: &str,
+        width: usize,
+        height: usize,
+        scale_factor: f32,
+        _options: BrowserOptions,
+    ) -> Result<Self> {
+        Self::new(url, width, height, scale_factor)
+    }
+
     pub fn resize(&mut self, _width: usize, _height: usize, _scale_factor: f32) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn request_repaint(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -91,7 +326,23 @@ impl Browser {
         Ok(())
     }
 
+    pub fn execute_javascript(&mut self, _code: &str) -> Result<()> {
+        Ok(())
+    }
+
     pub fn set_focus(&mut self, _focus: bool) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn selected_text(&self) -> String {
+        String::new()
+    }
+
+    pub fn copy_selection(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn cut_selection(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -102,6 +353,10 @@ impl Browser {
         _modifiers: u32,
         _mouse_leave: bool,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn send_capture_lost_event(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -148,25 +403,161 @@ impl Browser {
     pub fn take_frame(&mut self) -> Option<Frame> {
         None
     }
+
+    pub fn try_take_frame(&mut self) -> Option<CapturedFrame> {
+        None
+    }
+
+    pub fn navigation_epoch(&self) -> u64 {
+        0
+    }
+
+    pub fn take_error(&mut self) -> Option<String> { None }
+
+    pub fn is_accelerated(&self) -> bool {
+        false
+    }
+
+    pub fn render_mode(&self) -> RenderMode {
+        RenderMode::None
+    }
+
+    pub fn accelerated_stats(&self) -> AcceleratedStats {
+        AcceleratedStats::default()
+    }
+
+    pub fn set_accelerated_target(
+        &mut self,
+        _handle: u64,
+        _width: usize,
+        _height: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn clear_accelerated_target(&mut self) {}
+
+    pub fn set_frame_sink(&mut self, _sink: Option<std::sync::Arc<dyn FrameSink>>) {}
+
+    pub fn accelerated_frame_counter(&self) -> u64 {
+        0
+    }
+
+    pub fn nav_generation(&self) -> u64 {
+        0
+    }
+
+    pub fn title(&self) -> String {
+        String::new()
+    }
+
+    pub fn url(&self) -> String {
+        String::new()
+    }
+
+    pub fn is_loading(&self) -> bool {
+        false
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        false
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        false
+    }
+
+    pub fn go_back(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn go_forward(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn stop_load(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn set_hidden(&mut self, _hidden: bool) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        false
+    }
+
+    pub fn take_popup_requests(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    pub fn take_favicon(&mut self) -> Option<Frame> {
+        None
+    }
+
+    pub fn editable_focus(&self) -> bool {
+        false
+    }
+
+    pub fn take_console_messages(&mut self) -> Vec<ConsoleMessage> {
+        Vec::new()
+    }
+
+    pub fn evaluate_javascript(&mut self, _expression: &str) -> Result<u64> {
+        Err(Error::new("CEF is not supported on this platform"))
+    }
+
+    pub fn take_evaluations(&mut self) -> Vec<Evaluation> {
+        Vec::new()
+    }
+
+    pub fn enable_audio_capture(&mut self, _config: AudioCaptureConfig) {}
+
+    pub fn disable_audio_capture(&mut self) {}
+
+    pub fn poll_audio(&mut self) -> Option<AudioEvent> {
+        None
+    }
+
+    pub fn recycle_audio_packet(&mut self, _packet: AudioPacket) {}
+
+    pub fn audio_capture_stats(&self) -> AudioCaptureStats {
+        AudioCaptureStats::default()
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub fn bootstrap() -> Result<BootstrapResult> {
     Ok(BootstrapResult::Continue)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub fn do_message_loop_work() {}
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 pub fn initialize() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn shutdown() {}
-
-#[cfg(not(target_os = "macos"))]
-pub fn reexec_into_app_bundle_if_needed() -> Result<()> {
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn prepare() -> Result<()> {
     Ok(())
 }
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn is_initialized() -> bool {
+    false
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn shutdown() {}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn flush_profile() {}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+pub fn initialization_error() -> Option<String> { None }

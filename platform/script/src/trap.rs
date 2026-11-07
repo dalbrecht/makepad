@@ -1,3 +1,4 @@
+use makepad_relax_api::relax_api;
 use crate::makepad_script_derive::*;
 use crate::value::*;
 use std::cell::RefCell;
@@ -14,17 +15,112 @@ pub struct ScriptError {
 #[derive(Debug, Clone, Copy)]
 pub enum ScriptTrapOn {
     Pause,
+    TimeBudgetYield,
     Return(ScriptValue),
     Bail(ScriptValue),
 }
 use std::cell::Cell;
+
+/// Bit set in `pending` when the error queue is non-empty.
+pub const TRAP_PENDING_ERR: u8 = 1;
+/// Bit set in `pending` when `on` holds a trap (pause/return/bail/yield).
+pub const TRAP_PENDING_ON: u8 = 2;
+
+#[relax_api(handle)]
 #[derive(Default, Debug)]
 pub struct ScriptTrapInner {
-    pub(crate) err: RefCell<VecDeque<ScriptError>>,
-    pub(crate) on: Cell<Option<ScriptTrapOn>>,
+    err: RefCell<VecDeque<ScriptError>>,
+    on: Cell<Option<ScriptTrapOn>>,
+    /// Mirror of "err non-empty" / "on set" as a bitfield so the interpreter
+    /// loop polls both interrupt sources with a single Cell load per
+    /// instruction. Only the accessors below may touch `err`/`on` — they
+    /// keep this in sync.
+    pending: Cell<u8>,
     pub ip: ScriptIp,
 }
 
+impl ScriptTrapInner {
+    /// One-load poll for the interpreter loop: non-zero when there are
+    /// pending errors (TRAP_PENDING_ERR) and/or a trap to handle
+    /// (TRAP_PENDING_ON).
+    #[inline(always)]
+    pub fn pending(&self) -> u8 {
+        self.pending.get()
+    }
+
+    #[inline(always)]
+    pub fn has_err(&self) -> bool {
+        self.pending.get() & TRAP_PENDING_ERR != 0
+    }
+
+    /// Take and clear the whole error queue.
+    #[inline]
+    pub fn err_take(&self) -> VecDeque<ScriptError> {
+        self.pending
+            .set(self.pending.get() & !TRAP_PENDING_ERR);
+        self.err.take()
+    }
+
+    /// Drop all pending errors.
+    #[inline]
+    pub fn err_clear(&self) {
+        self.pending
+            .set(self.pending.get() & !TRAP_PENDING_ERR);
+        self.err.borrow_mut().clear();
+    }
+
+    #[inline]
+    pub fn err_pop_front(&self) -> Option<ScriptError> {
+        let mut err = self.err.borrow_mut();
+        let r = err.pop_front();
+        if err.is_empty() {
+            self.pending
+                .set(self.pending.get() & !TRAP_PENDING_ERR);
+        }
+        r
+    }
+
+    #[inline]
+    pub fn err_is_empty(&self) -> bool {
+        !self.has_err()
+    }
+
+    /// Read-only view for diagnostics/GC marking.
+    #[inline]
+    pub fn err_borrow(&self) -> std::cell::Ref<'_, VecDeque<ScriptError>> {
+        self.err.borrow()
+    }
+
+    // `on` accessors — the trap slot shares the pending bitfield
+
+    #[inline]
+    pub fn set_on(&self, on: Option<ScriptTrapOn>) {
+        if on.is_some() {
+            self.pending.set(self.pending.get() | TRAP_PENDING_ON);
+        } else {
+            self.pending.set(self.pending.get() & !TRAP_PENDING_ON);
+        }
+        self.on.set(on);
+    }
+
+    #[inline]
+    pub fn get_on(&self) -> Option<ScriptTrapOn> {
+        self.on.get()
+    }
+
+    #[inline]
+    pub fn take_on(&self) -> Option<ScriptTrapOn> {
+        self.pending.set(self.pending.get() & !TRAP_PENDING_ON);
+        self.on.take()
+    }
+
+    #[inline]
+    pub fn on_is_none(&self) -> bool {
+        self.pending.get() & TRAP_PENDING_ON == 0
+    }
+}
+
+#[relax_api(plain)]
 #[derive(Clone, Copy)]
 pub enum ScriptTrap<'a> {
     NoTrap,
@@ -34,39 +130,50 @@ pub enum ScriptTrap<'a> {
 pub use ScriptTrap::NoTrap;
 
 impl<'a> ScriptTrap<'a> {
+    #[inline]
     pub fn pass(self) -> Self {
         self
     }
 }
 
 impl ScriptTrapInner {
+    #[inline]
     pub fn pass<'a>(&'a self) -> ScriptTrap<'a> {
         ScriptTrap::Inner(self)
     }
 }
 
+#[relax_api]
 impl ScriptTrapInner {
-    pub fn push_err(
-        &self,
-        value: ScriptValue,
-        message: String,
-        origin_file: String,
-        origin_line: u32,
-    ) -> ScriptValue {
+    /// Queues an error at this trap (text as views: the script_err_*! macros call this from
+    /// app code built by another compiler than the VM, loader-core.md section 8).
+    #[relax_api]
+    pub fn push_err(&self, value: ScriptValue, message: &str, origin_file: &str, origin_line: u32) -> ScriptValue {
+        self.pending.set(self.pending.get() | TRAP_PENDING_ERR);
         self.err.borrow_mut().push_back(ScriptError {
             value,
-            message,
-            origin_file,
+            message: message.to_string(),
+            origin_file: origin_file.to_string(),
             origin_line,
         });
         value
     }
+
+    /// Where this trap's thread is (the site errors raised now report).
+    #[inline]
+    #[relax_api]
+    pub fn cur_ip(&self) -> ScriptIp {
+        self.ip
+    }
+    #[inline]
     pub fn ip(&self) -> u32 {
         self.ip.index
     }
+    #[inline]
     pub fn goto(&mut self, wh: u32) {
         self.ip.index = wh;
     }
+    #[inline]
     pub fn goto_rel(&mut self, wh: u32) {
         self.ip.index += wh;
     }

@@ -10,30 +10,119 @@ repository = "https://github.com/makepad/makepad/"
 metadata.makepad-auto-version = "N0YGjn7dnhc4DEHmww9lwuYwMVI="
 
 [dependencies]
-makepad-draw = { path = "../draw", version = "2.0.0" }
-
-makepad-derive-widget = {path = "./derive_widget", version="2.0.0"}
-makepad-mbtile-reader = { path = "../libs/mbtile_reader", version = "1.0.0", optional = true }
-makepad-fast-inflate = { path = "../libs/fast_inflate", optional = true }
-makepad-voice = { path = "../libs/voice", version = "0.1.0", optional = true }
-makepad-cef = { path = "../libs/cef", optional = true }
-
-makepad-html = { path = "../libs/html", version = "1.0.0" }
-unicode-segmentation = { version = "1.12.0", path = "../libs/unicode/unicode-segmentation" }
-pulldown-cmark = { version = "0.12.2", path = "../libs/pulldown-cmark", default-features = false, features = ["simd"] }
-makepad-latex-math = { path = "../libs/latex_math", version = "0.1.0" }
-makepad-pdf-parse = { path = "../libs/pdf_parse", version = "1.0.0", optional = true }
-ttf-parser = { path = "../libs/ttf-parser" }
-
-serde = { version = "1.0", optional = true, features = ["derive"] }
+# The library is makepad-widgets-core plus one crate per widget family
+# (widgets/families). None of them has features, so each compiles once per
+# profile whatever mix of families the apps in a target dir pick; this crate
+# is the thin front that every app names, and its features only choose which
+# family crates it links, re-exports and registers.
+makepad-widgets-core = { path = "./core", version = "2.0.0" }
+makepad-widgets-data = { path = "./families/data", version = "2.0.0", optional = true }
+makepad-widgets-rich-text = { path = "./families/rich_text", version = "2.0.0", optional = true }
+makepad-widgets-menus = { path = "./families/menus", version = "2.0.0", optional = true }
+makepad-widgets-extras = { path = "./families/extras", version = "2.0.0", optional = true }
+makepad-widgets-maps = { path = "./families/maps", version = "2.0.0", optional = true }
+makepad-widgets-pdf = { path = "./families/pdf", version = "2.0.0", optional = true }
+makepad-widgets-voice = { path = "./families/voice", version = "2.0.0", optional = true }
+makepad-widgets-browser = { path = "./families/browser", version = "2.0.0", optional = true }
+makepad-widgets-ai = { path = "./families/ai", version = "2.0.0", optional = true }
+makepad-widgets-fab = { path = "./families/fab", version = "2.0.0", optional = true }
+makepad-widgets-editors = { path = "./families/editors", version = "2.0.0", optional = true }
+makepad-widgets-hotkeys = { path = "./families/hotkeys", version = "2.0.0", optional = true }
+makepad-widgets-media = { path = "./families/media", version = "2.0.0", optional = true }
+makepad-widgets-collections = { path = "./families/collections", version = "2.0.0", optional = true }
+makepad-widgets-pickers = { path = "./families/pickers", version = "2.0.0", optional = true }
+makepad-widgets-catalog = { path = "./families/catalog", version = "2.0.0", optional = true }
 
 [features]
-default = []
+# The big widget families, each a feature and all on by default. An app that
+# wants a smaller build takes `default-features = false` and names the
+# families it uses; the core (views, window, labels, buttons, inputs, menus,
+# lists, tabs, popups and the like) is always there. A feature only links its
+# family crate: the crates themselves never change with the features.
+default = [
+    "charts",
+    "color",
+    "data",
+    "dates",
+    "chat",
+    "dock",
+    "rich_text",
+    "dropzone",
+    "vector",
+    "glass",
+    "nav_menus",
+    "command_palette",
+    "fab",
+    "editors",
+    "hotkeys",
+    "media",
+    "collections",
+    "pickers",
+    "catalog",
+]
 
-voice = ["dep:makepad-voice"]
-maps = ["dep:makepad-mbtile-reader", "dep:makepad-fast-inflate"]
-pdf = ["dep:makepad-pdf-parse"]
-cef = ["dep:makepad-cef"]
+# The design overlay (Shift+F10 with the dev overlays on) is not a feature
+# here: an app links `makepad-widgets-tweaker` itself and calls
+# `makepad_widgets_tweaker::link(vm)` before `makepad_widgets::script_mod`
+# (see widgets/families/tweaker), turning on "data", "dock" and "fab"
+# with it (the panel is built of those families' widgets). So
+# no crate built on this one waits for the overlay to compile.
 
-## Enables certain public-facing types to derive serde serialization traits.
-serde = ["dep:serde", "makepad-draw/serde", "makepad-derive-widget/serde"]
+# Chart, chart shapes and the waveform lane.
+charts = ["dep:makepad-widgets-extras", "color"]
+# The colour picker family.
+color = ["dep:makepad-widgets-extras"]
+# Data grid, tree view and file tree.
+data = ["dep:makepad-widgets-data"]
+# Calendar, date picker and time picker.
+dates = ["dep:makepad-widgets-extras"]
+# Chat bubbles and the chat list.
+chat = ["dep:makepad-widgets-extras"]
+# The docking layout.
+dock = ["dep:makepad-widgets-data"]
+# Text flow, rich text, HTML, Markdown, LaTeX maths and the log list.
+rich_text = ["dep:makepad-widgets-rich-text"]
+# The file drop target and upload list.
+dropzone = ["dep:makepad-widgets-extras"]
+# The vector drawing widget.
+vector = ["dep:makepad-widgets-extras"]
+# The glass panel family.
+glass = ["dep:makepad-widgets-extras"]
+# Floating action, radial, pill-nav, line and hamburger menus.
+nav_menus = ["dep:makepad-widgets-menus"]
+# The command palette.
+command_palette = ["dep:makepad-widgets-menus"]
+
+# The rarer widgets, which were the core's until they moved into families of
+# their own: every app built on the core waited for them.
+#
+# The fab design-tool controls (sliders, knobs, colour picks, value inputs
+# and their palette), the property inspector, the menu bar and the tween
+# inspector. The tweaker is built of them.
+fab = ["dep:makepad-widgets-fab"]
+# The ease-curve editor, the sequencer timeline, and the 3D gizmo and view cube.
+editors = ["dep:makepad-widgets-editors"]
+# Hotkey bindings, the hotkey editor and the keyboard map.
+hotkeys = ["dep:makepad-widgets-hotkeys"]
+# Video, the playback bar, level meters, the marquee, content placeholders and
+# media frames.
+media = ["dep:makepad-widgets-media"]
+# Carousels, list items, tables, masonry, tile lists, item grids, kanban
+# boards, scroll marks, SVG selection, conceding rows and corner caps.
+collections = ["dep:makepad-widgets-collections"]
+# Number fields, range sliders, drop toggles, the combo box and DropDown2,
+# ratings, tag fields, radio groups, wheel pickers, avatars, forms, and the
+# column, tree and transfer pickers.
+pickers = ["dep:makepad-widgets-pickers"]
+# Alerts and banners, accordions, breadcrumbs, pagination, floating panels,
+# spinners, toasts, empty states, code blocks and the tour.
+catalog = ["dep:makepad-widgets-catalog"]
+
+voice = ["dep:makepad-widgets-voice"]
+maps = ["dep:makepad-widgets-maps"]
+pdf = ["dep:makepad-widgets-pdf"]
+browser = ["dep:makepad-widgets-browser"]
+# The AI chat slot (F10) in every Window. Not a default: `makepad-app-aichat`
+# turns it on, so exactly the apps that link the chat get the slot.
+ai = ["dep:makepad-widgets-ai"]
+

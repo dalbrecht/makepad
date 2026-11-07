@@ -1,8 +1,8 @@
+use makepad_relax_api::relax_api;
 use crate::{vm, ScriptStd, ScriptVmStdExt};
 use makepad_network::{FromUISender, ToUIReceiver};
 use makepad_script::*;
 use std::{
-    any::Any,
     collections::hash_map::HashMap,
     io::prelude::*,
     io::BufReader,
@@ -37,6 +37,7 @@ pub struct ScriptChildProcessState {
     pub events: ScriptChildEvents,
 }
 
+#[relax_api(plain)]
 #[derive(Script, ScriptHook)]
 pub struct ScriptChildEvents {
     #[live]
@@ -59,38 +60,57 @@ pub struct ScriptChildCmd {
     pub cwd: Option<String>,
 }
 
-pub fn handle_script_child_processes<H: Any>(
-    host: &mut H,
-    std: &mut ScriptStd,
-    script_vm: &mut Option<Box<ScriptVmBase>>,
-) {
+pub fn handle_script_child_processes(host: &mut ScriptHostContext) {
     let mut i = 0;
-    while i < std.data.child_processes.len() {
+    while i < host
+        .std_ref::<ScriptStd>()
+        .unwrap()
+        .data
+        .child_processes
+        .len()
+    {
         let mut term = false;
 
-        while let Ok(value) = std.data.child_processes[i].child.out_recv.try_recv() {
+        loop {
+            let value = host.std_mut::<ScriptStd>().unwrap().data.child_processes[i]
+                .child
+                .out_recv
+                .try_recv();
+            let Ok(value) = value else {
+                break;
+            };
             match value {
                 ChildOut::StdOut(s) => {
-                    if let Some(handler) = std.data.child_processes[i].events.on_stdout.as_object()
-                    {
-                        vm::with_vm_and_async(host, std, script_vm, |vm| {
-                            let str = vm.bx.heap.new_string_from_str(&s);
+                    let handler = host.std_ref::<ScriptStd>().unwrap().data.child_processes[i]
+                        .events
+                        .on_stdout
+                        .as_object();
+                    if let Some(handler) = handler {
+                        vm::with_vm_and_async(host, |vm| {
+                            let str = vm.new_string(&s);
                             vm.call(handler.into(), &[str.into()]);
                         });
                     }
                 }
                 ChildOut::StdErr(s) => {
-                    if let Some(handler) = std.data.child_processes[i].events.on_stderr.as_object()
-                    {
-                        vm::with_vm_and_async(host, std, script_vm, |vm| {
-                            let str = vm.bx.heap.new_string_from_str(&s);
+                    let handler = host.std_ref::<ScriptStd>().unwrap().data.child_processes[i]
+                        .events
+                        .on_stderr
+                        .as_object();
+                    if let Some(handler) = handler {
+                        vm::with_vm_and_async(host, |vm| {
+                            let str = vm.new_string(&s);
                             vm.call(handler.into(), &[str.into()]);
                         });
                     }
                 }
                 ChildOut::Term => {
-                    if let Some(handler) = std.data.child_processes[i].events.on_term.as_object() {
-                        vm::with_vm_and_async(host, std, script_vm, |vm| {
+                    let handler = host.std_ref::<ScriptStd>().unwrap().data.child_processes[i]
+                        .events
+                        .on_term
+                        .as_object();
+                    if let Some(handler) = handler {
+                        vm::with_vm_and_async(host, |vm| {
                             vm.call(handler.into(), &[]);
                         });
                     }
@@ -100,7 +120,11 @@ pub fn handle_script_child_processes<H: Any>(
             }
         }
         if term {
-            std.data.child_processes.remove(i);
+            host.std_mut::<ScriptStd>()
+                .unwrap()
+                .data
+                .child_processes
+                .remove(i);
         } else {
             i += 1;
         }
@@ -158,7 +182,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
                         .push(ScriptChildProcessState { child, id, events });
                     id.escape()
                 }
-                Err(_) => script_err_io!(vm.bx.threads.trap(), "child process error"),
+                Err(_) => script_err_io!(vm.trap(), "child process error"),
             }
         },
     );
@@ -176,7 +200,9 @@ impl ChildProcess {
         let out_send = out_recv.sender();
 
         let mut in_send: FromUISender<ChildIn> = Default::default();
-        let in_recv = in_send.receiver();
+        let in_recv = in_send
+            .receiver()
+            .expect("child stdin receiver is taken exactly once");
 
         let _stdout_thread = {
             let out_send = out_send.clone();

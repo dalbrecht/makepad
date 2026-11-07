@@ -28,7 +28,18 @@ impl<'a> ScriptVm<'a> {
     }
 
     pub(crate) fn handle_if_else(&mut self, opargs: OpcodeArgs) {
+        // NEED_NIL: the true arm left no value but the if's value is used
+        if opargs.is_need_nil() {
+            self.bx.threads.cur().push_stack_unchecked(NIL);
+        }
         self.bx.threads.cur().trap.goto_rel(opargs.to_u32());
+    }
+
+    /// The value of an if/match arm that leaves none (see the parser's
+    /// close_if_else).
+    pub(crate) fn handle_nil_arm(&mut self) {
+        self.bx.threads.cur().push_stack_unchecked(NIL);
+        self.bx.threads.cur().trap.goto_next();
     }
 
     // RETURN handlers
@@ -43,6 +54,15 @@ impl<'a> ScriptVm<'a> {
             self.bail("calls empty in handle_return");
             return;
         };
+        self.bx.threads.cur().slot_base = call.prev_slot_base;
+        // A body run's last scope holds everything the body defined after
+        // a shadowing let; keep it for host->script lookups. Only a body
+        // root: pinning a host->fn call's scope would defeat its eager free
+        // (one leaked scope per host tick until GC).
+        if call.body_root {
+            let end = self.bx.threads.cur_ref().scopes.last().copied();
+            self.bx.threads.cur().root_end_scope = end.map(|s| self.bx.heap.new_object_ref(s));
+        }
         self.bx
             .threads
             .cur()
@@ -51,7 +71,8 @@ impl<'a> ScriptVm<'a> {
         if let Some(ret) = call.return_ip {
             self.bx.threads.cur().trap.ip = ret;
             self.bx.threads.cur().push_stack_unchecked(value);
-            if call.args.is_pop_to_me() {
+            if !self.bx.threads.cur_ref().has_execution_limit_exceeded() && call.args.is_pop_to_me()
+            {
                 self.pop_to_me();
             }
         } else {
@@ -59,8 +80,7 @@ impl<'a> ScriptVm<'a> {
                 .threads
                 .cur()
                 .trap
-                .on
-                .set(Some(ScriptTrapOn::Return(value)));
+                .set_on(Some(ScriptTrapOn::Return(value)));
         }
     }
 
@@ -71,6 +91,7 @@ impl<'a> ScriptVm<'a> {
                 self.bail("calls empty in handle_return_if_err");
                 return true;
             };
+            self.bx.threads.cur().slot_base = call.prev_slot_base;
             self.bx
                 .threads
                 .cur()
@@ -78,7 +99,9 @@ impl<'a> ScriptVm<'a> {
             if let Some(ret) = call.return_ip {
                 self.bx.threads.cur().trap.ip = ret;
                 self.bx.threads.cur().push_stack_unchecked(value);
-                if call.args.is_pop_to_me() {
+                if !self.bx.threads.cur_ref().has_execution_limit_exceeded()
+                    && call.args.is_pop_to_me()
+                {
                     self.pop_to_me();
                 }
             } else {
@@ -86,8 +109,7 @@ impl<'a> ScriptVm<'a> {
                     .threads
                     .cur()
                     .trap
-                    .on
-                    .set(Some(ScriptTrapOn::Return(value)));
+                    .set_on(Some(ScriptTrapOn::Return(value)));
             }
             true
         } else {
@@ -317,7 +339,10 @@ impl<'a> ScriptVm<'a> {
     }
 
     pub(crate) fn handle_ok_end(&mut self) {
-        self.bx.threads.cur().tries.pop();
+        if self.bx.threads.cur().tries.pop().is_none() {
+            self.bail("tries empty in handle_ok_end");
+            return;
+        }
         self.bx.threads.cur().trap.goto_next();
     }
 
@@ -338,7 +363,11 @@ impl<'a> ScriptVm<'a> {
             self.bail("tries empty in handle_try_err");
             return;
         }
-        self.bx.threads.cur().trap.goto_rel(opargs.to_u32() + 1);
+        // The parser encodes the success-path distance directly, including
+        // the extra skip over TRY_OK only when a legacy `ok` branch exists.
+        // An unconditional +1 here skipped the enclosing opcode (e.g. LET)
+        // whenever there was no `ok` branch.
+        self.bx.threads.cur().trap.goto_rel(opargs.to_u32());
     }
 
     pub(crate) fn handle_try_ok(&mut self, opargs: OpcodeArgs) {

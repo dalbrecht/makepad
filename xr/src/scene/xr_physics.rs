@@ -5,11 +5,19 @@ use super::*;
 use crate::algorithms::tsdf_query::{
     depth_query_plane_supports_body, DepthQueryColliderGeometry, DepthQueryColliderRole,
 };
-use rapier3d::control::{DynamicRayCastVehicleController, WheelTuning};
-use rapier3d::dynamics::CoefficientCombineRule;
-use rapier3d::pipeline::{ActiveHooks, PairFilterContext, PhysicsHooks};
-use rapier3d::prelude::{Collider, QueryFilter, RigidBodyType, SolverFlags};
+use crate::scene::raycast_vehicle::{
+    b3_pos, b3_quat, b3_transform, b3_vec3, from_b3_transform, from_b3_vec3,
+    DynamicRayCastVehicleController, WheelTuning,
+};
+use makepad_box3d::body as b3body;
+use makepad_box3d::hull as b3hull;
+use makepad_box3d::math_functions as b3m;
+use makepad_box3d::physics_world as b3world;
+use makepad_box3d::shape as b3shape;
+use makepad_box3d::types as b3t;
 use std::collections::{HashMap, HashSet};
+
+pub(crate) use makepad_box3d::types::BodyType;
 
 const XR_MAX_LINKED_SUPPORT_BODIES_PER_CUBE: usize = XR_RUNTIME_LINKED_SUPPORT_BODY_COUNT;
 pub(super) const XR_MAX_DEPTH_QUERY_KEYS_PER_CUBE: usize =
@@ -28,7 +36,9 @@ const XR_FOUR_WHEEL_MIN_CHASSIS_CLEARANCE_FRACTION: f32 = 0.0;
 const XR_CAR_MASS_KG: f32 = 500.0;
 const XR_CAR_MAX_STEER_DEG: f32 = 55.0;
 const XR_CAR_STEER_SMOOTHING_FACTOR: f32 = 0.1;
-const XR_CAR_ACCELERATION_FORCE: f32 = 18.0;
+// The original tuning supplied 18 N*s per wheel at the default tick.
+// Store force so changing the simulation timestep does not change thrust.
+const XR_CAR_ACCELERATION_FORCE: f32 = 18.0 / XR_SIMULATION_DT;
 const XR_CAR_BRAKE_FORCE: f32 = 12.0;
 const XR_CAR_TOP_SPEED_MPS: f32 = 25.0;
 const XR_CAR_DOWNFORCE_GAIN: f32 = 20.0;
@@ -40,8 +50,32 @@ const XR_CAR_WHEEL_SIDE_FRICTION_STIFFNESS: f32 = 0.7;
 const XR_CAR_WHEEL_FRICTION_LOW: f32 = 1.0;
 const XR_CAR_WHEEL_FRICTION_HIGH: f32 = 20.0;
 
+/// Number of box3d solver sub-steps per world step. Maps the old per-body
+/// `additional_solver_iterations` tuning onto box3d's sub-stepping solver.
+const XR_PHYSICS_SUB_STEPS: i32 = 4;
+
+// box3d has no half-space shape. Depth-query "surface planes" and the
+// synthetic floor are big thin static box slabs whose top face is positioned
+// on the plane instead.
+const XR_DEPTH_QUERY_SURFACE_SLAB_HALF_EXTENT: f32 = 30.0;
+const XR_DEPTH_QUERY_SURFACE_SLAB_HALF_THICKNESS: f32 = 0.5;
+const XR_FLOOR_SLAB_HALF_EXTENT: f32 = 200.0;
+const XR_FLOOR_SLAB_HALF_THICKNESS: f32 = 0.5;
+
+// Collision filter categories. All shapes created by this module use explicit
+// filters; combined with per-depth-query-key group indices they reproduce the
+// old contact-pair filter hook:
+// - depth-query surfaces collide ONLY with shapes carrying the same key
+//   (same positive group index always collides),
+// - surfaces never collide with anything else (mask/category test fails),
+// - everything else collides normally.
+const XR_FILTER_CAT_WORLD: u64 = 1 << 0;
+const XR_FILTER_CAT_DEPTH_QUERY_BODY: u64 = 1 << 1;
+const XR_FILTER_CAT_DEPTH_QUERY_SURFACE: u64 = 1 << 2;
+
+/// One collider of a hand as the physics builds it (world space).
 #[derive(Clone, Copy, Debug)]
-pub(super) enum HandCollider {
+pub enum HandCollider {
     Capsule { a: Vec3f, b: Vec3f, radius: f32 },
     Ball { center: Vec3f, radius: f32 },
     Box { pose: Pose, half_extents: Vec3f },
@@ -52,6 +86,7 @@ pub(crate) struct PhysicsCube {
     pub(crate) widget_uid: WidgetUid,
     pub(crate) body: RigidBodyHandle,
     pub(crate) collider: ColliderHandle,
+    pub(crate) is_sphere: bool,
     pub(crate) half_extents: Vec3f,
     pub(crate) query_radius: f32,
     pub(crate) scale: Vec3f,
@@ -67,8 +102,17 @@ pub(super) struct HandColliderBody {
     pub(super) collider: ColliderHandle,
 }
 
+/// A player's hand collider slots and grab states, while it is not the one in the scene's fields.
+pub(super) struct HandRig {
+    player: u32,
+    left_hand: Vec<HandColliderBody>,
+    right_hand: Vec<HandColliderBody>,
+    left_hand_grab: HandGrabState,
+    right_hand_grab: HandGrabState,
+}
+
 #[derive(Clone, Copy)]
-struct FloorHalfspaceCollider {
+struct FloorSlabCollider {
     body: RigidBodyHandle,
     collider: ColliderHandle,
 }
@@ -76,28 +120,130 @@ struct FloorHalfspaceCollider {
 #[derive(Clone, Copy, Debug)]
 struct HandGrabState {
     shared_hand: XrSharedHand,
+    /// the grip point (the pinch point with the palm's orientation, or the controller's grip):
+    /// where a grab reaches for a body
     pose: Pose,
+    /// the frame a hold follows rigidly (the palm, or the controller's grip; `xr_hold_frame`):
+    /// the fingertips that place the grip point jitter with the finger tracking, the palm
+    /// does not, so a held body is `hold_frame * grab_offset`
+    hold_frame: Pose,
     previous_pose: Pose,
     linvel: Vec3f,
     tracked: bool,
     gripping: bool,
     held_body: Option<RigidBodyHandle>,
     grab_offset: Pose,
+    /// The hand's most curled mean finger bend (degrees) in this hold: the hold lets go when
+    /// the hand opens from it (`updated_hand_grab_state`).
+    hold_bend: f32,
+    /// The grip began at this step (it was not gripping the step before).
+    grip_began: bool,
+    /// Steps since the grip began (a grab takes a body only within `XR_GRAB_ACQUIRE_STEPS` of
+    /// it: holds begin on a grab, never because a closed hand happens to touch something).
+    grip_steps: u32,
+    /// Consecutive steps the hand has not gripped (a new grab needs `XR_GRAB_REARM_STEPS` of
+    /// them: a grasp value flickering off and on is no new grab).
+    open_steps: u32,
+    /// Consecutive steps a holding hand has been untracked (the hold waits
+    /// `XR_HOLD_LOST_GRACE_STEPS` for it to come back).
+    lost_steps: u32,
+    /// The mean finger bend smoothed over steps (degrees): the hold's most curled is the most
+    /// of this, so one bad joint sample (a 120 degree spike) does not make the ordinary grip
+    /// read as opened afterwards.
+    bend_smooth: f32,
+    /// Consecutive steps the holding hand has looked let go (`XR_HOLD_LET_GO_STEPS` end it).
+    let_go_steps: u32,
 }
+
+/// The mean finger bend's smoothing per step (an exponential average: ~4 steps, 33 ms).
+const XR_HOLD_BEND_SMOOTHING: f32 = 0.25;
+/// Steps a holding hand must look let go before the hold ends (25 ms: under two pictures; a
+/// single odd hand sample does not drop the body).
+const XR_HOLD_LET_GO_STEPS: u32 = 3;
+
+/// Steps (of the worker's fixed 1/120 s) a hand must have been open before a grip counts as a
+/// new grab (50 ms).
+const XR_GRAB_REARM_STEPS: u32 = 6;
+/// Steps after a grab begins in which it may take a body (250 ms: the hand closes a moment
+/// before it touches).
+const XR_GRAB_ACQUIRE_STEPS: u32 = 30;
+/// Steps a hold survives the hand being untracked (300 ms: a hand the cameras lose for a few
+/// frames keeps its cube; then it falls).
+const XR_HOLD_LOST_GRACE_STEPS: u32 = 36;
+/// A free body is taken by a grab touching it, or this near (metres) without a contact yet.
+const XR_HAND_GRAB_REACH_WITHOUT_CONTACT: f32 = 0.03;
+/// The fingers opening this far (degrees of mean bend) from the hold's most curled end a hold.
+const XR_HOLD_RELEASE_OPENING_DEGREES: f32 = 20.0;
+const XR_CONTROLLER_GRAB_GRIP: f32 = 0.55;
+const XR_CONTROLLER_RELEASE_GRIP: f32 = 0.35;
 
 impl HandGrabState {
     fn new(shared_hand: XrSharedHand) -> Self {
         Self {
             shared_hand,
             pose: Pose::default(),
+            hold_frame: Pose::default(),
             previous_pose: Pose::default(),
             linvel: vec3f(0.0, 0.0, 0.0),
             tracked: false,
             gripping: false,
             held_body: None,
             grab_offset: Pose::default(),
+            hold_bend: 0.0,
+            grip_began: false,
+            grip_steps: 0,
+            open_steps: 0,
+            lost_steps: 0,
+            bend_smooth: 0.0,
+            let_go_steps: 0,
         }
     }
+
+    /// Holding on (also while briefly untracked: the grace keeps `tracked` and `gripping`).
+    fn holds_on(&self) -> bool {
+        self.tracked && self.gripping
+    }
+}
+
+/// Whether a holding hand has let go: open (all four fingers straight), or with the grasp and
+/// the pinch both over, the fingers opened `XR_HOLD_RELEASE_OPENING_DEGREES` from the hold's
+/// most curled (`hold_bend`). (Holding a cube the index often lies straight along it and the
+/// runtime's grasp value sags on a loose hold: either alone let go of the cube mid-wave; waiting
+/// for a fully open hand kept a cube on a relaxed hand for a second.) Fingers without valid
+/// joints and no grasp or pinch count as open. Answers (let go, at once): an open hand (or one
+/// without finger joints) lets go at once; an opening read from the bend only when it lasts
+/// `XR_HOLD_LET_GO_STEPS` (the bend is the noisiest reading of a hand).
+fn hand_let_go(hand: &XrHand, hold_bend: f32) -> (bool, bool) {
+    if hand.is_open() {
+        return (true, true);
+    }
+    if hand.grab_intent() || hand.pinch_index() {
+        return (false, false);
+    }
+    match hand.average_open_finger_bend_degrees() {
+        None => (true, true),
+        Some(bend) => (bend <= hold_bend - XR_HOLD_RELEASE_OPENING_DEGREES, false),
+    }
+}
+
+/// A body held by two hands: the primary hand's hold turned so the line between the two
+/// hold points follows the line between the two grips, placed midway between where each hand
+/// alone would put it. Both the physics target and the draw use this.
+pub fn xr_two_hand_hold_pose(primary_grip: Pose, primary_offset: Pose, secondary_grip: Pose, secondary_offset: Pose) -> Pose {
+    let primary_single_target = Pose::multiply(&primary_grip, &primary_offset);
+    let primary_anchor_local = primary_offset.invert().position;
+    let secondary_anchor_local = secondary_offset.invert().position;
+    let local_anchor_delta = secondary_anchor_local - primary_anchor_local;
+    let world_hand_delta = secondary_grip.position - primary_grip.position;
+    if local_anchor_delta.length() < XR_HAND_DUAL_GRAB_MIN_SPAN || world_hand_delta.length() < XR_HAND_DUAL_GRAB_MIN_SPAN {
+        return primary_single_target;
+    }
+    let baseline_world_delta = primary_single_target.orientation.rotate_vec3(&local_anchor_delta);
+    let orientation = Quat::multiply(&quat_from_to(baseline_world_delta, world_hand_delta), &primary_single_target.orientation);
+    let primary_world_anchor = orientation.rotate_vec3(&primary_anchor_local);
+    let secondary_world_anchor = orientation.rotate_vec3(&secondary_anchor_local);
+    let position = ((primary_grip.position - primary_world_anchor) + (secondary_grip.position - secondary_world_anchor)) * 0.5;
+    Pose::new(orientation, position)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -223,30 +369,38 @@ pub(crate) struct DepthQueryPhysicsStats {
     pub(crate) surface_count: usize,
 }
 
-struct RapierDepthQueryHooks;
-
-const DEPTH_QUERY_BODY_USER_DATA_TAG: u128 = 1u128 << 127;
-const DEPTH_QUERY_SURFACE_USER_DATA_TAG: u128 = 1u128 << 126;
-const DEPTH_QUERY_USER_DATA_OWNER_MASK: u128 = u64::MAX as u128;
-static RAPIER_DEPTH_QUERY_HOOKS: RapierDepthQueryHooks = RapierDepthQueryHooks;
+// The depth-query user data tags live in the top bits of box3d's u64 shape
+// user data (the previous engine used a u128; filter keys are small monotonic
+// counters so 61 bits of owner key is plenty).
+const DEPTH_QUERY_BODY_USER_DATA_TAG: u64 = 1u64 << 63;
+const DEPTH_QUERY_SURFACE_USER_DATA_TAG: u64 = 1u64 << 62;
+const DEPTH_QUERY_SURFACE_IMPACT_ROLE_TAG: u64 = 1u64 << 61;
+const DEPTH_QUERY_USER_DATA_OWNER_MASK: u64 = (1u64 << 61) - 1;
 const XR_ENABLE_SYNTHETIC_GROUND_PLANE: bool = false;
-const DEPTH_QUERY_SURFACE_IMPACT_ROLE_TAG: u128 = 1u128 << 125;
 // Keep shadow extrapolation aligned with XrPeerSync so remote bodies do not drift forever
 // when UDP state stalls.
 const XR_SHADOW_BODY_MAX_EXTRAPOLATION_SECONDS: f32 = 0.10;
 
-pub(crate) struct RapierScene {
-    gravity: RapierVector,
-    integration_parameters: IntegrationParameters,
-    pipeline: PhysicsPipeline,
-    islands: IslandManager,
-    broad_phase: BroadPhaseBvh,
-    narrow_phase: NarrowPhase,
-    pub(crate) bodies: RigidBodySet,
-    pub(super) colliders: ColliderSet,
-    impulse_joints: ImpulseJointSet,
-    multibody_joints: MultibodyJointSet,
-    ccd_solver: CCDSolver,
+/// Hashable key for a box3d body id (box3d ids do not implement `Hash`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct BodyKey {
+    index1: i32,
+    world0: u16,
+    generation: u16,
+}
+
+fn body_key(handle: RigidBodyHandle) -> BodyKey {
+    BodyKey {
+        index1: handle.index1,
+        world0: handle.world0,
+        generation: handle.generation,
+    }
+}
+
+pub(crate) struct PhysicsScene {
+    pub(super) world: b3world::World,
+    gravity: Vec3f,
+    simulation_dt: f32,
     pub(crate) cubes: Vec<PhysicsCube>,
     linked_support_bodies: Vec<LinkedSupportBody>,
     vehicles: Vec<VehicleRuntime>,
@@ -255,34 +409,175 @@ pub(crate) struct RapierScene {
     spawn_pool_cube_cursor: usize,
     depth_query_surface_sets: Vec<DepthQueryBodySurfaceSet>,
     depth_query_stats: DepthQueryPhysicsStats,
-    floor_halfspace: Option<FloorHalfspaceCollider>,
+    floor_slab: Option<FloorSlabCollider>,
     pub(super) left_hand: Vec<HandColliderBody>,
     pub(super) right_hand: Vec<HandColliderBody>,
     left_hand_grab: HandGrabState,
     right_hand_grab: HandGrabState,
-    shadow_body_motion: HashMap<RigidBodyHandle, ShadowBodyMotion>,
-    body_drive_motion: HashMap<RigidBodyHandle, BodyDriveMotion>,
-    settle_frame_counts: HashMap<RigidBodyHandle, u8>,
-    actively_driven_bodies: HashSet<RigidBodyHandle>,
+    /// the player whose hands are in the fields above (0: the local one)
+    active_player: u32,
+    /// every other player's hands (a host simulating for remote players): swapped into the
+    /// fields above while their hands sync, hold and grab, so one player's code serves all
+    other_rigs: Vec<HandRig>,
+    shadow_body_motion: HashMap<BodyKey, ShadowBodyMotion>,
+    body_drive_motion: HashMap<BodyKey, BodyDriveMotion>,
+    settle_frame_counts: HashMap<BodyKey, u8>,
+    actively_driven_bodies: HashSet<BodyKey>,
 }
 
-fn rapier_vec3(v: Vec3f) -> RapierVector {
-    RapierVector::new(v.x, v.y, v.z)
+// ---------------------------------------------------------------------------
+// Filters and user data tags
+// ---------------------------------------------------------------------------
+
+fn depth_query_group_index(filter_key: u64) -> i32 {
+    // Positive group indices force collision between same-key shapes; keys are
+    // monotonic from 1 so they fit an i32 in practice.
+    (((filter_key.max(1) - 1) % (i32::MAX as u64)) + 1) as i32
 }
 
-fn rapier_rotation(q: Quat) -> RapierRotation {
-    RapierRotation::from_xyzw(q.x, q.y, q.z, q.w)
+fn world_filter() -> b3t::Filter {
+    b3t::Filter {
+        category_bits: XR_FILTER_CAT_WORLD,
+        mask_bits: XR_FILTER_CAT_WORLD | XR_FILTER_CAT_DEPTH_QUERY_BODY,
+        group_index: 0,
+    }
 }
 
-fn rapier_pose(pose: Pose) -> RapierPose {
-    RapierPose::from_parts(
-        rapier_vec3(pose.position),
-        rapier_rotation(pose.orientation),
+fn depth_query_body_filter(filter_key: u64) -> b3t::Filter {
+    b3t::Filter {
+        category_bits: XR_FILTER_CAT_WORLD | XR_FILTER_CAT_DEPTH_QUERY_BODY,
+        mask_bits: XR_FILTER_CAT_WORLD | XR_FILTER_CAT_DEPTH_QUERY_BODY,
+        group_index: depth_query_group_index(filter_key),
+    }
+}
+
+fn depth_query_surface_filter(filter_key: u64) -> b3t::Filter {
+    b3t::Filter {
+        category_bits: XR_FILTER_CAT_DEPTH_QUERY_SURFACE,
+        mask_bits: XR_FILTER_CAT_DEPTH_QUERY_BODY,
+        group_index: depth_query_group_index(filter_key),
+    }
+}
+
+fn disabled_filter() -> b3t::Filter {
+    b3t::Filter {
+        category_bits: 0,
+        mask_bits: 0,
+        group_index: 0,
+    }
+}
+
+/// Query filter used by the wheel ray casts: pretend to be a depth-query body
+/// so that surface slabs (whose mask only accepts depth-query bodies) are
+/// visible to the ray; the per-hit callback applies the ownership filter.
+fn wheel_ray_query_filter() -> b3t::QueryFilter {
+    b3t::QueryFilter {
+        category_bits: XR_FILTER_CAT_WORLD | XR_FILTER_CAT_DEPTH_QUERY_BODY,
+        mask_bits: u64::MAX,
+        id: 0,
+        name: "xr_wheel_ray",
+    }
+}
+
+fn depth_query_body_user_data(filter_key: u64) -> u64 {
+    DEPTH_QUERY_BODY_USER_DATA_TAG | (filter_key & DEPTH_QUERY_USER_DATA_OWNER_MASK)
+}
+
+fn depth_query_surface_user_data(filter_key: u64, role: DepthQueryColliderRole) -> u64 {
+    DEPTH_QUERY_SURFACE_USER_DATA_TAG
+        | (filter_key & DEPTH_QUERY_USER_DATA_OWNER_MASK)
+        | match role {
+            DepthQueryColliderRole::Support => 0,
+            DepthQueryColliderRole::Impact => DEPTH_QUERY_SURFACE_IMPACT_ROLE_TAG,
+        }
+}
+
+fn decode_depth_query_body_owner(user_data: u64) -> Option<u64> {
+    ((user_data & DEPTH_QUERY_BODY_USER_DATA_TAG) != 0)
+        .then_some(user_data & DEPTH_QUERY_USER_DATA_OWNER_MASK)
+}
+
+fn decode_depth_query_surface_owner(user_data: u64) -> Option<u64> {
+    ((user_data & DEPTH_QUERY_SURFACE_USER_DATA_TAG) != 0)
+        .then_some(user_data & DEPTH_QUERY_USER_DATA_OWNER_MASK)
+}
+
+fn decode_depth_query_surface_role(user_data: u64) -> Option<DepthQueryColliderRole> {
+    ((user_data & DEPTH_QUERY_SURFACE_USER_DATA_TAG) != 0).then_some(
+        if (user_data & DEPTH_QUERY_SURFACE_IMPACT_ROLE_TAG) != 0 {
+            DepthQueryColliderRole::Impact
+        } else {
+            DepthQueryColliderRole::Support
+        },
     )
 }
 
-fn makepad_vec3(v: RapierVector) -> Vec3f {
-    vec3f(v.x, v.y, v.z)
+/// The collision filter a shape should carry when it is enabled, derived from
+/// its user data tag.
+fn enabled_filter_for_shape(world: &b3world::World, shape: ColliderHandle) -> b3t::Filter {
+    let user_data = b3shape::shape_get_user_data(world, shape);
+    if let Some(owner) = decode_depth_query_surface_owner(user_data) {
+        depth_query_surface_filter(owner)
+    } else if let Some(owner) = decode_depth_query_body_owner(user_data) {
+        depth_query_body_filter(owner)
+    } else {
+        world_filter()
+    }
+}
+
+fn collider_is_enabled(world: &b3world::World, shape: ColliderHandle) -> bool {
+    if !b3world::shape_is_valid(world, shape) {
+        return false;
+    }
+    b3shape::shape_get_filter(world, shape).category_bits != 0
+}
+
+fn set_collider_enabled(world: &mut b3world::World, shape: ColliderHandle, enabled: bool) {
+    if !b3world::shape_is_valid(world, shape) {
+        return;
+    }
+    let filter = if enabled {
+        enabled_filter_for_shape(world, shape)
+    } else {
+        disabled_filter()
+    };
+    b3shape::shape_set_filter(world, shape, filter, true);
+}
+
+// ---------------------------------------------------------------------------
+// Small body helpers
+// ---------------------------------------------------------------------------
+
+fn teleport_body(world: &mut b3world::World, body: RigidBodyHandle, pose: Pose) {
+    b3body::body_set_transform(world, body, b3_pos(pose.position), b3_quat(pose.orientation));
+}
+
+/// Emulates a position-based kinematic target: box3d kinematic bodies
+/// follow their velocity, so derive the velocity that reaches `pose` over the
+/// next `dt` seconds.
+fn set_kinematic_target(world: &mut b3world::World, body: RigidBodyHandle, pose: Pose, dt: f32) {
+    b3body::body_set_target_transform(world, body, b3_transform(pose), dt.max(0.0001), true);
+}
+
+fn zero_body_velocity(world: &mut b3world::World, body: RigidBodyHandle) {
+    b3body::body_set_linear_velocity(world, body, b3m::Vec3::ZERO);
+    b3body::body_set_angular_velocity(world, body, b3m::Vec3::ZERO);
+}
+
+fn wake_body(world: &mut b3world::World, body: RigidBodyHandle) {
+    b3body::body_set_awake(world, body, true);
+}
+
+fn set_body_enabled(world: &mut b3world::World, body: RigidBodyHandle, enabled: bool) {
+    if enabled {
+        b3body::body_enable(world, body);
+    } else {
+        b3body::body_disable(world, body);
+    }
+}
+
+fn rotation_from_two_vectors(from: Vec3f, to: Vec3f) -> Quat {
+    quat_from_to(from, to)
 }
 
 fn predict_pose(pose: Pose, linvel: Vec3f, angvel: Vec3f, dt: f32) -> Pose {
@@ -324,6 +619,18 @@ fn grab_offset_from_body_anchor(
     grab_offset
 }
 
+/// The grip point a grab reaches from: the controller's grip while it is tracked, else the
+/// hand's pinch point with the palm's orientation.
+pub fn xr_grip_pose(hand: &XrHand, controller: &XrController) -> Option<Pose> {
+    controller_grab_pose(controller).or_else(|| hand_grab_pose(hand))
+}
+
+/// The frame a hold follows (a held body is this times its grab offset): the controller's grip
+/// while it is tracked, else the hand's palm.
+pub fn xr_hold_frame(hand: &XrHand, controller: &XrController) -> Option<Pose> {
+    controller_grab_pose(controller).or_else(|| hand.tracking_pose())
+}
+
 fn hand_grab_pose(hand: &XrHand) -> Option<Pose> {
     let palm_pose = hand.tracking_pose()?;
     let thumb_tip = hand.tip_pos_checked(XrHand::THUMB_TIP);
@@ -339,39 +646,6 @@ fn hand_grab_pose(hand: &XrHand) -> Option<Pose> {
 fn controller_grab_pose(controller: &XrController) -> Option<Pose> {
     let pose = controller.grip_pose;
     (controller.active() && pose.is_finite()).then_some(pose)
-}
-
-fn depth_query_body_user_data(filter_key: u64) -> u128 {
-    DEPTH_QUERY_BODY_USER_DATA_TAG | filter_key as u128
-}
-
-fn depth_query_surface_user_data(filter_key: u64, role: DepthQueryColliderRole) -> u128 {
-    DEPTH_QUERY_SURFACE_USER_DATA_TAG
-        | filter_key as u128
-        | match role {
-            DepthQueryColliderRole::Support => 0,
-            DepthQueryColliderRole::Impact => DEPTH_QUERY_SURFACE_IMPACT_ROLE_TAG,
-        }
-}
-
-fn decode_depth_query_body_owner(user_data: u128) -> Option<u64> {
-    ((user_data & DEPTH_QUERY_BODY_USER_DATA_TAG) != 0)
-        .then_some((user_data & DEPTH_QUERY_USER_DATA_OWNER_MASK) as u64)
-}
-
-fn decode_depth_query_surface_owner(user_data: u128) -> Option<u64> {
-    ((user_data & DEPTH_QUERY_SURFACE_USER_DATA_TAG) != 0)
-        .then_some((user_data & DEPTH_QUERY_USER_DATA_OWNER_MASK) as u64)
-}
-
-fn decode_depth_query_surface_role(user_data: u128) -> Option<DepthQueryColliderRole> {
-    ((user_data & DEPTH_QUERY_SURFACE_USER_DATA_TAG) != 0).then_some(
-        if (user_data & DEPTH_QUERY_SURFACE_IMPACT_ROLE_TAG) != 0 {
-            DepthQueryColliderRole::Impact
-        } else {
-            DepthQueryColliderRole::Support
-        },
-    )
 }
 
 fn quat_from_to(from: Vec3f, to: Vec3f) -> Quat {
@@ -500,19 +774,21 @@ fn linked_support_world_linvel(
 }
 
 fn wheel_query_accepts_collider(
-    _handle: ColliderHandle,
-    collider: &Collider,
+    world: &b3world::World,
+    shape: ColliderHandle,
     owner_body: RigidBodyHandle,
     support_body: RigidBodyHandle,
     support_filter_key: u64,
 ) -> bool {
-    if collider.parent() == Some(owner_body) || collider.parent() == Some(support_body) {
+    let parent = b3shape::shape_get_body(world, shape);
+    if parent == owner_body || parent == support_body {
         return false;
     }
-    if let Some(owner) = decode_depth_query_surface_owner(collider.user_data) {
+    let user_data = b3shape::shape_get_user_data(world, shape);
+    if let Some(owner) = decode_depth_query_surface_owner(user_data) {
         return owner == support_filter_key;
     }
-    decode_depth_query_body_owner(collider.user_data).is_none()
+    decode_depth_query_body_owner(user_data).is_none()
 }
 
 fn depth_query_surface_target_should_enable(
@@ -539,63 +815,217 @@ fn depth_query_surface_target_should_enable(
     }
 }
 
-impl PhysicsHooks for RapierDepthQueryHooks {
-    fn filter_contact_pair(&self, context: &PairFilterContext) -> Option<SolverFlags> {
-        let collider1 = context.colliders.get(context.collider1)?;
-        let collider2 = context.colliders.get(context.collider2)?;
-        match (
-            decode_depth_query_surface_owner(collider1.user_data),
-            decode_depth_query_surface_owner(collider2.user_data),
-        ) {
-            (Some(owner1), None) => (decode_depth_query_body_owner(collider2.user_data)
-                == Some(owner1))
-            .then_some(SolverFlags::COMPUTE_IMPULSES),
-            (None, Some(owner2)) => (decode_depth_query_body_owner(collider1.user_data)
-                == Some(owner2))
-            .then_some(SolverFlags::COMPUTE_IMPULSES),
-            (Some(_), Some(_)) => None,
-            (None, None) => Some(SolverFlags::COMPUTE_IMPULSES),
-        }
-    }
-}
-
-pub(crate) fn makepad_pose(pose: &RapierPose) -> Pose {
+/// Pose of the thin slab used to emulate an (infinite) half-space plane: the
+/// slab's +Y face lies on the plane.
+fn depth_query_surface_slab_pose(point: Vec3f, normal: Vec3f, half_thickness: f32) -> Pose {
     Pose::new(
-        Quat {
-            x: pose.rotation.x,
-            y: pose.rotation.y,
-            z: pose.rotation.z,
-            w: pose.rotation.w,
-        },
-        vec3f(pose.translation.x, pose.translation.y, pose.translation.z),
+        rotation_from_two_vectors(vec3f(0.0, 1.0, 0.0), normal),
+        point - normal * half_thickness,
     )
 }
 
-pub(super) fn capsule_pose(a: Vec3f, b: Vec3f) -> (RapierPose, RapierReal) {
+pub(super) fn capsule_pose(a: Vec3f, b: Vec3f) -> (Pose, f32) {
     let delta = b - a;
     let length = delta.length();
     let rotation = if length > 1.0e-4 {
-        RapierRotation::from_rotation_arc(RapierVector::Y, rapier_vec3(delta * (1.0 / length)))
+        quat_from_to(vec3f(0.0, 1.0, 0.0), delta * (1.0 / length))
     } else {
-        RapierRotation::IDENTITY
+        Quat::default()
     };
     (
-        RapierPose::from_parts(rapier_vec3((a + b) * 0.5), rotation),
+        Pose::new(rotation, (a + b) * 0.5),
         (length * 0.5).max(0.0005),
     )
 }
 
-impl RapierScene {
+/// Rebuilds the hand collider slots from this frame's tracked hand shapes.
+/// box3d shape geometry is immutable, so shapes are destroyed and recreated
+/// when a slot is active (box3d shape geometry cannot be mutated in place).
+pub(super) fn sync_hand_bodies(
+    world: &mut b3world::World,
+    slots: &mut [HandColliderBody],
+    colliders: &[HandCollider],
+    dt: f32,
+) {
+    for (index, slot) in slots.iter_mut().enumerate() {
+        let active = index < colliders.len();
+        if !active {
+            if collider_is_enabled(world, slot.collider) {
+                set_collider_enabled(world, slot.collider, false);
+            }
+            // Kinematic bodies keep following their velocity; freeze them so a
+            // lost slot does not drift away.
+            zero_body_velocity(world, slot.body);
+            continue;
+        }
+        let was_enabled = collider_is_enabled(world, slot.collider);
+
+        let mut shape_def = b3t::default_shape_def();
+        shape_def.filter = world_filter();
+        shape_def.base_material.friction = XR_HAND_COLLIDER_FRICTION;
+        shape_def.base_material.restitution = 0.0;
+        shape_def.update_body_mass = false;
+
+        b3shape::destroy_shape(world, slot.collider, false);
+        let target_pose = match colliders[index] {
+            HandCollider::Capsule { a, b, radius } => {
+                let center = (a + b) * 0.5;
+                let mut local_half = (b - a) * 0.5;
+                if local_half.length() < 0.0005 {
+                    local_half = vec3f(0.0, 0.0005, 0.0);
+                }
+                slot.collider = b3shape::create_capsule_shape(
+                    world,
+                    slot.body,
+                    &shape_def,
+                    &b3t::Capsule {
+                        center1: b3_vec3(local_half * -1.0),
+                        center2: b3_vec3(local_half),
+                        radius: radius.max(0.0005),
+                    },
+                );
+                Pose::new(Quat::default(), center)
+            }
+            HandCollider::Ball { center, radius } => {
+                slot.collider = b3shape::create_sphere_shape(
+                    world,
+                    slot.body,
+                    &shape_def,
+                    &b3t::Sphere {
+                        center: b3m::Vec3::ZERO,
+                        radius: radius.max(0.0005),
+                    },
+                );
+                Pose::new(Quat::default(), center)
+            }
+            HandCollider::Box { pose, half_extents } => {
+                let hull = b3hull::make_box_hull(
+                    half_extents.x.max(0.0005),
+                    half_extents.y.max(0.0005),
+                    half_extents.z.max(0.0005),
+                );
+                slot.collider = b3shape::create_hull_shape(world, slot.body, &shape_def, &hull);
+                pose
+            }
+        };
+        if !was_enabled {
+            // Reset the body pose on reacquire so tracking loss doesn't inject a huge velocity spike.
+            teleport_body(world, slot.body, target_pose);
+            zero_body_velocity(world, slot.body);
+        }
+        set_kinematic_target(world, slot.body, target_pose, dt);
+    }
+}
+
+impl PhysicsScene {
     pub(crate) fn gravity_vector(&self) -> Vec3f {
-        vec3f(self.gravity.x, self.gravity.y, self.gravity.z)
+        self.gravity
     }
 
     pub(crate) fn set_simulation_dt(&mut self, dt: f32) {
-        self.integration_parameters.dt = dt.max(0.0001);
+        self.simulation_dt = dt.max(0.0001);
     }
 
     pub(crate) fn simulation_dt(&self) -> f32 {
-        self.integration_parameters.dt
+        self.simulation_dt
+    }
+
+    // --- read helpers shared with the worker / depth / tests ---------------
+
+    pub(crate) fn body_is_valid(&self, handle: RigidBodyHandle) -> bool {
+        b3world::body_is_valid(&self.world, handle)
+    }
+
+    pub(crate) fn body_pose(&self, handle: RigidBodyHandle) -> Pose {
+        from_b3_transform(b3body::body_get_transform(&self.world, handle))
+    }
+
+    pub(crate) fn body_linvel(&self, handle: RigidBodyHandle) -> Vec3f {
+        from_b3_vec3(b3body::body_get_linear_velocity(&self.world, handle))
+    }
+
+    pub(crate) fn body_angvel(&self, handle: RigidBodyHandle) -> Vec3f {
+        from_b3_vec3(b3body::body_get_angular_velocity(&self.world, handle))
+    }
+
+    pub(crate) fn body_is_enabled(&self, handle: RigidBodyHandle) -> bool {
+        self.body_is_valid(handle) && b3body::body_is_enabled(&self.world, handle)
+    }
+
+    pub(crate) fn body_is_sleeping(&self, handle: RigidBodyHandle) -> bool {
+        !b3body::body_is_awake(&self.world, handle)
+    }
+
+    pub(crate) fn body_type(&self, handle: RigidBodyHandle) -> BodyType {
+        b3body::body_get_type(&self.world, handle)
+    }
+
+    pub(crate) fn body_is_dynamic(&self, handle: RigidBodyHandle) -> bool {
+        self.body_type(handle) == BodyType::Dynamic
+    }
+
+    pub(crate) fn set_body_gravity_scale(&mut self, handle: RigidBodyHandle, gravity_scale: f32) {
+        if self.body_is_valid(handle) {
+            b3body::body_set_gravity_scale(&mut self.world, handle, gravity_scale.max(0.0));
+        }
+    }
+
+    /// Deepest contact penetration (meters) between two bodies; 0.0 when they
+    /// are not touching. Used by tests.
+    pub(crate) fn deepest_contact_penetration_between(
+        &self,
+        body_a: RigidBodyHandle,
+        body_b: RigidBodyHandle,
+    ) -> f32 {
+        let mut deepest = 0.0f32;
+        if !self.body_is_valid(body_a) || !self.body_is_valid(body_b) {
+            return deepest;
+        }
+        let capacity = b3body::body_get_contact_capacity(&self.world, body_a);
+        if capacity <= 0 {
+            return deepest;
+        }
+        let mut contacts = Vec::with_capacity(capacity as usize);
+        b3body::body_get_contact_data(&self.world, body_a, &mut contacts, capacity);
+        for contact in &contacts {
+            let parent_a = b3shape::shape_get_body(&self.world, contact.shape_id_a);
+            let parent_b = b3shape::shape_get_body(&self.world, contact.shape_id_b);
+            let other = if parent_a == body_a { parent_b } else { parent_a };
+            if other != body_b {
+                continue;
+            }
+            for manifold in contact.manifolds {
+                for point in &manifold.points[..manifold.point_count.max(0) as usize] {
+                    deepest = deepest.max(-point.separation);
+                }
+            }
+        }
+        deepest
+    }
+
+    /// Calls `f(own_shape, other_shape)` for every touching contact of `body`.
+    fn for_each_touching_contact(
+        &self,
+        body: RigidBodyHandle,
+        f: &mut dyn FnMut(ColliderHandle, ColliderHandle),
+    ) {
+        if !self.body_is_valid(body) {
+            return;
+        }
+        let capacity = b3body::body_get_contact_capacity(&self.world, body);
+        if capacity <= 0 {
+            return;
+        }
+        let mut contacts = Vec::with_capacity(capacity as usize);
+        b3body::body_get_contact_data(&self.world, body, &mut contacts, capacity);
+        for contact in &contacts {
+            let parent_a = b3shape::shape_get_body(&self.world, contact.shape_id_a);
+            if parent_a == body {
+                f(contact.shape_id_a, contact.shape_id_b);
+            } else {
+                f(contact.shape_id_b, contact.shape_id_a);
+            }
+        }
     }
 
     fn allocate_depth_query_filter_key(&mut self) -> u64 {
@@ -605,20 +1035,34 @@ impl RapierScene {
     }
 
     fn spawn_dynamic_body(&mut self, pose: Pose) -> RigidBodyHandle {
-        let body = self.bodies.insert(
-            RigidBodyBuilder::dynamic()
-                .pose(rapier_pose(pose))
-                .ccd_enabled(true)
-                .linear_damping(XR_BODY_LINEAR_DAMPING)
-                .angular_damping(XR_BODY_ANGULAR_DAMPING)
-                .additional_solver_iterations(XR_BODY_ADDITIONAL_SOLVER_ITERATIONS),
-        );
-        if let Some(rigid_body) = self.bodies.get_mut(body) {
-            let activation = rigid_body.activation_mut();
-            activation.angular_threshold = XR_BODY_SLEEP_ANGULAR_THRESHOLD;
-            activation.time_until_sleep = XR_BODY_SLEEP_TIME;
-        }
-        body
+        let mut def = b3t::default_body_def();
+        def.body_type = BodyType::Dynamic;
+        def.position = b3_pos(pose.position);
+        def.rotation = b3_quat(pose.orientation);
+        def.linear_damping = XR_BODY_LINEAR_DAMPING;
+        def.angular_damping = XR_BODY_ANGULAR_DAMPING;
+        // Continuous collision detection for fast bodies.
+        def.is_bullet = true;
+        // Note: the old engine tuned per-body sleep (angular threshold +
+        // time). box3d uses a single linear sleep threshold; the explicit
+        // settle logic in settle_resting_bodies covers the rest.
+        b3body::create_body(&mut self.world, &def)
+    }
+
+    fn cube_shape_def(
+        user_data: u64,
+        filter: b3t::Filter,
+        density: f32,
+        friction: f32,
+        restitution: f32,
+    ) -> b3t::ShapeDef {
+        let mut def = b3t::default_shape_def();
+        def.user_data = user_data;
+        def.filter = filter;
+        def.density = density.max(0.001);
+        def.base_material.friction = friction.max(0.0);
+        def.base_material.restitution = restitution.max(0.0);
+        def
     }
 
     fn spawn_linked_support_marker(
@@ -635,24 +1079,29 @@ impl RapierScene {
         let local_pose = Pose::new(Quat::default(), spec.local_position);
         let world_pose = Pose::multiply(&owner_pose, &local_pose);
         let body = self.spawn_dynamic_body(world_pose);
-        let collider = self.colliders.insert_with_parent(
-            ColliderBuilder::ball(spec.radius)
-                .user_data(depth_query_body_user_data(depth_query_filter_key))
-                .density(density.max(1.0))
-                .friction(friction.max(0.0))
-                .friction_combine_rule(CoefficientCombineRule::Max)
-                .restitution(restitution.max(0.0)),
-            body,
-            &mut self.bodies,
+        // The support marker collider is never enabled: the marker is a
+        // kinematic probe for wheel ray casts and depth queries, so its
+        // friction combine rule never matters.
+        let mut shape_def = Self::cube_shape_def(
+            depth_query_body_user_data(depth_query_filter_key),
+            disabled_filter(),
+            density.max(1.0),
+            friction,
+            restitution,
         );
-        if let Some(collider) = self.colliders.get_mut(collider) {
-            collider.set_enabled(false);
-        }
-        if let Some(body) = self.bodies.get_mut(body) {
-            body.set_body_type(RigidBodyType::KinematicPositionBased, false);
-            body.set_position(rapier_pose(world_pose), false);
-            body.set_next_kinematic_position(rapier_pose(world_pose));
-        }
+        shape_def.update_body_mass = false;
+        let collider = b3shape::create_sphere_shape(
+            &mut self.world,
+            body,
+            &shape_def,
+            &b3t::Sphere {
+                center: b3m::Vec3::ZERO,
+                radius: spec.radius,
+            },
+        );
+        b3body::body_set_type(&mut self.world, body, BodyType::Kinematic);
+        teleport_body(&mut self.world, body, world_pose);
+        zero_body_velocity(&mut self.world, body);
         let depth_query_surface_set = XR_ENABLE_DEPTH_QUERY_PHYSICS.then(|| {
             self.spawn_depth_query_surface_set(
                 depth_query_filter_key,
@@ -745,23 +1194,33 @@ impl RapierScene {
             } else {
                 vec3f(0.0, 0.0, 0.0)
             };
-        let collider_builder = ColliderBuilder::cuboid(
-            collider_half_extents.x,
-            collider_half_extents.y,
-            collider_half_extents.z,
-        )
-        .translation(rapier_vec3(collider_translation))
-        .user_data(
-            depth_query_filter_key
-                .map(depth_query_body_user_data)
-                .unwrap_or(0),
-        )
-        .density(density.max(0.0))
-        .friction(friction.max(0.0))
-        .restitution(restitution.max(0.0));
-        let collider = self
-            .colliders
-            .insert_with_parent(collider_builder, body, &mut self.bodies);
+        let user_data = depth_query_filter_key
+            .map(depth_query_body_user_data)
+            .unwrap_or(0);
+        let filter = depth_query_filter_key
+            .map(depth_query_body_filter)
+            .unwrap_or_else(world_filter);
+        let shape_def = Self::cube_shape_def(user_data, filter, density, friction, restitution);
+        let hull = b3hull::make_box_hull(
+            collider_half_extents.x.max(0.0005),
+            collider_half_extents.y.max(0.0005),
+            collider_half_extents.z.max(0.0005),
+        );
+        let collider = if collider_translation.length() > 1.0e-6 {
+            b3shape::create_transformed_hull_shape(
+                &mut self.world,
+                body,
+                &shape_def,
+                &hull,
+                b3m::Transform {
+                    p: b3_vec3(collider_translation),
+                    q: b3m::Quat::IDENTITY,
+                },
+                b3m::Vec3::ONE,
+            )
+        } else {
+            b3shape::create_hull_shape(&mut self.world, body, &shape_def, &hull)
+        };
         let depth_query_surface_set = if XR_ENABLE_DEPTH_QUERY_PHYSICS
             && matches!(
                 depth_query_support,
@@ -795,6 +1254,7 @@ impl RapierScene {
             widget_uid,
             body,
             collider,
+            is_sphere: false,
             half_extents,
             query_radius,
             scale,
@@ -845,18 +1305,21 @@ impl RapierScene {
         let radius = radius.max(0.0005);
         let depth_query_filter_key = (!matches!(depth_query_support, XrDepthQuerySupportRig::None))
             .then(|| self.allocate_depth_query_filter_key());
-        let collider = self.colliders.insert_with_parent(
-            ColliderBuilder::ball(radius)
-                .user_data(
-                    depth_query_filter_key
-                        .map(depth_query_body_user_data)
-                        .unwrap_or(0),
-                )
-                .density(density.max(0.0))
-                .friction(friction.max(0.0))
-                .restitution(restitution.max(0.0)),
+        let user_data = depth_query_filter_key
+            .map(depth_query_body_user_data)
+            .unwrap_or(0);
+        let filter = depth_query_filter_key
+            .map(depth_query_body_filter)
+            .unwrap_or_else(world_filter);
+        let shape_def = Self::cube_shape_def(user_data, filter, density, friction, restitution);
+        let collider = b3shape::create_sphere_shape(
+            &mut self.world,
             body,
-            &mut self.bodies,
+            &shape_def,
+            &b3t::Sphere {
+                center: b3m::Vec3::ZERO,
+                radius,
+            },
         );
         let depth_query_surface_set = if XR_ENABLE_DEPTH_QUERY_PHYSICS
             && !matches!(depth_query_support, XrDepthQuerySupportRig::None)
@@ -877,6 +1340,7 @@ impl RapierScene {
             widget_uid,
             body,
             collider,
+            is_sphere: true,
             half_extents: vec3f(radius, radius, radius),
             query_radius: radius,
             scale,
@@ -909,6 +1373,14 @@ impl RapierScene {
         );
     }
 
+    fn spawn_fixed_body(&mut self, pose: Pose) -> RigidBodyHandle {
+        let mut def = b3t::default_body_def();
+        def.body_type = BodyType::Static;
+        def.position = b3_pos(pose.position);
+        def.rotation = b3_quat(pose.orientation);
+        b3body::create_body(&mut self.world, &def)
+    }
+
     pub(crate) fn spawn_fixed_box(
         &mut self,
         widget_uid: WidgetUid,
@@ -918,21 +1390,19 @@ impl RapierScene {
         friction: f32,
         restitution: f32,
     ) {
-        let body = self
-            .bodies
-            .insert(RigidBodyBuilder::fixed().pose(rapier_pose(pose)));
-        let collider = self.colliders.insert_with_parent(
-            ColliderBuilder::cuboid(half_extents.x, half_extents.y, half_extents.z)
-                .user_data(0)
-                .friction(friction.max(0.0))
-                .restitution(restitution.max(0.0)),
-            body,
-            &mut self.bodies,
+        let body = self.spawn_fixed_body(pose);
+        let shape_def = Self::cube_shape_def(0, world_filter(), 1.0, friction, restitution);
+        let hull = b3hull::make_box_hull(
+            half_extents.x.max(0.0005),
+            half_extents.y.max(0.0005),
+            half_extents.z.max(0.0005),
         );
+        let collider = b3shape::create_hull_shape(&mut self.world, body, &shape_def, &hull);
         self.cubes.push(PhysicsCube {
             widget_uid,
             body,
             collider,
+            is_sphere: false,
             half_extents,
             query_radius: half_extents.length().max(0.0005),
             scale,
@@ -952,22 +1422,23 @@ impl RapierScene {
         friction: f32,
         restitution: f32,
     ) {
-        let body = self
-            .bodies
-            .insert(RigidBodyBuilder::fixed().pose(rapier_pose(pose)));
+        let body = self.spawn_fixed_body(pose);
         let radius = radius.max(0.0005);
-        let collider = self.colliders.insert_with_parent(
-            ColliderBuilder::ball(radius)
-                .user_data(0)
-                .friction(friction.max(0.0))
-                .restitution(restitution.max(0.0)),
+        let shape_def = Self::cube_shape_def(0, world_filter(), 1.0, friction, restitution);
+        let collider = b3shape::create_sphere_shape(
+            &mut self.world,
             body,
-            &mut self.bodies,
+            &shape_def,
+            &b3t::Sphere {
+                center: b3m::Vec3::ZERO,
+                radius,
+            },
         );
         self.cubes.push(PhysicsCube {
             widget_uid,
             body,
             collider,
+            is_sphere: true,
             half_extents: vec3f(radius, radius, radius),
             query_radius: radius,
             scale,
@@ -979,21 +1450,18 @@ impl RapierScene {
     }
 
     pub(crate) fn new(gravity: f32) -> Self {
+        let mut world_def = b3t::default_world_def();
+        world_def.gravity = b3m::vec3(0.0, -gravity, 0.0);
+        // The scene lives on the dedicated physics worker thread; keep the
+        // solver serial inside it.
+        world_def.worker_count = 0;
+        // box3d's default restitution mixing is max(a, b), which is what
+        // the depth-query surfaces relied on before.
+        let world = b3world::create_world(&world_def);
         let mut scene = Self {
-            gravity: RapierVector::new(0.0, -gravity, 0.0),
-            integration_parameters: IntegrationParameters {
-                dt: XR_SIMULATION_DT,
-                ..IntegrationParameters::default()
-            },
-            pipeline: PhysicsPipeline::new(),
-            islands: IslandManager::new(),
-            broad_phase: BroadPhaseBvh::new(),
-            narrow_phase: NarrowPhase::new(),
-            bodies: RigidBodySet::new(),
-            colliders: ColliderSet::new(),
-            impulse_joints: ImpulseJointSet::new(),
-            multibody_joints: MultibodyJointSet::new(),
-            ccd_solver: CCDSolver::new(),
+            world,
+            gravity: vec3f(0.0, -gravity, 0.0),
+            simulation_dt: XR_SIMULATION_DT,
             cubes: Vec::new(),
             linked_support_bodies: Vec::new(),
             vehicles: Vec::new(),
@@ -1002,11 +1470,13 @@ impl RapierScene {
             spawn_pool_cube_cursor: 0,
             depth_query_surface_sets: Vec::new(),
             depth_query_stats: DepthQueryPhysicsStats::default(),
-            floor_halfspace: None,
+            floor_slab: None,
             left_hand: Vec::new(),
             right_hand: Vec::new(),
             left_hand_grab: HandGrabState::new(XrSharedHand::LeftHand),
             right_hand_grab: HandGrabState::new(XrSharedHand::RightHand),
+            active_player: 0,
+            other_rigs: Vec::new(),
             shadow_body_motion: HashMap::new(),
             body_drive_motion: HashMap::new(),
             settle_frame_counts: HashMap::new(),
@@ -1022,20 +1492,23 @@ impl RapierScene {
         scene
     }
 
-    fn ensure_floor_halfspace(&mut self) -> FloorHalfspaceCollider {
-        if let Some(floor_halfspace) = self.floor_halfspace {
-            return floor_halfspace;
+    fn ensure_floor_slab(&mut self) -> FloorSlabCollider {
+        if let Some(floor_slab) = self.floor_slab {
+            return floor_slab;
         }
-        let body = self.bodies.insert(RigidBodyBuilder::fixed().build());
-        let collider = self.colliders.insert_with_parent(
-            ColliderBuilder::new(SharedShape::halfspace(RapierVector::new(0.0, 1.0, 0.0)))
-                .friction(0.9),
-            body,
-            &mut self.bodies,
+        let body = self.spawn_fixed_body(Pose::default());
+        let mut shape_def = b3t::default_shape_def();
+        shape_def.filter = disabled_filter();
+        shape_def.base_material.friction = 0.9;
+        let hull = b3hull::make_box_hull(
+            XR_FLOOR_SLAB_HALF_EXTENT,
+            XR_FLOOR_SLAB_HALF_THICKNESS,
+            XR_FLOOR_SLAB_HALF_EXTENT,
         );
-        let floor_halfspace = FloorHalfspaceCollider { body, collider };
-        self.floor_halfspace = Some(floor_halfspace);
-        floor_halfspace
+        let collider = b3shape::create_hull_shape(&mut self.world, body, &shape_def, &hull);
+        let floor_slab = FloorSlabCollider { body, collider };
+        self.floor_slab = Some(floor_slab);
+        floor_slab
     }
 
     pub(crate) fn sync_floor_halfspace(&mut self, floor_y: Option<f32>) {
@@ -1043,26 +1516,21 @@ impl RapierScene {
             .filter(|value| value.is_finite())
             .or(XR_ENABLE_SYNTHETIC_GROUND_PLANE.then_some(0.0));
         let Some(floor_y) = floor_y else {
-            if let Some(floor_halfspace) = self.floor_halfspace {
-                if let Some(collider) = self.colliders.get_mut(floor_halfspace.collider) {
-                    collider.set_enabled(false);
-                }
+            if let Some(floor_slab) = self.floor_slab {
+                set_collider_enabled(&mut self.world, floor_slab.collider, false);
             }
             return;
         };
-        let floor_halfspace = self.ensure_floor_halfspace();
-        if let Some(body) = self.bodies.get_mut(floor_halfspace.body) {
-            body.set_position(
-                RapierPose::from_parts(
-                    RapierVector::new(0.0, floor_y, 0.0),
-                    RapierRotation::IDENTITY,
-                ),
-                false,
-            );
-        }
-        if let Some(collider) = self.colliders.get_mut(floor_halfspace.collider) {
-            collider.set_enabled(true);
-        }
+        let floor_slab = self.ensure_floor_slab();
+        teleport_body(
+            &mut self.world,
+            floor_slab.body,
+            Pose::new(
+                Quat::default(),
+                vec3f(0.0, floor_y - XR_FLOOR_SLAB_HALF_THICKNESS, 0.0),
+            ),
+        );
+        set_collider_enabled(&mut self.world, floor_slab.collider, true);
     }
 
     fn vehicle_index_for_widget_uid(&self, widget_uid: WidgetUid) -> Option<usize> {
@@ -1090,6 +1558,9 @@ impl RapierScene {
         controller.index_forward_axis = 2;
 
         let mut wheels = Vec::new();
+        let gravity = b3world::world_get_gravity(&self.world);
+        let gravity_magnitude =
+            (gravity.x * gravity.x + gravity.y * gravity.y + gravity.z * gravity.z).sqrt() as f32;
         for (slot, spec) in four_wheel_support_specs(half_extents)
             .into_iter()
             .enumerate()
@@ -1097,19 +1568,26 @@ impl RapierScene {
             let (Some(spec), Some(support_index)) = (spec, linked_support_bodies[slot]) else {
                 continue;
             };
+            // Each spring's force is stiffness * compression * chassis mass.
+            // Four springs must support gravity before consuming half their
+            // rest length, including when the car is scaled down. A fixed
+            // stiffness of 50 needs 4.9 cm of sag regardless of vehicle size.
+            let stiffness = XR_CAR_WHEEL_SUSPENSION_STIFFNESS
+                .max(gravity_magnitude / (4.0 * 0.5 * spec.rest_length));
+            let damping_scale = (stiffness / XR_CAR_WHEEL_SUSPENSION_STIFFNESS).sqrt();
             let tuning = WheelTuning {
-                suspension_stiffness: XR_CAR_WHEEL_SUSPENSION_STIFFNESS,
-                suspension_compression: XR_CAR_WHEEL_SUSPENSION_COMPRESSION,
-                suspension_damping: XR_CAR_WHEEL_SUSPENSION_RELAXATION,
+                suspension_stiffness: stiffness,
+                suspension_compression: XR_CAR_WHEEL_SUSPENSION_COMPRESSION * damping_scale,
+                suspension_damping: XR_CAR_WHEEL_SUSPENSION_RELAXATION * damping_scale,
                 max_suspension_travel: (spec.max_length - spec.rest_length).max(0.0),
                 side_friction_stiffness: XR_CAR_WHEEL_SIDE_FRICTION_STIFFNESS,
                 friction_slip: XR_CAR_WHEEL_FRICTION_HIGH,
                 max_suspension_force: XR_CAR_WHEEL_MAX_SUSPENSION_FORCE,
             };
             controller.add_wheel(
-                rapier_vec3(spec.anchor_local_position),
-                RapierVector::new(0.0, -1.0, 0.0),
-                RapierVector::new(-1.0, 0.0, 0.0),
+                spec.anchor_local_position,
+                vec3f(0.0, -1.0, 0.0),
+                vec3f(-1.0, 0.0, 0.0),
                 spec.rest_length,
                 spec.radius,
                 &tuning,
@@ -1133,12 +1611,42 @@ impl RapierScene {
             });
         }
 
-        if let Some(body) = self.bodies.get_mut(chassis_body) {
-            let additional_mass = (config.mass_kg - body.mass()).max(0.0);
-            if additional_mass > 0.0 {
-                body.set_additional_mass(additional_mass, true);
+        if self.body_is_valid(chassis_body) {
+            // Raise the chassis mass to the car config, scaling the inertia
+            // tensor with the same shape distribution. Note: the old engine's
+            // set_additional_mass added the extra mass with ZERO additional
+            // angular inertia, leaving the 500 kg chassis with the rotational
+            // inertia of the sub-kilogram collider. That put the suspension's
+            // angular modes far beyond the explicit-integration stability
+            // limit; it only survived because the solver preserved bitwise
+            // symmetry on the unstable equilibrium. box3d does not, so use
+            // the physically consistent (stable) scaled inertia instead.
+            let current_mass = b3body::body_get_mass(&self.world, chassis_body);
+            let additional_mass = (config.mass_kg - current_mass).max(0.0);
+            if additional_mass > 0.0 && current_mass > 1.0e-6 {
+                let mut mass_data = b3body::body_get_mass_data(&self.world, chassis_body);
+                let scale = (mass_data.mass + additional_mass) / mass_data.mass.max(1.0e-6);
+                mass_data.mass += additional_mass;
+                mass_data.inertia = b3m::Matrix3 {
+                    cx: b3m::vec3(
+                        mass_data.inertia.cx.x * scale,
+                        mass_data.inertia.cx.y * scale,
+                        mass_data.inertia.cx.z * scale,
+                    ),
+                    cy: b3m::vec3(
+                        mass_data.inertia.cy.x * scale,
+                        mass_data.inertia.cy.y * scale,
+                        mass_data.inertia.cy.z * scale,
+                    ),
+                    cz: b3m::vec3(
+                        mass_data.inertia.cz.x * scale,
+                        mass_data.inertia.cz.y * scale,
+                        mass_data.inertia.cz.z * scale,
+                    ),
+                };
+                b3body::body_set_mass_data(&mut self.world, chassis_body, mass_data);
             }
-            body.wake_up(true);
+            wake_body(&mut self.world, chassis_body);
         }
 
         self.vehicles.push(VehicleRuntime {
@@ -1178,12 +1686,12 @@ impl RapierScene {
         let Some(vehicle) = self.vehicles.get(vehicle_index) else {
             return;
         };
-        let Some(chassis) = self.bodies.get(vehicle.chassis_body) else {
+        if !self.body_is_valid(vehicle.chassis_body) {
             return;
-        };
-        let owner_pose = makepad_pose(chassis.position());
-        let owner_linvel = vec3f(chassis.linvel().x, chassis.linvel().y, chassis.linvel().z);
-        let owner_angvel = vec3f(chassis.angvel().x, chassis.angvel().y, chassis.angvel().z);
+        }
+        let owner_pose = self.body_pose(vehicle.chassis_body);
+        let owner_linvel = self.body_linvel(vehicle.chassis_body);
+        let owner_angvel = self.body_angvel(vehicle.chassis_body);
         let wheel_states = vehicle
             .wheels
             .iter()
@@ -1199,8 +1707,8 @@ impl RapierScene {
             .collect::<Vec<_>>();
 
         for (_wheel_index, wheel_runtime, mut support, wheel) in wheel_states {
-            let wheel_center = makepad_vec3(wheel.center());
-            let hard_point = makepad_vec3(wheel.raycast_info().hard_point_ws);
+            let wheel_center = wheel.center();
+            let hard_point = wheel.raycast_info().hard_point_ws;
             let has_controller_pose = prefer_controller_pose
                 && (wheel_center.length() > 1.0e-6 || hard_point.length() > 1.0e-6);
             let support_pose = if has_controller_pose {
@@ -1229,18 +1737,23 @@ impl RapierScene {
             support.spin_angle = wheel.rotation;
             support.steer_angle = wheel.steering;
             self.linked_support_bodies[wheel_runtime.support_index] = support;
-            if let Some(body) = self.bodies.get_mut(support.body) {
-                body.set_enabled(true);
-                if body.body_type() != RigidBodyType::KinematicPositionBased {
-                    body.set_body_type(RigidBodyType::KinematicPositionBased, false);
+            if self.body_is_valid(support.body) {
+                set_body_enabled(&mut self.world, support.body, true);
+                if self.body_type(support.body) != BodyType::Kinematic {
+                    b3body::body_set_type(&mut self.world, support.body, BodyType::Kinematic);
                 }
-                body.set_position(rapier_pose(support_pose), false);
-                body.set_next_kinematic_position(rapier_pose(support_pose));
-                body.set_linvel(rapier_vec3(point_velocity), false);
-                body.set_angvel(rapier_vec3(owner_angvel), false);
-                body.reset_forces(false);
-                body.reset_torques(false);
-                body.wake_up(true);
+                teleport_body(&mut self.world, support.body, support_pose);
+                b3body::body_set_linear_velocity(
+                    &mut self.world,
+                    support.body,
+                    b3_vec3(point_velocity),
+                );
+                b3body::body_set_angular_velocity(
+                    &mut self.world,
+                    support.body,
+                    b3_vec3(owner_angvel),
+                );
+                wake_body(&mut self.world, support.body);
             }
         }
     }
@@ -1252,9 +1765,7 @@ impl RapierScene {
     }
 
     fn update_four_wheel_vehicles(&mut self) {
-        let dt = self.integration_parameters.dt.max(1.0 / 480.0);
-        let broad_phase = &self.broad_phase;
-        let dispatcher = self.narrow_phase.query_dispatcher();
+        let dt = self.simulation_dt.max(1.0 / 480.0);
         for vehicle_index in 0..self.vehicles.len() {
             let (
                 chassis_body,
@@ -1269,21 +1780,22 @@ impl RapierScene {
                 shadowed,
             ) = {
                 let vehicle = &self.vehicles[vehicle_index];
-                let Some(body) = self.bodies.get(vehicle.chassis_body) else {
+                if !self.body_is_valid(vehicle.chassis_body) {
                     continue;
-                };
-                let pose = makepad_pose(body.position());
+                }
+                let pose = self.body_pose(vehicle.chassis_body);
                 (
                     vehicle.chassis_body,
-                    vec3f(body.linvel().x, body.linvel().y, body.linvel().z),
+                    self.body_linvel(vehicle.chassis_body),
                     pose.orientation.rotate_vec3(&vec3f(0.0, 1.0, 0.0)),
                     pose.orientation.rotate_vec3(&vec3f(0.0, 0.0, 1.0)),
                     pose.orientation.rotate_vec3(&vec3f(1.0, 0.0, 0.0)),
-                    body.mass().max(0.001),
-                    body.is_enabled(),
-                    body.body_type() == RigidBodyType::Dynamic,
+                    b3body::body_get_mass(&self.world, vehicle.chassis_body).max(0.001),
+                    self.body_is_enabled(vehicle.chassis_body),
+                    self.body_is_dynamic(vehicle.chassis_body),
                     self.held_by_for_body(vehicle.chassis_body).is_some(),
-                    self.shadow_body_motion.contains_key(&vehicle.chassis_body),
+                    self.shadow_body_motion
+                        .contains_key(&body_key(vehicle.chassis_body)),
                 )
             };
             if !body_enabled || !dynamic_body || held || shadowed {
@@ -1322,7 +1834,7 @@ impl RapierScene {
 
                 let reached_top_speed = current_speed > vehicle.config.top_speed_mps;
                 let accel_force = if current_acc != 0.0 && !reached_top_speed {
-                    (vehicle.config.acceleration_force / dt) * current_acc
+                    vehicle.config.acceleration_force * current_acc
                 } else {
                     0.0
                 };
@@ -1366,38 +1878,44 @@ impl RapierScene {
             };
 
             if downforce_impulse > 0.0 {
-                if let Some(body) = self.bodies.get_mut(chassis_body) {
-                    body.apply_impulse(rapier_vec3(-up_ws * downforce_impulse), true);
-                }
+                b3body::body_apply_linear_impulse_to_center(
+                    &mut self.world,
+                    chassis_body,
+                    b3_vec3(up_ws * -downforce_impulse),
+                    true,
+                );
             }
 
             {
-                let vehicle = &mut self.vehicles[vehicle_index];
-                let filter = |wheel_slot: usize, handle: ColliderHandle, collider: &Collider| {
-                    let Some(wheel_runtime) = vehicle.wheels.get(wheel_slot) else {
+                let wheel_meta: Vec<(RigidBodyHandle, u64)> = self.vehicles[vehicle_index]
+                    .wheels
+                    .iter()
+                    .map(|wheel_runtime| {
+                        (
+                            self.linked_support_bodies
+                                .get(wheel_runtime.support_index)
+                                .map(|support| support.body)
+                                .unwrap_or_default(),
+                            wheel_runtime.depth_query_filter_key,
+                        )
+                    })
+                    .collect();
+                let filter = move |wheel_slot: usize,
+                                   shape: ColliderHandle,
+                                   world: &b3world::World|
+                      -> bool {
+                    let Some(&(support_body, filter_key)) = wheel_meta.get(wheel_slot) else {
                         return false;
                     };
-                    let Some(support) = self.linked_support_bodies.get(wheel_runtime.support_index)
-                    else {
-                        return false;
-                    };
-                    wheel_query_accepts_collider(
-                        handle,
-                        collider,
-                        chassis_body,
-                        support.body,
-                        wheel_runtime.depth_query_filter_key,
-                    )
+                    wheel_query_accepts_collider(world, shape, chassis_body, support_body, filter_key)
                 };
-                let query_pipeline = broad_phase.as_query_pipeline_mut(
-                    dispatcher,
-                    &mut self.bodies,
-                    &mut self.colliders,
-                    QueryFilter::new(),
+                let vehicle = &mut self.vehicles[vehicle_index];
+                vehicle.controller.update_vehicle_with_filter(
+                    &mut self.world,
+                    dt,
+                    wheel_ray_query_filter(),
+                    &filter,
                 );
-                vehicle
-                    .controller
-                    .update_vehicle_with_filter(dt, query_pipeline, filter);
                 if vehicle
                     .controller
                     .wheels()
@@ -1411,7 +1929,7 @@ impl RapierScene {
             }
 
             if driven_active {
-                self.actively_driven_bodies.insert(chassis_body);
+                self.actively_driven_bodies.insert(body_key(chassis_body));
             }
         }
     }
@@ -1445,6 +1963,10 @@ impl RapierScene {
         );
     }
 
+    /// One step of a hand's grip. The holder logic is event based: a grip BEGINS (after the hand
+    /// was open for `XR_GRAB_REARM_STEPS`) and ENDS (an empty grip when the grasp and pinch are
+    /// over; a hold when the hand lets go, `hand_let_go`, or stays untracked past the grace).
+    /// Nothing in between changes who holds what.
     fn updated_hand_grab_state(
         &self,
         mut state: HandGrabState,
@@ -1453,32 +1975,86 @@ impl RapierScene {
         hand_shared: XrSharedHand,
         controller_shared: XrSharedHand,
     ) -> HandGrabState {
-        let next_source = controller_grab_pose(controller)
-            .map(|pose| (pose, controller.grip >= 0.55, controller_shared))
-            .or_else(|| hand_grab_pose(hand).map(|pose| (pose, hand.grab_intent(), hand_shared)));
-        let Some((pose, gripping, shared_hand)) = next_source else {
+        let holding = state.held_body.is_some();
+        let source = if let Some(pose) = controller_grab_pose(controller) {
+            let threshold = if state.gripping && state.shared_hand == controller_shared { XR_CONTROLLER_RELEASE_GRIP } else { XR_CONTROLLER_GRAB_GRIP };
+            Some((pose, pose, controller.grip >= threshold, controller_shared))
+        } else {
+            // a hand grips with a grasp (the fist) or an index pinch; the grip point is the
+            // pinch point either way (hand_grab_pose)
+            hand_grab_pose(hand).zip(hand.tracking_pose()).map(|(pose, palm)| {
+                let grips = if holding && state.gripping && state.shared_hand == hand_shared {
+                    // (let go: only once it has looked so for XR_HOLD_LET_GO_STEPS)
+                    let (let_go, at_once) = hand_let_go(hand, state.hold_bend);
+                    state.let_go_steps = if let_go { state.let_go_steps + 1 } else { 0 };
+                    !(at_once || state.let_go_steps >= XR_HOLD_LET_GO_STEPS)
+                } else {
+                    state.let_go_steps = 0;
+                    hand.grab_intent() || hand.pinch_index()
+                };
+                (pose, palm, grips, hand_shared)
+            })
+        };
+        if let Some(b) = hand.average_open_finger_bend_degrees() {
+            state.bend_smooth = if state.tracked { state.bend_smooth + (b - state.bend_smooth) * XR_HOLD_BEND_SMOOTHING } else { b };
+        }
+        state.hold_bend = if holding { state.hold_bend.max(state.bend_smooth) } else { state.bend_smooth };
+        state.grip_began = false;
+        let Some((pose, hold_frame, grips, shared_hand)) = source else {
+            if holding && state.gripping {
+                state.lost_steps += 1;
+                if state.lost_steps <= XR_HOLD_LOST_GRACE_STEPS {
+                    // the hold waits where it is for the hand to come back
+                    state.previous_pose = state.pose;
+                    state.linvel = vec3f(0.0, 0.0, 0.0);
+                    state.grip_steps = state.grip_steps.saturating_add(1);
+                    return state;
+                }
+                eprintln!("[xr physics] holder: {:?} of player {} lets go: untracked for {} steps (flags {:#x}, controller buttons {:#x})",
+                    state.shared_hand, self.active_player, state.lost_steps, hand.flags, controller.buttons);
+            }
             state.previous_pose = state.pose;
             state.linvel = vec3f(0.0, 0.0, 0.0);
             state.tracked = false;
             state.gripping = false;
+            state.grip_steps = 0;
+            // a hand that comes back closed is no grab: it opens first
+            state.open_steps = 0;
             state.shared_hand = hand_shared;
             return state;
         };
-        let was_tracked = state.tracked;
-        let previous_pose = if was_tracked && state.shared_hand == shared_hand {
-            state.pose
-        } else {
-            pose
-        };
-        let dt = self.integration_parameters.dt.max(0.0001);
+        if state.lost_steps > 0 && holding {
+            eprintln!("[xr physics] holder: {:?} of player {} tracked again after {} steps, still holding", state.shared_hand, self.active_player, state.lost_steps);
+        }
+        state.lost_steps = 0;
+        let was_tracked = state.tracked && state.shared_hand == shared_hand;
+        let previous_pose = if was_tracked { state.pose } else { pose };
+        let previous_hold = if was_tracked { state.hold_frame } else { hold_frame };
+        let dt = self.simulation_dt.max(0.0001);
         state.previous_pose = previous_pose;
         state.pose = pose;
-        state.linvel = if was_tracked {
-            (pose.position - previous_pose.position) * (1.0 / dt)
-        } else {
-            vec3f(0.0, 0.0, 0.0)
-        };
+        state.hold_frame = hold_frame;
+        // (the hold frame's motion: what a released body flies off with)
+        state.linvel = if was_tracked { (hold_frame.position - previous_hold.position) * (1.0 / dt) } else { vec3f(0.0, 0.0, 0.0) };
         state.tracked = true;
+        let was_gripping = state.gripping && state.shared_hand == shared_hand;
+        // (a controller's grip is a button with hysteresis: every press is a grab; a hand's
+        // grasp value flickers, so a hand must have been open a moment first)
+        let rearmed = shared_hand == controller_shared || state.open_steps >= XR_GRAB_REARM_STEPS;
+        let gripping = if was_gripping { grips } else { grips && rearmed };
+        if grips {
+            if !was_gripping {
+                state.open_steps = 0;
+            }
+        } else {
+            state.open_steps = state.open_steps.saturating_add(1);
+        }
+        if holding && was_gripping && !gripping {
+            eprintln!("[xr physics] holder: {:?} of player {} lets go: open {} (mean bend {:?}, hold's most curled {:.0}) grasp {} pinch {} controller grip {:.2}",
+                shared_hand, self.active_player, hand.is_open(), hand.average_open_finger_bend_degrees(), state.hold_bend, hand.grab_intent(), hand.pinch_index(), controller.grip);
+        }
+        state.grip_began = gripping && !was_gripping;
+        state.grip_steps = if state.grip_began { 0 } else if gripping { state.grip_steps.saturating_add(1) } else { 0 };
         state.gripping = gripping;
         state.shared_hand = shared_hand;
         state
@@ -1487,19 +2063,24 @@ impl RapierScene {
     fn spawn_hand_colliders(&mut self, count: usize) -> Vec<HandColliderBody> {
         let mut result = Vec::with_capacity(count);
         for _ in 0..count {
-            let body = self
-                .bodies
-                .insert(RigidBodyBuilder::kinematic_position_based().pose(RapierPose::IDENTITY));
-            let collider = self.colliders.insert_with_parent(
-                ColliderBuilder::capsule_y(0.01, 0.01)
-                    .friction(XR_HAND_COLLIDER_FRICTION)
-                    .restitution(0.0),
+            let mut body_def = b3t::default_body_def();
+            body_def.body_type = BodyType::Kinematic;
+            let body = b3body::create_body(&mut self.world, &body_def);
+            let mut shape_def = b3t::default_shape_def();
+            shape_def.filter = disabled_filter();
+            shape_def.base_material.friction = XR_HAND_COLLIDER_FRICTION;
+            shape_def.base_material.restitution = 0.0;
+            shape_def.update_body_mass = false;
+            let collider = b3shape::create_capsule_shape(
+                &mut self.world,
                 body,
-                &mut self.bodies,
+                &shape_def,
+                &b3t::Capsule {
+                    center1: b3m::vec3(0.0, -0.01, 0.0),
+                    center2: b3m::vec3(0.0, 0.01, 0.0),
+                    radius: 0.01,
+                },
             );
-            if let Some(collider) = self.colliders.get_mut(collider) {
-                collider.set_enabled(false);
-            }
             result.push(HandColliderBody { body, collider });
         }
         result
@@ -1509,23 +2090,21 @@ impl RapierScene {
         &mut self,
         depth_query_filter_key: u64,
     ) -> DepthQuerySurfaceCollider {
-        let body = self.bodies.insert(RigidBodyBuilder::fixed().build());
-        let collider = self.colliders.insert_with_parent(
-            ColliderBuilder::new(SharedShape::halfspace(RapierVector::new(0.0, 1.0, 0.0)))
-                .user_data(depth_query_surface_user_data(
-                    depth_query_filter_key,
-                    DepthQueryColliderRole::Support,
-                ))
-                .active_hooks(ActiveHooks::FILTER_CONTACT_PAIRS)
-                .friction(XR_DEPTH_QUERY_FRICTION)
-                .restitution(0.0)
-                .restitution_combine_rule(CoefficientCombineRule::Max),
-            body,
-            &mut self.bodies,
+        let body = self.spawn_fixed_body(Pose::default());
+        let mut shape_def = b3t::default_shape_def();
+        shape_def.user_data = depth_query_surface_user_data(
+            depth_query_filter_key,
+            DepthQueryColliderRole::Support,
         );
-        if let Some(collider) = self.colliders.get_mut(collider) {
-            collider.set_enabled(false);
-        }
+        shape_def.filter = disabled_filter();
+        shape_def.base_material.friction = XR_DEPTH_QUERY_FRICTION;
+        shape_def.base_material.restitution = 0.0;
+        let hull = b3hull::make_box_hull(
+            XR_DEPTH_QUERY_SURFACE_SLAB_HALF_EXTENT,
+            XR_DEPTH_QUERY_SURFACE_SLAB_HALF_THICKNESS,
+            XR_DEPTH_QUERY_SURFACE_SLAB_HALF_EXTENT,
+        );
+        let collider = b3shape::create_hull_shape(&mut self.world, body, &shape_def, &hull);
         DepthQuerySurfaceCollider {
             collider,
             fingerprint: 0,
@@ -1554,148 +2133,163 @@ impl RapierScene {
         index
     }
 
-    pub(super) fn sync_hand_bodies(
-        bodies: &[HandColliderBody],
-        colliders: &[HandCollider],
-        rigid_bodies: &mut RigidBodySet,
-        collider_set: &mut ColliderSet,
-    ) {
-        for (index, slot) in bodies.iter().enumerate() {
-            let active = index < colliders.len();
-            if active {
-                let (target_pose, shape) = match colliders[index] {
-                    HandCollider::Capsule { a, b, radius } => {
-                        let (target_pose, half_height) = capsule_pose(a, b);
-                        (target_pose, SharedShape::capsule_y(half_height, radius))
-                    }
-                    HandCollider::Ball { center, radius } => (
-                        RapierPose::from_parts(rapier_vec3(center), RapierRotation::IDENTITY),
-                        SharedShape::ball(radius),
-                    ),
-                    HandCollider::Box { pose, half_extents } => (
-                        rapier_pose(pose),
-                        SharedShape::cuboid(half_extents.x, half_extents.y, half_extents.z),
-                    ),
-                };
-                let was_enabled = collider_set
-                    .get(slot.collider)
-                    .map(|collider| collider.is_enabled())
-                    .unwrap_or(false);
-                if let Some(collider) = collider_set.get_mut(slot.collider) {
-                    collider.set_shape(shape);
-                    collider.set_enabled(true);
-                }
-                if let Some(body) = rigid_bodies.get_mut(slot.body) {
-                    if !was_enabled {
-                        // Reset the body pose on reacquire so tracking loss doesn't inject a huge velocity spike.
-                        body.set_position(target_pose, false);
-                    }
-                    body.set_next_kinematic_position(target_pose);
-                    body.wake_up(true);
-                }
-            } else if let Some(collider) = collider_set.get_mut(slot.collider) {
-                collider.set_enabled(false);
-            }
-        }
-    }
-
     fn sync_linked_support_bodies(&mut self) {
         for index in 0..self.linked_support_bodies.len() {
             let support = self.linked_support_bodies[index];
             if self.vehicle_index_for_body(support.owner_body).is_some() {
                 continue;
             }
-            let owner_state = self
-                .bodies
-                .get(support.owner_body)
-                .map(|owner| {
-                    (
-                        owner.is_enabled(),
-                        owner.body_type(),
-                        makepad_pose(owner.position()),
-                    )
-                })
-                .unwrap_or((false, RigidBodyType::Dynamic, Pose::default()));
-            let owner_enabled = owner_state.0;
-            let support_pose = linked_support_world_pose(owner_state.2, support);
-            if let Some(body) = self.bodies.get_mut(support.body) {
+            let owner_valid = self.body_is_valid(support.owner_body);
+            let owner_enabled = owner_valid && self.body_is_enabled(support.owner_body);
+            let owner_pose = if owner_valid {
+                self.body_pose(support.owner_body)
+            } else {
+                Pose::default()
+            };
+            let support_pose = linked_support_world_pose(owner_pose, support);
+            if self.body_is_valid(support.body) {
                 if !owner_enabled {
-                    body.set_enabled(false);
-                    body.set_linvel(RapierVector::ZERO, false);
-                    body.set_angvel(RapierVector::ZERO, false);
-                    body.reset_forces(false);
-                    body.reset_torques(false);
+                    zero_body_velocity(&mut self.world, support.body);
+                    set_body_enabled(&mut self.world, support.body, false);
                 } else {
-                    body.set_enabled(true);
-                    if body.body_type() != RigidBodyType::KinematicPositionBased {
-                        body.set_body_type(RigidBodyType::KinematicPositionBased, false);
+                    set_body_enabled(&mut self.world, support.body, true);
+                    if self.body_type(support.body) != BodyType::Kinematic {
+                        b3body::body_set_type(&mut self.world, support.body, BodyType::Kinematic);
                     }
-                    body.set_position(rapier_pose(support_pose), false);
-                    body.set_next_kinematic_position(rapier_pose(support_pose));
-                    body.set_linvel(RapierVector::ZERO, false);
-                    body.set_angvel(RapierVector::ZERO, false);
-                    body.reset_forces(false);
-                    body.reset_torques(false);
-                    body.wake_up(true);
+                    teleport_body(&mut self.world, support.body, support_pose);
+                    zero_body_velocity(&mut self.world, support.body);
+                    wake_body(&mut self.world, support.body);
                 }
             }
-            if let Some(collider) = self.colliders.get_mut(support.collider) {
-                collider.set_enabled(false);
+            if collider_is_enabled(&self.world, support.collider) {
+                set_collider_enabled(&mut self.world, support.collider, false);
             }
         }
     }
 
+    /// Swaps `rig` with the hands in the scene's fields (twice: back again).
+    fn swap_rig(&mut self, rig: &mut HandRig) {
+        std::mem::swap(&mut self.left_hand, &mut rig.left_hand);
+        std::mem::swap(&mut self.right_hand, &mut rig.right_hand);
+        std::mem::swap(&mut self.left_hand_grab, &mut rig.left_hand_grab);
+        std::mem::swap(&mut self.right_hand_grab, &mut rig.right_hand_grab);
+        std::mem::swap(&mut self.active_player, &mut rig.player);
+    }
+
+    /// Runs `f` with each player's hands in the scene's fields in turn (the local player's first).
+    pub(super) fn for_each_rig(&mut self, mut f: impl FnMut(&mut Self)) {
+        f(self);
+        let mut rigs = std::mem::take(&mut self.other_rigs);
+        for rig in rigs.iter_mut() {
+            self.swap_rig(rig);
+            f(self);
+            self.swap_rig(rig);
+        }
+        self.other_rigs = rigs;
+    }
+
+    /// Runs `f` with `player`'s hands in the scene's fields, making that player's collider slots
+    /// the first time.
+    pub(super) fn with_rig(&mut self, player: u32, f: impl FnOnce(&mut Self)) {
+        if player == self.active_player {
+            return f(self);
+        }
+        let at = match self.other_rigs.iter().position(|r| r.player == player) {
+            Some(at) => at,
+            None => {
+                let (left_hand, right_hand) = if XR_ENABLE_HAND_PHYSICS {
+                    (self.spawn_hand_colliders(XR_HAND_COLLIDER_SLOTS_PER_HAND), self.spawn_hand_colliders(XR_HAND_COLLIDER_SLOTS_PER_HAND))
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                self.other_rigs.push(HandRig { player, left_hand, right_hand,
+                    left_hand_grab: HandGrabState::new(XrSharedHand::LeftHand), right_hand_grab: HandGrabState::new(XrSharedHand::RightHand) });
+                self.other_rigs.len() - 1
+            }
+        };
+        let mut rig = self.other_rigs.swap_remove(at);
+        self.swap_rig(&mut rig);
+        f(self);
+        self.swap_rig(&mut rig);
+        self.other_rigs.push(rig);
+    }
+
+    /// The players whose hands the scene has slots for.
+    pub(super) fn rig_players(&self) -> Vec<u32> {
+        let mut out = vec![self.active_player];
+        out.extend(self.other_rigs.iter().map(|r| r.player));
+        out
+    }
+
+    /// The hold's offset (the body is the grip pose times it) of whoever holds `body_handle`.
+    pub(crate) fn grab_offset_for_body(&self, body_handle: RigidBodyHandle) -> Option<Pose> {
+        let here = [&self.left_hand_grab, &self.right_hand_grab];
+        let others = self.other_rigs.iter().flat_map(|r| [&r.left_hand_grab, &r.right_hand_grab]);
+        here.into_iter().chain(others).find(|g| g.held_body == Some(body_handle)).map(|g| g.grab_offset)
+    }
+
+    /// The second hand of a two-handed hold of `body_handle` (the first is `held_by_for_body`'s,
+    /// with `grab_offset_for_body`): its hand and offset.
+    pub(crate) fn second_hold_for_body(&self, body_handle: RigidBodyHandle) -> Option<(XrSharedHand, Pose)> {
+        let here = [&self.left_hand_grab, &self.right_hand_grab];
+        let others = self.other_rigs.iter().flat_map(|r| [&r.left_hand_grab, &r.right_hand_grab]);
+        here.into_iter().chain(others).filter(|g| g.held_body == Some(body_handle)).nth(1).map(|g| (g.shared_hand, g.grab_offset))
+    }
+
+    fn body_held_by_any(&self, body: RigidBodyHandle) -> Option<(u32, XrSharedHand)> {
+        let here = [(self.active_player, &self.left_hand_grab), (self.active_player, &self.right_hand_grab)];
+        let others = self.other_rigs.iter().flat_map(|r| [(r.player, &r.left_hand_grab), (r.player, &r.right_hand_grab)]);
+        here.into_iter().chain(others).find(|(_, g)| g.held_body == Some(body)).map(|(p, g)| (p, g.shared_hand))
+    }
+
+    fn cube_has_any_hand_contact(&self, cube: &PhysicsCube) -> bool {
+        self.cube_has_hand_contact(cube, &self.left_hand)
+            || self.cube_has_hand_contact(cube, &self.right_hand)
+            || self.other_rigs.iter().any(|r| self.cube_has_hand_contact(cube, &r.left_hand) || self.cube_has_hand_contact(cube, &r.right_hand))
+    }
+
     pub(crate) fn step(&mut self) {
-        self.apply_held_body_targets();
+        self.for_each_rig(|s| s.apply_held_body_targets());
         self.apply_shadow_body_targets();
         self.sync_linked_support_bodies();
         self.sync_vehicle_query_sources_pre_step();
         self.update_four_wheel_vehicles();
-        self.pipeline.step(
-            self.gravity,
-            &self.integration_parameters,
-            &mut self.islands,
-            &mut self.broad_phase,
-            &mut self.narrow_phase,
-            &mut self.bodies,
-            &mut self.colliders,
-            &mut self.impulse_joints,
-            &mut self.multibody_joints,
-            &mut self.ccd_solver,
-            &RAPIER_DEPTH_QUERY_HOOKS,
-            &(),
-        );
+        b3world::world_step(&mut self.world, self.simulation_dt, XR_PHYSICS_SUB_STEPS);
         self.sync_vehicle_support_bodies_post_step();
-        self.acquire_hand_grabs();
+        self.for_each_rig(|s| s.acquire_hand_grabs());
         self.settle_resting_bodies();
         self.actively_driven_bodies.clear();
     }
 
     fn apply_shadow_body_targets(&mut self) {
         let dt = self
-            .integration_parameters
-            .dt
+            .simulation_dt
             .clamp(0.0, XR_SHADOW_BODY_MAX_EXTRAPOLATION_SECONDS);
         let shadow_bodies = self
             .shadow_body_motion
             .iter()
-            .map(|(&body_handle, &motion)| (body_handle, motion))
+            .map(|(&key, &motion)| (key, motion))
             .collect::<Vec<_>>();
         let mut stale = Vec::new();
-        for (body_handle, mut motion) in shadow_bodies {
+        for (key, mut motion) in shadow_bodies {
+            let body_handle = self
+                .cubes
+                .iter()
+                .map(|cube| cube.body)
+                .find(|handle| body_key(*handle) == key);
+            let Some(body_handle) = body_handle else {
+                stale.push(key);
+                continue;
+            };
             if self.held_by_for_body(body_handle).is_some() {
                 continue;
             }
-            let Some(body) = self.bodies.get_mut(body_handle) else {
-                stale.push(body_handle);
-                continue;
-            };
-            if !body.is_enabled() {
-                stale.push(body_handle);
+            if !self.body_is_valid(body_handle) || !self.body_is_enabled(body_handle) {
+                stale.push(key);
                 continue;
             }
-            if body.body_type() != RigidBodyType::KinematicPositionBased {
-                stale.push(body_handle);
+            if self.body_type(body_handle) != BodyType::Kinematic {
+                stale.push(key);
                 continue;
             }
             let advance_dt = dt.min(motion.remaining_prediction_seconds.max(0.0));
@@ -1704,42 +2298,37 @@ impl RapierScene {
                 motion.remaining_prediction_seconds =
                     (motion.remaining_prediction_seconds - advance_dt).max(0.0);
             }
-            body.set_next_kinematic_position(rapier_pose(motion.pose));
-            body.wake_up(true);
-            self.shadow_body_motion.insert(body_handle, motion);
+            set_kinematic_target(&mut self.world, body_handle, motion.pose, self.simulation_dt);
+            self.shadow_body_motion.insert(key, motion);
         }
-        for body_handle in stale {
-            self.shadow_body_motion.remove(&body_handle);
+        for key in stale {
+            self.shadow_body_motion.remove(&key);
         }
     }
 
     fn apply_held_body_targets(&mut self) {
-        if let (Some(left_body), Some(right_body)) = (
-            self.left_hand_grab.held_body,
-            self.right_hand_grab.held_body,
-        ) {
+        if let (Some(left_body), Some(right_body)) = (self.left_hand_grab.held_body, self.right_hand_grab.held_body) {
             if left_body == right_body {
-                match (
-                    self.left_hand_grab.tracked && self.left_hand_grab.gripping,
-                    self.right_hand_grab.tracked && self.right_hand_grab.gripping,
-                ) {
+                match (self.left_hand_grab.holds_on(), self.right_hand_grab.holds_on()) {
                     (true, true) => {
                         self.apply_dual_held_body_target(self.left_hand_grab, self.right_hand_grab);
                         return;
                     }
                     (true, false) => {
                         self.right_hand_grab = Self::drop_hand_hold(self.right_hand_grab);
+                        self.left_hand_grab = self.rebased_hold(self.left_hand_grab, left_body);
                         self.left_hand_grab = self.apply_held_body_target(self.left_hand_grab);
                         return;
                     }
                     (false, true) => {
                         self.left_hand_grab = Self::drop_hand_hold(self.left_hand_grab);
+                        self.right_hand_grab = self.rebased_hold(self.right_hand_grab, left_body);
                         self.right_hand_grab = self.apply_held_body_target(self.right_hand_grab);
                         return;
                     }
                     (false, false) => {
-                        let (left, right) =
-                            self.release_dual_hand_hold(self.left_hand_grab, self.right_hand_grab);
+                        eprintln!("[xr physics] holder: both hands of player {} let go of body {:?} together", self.active_player, left_body);
+                        let (left, right) = self.release_dual_hand_hold(self.left_hand_grab, self.right_hand_grab);
                         self.left_hand_grab = left;
                         self.right_hand_grab = right;
                         return;
@@ -1749,6 +2338,16 @@ impl RapierScene {
         }
         self.left_hand_grab = self.apply_held_body_target(self.left_hand_grab);
         self.right_hand_grab = self.apply_held_body_target(self.right_hand_grab);
+    }
+
+    /// The hand left holding a two-handed hold carries the body on from where it is now (its
+    /// own offset from the grab would jump it from between the hands back to that hand).
+    fn rebased_hold(&self, mut hand: HandGrabState, body: RigidBodyHandle) -> HandGrabState {
+        if self.body_is_valid(body) {
+            hand.grab_offset = Pose::multiply(&hand.hold_frame.invert(), &self.body_pose(body));
+        }
+        eprintln!("[xr physics] holder: the other hand let go of body {:?}; {:?} of player {} holds it on alone", body, hand.shared_hand, self.active_player);
+        hand
     }
 
     fn drop_hand_hold(mut hand: HandGrabState) -> HandGrabState {
@@ -1764,24 +2363,25 @@ impl RapierScene {
         if !hand.tracked || !hand.gripping {
             return self.release_hand_hold(hand);
         }
-        let Some(body) = self.bodies.get_mut(body_handle) else {
-            hand.held_body = None;
-            return hand;
-        };
-        if !body.is_enabled() {
+        if !self.body_is_valid(body_handle) {
             hand.held_body = None;
             return hand;
         }
-        let target_pose = Pose::multiply(&hand.pose, &hand.grab_offset);
+        if !self.body_is_enabled(body_handle) {
+            hand.held_body = None;
+            return hand;
+        }
+        let target_pose = Pose::multiply(&hand.hold_frame, &hand.grab_offset);
         if !target_pose.is_finite() {
             return self.release_hand_hold(hand);
         }
-        if body.body_type() != RigidBodyType::KinematicPositionBased {
-            body.set_body_type(RigidBodyType::KinematicPositionBased, true);
-            body.set_position(rapier_pose(target_pose), false);
+        if self.body_type(body_handle) != BodyType::Kinematic {
+            b3body::body_set_type(&mut self.world, body_handle, BodyType::Kinematic);
+            teleport_body(&mut self.world, body_handle, target_pose);
+            zero_body_velocity(&mut self.world, body_handle);
         }
-        body.set_next_kinematic_position(rapier_pose(target_pose));
-        body.wake_up(true);
+        set_kinematic_target(&mut self.world, body_handle, target_pose, self.simulation_dt);
+        wake_body(&mut self.world, body_handle);
         hand
     }
 
@@ -1789,60 +2389,38 @@ impl RapierScene {
         let Some(body_handle) = primary.held_body else {
             return;
         };
-        let Some(body) = self.bodies.get_mut(body_handle) else {
-            self.left_hand_grab = Self::drop_hand_hold(self.left_hand_grab);
-            self.right_hand_grab = Self::drop_hand_hold(self.right_hand_grab);
-            return;
-        };
-        if !body.is_enabled() {
+        if !self.body_is_valid(body_handle) {
             self.left_hand_grab = Self::drop_hand_hold(self.left_hand_grab);
             self.right_hand_grab = Self::drop_hand_hold(self.right_hand_grab);
             return;
         }
-        let primary_single_target = Pose::multiply(&primary.pose, &primary.grab_offset);
-        let primary_anchor_local = primary.grab_offset.invert().position;
-        let secondary_anchor_local = secondary.grab_offset.invert().position;
-        let local_anchor_delta = secondary_anchor_local - primary_anchor_local;
-        let world_hand_delta = secondary.pose.position - primary.pose.position;
-        let target_pose = if local_anchor_delta.length() >= XR_HAND_DUAL_GRAB_MIN_SPAN
-            && world_hand_delta.length() >= XR_HAND_DUAL_GRAB_MIN_SPAN
-        {
-            let baseline_world_delta = primary_single_target
-                .orientation
-                .rotate_vec3(&local_anchor_delta);
-            let orientation = Quat::multiply(
-                &quat_from_to(baseline_world_delta, world_hand_delta),
-                &primary_single_target.orientation,
-            );
-            let primary_world_anchor = orientation.rotate_vec3(&primary_anchor_local);
-            let secondary_world_anchor = orientation.rotate_vec3(&secondary_anchor_local);
-            let position = ((primary.pose.position - primary_world_anchor)
-                + (secondary.pose.position - secondary_world_anchor))
-                * 0.5;
-            Pose::new(orientation, position)
-        } else {
-            primary_single_target
-        };
+        if !self.body_is_enabled(body_handle) {
+            self.left_hand_grab = Self::drop_hand_hold(self.left_hand_grab);
+            self.right_hand_grab = Self::drop_hand_hold(self.right_hand_grab);
+            return;
+        }
+        let target_pose = xr_two_hand_hold_pose(primary.hold_frame, primary.grab_offset, secondary.hold_frame, secondary.grab_offset);
         if !target_pose.is_finite() {
-            let _ = body;
             let (left, right) =
                 self.release_dual_hand_hold(self.left_hand_grab, self.right_hand_grab);
             self.left_hand_grab = left;
             self.right_hand_grab = right;
             return;
         }
-        if body.body_type() != RigidBodyType::KinematicPositionBased {
-            body.set_body_type(RigidBodyType::KinematicPositionBased, true);
-            body.set_position(rapier_pose(target_pose), false);
+        if self.body_type(body_handle) != BodyType::Kinematic {
+            b3body::body_set_type(&mut self.world, body_handle, BodyType::Kinematic);
+            teleport_body(&mut self.world, body_handle, target_pose);
+            zero_body_velocity(&mut self.world, body_handle);
         }
-        body.set_next_kinematic_position(rapier_pose(target_pose));
-        body.wake_up(true);
+        set_kinematic_target(&mut self.world, body_handle, target_pose, self.simulation_dt);
+        wake_body(&mut self.world, body_handle);
     }
 
     fn release_hand_hold(&mut self, mut hand: HandGrabState) -> HandGrabState {
         let Some(body_handle) = hand.held_body.take() else {
             return hand;
         };
+        eprintln!("[xr physics] holder: {:?} of player {} releases body {:?} at {:.2} m/s", hand.shared_hand, self.active_player, body_handle, hand.linvel.length());
         self.release_body_into_dynamics(
             body_handle,
             hand.linvel * XR_HAND_GRAB_RELEASE_LINEAR_VELOCITY_SCALE,
@@ -1892,7 +2470,8 @@ impl RapierScene {
         slots: &[HandColliderBody],
         other_held_body: Option<RigidBodyHandle>,
     ) -> HandGrabState {
-        if !hand.tracked || !hand.gripping || hand.held_body.is_some() {
+        // only a grab that began a moment ago takes a body (holds begin on a grab event)
+        if !hand.tracked || !hand.gripping || hand.held_body.is_some() || hand.lost_steps > 0 || hand.grip_steps > XR_GRAB_ACQUIRE_STEPS {
             return hand;
         }
 
@@ -1902,18 +2481,18 @@ impl RapierScene {
                 continue;
             }
             let shared_candidate = other_held_body == Some(cube.body);
-            if self.shadow_body_motion.contains_key(&cube.body) {
+            if self.shadow_body_motion.contains_key(&body_key(cube.body)) {
                 continue;
             }
-            let Some(body) = self.bodies.get(cube.body) else {
-                continue;
-            };
-            if !body.is_enabled() {
+            if !self.body_is_valid(cube.body) {
                 continue;
             }
-            let body_type = body.body_type();
-            if !(body_type == RigidBodyType::Dynamic
-                || (shared_candidate && body_type == RigidBodyType::KinematicPositionBased))
+            if !self.body_is_enabled(cube.body) {
+                continue;
+            }
+            let body_type = self.body_type(cube.body);
+            if !(body_type == BodyType::Dynamic
+                || (shared_candidate && body_type == BodyType::Kinematic))
             {
                 continue;
             }
@@ -1925,7 +2504,14 @@ impl RapierScene {
             if distance > XR_HAND_GRAB_MAX_DISTANCE {
                 continue;
             }
-            if !shared_candidate && !self.cube_has_hand_contact(cube, slots) {
+            // a body the other hand holds is joined (a two-handed hold) only by this hand's own
+            // grab on it: an idle hand's grasp value, noisy, took it whenever it flickered on
+            // near the cube (the cube jumped to the middle of both hands and back). (A held body
+            // is kinematic: no contacts with the hand's colliders, so the reach is its distance.)
+            if shared_candidate && distance > XR_HAND_SHARED_GRAB_MAX_DISTANCE {
+                continue;
+            }
+            if !shared_candidate && distance > XR_HAND_GRAB_REACH_WITHOUT_CONTACT && !self.cube_has_hand_contact(cube, slots) {
                 continue;
             }
             if best_candidate
@@ -1939,24 +2525,29 @@ impl RapierScene {
         let Some((_, body_handle, body_pose, body_anchor_local)) = best_candidate else {
             return hand;
         };
-        hand.grab_offset = grab_offset_from_body_anchor(hand.pose, body_pose, body_anchor_local);
+        // the body's grabbed surface point goes to the grip point, and from then on it rides the
+        // hold frame rigidly
+        let at_grip = Pose::multiply(&hand.pose, &grab_offset_from_body_anchor(hand.pose, body_pose, body_anchor_local));
+        hand.grab_offset = Pose::multiply(&hand.hold_frame.invert(), &at_grip);
         hand.held_body = Some(body_handle);
+        eprintln!("[xr physics] holder: {:?} of player {} grabs body {:?} ({} steps into the grab){}", hand.shared_hand, self.active_player, body_handle, hand.grip_steps,
+            if other_held_body == Some(body_handle) { ": the other hand holds it too, a two-handed hold" } else { "" });
         self.release_settle_state(body_handle);
-        let target_pose = Pose::multiply(&hand.pose, &hand.grab_offset);
+        let target_pose = Pose::multiply(&hand.hold_frame, &hand.grab_offset);
         if !target_pose.is_finite() {
             hand.held_body = None;
             hand.grab_offset = Pose::default();
             return hand;
         }
         if other_held_body != Some(body_handle) {
-            if let Some(body) = self.bodies.get_mut(body_handle) {
-                body.set_body_type(RigidBodyType::KinematicPositionBased, true);
-                body.set_position(rapier_pose(target_pose), false);
-                body.set_next_kinematic_position(rapier_pose(target_pose));
-                body.wake_up(true);
+            if self.body_is_valid(body_handle) {
+                b3body::body_set_type(&mut self.world, body_handle, BodyType::Kinematic);
+                teleport_body(&mut self.world, body_handle, target_pose);
+                zero_body_velocity(&mut self.world, body_handle);
+                wake_body(&mut self.world, body_handle);
             }
-        } else if let Some(body) = self.bodies.get_mut(body_handle) {
-            body.wake_up(true);
+        } else if self.body_is_valid(body_handle) {
+            wake_body(&mut self.world, body_handle);
         }
         hand
     }
@@ -1966,16 +2557,49 @@ impl RapierScene {
         cube: &PhysicsCube,
         hand_pose: Pose,
     ) -> Option<(f32, Pose, Vec3f)> {
-        let body = self.bodies.get(cube.body)?;
-        let collider = self.colliders.get(cube.collider)?;
-        let body_pose = makepad_pose(body.position());
-        let surface_projection = collider.shape().project_point(
-            collider.position(),
-            rapier_vec3(hand_pose.position),
-            false,
-        );
-        let world_anchor = makepad_vec3(surface_projection.point);
-        let body_anchor_local = body_pose.invert().transform_vec3(&world_anchor);
+        if !self.body_is_valid(cube.body) {
+            return None;
+        }
+        let body_pose = self.body_pose(cube.body);
+        // Project the hand point onto the shape boundary (like the old
+        // engine's solid=false point projection: points inside the shape
+        // still project onto the surface).
+        let local_point = body_pose.invert().transform_vec3(&hand_pose.position);
+        let body_anchor_local = if cube.is_sphere {
+            let radius = cube.half_extents.x.max(0.0005);
+            let length = local_point.length();
+            if length > 1.0e-6 {
+                local_point * (radius / length)
+            } else {
+                vec3f(radius, 0.0, 0.0)
+            }
+        } else {
+            let h = cube.half_extents;
+            let clamped = vec3f(
+                local_point.x.clamp(-h.x, h.x),
+                local_point.y.clamp(-h.y, h.y),
+                local_point.z.clamp(-h.z, h.z),
+            );
+            if clamped != local_point {
+                // Outside: clamping is the boundary projection.
+                clamped
+            } else {
+                // Inside: push to the nearest face.
+                let dx = h.x - local_point.x.abs();
+                let dy = h.y - local_point.y.abs();
+                let dz = h.z - local_point.z.abs();
+                let mut projected = local_point;
+                if dx <= dy && dx <= dz {
+                    projected.x = h.x * local_point.x.signum();
+                } else if dy <= dz {
+                    projected.y = h.y * local_point.y.signum();
+                } else {
+                    projected.z = h.z * local_point.z.signum();
+                }
+                projected
+            }
+        };
+        let world_anchor = body_pose.transform_vec3(&body_anchor_local);
         let distance = (world_anchor - hand_pose.position).length();
         (distance.is_finite() && body_anchor_local.is_finite()).then_some((
             distance,
@@ -1984,19 +2608,19 @@ impl RapierScene {
         ))
     }
 
-    fn cube_contact_colliders(
+    fn cube_contact_bodies(
         &self,
         cube: &PhysicsCube,
-    ) -> [Option<ColliderHandle>; XR_MAX_DEPTH_QUERY_KEYS_PER_CUBE] {
-        let mut colliders = [None; XR_MAX_DEPTH_QUERY_KEYS_PER_CUBE];
-        colliders[0] = Some(cube.collider);
+    ) -> [Option<RigidBodyHandle>; XR_MAX_DEPTH_QUERY_KEYS_PER_CUBE] {
+        let mut bodies = [None; XR_MAX_DEPTH_QUERY_KEYS_PER_CUBE];
+        bodies[0] = Some(cube.body);
         for (slot, support_index) in cube.linked_support_bodies.iter().flatten().enumerate() {
-            colliders[slot + 1] = self
+            bodies[slot + 1] = self
                 .linked_support_bodies
                 .get(*support_index)
-                .map(|support| support.collider);
+                .map(|support| support.body);
         }
-        colliders
+        bodies
     }
 
     fn cube_depth_query_keys(
@@ -2006,7 +2630,7 @@ impl RapierScene {
         let mut keys = [None; XR_MAX_DEPTH_QUERY_KEYS_PER_CUBE];
         keys[0] = cube
             .depth_query_surface_set
-            .map(RapierScene::depth_query_key);
+            .map(PhysicsScene::depth_query_key);
         for (slot, support_index) in cube.linked_support_bodies.iter().flatten().enumerate() {
             keys[slot + 1] = self
                 .linked_support_bodies
@@ -2014,7 +2638,7 @@ impl RapierScene {
                 .and_then(|support| {
                     support
                         .depth_query_surface_set
-                        .map(RapierScene::depth_query_key)
+                        .map(PhysicsScene::depth_query_key)
                 });
         }
         keys
@@ -2061,16 +2685,13 @@ impl RapierScene {
             support.suspension_length = support.rest_length;
             support.previous_suspension_length = support.rest_length;
             self.linked_support_bodies[*support_index] = support;
-            if let Some(body) = self.bodies.get_mut(support.body) {
-                body.set_enabled(true);
-                body.set_body_type(RigidBodyType::KinematicPositionBased, false);
-                body.set_position(rapier_pose(support_pose), false);
-                body.set_next_kinematic_position(rapier_pose(support_pose));
-                body.set_linvel(rapier_vec3(linvel), false);
-                body.set_angvel(rapier_vec3(angvel), false);
-                body.reset_forces(false);
-                body.reset_torques(false);
-                body.wake_up(true);
+            if self.body_is_valid(support.body) {
+                set_body_enabled(&mut self.world, support.body, true);
+                b3body::body_set_type(&mut self.world, support.body, BodyType::Kinematic);
+                teleport_body(&mut self.world, support.body, support_pose);
+                b3body::body_set_linear_velocity(&mut self.world, support.body, b3_vec3(linvel));
+                b3body::body_set_angular_velocity(&mut self.world, support.body, b3_vec3(angvel));
+                wake_body(&mut self.world, support.body);
             }
         }
     }
@@ -2080,10 +2701,10 @@ impl RapierScene {
         cube: PhysicsCube,
     ) -> [Option<Pose>; XR_MAX_LINKED_SUPPORT_BODIES_PER_CUBE] {
         let mut local_poses = [None; XR_MAX_LINKED_SUPPORT_BODIES_PER_CUBE];
-        let Some(owner_body) = self.bodies.get(cube.body) else {
+        if !self.body_is_valid(cube.body) {
             return local_poses;
-        };
-        let owner_pose = makepad_pose(owner_body.position());
+        }
+        let owner_pose = self.body_pose(cube.body);
         let owner_inverse = owner_pose.invert();
         let inverse_scale = vec3f(
             if cube.scale.x.abs() > 1.0e-6 {
@@ -2106,13 +2727,10 @@ impl RapierScene {
             let Some(support) = self.linked_support_bodies.get(*support_index).copied() else {
                 continue;
             };
-            let Some(support_body) = self.bodies.get(support.body) else {
-                continue;
-            };
-            if !support_body.is_enabled() {
+            if !self.body_is_valid(support.body) || !self.body_is_enabled(support.body) {
                 continue;
             }
-            let support_pose = makepad_pose(support_body.position());
+            let support_pose = self.body_pose(support.body);
             let mut local_pose = Pose::multiply(&owner_inverse, &support_pose);
             local_pose.position = vec3f(
                 local_pose.position.x * inverse_scale.x,
@@ -2157,63 +2775,48 @@ impl RapierScene {
             let Some(support) = self.linked_support_bodies.get(*support_index).copied() else {
                 continue;
             };
-            if let Some(body) = self.bodies.get_mut(support.body) {
-                body.set_enabled(false);
-                body.set_linvel(RapierVector::ZERO, false);
-                body.set_angvel(RapierVector::ZERO, false);
-                body.reset_forces(false);
-                body.reset_torques(false);
+            if self.body_is_valid(support.body) {
+                zero_body_velocity(&mut self.world, support.body);
+                set_body_enabled(&mut self.world, support.body, false);
             }
-            if let Some(collider) = self.colliders.get_mut(support.collider) {
-                collider.set_enabled(false);
+            if collider_is_enabled(&self.world, support.collider) {
+                set_collider_enabled(&mut self.world, support.collider, false);
             }
         }
     }
 
     fn cube_has_hand_contact(&self, cube: &PhysicsCube, slots: &[HandColliderBody]) -> bool {
-        self.cube_contact_colliders(cube)
-            .into_iter()
-            .flatten()
-            .any(|cube_collider| {
-                self.narrow_phase
-                    .contact_pairs_with(cube_collider)
-                    .any(|pair| {
-                        pair.has_any_active_contact()
-                            && slots.iter().any(|slot| {
-                                self.colliders
-                                    .get(slot.collider)
-                                    .map(|collider| collider.is_enabled())
-                                    .unwrap_or(false)
-                                    && (pair.collider1 == slot.collider
-                                        || pair.collider2 == slot.collider)
-                            })
+        for body in self.cube_contact_bodies(cube).into_iter().flatten() {
+            let mut found = false;
+            self.for_each_touching_contact(body, &mut |_own, other| {
+                if !found
+                    && slots.iter().any(|slot| {
+                        slot.collider == other && collider_is_enabled(&self.world, slot.collider)
                     })
-            })
+                {
+                    found = true;
+                }
+            });
+            if found {
+                return true;
+            }
+        }
+        false
     }
 
     fn cube_settle_contact_state(&self, cube: &PhysicsCube) -> SettleContactState {
         let mut state = SettleContactState::default();
-        for cube_collider in self.cube_contact_colliders(cube).into_iter().flatten() {
-            for pair in self.narrow_phase.contact_pairs_with(cube_collider) {
-                if !pair.has_any_active_contact() {
-                    continue;
-                }
+        for body in self.cube_contact_bodies(cube).into_iter().flatten() {
+            self.for_each_touching_contact(body, &mut |_own, other| {
                 state.has_active_contact = true;
-                let other = if pair.collider1 == cube_collider {
-                    pair.collider2
-                } else {
-                    pair.collider1
-                };
-                let Some(other_collider) = self.colliders.get(other) else {
-                    continue;
-                };
-                if let Some(role) = decode_depth_query_surface_role(other_collider.user_data) {
+                let user_data = b3shape::shape_get_user_data(&self.world, other);
+                if let Some(role) = decode_depth_query_surface_role(user_data) {
                     state.has_depth_query_contact = true;
                     if role == DepthQueryColliderRole::Support {
                         state.has_support_contact = true;
                     }
                 }
-            }
+            });
         }
         state
     }
@@ -2234,32 +2837,20 @@ impl RapierScene {
     pub(crate) fn snapshot_active_contacts(&self, contacts: &mut Vec<(WidgetUid, WidgetUid)>) {
         contacts.clear();
         for cube in &self.cubes {
-            let Some(body) = self.bodies.get(cube.body) else {
-                continue;
-            };
-            if !body.is_enabled() {
+            if !self.body_is_valid(cube.body) || !self.body_is_enabled(cube.body) {
                 continue;
             }
-            for cube_collider in self.cube_contact_colliders(cube).into_iter().flatten() {
-                for pair in self.narrow_phase.contact_pairs_with(cube_collider) {
-                    if !pair.has_any_active_contact() {
-                        continue;
-                    }
-                    let Some(other_uid) =
-                        self.widget_uid_for_collider(if pair.collider1 == cube_collider {
-                            pair.collider2
-                        } else {
-                            pair.collider1
-                        })
-                    else {
-                        continue;
+            for body in self.cube_contact_bodies(cube).into_iter().flatten() {
+                self.for_each_touching_contact(body, &mut |_own, other| {
+                    let Some(other_uid) = self.widget_uid_for_collider(other) else {
+                        return;
                     };
                     let a = cube.widget_uid;
                     let b = other_uid;
                     if a.0 < b.0 {
                         contacts.push((a, b));
                     }
-                }
+                });
             }
         }
         contacts.sort_unstable_by_key(|(a, b)| (a.0, b.0));
@@ -2267,12 +2858,12 @@ impl RapierScene {
     }
 
     fn release_settle_state(&mut self, body_handle: RigidBodyHandle) {
-        self.settle_frame_counts.remove(&body_handle);
+        self.settle_frame_counts.remove(&body_key(body_handle));
     }
 
     fn release_drive_state(&mut self, body_handle: RigidBodyHandle) {
-        self.body_drive_motion.remove(&body_handle);
-        self.actively_driven_bodies.remove(&body_handle);
+        self.body_drive_motion.remove(&body_key(body_handle));
+        self.actively_driven_bodies.remove(&body_key(body_handle));
     }
 
     fn release_body_into_dynamics(
@@ -2281,46 +2872,47 @@ impl RapierScene {
         linvel: Vec3f,
         angvel: Vec3f,
     ) {
-        self.shadow_body_motion.remove(&body_handle);
+        self.shadow_body_motion.remove(&body_key(body_handle));
         self.release_drive_state(body_handle);
         self.release_settle_state(body_handle);
-        let Some(body) = self.bodies.get_mut(body_handle) else {
+        if !self.body_is_valid(body_handle) {
             return;
-        };
-        if body.body_type() != RigidBodyType::Dynamic {
-            body.set_body_type(RigidBodyType::Dynamic, true);
         }
-        body.set_linvel(rapier_vec3(linvel), true);
-        body.set_angvel(rapier_vec3(angvel), true);
-        body.wake_up(true);
+        if self.body_type(body_handle) != BodyType::Dynamic {
+            b3body::body_set_type(&mut self.world, body_handle, BodyType::Dynamic);
+        }
+        b3body::body_set_linear_velocity(&mut self.world, body_handle, b3_vec3(linvel));
+        b3body::body_set_angular_velocity(&mut self.world, body_handle, b3_vec3(angvel));
+        wake_body(&mut self.world, body_handle);
     }
 
     fn clear_held_body(&mut self, body_handle: RigidBodyHandle) {
         self.release_drive_state(body_handle);
         self.release_settle_state(body_handle);
-        if self.left_hand_grab.held_body == Some(body_handle) {
-            self.left_hand_grab = self.release_hand_hold(self.left_hand_grab);
-        }
-        if self.right_hand_grab.held_body == Some(body_handle) {
-            self.right_hand_grab = self.release_hand_hold(self.right_hand_grab);
-        }
+        self.for_each_rig(|s| {
+            if s.left_hand_grab.held_body == Some(body_handle) {
+                s.left_hand_grab = s.release_hand_hold(s.left_hand_grab);
+            }
+            if s.right_hand_grab.held_body == Some(body_handle) {
+                s.right_hand_grab = s.release_hand_hold(s.right_hand_grab);
+            }
+        });
     }
 
     pub(crate) fn held_by_for_body(&self, body_handle: RigidBodyHandle) -> Option<XrSharedHand> {
-        if self.left_hand_grab.held_body == Some(body_handle) {
-            Some(self.left_hand_grab.shared_hand)
-        } else if self.right_hand_grab.held_body == Some(body_handle) {
-            Some(self.right_hand_grab.shared_hand)
-        } else {
-            None
-        }
+        self.body_held_by_any(body_handle).map(|(_, hand)| hand)
+    }
+
+    /// The player holding `body_handle`, if any.
+    pub(crate) fn held_by_player_for_body(&self, body_handle: RigidBodyHandle) -> Option<u32> {
+        self.body_held_by_any(body_handle).map(|(player, _)| player)
     }
 
     pub(crate) fn shadow_body_motion_for_body(
         &self,
         body_handle: RigidBodyHandle,
     ) -> Option<(Vec3f, Vec3f)> {
-        let motion = self.shadow_body_motion.get(&body_handle)?;
+        let motion = self.shadow_body_motion.get(&body_key(body_handle))?;
         if motion.remaining_prediction_seconds > 0.0 {
             Some((motion.linvel, motion.angvel))
         } else {
@@ -2329,7 +2921,7 @@ impl RapierScene {
     }
 
     pub(crate) fn is_shadow_body(&self, body_handle: RigidBodyHandle) -> bool {
-        self.shadow_body_motion.contains_key(&body_handle)
+        self.shadow_body_motion.contains_key(&body_key(body_handle))
     }
 
     fn settle_resting_bodies(&mut self) {
@@ -2337,50 +2929,45 @@ impl RapierScene {
         let angular_speed_sq = XR_BODY_SNAP_SLEEP_ANGULAR_SPEED * XR_BODY_SNAP_SLEEP_ANGULAR_SPEED;
         let mut to_sleep = Vec::new();
         let mut to_reset = Vec::new();
+        let mut to_wake = Vec::new();
 
-        for cube in &self.cubes {
+        for cube_index in 0..self.cubes.len() {
+            let cube = self.cubes[cube_index];
             if !matches!(cube.body_kind, XrBodyKind::Dynamic) {
                 continue;
             }
-            if self.left_hand_grab.held_body == Some(cube.body)
-                || self.right_hand_grab.held_body == Some(cube.body)
-            {
+            if self.body_held_by_any(cube.body).is_some() {
                 to_reset.push(cube.body);
                 continue;
             }
-            let contact_state = self.cube_settle_contact_state(cube);
+            let contact_state = self.cube_settle_contact_state(&cube);
             if !contact_state.has_active_contact {
                 to_reset.push(cube.body);
                 continue;
             }
-            if self.actively_driven_bodies.contains(&cube.body) {
+            if self.actively_driven_bodies.contains(&body_key(cube.body)) {
                 to_reset.push(cube.body);
                 continue;
             }
-            let has_hand_contact = self.cube_has_hand_contact(cube, &self.left_hand)
-                || self.cube_has_hand_contact(cube, &self.right_hand);
+            let has_hand_contact = self.cube_has_any_hand_contact(&cube);
 
-            let Some(body) = self.bodies.get(cube.body) else {
-                to_reset.push(cube.body);
-                continue;
-            };
-            let body_type = body.body_type();
-            let body_is_sleeping = body.is_sleeping();
-            let linvel = body.linvel();
-            let angvel = body.angvel();
-            if body_type != RigidBodyType::Dynamic {
+            if !self.body_is_valid(cube.body) {
                 to_reset.push(cube.body);
                 continue;
             }
-            if body_is_sleeping {
+            if !self.body_is_dynamic(cube.body) {
+                to_reset.push(cube.body);
+                continue;
+            }
+            if self.body_is_sleeping(cube.body) {
                 if has_hand_contact {
-                    if let Some(body) = self.bodies.get_mut(cube.body) {
-                        body.wake_up(true);
-                    }
+                    to_wake.push(cube.body);
                 }
                 to_reset.push(cube.body);
                 continue;
             }
+            let linvel = self.body_linvel(cube.body);
+            let angvel = self.body_angvel(cube.body);
 
             let linvel_sq = linvel.x * linvel.x + linvel.y * linvel.y + linvel.z * linvel.z;
             let angvel_sq = angvel.x * angvel.x + angvel.y * angvel.y + angvel.z * angvel.z;
@@ -2390,7 +2977,7 @@ impl RapierScene {
             if allow_settle && linvel_sq <= linear_speed_sq && angvel_sq <= angular_speed_sq {
                 let frames = self
                     .settle_frame_counts
-                    .entry(cube.body)
+                    .entry(body_key(cube.body))
                     .and_modify(|frames| *frames = frames.saturating_add(1))
                     .or_insert(1);
                 if *frames >= XR_BODY_SNAP_SLEEP_SETTLE_FRAMES {
@@ -2401,13 +2988,15 @@ impl RapierScene {
             }
         }
 
+        for handle in to_wake {
+            wake_body(&mut self.world, handle);
+        }
         for handle in to_reset {
             self.release_settle_state(handle);
         }
         for handle in to_sleep {
-            if let Some(body) = self.bodies.get_mut(handle) {
-                body.set_linvel(RapierVector::ZERO, false);
-                body.set_angvel(RapierVector::ZERO, false);
+            if self.body_is_valid(handle) {
+                zero_body_velocity(&mut self.world, handle);
             }
             self.release_settle_state(handle);
         }
@@ -2434,22 +3023,17 @@ impl RapierScene {
             return;
         };
         if cube.linked_support_bodies.iter().any(Option::is_some) {
-            // Let Rapier consume the newly inserted suspension joints before we park the pooled body.
+            // Let the engine settle the freshly spawned support rig before we park the pooled body.
             self.step();
         }
         self.spawn_pool_cube_indices.push(cube_index);
-        self.shadow_body_motion.remove(&cube.body);
+        self.shadow_body_motion.remove(&body_key(cube.body));
         self.release_drive_state(cube.body);
-        if let Some(body) = self.bodies.get_mut(cube.body) {
-            body.set_enabled(false);
-            body.set_linvel(RapierVector::ZERO, false);
-            body.set_angvel(RapierVector::ZERO, false);
-            body.reset_forces(false);
-            body.reset_torques(false);
+        if self.body_is_valid(cube.body) {
+            zero_body_velocity(&mut self.world, cube.body);
+            set_body_enabled(&mut self.world, cube.body, false);
         }
-        if let Some(collider) = self.colliders.get_mut(cube.collider) {
-            collider.set_enabled(false);
-        }
+        set_collider_enabled(&mut self.world, cube.collider, false);
         self.disable_cube_linked_support_bodies(cube);
         self.sync_linked_support_bodies();
     }
@@ -2472,7 +3056,7 @@ impl RapierScene {
             return [None; XR_MAX_DEPTH_QUERY_KEYS_PER_CUBE];
         };
         self.clear_held_body(cube.body);
-        self.shadow_body_motion.remove(&cube.body);
+        self.shadow_body_motion.remove(&body_key(cube.body));
         self.release_drive_state(cube.body);
         self.release_settle_state(cube.body);
         if let Some(vehicle_index) = self.vehicle_index_for_body(cube.body) {
@@ -2483,22 +3067,20 @@ impl RapierScene {
             vehicle.brake_input = 0.0;
             vehicle.airtime = 0.0;
         }
-        if let Some(body) = self.bodies.get_mut(cube.body) {
-            body.set_enabled(true);
-            body.set_position(rapier_pose(pose), false);
+        if self.body_is_valid(cube.body) {
+            set_body_enabled(&mut self.world, cube.body, true);
+            teleport_body(&mut self.world, cube.body, pose);
             if shadow {
                 let remaining_prediction_seconds = if matches!(mode, XrSharedObjectMode::Sleeping) {
                     0.0
                 } else {
                     XR_SHADOW_BODY_MAX_EXTRAPOLATION_SECONDS
                 };
-                body.set_body_type(RigidBodyType::KinematicPositionBased, true);
-                body.set_next_kinematic_position(rapier_pose(pose));
-                body.set_linvel(RapierVector::ZERO, false);
-                body.set_angvel(RapierVector::ZERO, false);
-                body.wake_up(true);
+                b3body::body_set_type(&mut self.world, cube.body, BodyType::Kinematic);
+                zero_body_velocity(&mut self.world, cube.body);
+                wake_body(&mut self.world, cube.body);
                 self.shadow_body_motion.insert(
-                    cube.body,
+                    body_key(cube.body),
                     ShadowBodyMotion {
                         pose,
                         linvel,
@@ -2509,31 +3091,41 @@ impl RapierScene {
             } else {
                 match mode {
                     XrSharedObjectMode::ContactDominated { .. } => {
-                        body.set_body_type(RigidBodyType::KinematicPositionBased, true);
-                        body.set_next_kinematic_position(rapier_pose(pose));
-                        body.set_linvel(RapierVector::ZERO, false);
-                        body.set_angvel(RapierVector::ZERO, false);
-                        body.wake_up(true);
+                        b3body::body_set_type(&mut self.world, cube.body, BodyType::Kinematic);
+                        zero_body_velocity(&mut self.world, cube.body);
+                        wake_body(&mut self.world, cube.body);
                     }
                     XrSharedObjectMode::Dynamic => {
-                        body.set_body_type(RigidBodyType::Dynamic, true);
-                        body.set_linvel(rapier_vec3(linvel), true);
-                        body.set_angvel(rapier_vec3(angvel), true);
-                        body.wake_up(true);
+                        b3body::body_set_type(&mut self.world, cube.body, BodyType::Dynamic);
+                        b3body::body_set_linear_velocity(
+                            &mut self.world,
+                            cube.body,
+                            b3_vec3(linvel),
+                        );
+                        b3body::body_set_angular_velocity(
+                            &mut self.world,
+                            cube.body,
+                            b3_vec3(angvel),
+                        );
+                        wake_body(&mut self.world, cube.body);
                     }
                     XrSharedObjectMode::Sleeping => {
-                        body.set_body_type(RigidBodyType::Dynamic, true);
-                        body.set_linvel(rapier_vec3(linvel), false);
-                        body.set_angvel(rapier_vec3(angvel), false);
+                        b3body::body_set_type(&mut self.world, cube.body, BodyType::Dynamic);
+                        b3body::body_set_linear_velocity(
+                            &mut self.world,
+                            cube.body,
+                            b3_vec3(linvel),
+                        );
+                        b3body::body_set_angular_velocity(
+                            &mut self.world,
+                            cube.body,
+                            b3_vec3(angvel),
+                        );
                     }
                 }
             }
-            body.reset_forces(false);
-            body.reset_torques(false);
         }
-        if let Some(collider) = self.colliders.get_mut(cube.collider) {
-            collider.set_enabled(true);
-        }
+        set_collider_enabled(&mut self.world, cube.collider, true);
         self.sync_cube_linked_support_body_poses(cube, pose, linvel, angvel);
         self.sync_linked_support_bodies();
         self.cube_depth_query_keys(cube)
@@ -2555,17 +3147,22 @@ impl RapierScene {
         };
         self.release_drive_state(cube.body);
         self.release_settle_state(cube.body);
-        if self.shadow_body_motion.contains_key(&cube.body) {
+        if self.shadow_body_motion.contains_key(&body_key(cube.body)) {
             return false;
         }
-        let Some(body) = self.bodies.get_mut(cube.body) else {
-            return false;
-        };
-        if !body.is_enabled() || body.body_type() != RigidBodyType::Dynamic {
+        if !self.body_is_valid(cube.body) {
             return false;
         }
-        body.apply_impulse_at_point(rapier_vec3(impulse), rapier_vec3(point), true);
-        body.wake_up(true);
+        if !self.body_is_enabled(cube.body) || !self.body_is_dynamic(cube.body) {
+            return false;
+        }
+        b3body::body_apply_linear_impulse(
+            &mut self.world,
+            cube.body,
+            b3_vec3(impulse),
+            b3_pos(point),
+            true,
+        );
         true
     }
 
@@ -2585,18 +3182,20 @@ impl RapierScene {
         };
         self.release_drive_state(cube.body);
         self.release_settle_state(cube.body);
-        if self.shadow_body_motion.contains_key(&cube.body) {
+        if self.shadow_body_motion.contains_key(&body_key(cube.body)) {
             return false;
         }
-        let Some(body) = self.bodies.get_mut(cube.body) else {
-            return false;
-        };
-        if !body.is_enabled() || body.body_type() != RigidBodyType::Dynamic {
+        if !self.body_is_valid(cube.body) {
             return false;
         }
-        body.add_force(rapier_vec3(force), true);
-        body.add_torque(rapier_vec3(torque), true);
-        body.wake_up(true);
+        if !self.body_is_enabled(cube.body) || !self.body_is_dynamic(cube.body) {
+            return false;
+        }
+        // Note: the old engine's add_force persisted until reset; box3d
+        // forces apply to the next step only. Wrench senders re-issue every
+        // frame, so the behavior matches in practice.
+        b3body::body_apply_force_to_center(&mut self.world, cube.body, b3_vec3(force), true);
+        b3body::body_apply_torque(&mut self.world, cube.body, b3_vec3(torque), true);
         true
     }
 
@@ -2625,34 +3224,28 @@ impl RapierScene {
             return false;
         }
         self.release_settle_state(cube.body);
-        if self.shadow_body_motion.contains_key(&cube.body) {
+        if self.shadow_body_motion.contains_key(&body_key(cube.body)) {
             return false;
         }
-        let (physical_linvel, physical_angvel) = {
-            let Some(body) = self.bodies.get(cube.body) else {
-                return false;
-            };
-            if !body.is_enabled() || body.body_type() != RigidBodyType::Dynamic {
-                return false;
-            }
-            let linvel = body.linvel();
-            let angvel = body.angvel();
-            (
-                vec3f(linvel.x, linvel.y, linvel.z),
-                vec3f(angvel.x, angvel.y, angvel.z),
-            )
-        };
+        if !self.body_is_valid(cube.body) {
+            return false;
+        }
+        if !self.body_is_enabled(cube.body) || !self.body_is_dynamic(cube.body) {
+            return false;
+        }
+        let physical_linvel = self.body_linvel(cube.body);
+        let physical_angvel = self.body_angvel(cube.body);
         let dt = dt.max(1.0 / 480.0);
-        let drive_motion =
-            self.body_drive_motion
-                .get(&cube.body)
-                .copied()
-                .unwrap_or(BodyDriveMotion {
-                    linvel: physical_linvel,
-                    angvel: physical_angvel,
-                    max_linear_accel: max_linear_accel.max(0.0),
-                    max_angular_accel: max_angular_accel.max(0.0),
-                });
+        let drive_motion = self
+            .body_drive_motion
+            .get(&body_key(cube.body))
+            .copied()
+            .unwrap_or(BodyDriveMotion {
+                linvel: physical_linvel,
+                angvel: physical_angvel,
+                max_linear_accel: max_linear_accel.max(0.0),
+                max_angular_accel: max_angular_accel.max(0.0),
+            });
         let mut current_linvel = drive_motion.linvel;
         let current_angvel = drive_motion.angvel;
 
@@ -2675,7 +3268,7 @@ impl RapierScene {
             target_planar_speed > 0.001 || next_planar_speed > 0.001 || next_angular_speed > 0.001;
         if drive_is_active {
             self.body_drive_motion.insert(
-                cube.body,
+                body_key(cube.body),
                 BodyDriveMotion {
                     linvel: next_linvel,
                     angvel: next_angvel,
@@ -2683,17 +3276,14 @@ impl RapierScene {
                     max_angular_accel: max_angular_accel.max(0.0),
                 },
             );
-            self.actively_driven_bodies.insert(cube.body);
+            self.actively_driven_bodies.insert(body_key(cube.body));
         } else {
-            self.body_drive_motion.remove(&cube.body);
-            self.actively_driven_bodies.remove(&cube.body);
+            self.body_drive_motion.remove(&body_key(cube.body));
+            self.actively_driven_bodies.remove(&body_key(cube.body));
         }
-        let Some(body) = self.bodies.get_mut(cube.body) else {
-            return false;
-        };
-        body.set_linvel(rapier_vec3(next_linvel), true);
-        body.set_angvel(rapier_vec3(next_angvel), true);
-        body.wake_up(true);
+        b3body::body_set_linear_velocity(&mut self.world, cube.body, b3_vec3(next_linvel));
+        b3body::body_set_angular_velocity(&mut self.world, cube.body, b3_vec3(next_angvel));
+        wake_body(&mut self.world, cube.body);
         true
     }
 
@@ -2710,19 +3300,14 @@ impl RapierScene {
             return [None; XR_MAX_DEPTH_QUERY_KEYS_PER_CUBE];
         };
         self.clear_held_body(cube.body);
-        self.shadow_body_motion.remove(&cube.body);
+        self.shadow_body_motion.remove(&body_key(cube.body));
         self.release_drive_state(cube.body);
         self.release_settle_state(cube.body);
-        if let Some(body) = self.bodies.get_mut(cube.body) {
-            body.set_enabled(false);
-            body.set_linvel(RapierVector::ZERO, false);
-            body.set_angvel(RapierVector::ZERO, false);
-            body.reset_forces(false);
-            body.reset_torques(false);
+        if self.body_is_valid(cube.body) {
+            zero_body_velocity(&mut self.world, cube.body);
+            set_body_enabled(&mut self.world, cube.body, false);
         }
-        if let Some(collider) = self.colliders.get_mut(cube.collider) {
-            collider.set_enabled(false);
-        }
+        set_collider_enabled(&mut self.world, cube.collider, false);
         self.disable_cube_linked_support_bodies(cube);
         self.sync_linked_support_bodies();
         self.cube_depth_query_keys(cube)
@@ -2733,82 +3318,82 @@ impl RapierScene {
         set_index: usize,
         targets: &[Option<DepthQuerySurfaceTarget>; XR_DEPTH_QUERY_SURFACES_PER_PROBE],
     ) {
-        let Some(surface_set) = self.depth_query_surface_sets.get_mut(set_index) else {
+        let Some(surface_set) = self.depth_query_surface_sets.get(set_index) else {
             return;
         };
-        let query_body_enabled = self
-            .bodies
-            .get(surface_set.query_body)
-            .map(|body| body.is_enabled())
-            .unwrap_or(false);
-        if self
-            .shadow_body_motion
-            .contains_key(&surface_set.owner_body)
-            || !query_body_enabled
-        {
-            surface_set.targets = [None; XR_DEPTH_QUERY_SURFACES_PER_PROBE];
-            for surface in &surface_set.surfaces {
-                if let Some(collider) = self.colliders.get_mut(surface.collider) {
-                    collider.set_enabled(false);
-                }
+        let depth_query_filter_key = surface_set.depth_query_filter_key;
+        let owner_body = surface_set.owner_body;
+        let query_body = surface_set.query_body;
+        let query_radius = surface_set.query_radius;
+        let surfaces = surface_set.surfaces;
+
+        let query_body_enabled = self.body_is_valid(query_body) && self.body_is_enabled(query_body);
+        if self.shadow_body_motion.contains_key(&body_key(owner_body)) || !query_body_enabled {
+            for surface in &surfaces {
+                set_collider_enabled(&mut self.world, surface.collider, false);
             }
+            self.depth_query_surface_sets[set_index].targets =
+                [None; XR_DEPTH_QUERY_SURFACES_PER_PROBE];
             return;
         }
-        let body_position = self
-            .bodies
-            .get(surface_set.query_body)
-            .map(|body| makepad_pose(body.position()).position)
-            .unwrap_or(vec3f(0.0, 0.0, 0.0));
-        let body_velocity = self
-            .bodies
-            .get(surface_set.query_body)
-            .map(|body| {
-                let linvel = body.linvel();
-                vec3f(linvel.x, linvel.y, linvel.z)
-            })
-            .unwrap_or(vec3f(0.0, 0.0, 0.0));
-        let physics_edge_margin = (surface_set.query_radius * 0.08).clamp(0.002, 0.008);
-        for (index, (surface, target)) in surface_set
-            .surfaces
-            .iter_mut()
-            .zip(targets.iter())
-            .enumerate()
-        {
+        let body_position = if self.body_is_valid(query_body) {
+            self.body_pose(query_body).position
+        } else {
+            vec3f(0.0, 0.0, 0.0)
+        };
+        let body_velocity = if self.body_is_valid(query_body) {
+            self.body_linvel(query_body)
+        } else {
+            vec3f(0.0, 0.0, 0.0)
+        };
+        let physics_edge_margin = (query_radius * 0.08).clamp(0.002, 0.008);
+        for (index, target) in targets.iter().enumerate() {
+            let surface = surfaces[index];
             let Some(target) = target else {
-                if let Some(collider) = self.colliders.get_mut(surface.collider) {
-                    collider.set_enabled(false);
-                }
-                surface.fingerprint = 0;
-                surface_set.targets[index] = None;
+                set_collider_enabled(&mut self.world, surface.collider, false);
+                self.depth_query_surface_sets[set_index].surfaces[index].fingerprint = 0;
+                self.depth_query_surface_sets[set_index].targets[index] = None;
                 continue;
             };
-            if let Some(collider) = self.colliders.get_mut(surface.collider) {
-                let DepthQueryColliderGeometry::HalfSpace(plane) = target.collider.geometry;
-                let supports_body = depth_query_surface_target_should_enable(
-                    *target,
-                    body_position,
-                    body_velocity,
-                    surface_set.query_radius,
-                    physics_edge_margin,
+            if !b3world::shape_is_valid(&self.world, surface.collider) {
+                continue;
+            }
+            let DepthQueryColliderGeometry::HalfSpace(plane) = target.collider.geometry;
+            let supports_body = depth_query_surface_target_should_enable(
+                *target,
+                body_position,
+                body_velocity,
+                query_radius,
+                physics_edge_margin,
+            );
+            if surface.fingerprint != target.collider.fingerprint {
+                // Reposition the slab so its top face lies on the plane
+                // (the old engine mutated an infinite half-space shape here).
+                let slab_pose = depth_query_surface_slab_pose(
+                    plane.point,
+                    plane.normal,
+                    XR_DEPTH_QUERY_SURFACE_SLAB_HALF_THICKNESS,
                 );
-                if surface.fingerprint != target.collider.fingerprint {
-                    collider.set_shape(SharedShape::halfspace(rapier_vec3(plane.normal)));
-                    collider.set_position_wrt_parent(RapierPose::from_parts(
-                        rapier_vec3(plane.point),
-                        RapierRotation::IDENTITY,
-                    ));
-                    surface.fingerprint = target.collider.fingerprint;
-                }
-                collider.user_data = depth_query_surface_user_data(
-                    surface_set.depth_query_filter_key,
-                    target.collider.role,
-                );
-                collider.set_restitution(target.collider.restitution.max(0.0));
-                collider.set_enabled(supports_body);
-                surface_set.targets[index] = supports_body.then_some(*target);
-                if supports_body {
-                    self.depth_query_stats.surface_count += 1;
-                }
+                let surface_body = b3shape::shape_get_body(&self.world, surface.collider);
+                teleport_body(&mut self.world, surface_body, slab_pose);
+                self.depth_query_surface_sets[set_index].surfaces[index].fingerprint =
+                    target.collider.fingerprint;
+            }
+            b3shape::shape_set_user_data(
+                &mut self.world,
+                surface.collider,
+                depth_query_surface_user_data(depth_query_filter_key, target.collider.role),
+            );
+            b3shape::shape_set_restitution(
+                &mut self.world,
+                surface.collider,
+                target.collider.restitution.max(0.0),
+            );
+            set_collider_enabled(&mut self.world, surface.collider, supports_body);
+            self.depth_query_surface_sets[set_index].targets[index] =
+                supports_body.then_some(*target);
+            if supports_body {
+                self.depth_query_stats.surface_count += 1;
             }
         }
     }

@@ -1,11 +1,20 @@
 pub mod draw_cube;
+pub mod draw_fxaa;
 pub mod draw_glyph;
+pub mod draw_nv12;
+pub mod draw_nv12_pack;
 pub mod draw_pbr;
 pub mod draw_quad;
 pub mod draw_rotated_text;
+pub mod draw_sploded_hairline;
 pub mod draw_svg;
 pub mod draw_svg_glyph;
 pub mod draw_text;
 pub mod draw_text_3d;
 pub mod draw_vector;
 pub mod sdf;
+pub mod video_color;
+pub mod finish;
+pub mod surface;
+#[cfg(test)]
+mod frag_depth_tests;

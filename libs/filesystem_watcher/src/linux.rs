@@ -1,4 +1,4 @@
-use crate::{FileSystemEvent, FileSystemEventKind, WatchCallback, WatchRoot};
+use crate::{Emitter, ExcludePolicy, FileSystemEventKind, RescanReason, WatchRoot};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::fs;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const O_NONBLOCK: c_int = 0o00004000;
 const O_CLOEXEC: c_int = 0o2000000;
@@ -24,6 +24,8 @@ const IN_CREATE: u32 = 0x0000_0100;
 const IN_DELETE: u32 = 0x0000_0200;
 const IN_DELETE_SELF: u32 = 0x0000_0400;
 const IN_MOVE_SELF: u32 = 0x0000_0800;
+const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+const IN_IGNORED: u32 = 0x0000_8000;
 const IN_ISDIR: u32 = 0x4000_0000;
 
 #[repr(C)]
@@ -40,33 +42,78 @@ unsafe extern "C" {
     fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+    fn eventfd(initval: u32, flags: c_int) -> c_int;
+    fn poll(fds: *mut PollFd, nfds: std::os::raw::c_ulong, timeout: c_int) -> c_int;
 }
+
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+const POLLIN: i16 = 1;
 
 pub struct PlatformWatcher {
     stop: Arc<AtomicBool>,
+    /// an eventfd `stop` writes to: the watcher thread sleeps in poll() on it and the inotify fd
+    /// (-1: none could be made, the thread looks at `stop` every 80 ms)
+    wake: RawFd,
     thread: Option<JoinHandle<()>>,
 }
 
 impl PlatformWatcher {
-    pub fn start(roots: Vec<WatchRoot>, on_event: WatchCallback) -> Result<Self, String> {
+    pub fn start(roots: Vec<WatchRoot>, emitter: Arc<Emitter>) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
+        // Fail synchronously when inotify itself is unavailable, and install
+        // every watch before returning: the caller is watching from here.
+        let mut table = WatchTable::new(roots, emitter.exclude().clone())?;
+        let mounts: Vec<String> = table.roots.keys().cloned().collect();
+        for mount in mounts {
+            let _ = table.rescan_mount(&mount);
+        }
 
+        let wake = unsafe { eventfd(0, O_NONBLOCK | O_CLOEXEC) };
         let thread = thread::Builder::new()
             .name("fswatch-linux".to_string())
-            .spawn(move || run_loop(roots, stop_thread, on_event))
-            .map_err(|err| format!("failed to spawn linux watcher thread: {}", err))?;
+            .spawn(move || run_loop(table, stop_thread, wake, emitter))
+            .map_err(|err| {
+                if wake >= 0 {
+                    unsafe { close(wake) };
+                }
+                format!("failed to spawn linux watcher thread: {}", err)
+            })?;
 
         Ok(Self {
             stop,
+            wake,
             thread: Some(thread),
         })
     }
 
+    /// A backend that watches nothing; `stop` is a no-op.
+    pub fn idle() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            wake: -1,
+            thread: None,
+        }
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if self.wake >= 0 {
+            let one = 1u64;
+            let _ = unsafe { write(self.wake, &one as *const u64 as *const c_void, 8) };
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+        if self.wake >= 0 {
+            let _ = unsafe { close(self.wake) };
+            self.wake = -1;
         }
     }
 }
@@ -74,12 +121,13 @@ impl PlatformWatcher {
 struct WatchTable {
     fd: RawFd,
     roots: HashMap<String, PathBuf>,
+    exclude: ExcludePolicy,
     wd_to_entry: HashMap<i32, (String, PathBuf)>,
     path_to_wd: HashMap<PathBuf, i32>,
 }
 
 impl WatchTable {
-    fn new(roots: Vec<WatchRoot>) -> Result<Self, String> {
+    fn new(roots: Vec<WatchRoot>, exclude: ExcludePolicy) -> Result<Self, String> {
         let fd = unsafe { inotify_init1(O_NONBLOCK | O_CLOEXEC) };
         if fd < 0 {
             return Err(format!(
@@ -96,6 +144,7 @@ impl WatchTable {
         Ok(Self {
             fd,
             roots: root_map,
+            exclude,
             wd_to_entry: HashMap::new(),
             path_to_wd: HashMap::new(),
         })
@@ -114,12 +163,14 @@ impl WatchTable {
         }
     }
 
+    /// Reconcile the watch coverage of one root with the directories that
+    /// exist now: stale watches go, missing ones are added.
     fn rescan_mount(&mut self, mount: &str) -> Result<(), String> {
-        let Some(root) = self.roots.get(mount) else {
+        let Some(root) = self.roots.get(mount).cloned() else {
             return Ok(());
         };
         let mut dirs = Vec::new();
-        collect_dirs(root, &mut dirs);
+        collect_dirs(&root, &self.exclude, &mut dirs);
         let wanted: HashSet<PathBuf> = dirs.into_iter().collect();
 
         let stale: Vec<PathBuf> = self
@@ -185,17 +236,80 @@ impl WatchTable {
     }
 }
 
-fn run_loop(roots: Vec<WatchRoot>, stop: Arc<AtomicBool>, on_event: WatchCallback) {
-    let Ok(mut table) = WatchTable::new(roots) else {
-        return;
-    };
+/// One decoded inotify record, before rename pairing.
+struct Decoded {
+    mount: String,
+    path: PathBuf,
+    mask: u32,
+    cookie: u32,
+}
 
-    let mounts: Vec<String> = table.roots.keys().cloned().collect();
-    for mount in mounts {
-        let _ = table.rescan_mount(&mount);
+/// Map one `read` worth of decoded records to events, in kernel order.
+/// `IN_MOVED_FROM` / `IN_MOVED_TO` with the same cookie pair into
+/// `Renamed`; identical (mount, path, kind) repeats within the read collapse
+/// to one through a hash set.
+fn classify(records: &[Decoded]) -> Vec<(String, PathBuf, FileSystemEventKind, Option<bool>)> {
+    let mut out: Vec<(String, PathBuf, FileSystemEventKind, Option<bool>)> = Vec::new();
+    let mut seen: HashSet<(String, PathBuf, u8)> = HashSet::new();
+    let mut consumed = vec![false; records.len()];
+    for i in 0..records.len() {
+        if consumed[i] {
+            continue;
+        }
+        let record = &records[i];
+        let is_dir = Some(record.mask & IN_ISDIR != 0);
+        let kind = if record.mask & IN_MOVED_FROM != 0 {
+            let pair = (i + 1..records.len()).find(|&j| {
+                !consumed[j]
+                    && records[j].mask & IN_MOVED_TO != 0
+                    && records[j].cookie == record.cookie
+                    && records[j].mount == record.mount
+            });
+            match pair {
+                Some(j) => {
+                    consumed[j] = true;
+                    out.push((
+                        record.mount.clone(),
+                        records[j].path.clone(),
+                        FileSystemEventKind::Renamed {
+                            from: record.path.clone(),
+                        },
+                        Some(records[j].mask & IN_ISDIR != 0),
+                    ));
+                    continue;
+                }
+                None => FileSystemEventKind::Removed,
+            }
+        } else if record.mask & IN_MOVED_TO != 0 {
+            FileSystemEventKind::Created
+        } else if record.mask & IN_CREATE != 0 {
+            FileSystemEventKind::Created
+        } else if record.mask & (IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF) != 0 {
+            FileSystemEventKind::Removed
+        } else if record.mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB) != 0 {
+            FileSystemEventKind::Changed
+        } else {
+            continue;
+        };
+        let tag = match kind {
+            FileSystemEventKind::Changed => 0u8,
+            FileSystemEventKind::Created => 1,
+            FileSystemEventKind::Removed => 2,
+            FileSystemEventKind::Renamed { .. } => 3,
+            FileSystemEventKind::RescanRequired { .. } => 4,
+        };
+        if seen.insert((record.mount.clone(), record.path.clone(), tag)) {
+            out.push((record.mount.clone(), record.path.clone(), kind, is_dir));
+        }
     }
+    out
+}
 
+fn run_loop(mut table: WatchTable, stop: Arc<AtomicBool>, wake: RawFd, emitter: Arc<Emitter>) {
     let mut buffer = vec![0u8; 64 * 1024];
+    // Wall-clock of the last successful read: the lower bound of the
+    // interval an overflow may have lost.
+    let mut last_read_ok = SystemTime::now();
     while !stop.load(Ordering::Relaxed) {
         let read_len = unsafe { read(table.fd, buffer.as_mut_ptr() as *mut c_void, buffer.len()) };
         if read_len < 0 {
@@ -203,7 +317,13 @@ fn run_loop(roots: Vec<WatchRoot>, stop: Arc<AtomicBool>, on_event: WatchCallbac
             if err.kind() != std::io::ErrorKind::WouldBlock {
                 thread::sleep(Duration::from_millis(20));
             } else {
-                thread::sleep(Duration::from_millis(80));
+                // nothing to read: sleep until there is (or `stop` wakes it), no polling
+                let mut fds = [
+                    PollFd { fd: table.fd, events: POLLIN, revents: 0 },
+                    PollFd { fd: wake, events: POLLIN, revents: 0 },
+                ];
+                let n = if wake >= 0 { 2 } else { 1 };
+                let _ = unsafe { poll(fds.as_mut_ptr(), n, if wake >= 0 { -1 } else { 80 }) };
             }
             continue;
         }
@@ -213,7 +333,8 @@ fn run_loop(roots: Vec<WatchRoot>, stop: Arc<AtomicBool>, on_event: WatchCallbac
         }
 
         let mut touched_mounts = HashSet::new();
-        let mut changed_paths = Vec::<(String, PathBuf)>::new();
+        let mut overflow = false;
+        let mut records = Vec::<Decoded>::new();
         let mut offset = 0usize;
         let end = read_len as usize;
         while offset + size_of::<InotifyEvent>() <= end {
@@ -223,26 +344,70 @@ fn run_loop(roots: Vec<WatchRoot>, stop: Arc<AtomicBool>, on_event: WatchCallbac
             let name_end = (offset + name_len).min(end);
             let name_bytes = &buffer[offset..name_end];
             offset = name_end;
+            if event.mask & IN_Q_OVERFLOW != 0 {
+                overflow = true;
+                continue;
+            }
+            if event.mask & IN_IGNORED != 0 {
+                continue;
+            }
             if let Some((mount, watched_dir)) = table.wd_to_entry.get(&event.wd) {
                 let changed_path = changed_path_for_event(watched_dir, name_bytes);
-                push_unique_change(&mut changed_paths, mount.clone(), changed_path);
+                records.push(Decoded {
+                    mount: mount.clone(),
+                    path: changed_path,
+                    mask: event.mask,
+                    cookie: event.cookie,
+                });
                 if event_requires_rescan(event.mask) {
                     touched_mounts.insert(mount.clone());
                 }
             }
         }
 
+        if overflow {
+            // Events were lost, possibly directory creations: rebuild the
+            // watch coverage of every root before saying so, and bound the
+            // interval the consumer must reconcile.
+            let now = SystemTime::now();
+            let roots: Vec<(String, PathBuf)> = table
+                .roots
+                .iter()
+                .map(|(mount, path)| (mount.clone(), path.clone()))
+                .collect();
+            for (mount, _) in &roots {
+                let _ = table.rescan_mount(mount);
+            }
+            for (mount, root) in roots {
+                emitter.emit(
+                    mount,
+                    root.clone(),
+                    FileSystemEventKind::RescanRequired {
+                        root,
+                        reason: RescanReason::Overflow,
+                        missing: Some((last_read_ok, now)),
+                    },
+                    Some(true),
+                );
+            }
+            touched_mounts.clear();
+        }
+
         for mount in touched_mounts {
             let _ = table.rescan_mount(&mount);
         }
 
-        for (mount, path) in changed_paths {
-            on_event(FileSystemEvent {
-                mount,
-                path,
-                kind: FileSystemEventKind::Changed,
-            });
+        for (mount, path, kind, is_dir) in classify(&records) {
+            let excluded = table
+                .roots
+                .get(&mount)
+                .is_some_and(|root| table.exclude.excludes(root, &path, is_dir == Some(true)));
+            if excluded {
+                continue;
+            }
+            emitter.emit(mount, path, kind, is_dir);
         }
+        last_read_ok = SystemTime::now();
     }
 
     table.close_all();
@@ -267,17 +432,7 @@ fn changed_path_for_event(watched_dir: &Path, name_bytes: &[u8]) -> PathBuf {
     )))
 }
 
-fn push_unique_change(changes: &mut Vec<(String, PathBuf)>, mount: String, path: PathBuf) {
-    if changes
-        .iter()
-        .any(|(existing_mount, existing_path)| existing_mount == &mount && existing_path == &path)
-    {
-        return;
-    }
-    changes.push((mount, path));
-}
-
-fn collect_dirs(root: &Path, out: &mut Vec<PathBuf>) {
+fn collect_dirs(root: &Path, exclude: &ExcludePolicy, out: &mut Vec<PathBuf>) {
     if !root.is_dir() {
         return;
     }
@@ -296,11 +451,11 @@ fn collect_dirs(root: &Path, out: &mut Vec<PathBuf>) {
             if !file_type.is_dir() || file_type.is_symlink() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" || name == "target" {
+            let child = entry.path();
+            if exclude.excludes_dir(root, &child) {
                 continue;
             }
-            stack.push(entry.path());
+            stack.push(child);
         }
     }
 }
@@ -308,6 +463,15 @@ fn collect_dirs(root: &Path, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decoded(path: &str, mask: u32, cookie: u32) -> Decoded {
+        Decoded {
+            mount: "m".into(),
+            path: PathBuf::from(path),
+            mask,
+            cookie,
+        }
+    }
 
     #[test]
     fn file_event_path_uses_directory_and_name() {
@@ -328,5 +492,55 @@ mod tests {
         assert!(event_requires_rescan(IN_DELETE_SELF));
         assert!(!event_requires_rescan(IN_CLOSE_WRITE));
         assert!(!event_requires_rescan(IN_MODIFY));
+    }
+
+    #[test]
+    fn masks_map_to_kinds_and_cookies_pair_renames() {
+        let out = classify(&[
+            decoded("/w/a.rs", IN_CREATE, 0),
+            decoded("/w/a.rs", IN_MODIFY, 0),
+            decoded("/w/a.rs", IN_MODIFY, 0),
+            decoded("/w/a.rs", IN_CLOSE_WRITE, 0),
+            decoded("/w/a.rs", IN_MOVED_FROM, 7),
+            decoded("/w/b.rs", IN_MOVED_TO, 7),
+            decoded("/w/c.rs", IN_MOVED_FROM, 9),
+            decoded("/w/d.rs", IN_MOVED_TO, 11),
+            decoded("/w/sub", IN_DELETE | IN_ISDIR, 0),
+        ]);
+        let kinds: Vec<_> = out.iter().map(|(_, p, k, d)| (p.clone(), k.clone(), *d)).collect();
+        assert_eq!(kinds[0], (PathBuf::from("/w/a.rs"), FileSystemEventKind::Created, Some(false)));
+        assert_eq!(kinds[1], (PathBuf::from("/w/a.rs"), FileSystemEventKind::Changed, Some(false)));
+        assert_eq!(
+            kinds[2],
+            (
+                PathBuf::from("/w/b.rs"),
+                FileSystemEventKind::Renamed {
+                    from: PathBuf::from("/w/a.rs")
+                },
+                Some(false)
+            )
+        );
+        assert_eq!(kinds[3], (PathBuf::from("/w/c.rs"), FileSystemEventKind::Removed, Some(false)));
+        assert_eq!(kinds[4], (PathBuf::from("/w/d.rs"), FileSystemEventKind::Created, Some(false)));
+        assert_eq!(kinds[5], (PathBuf::from("/w/sub"), FileSystemEventKind::Removed, Some(true)));
+        assert_eq!(kinds.len(), 6, "repeated IN_MODIFY within one read collapses");
+    }
+
+    #[test]
+    fn excluded_directories_are_never_walked() {
+        let dir = std::env::temp_dir().join(format!(
+            "fswatch-collect-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("target-wasm/debug")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        let mut dirs = Vec::new();
+        collect_dirs(&dir, &ExcludePolicy::default(), &mut dirs);
+        assert!(dirs.contains(&dir.join("src/deep")));
+        assert!(!dirs.iter().any(|d| d.starts_with(dir.join("target-wasm"))));
+        assert!(!dirs.iter().any(|d| d.starts_with(dir.join(".git"))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

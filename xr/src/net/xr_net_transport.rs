@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::clock::Instant;
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
@@ -8,7 +9,7 @@ use std::{
         mpsc, Arc,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Debug)]
@@ -252,6 +253,8 @@ struct XrNetUdpWorker {
     discovery_targets: Vec<SocketAddr>,
     discovery_interval: Duration,
     peer_timeout: Duration,
+    // (the browser never reaches the socket loops that read it)
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     poll_interval: Duration,
     bound_data_port: u16,
     bound_sync_port: u16,
@@ -285,6 +288,8 @@ impl XrNetUdpWorker {
             if should_break {
                 break;
             }
+            // Browser workers cannot create the UDP socket that reaches this loop.
+            #[cfg(not(target_arch = "wasm32"))]
             thread::sleep(self.poll_interval);
         }
 
@@ -644,6 +649,7 @@ impl XrNetUdpWorker {
 
 struct XrNetSyncWorker {
     node_id: XrNetPeerId,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     poll_interval: Duration,
     sync_listener: TcpListener,
     incoming_sender: mpsc::Sender<XrNetIncoming>,
@@ -690,6 +696,8 @@ impl XrNetSyncWorker {
             if should_break {
                 break;
             }
+            // Browser workers cannot create the TCP listener that reaches this loop.
+            #[cfg(not(target_arch = "wasm32"))]
             thread::sleep(self.poll_interval);
         }
 
