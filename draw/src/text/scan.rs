@@ -72,7 +72,9 @@ impl DrawText {
     pub fn scan_open_text(&self, cx: &mut Cx, scan: &ScanEvent) {
         self.text_style.ensure_fonts_loaded(cx);
         let Some(fonts) = cx.get_global_ref::<Rc<RefCell<Fonts>>>().cloned() else { return };
-        let family = fonts.borrow_mut().get_or_load_font_family(self.text_style.font_family_id());
+        let Some(family) = fonts.borrow_mut().get_or_load_font_family(self.text_style.font_family_id()) else {
+            return;
+        };
         for font in family.fonts() {
             scan.need_font_full(&font_hash(font.data().as_slice()));
         }
@@ -84,7 +86,9 @@ impl DrawText {
     pub fn scan_chars(&self, cx: &mut Cx, scan: &ScanEvent, chars: &str) {
         self.text_style.ensure_fonts_loaded(cx);
         let Some(fonts) = cx.get_global_ref::<Rc<RefCell<Fonts>>>().cloned() else { return };
-        let family = fonts.borrow_mut().get_or_load_font_family(self.text_style.font_family_id());
+        let Some(family) = fonts.borrow_mut().get_or_load_font_family(self.text_style.font_family_id()) else {
+            return;
+        };
         for font in family.fonts() {
             scan.need_glyphs(&font_hash(font.data().as_slice()), chars);
         }

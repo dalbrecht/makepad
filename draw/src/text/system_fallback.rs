@@ -75,7 +75,9 @@ impl SystemFallback {
         if !self.index_ready() {
             return false;
         }
-        let family = layouter.get_or_load_font_family(family_id);
+        let Some(family) = layouter.get_or_load_font_family(family_id) else {
+            return false;
+        };
         let Some(primary) = family.fonts().first() else {
             return false;
         };
