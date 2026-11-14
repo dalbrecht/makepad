@@ -1,4 +1,1008 @@
 import { WasmBridge } from "../makepad_wasm_bridge/wasm_bridge.js"
+import { MakepadA11y } from "./a11y.js"
+
+// The drawable has no pixel budget and no DPR ceiling of its own: the
+// canvas is the CSS size at the device's pixel ratio, bounded only by the
+// device's reported limits (MAX_TEXTURE_SIZE, MAX_RENDERBUFFER_SIZE,
+// MAX_VIEWPORT_DIMS). A page author can still choose a budget
+// (`renderpixelbudget`) or a ceiling (`maxdpr`) on the canvas. Nothing in
+// the runtime lowers it: an app scales its own targets on measured GPU time.
+export const MAKEPAD_WEBGL_PIXEL_BUDGET = Infinity;
+
+function makepad_positive_number(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+export function makepad_device_pixel_ratio(value) {
+    return makepad_positive_number(value, 1.0);
+}
+
+// Computes one uniform scale for both axes. CSS dimensions stay untouched;
+// only the drawable is reduced to fit the shared pixel and hardware limits.
+export function makepad_compute_webgl_size(
+    width,
+    height,
+    scale_ceiling,
+    limits = {},
+    pixel_budget = MAKEPAD_WEBGL_PIXEL_BUDGET,
+) {
+    const logical_width = Number.isFinite(Number(width)) && Number(width) > 0
+        ? Number(width)
+        : 0;
+    const logical_height = Number.isFinite(Number(height)) && Number(height) > 0
+        ? Number(height)
+        : 0;
+    const max_width = makepad_positive_number(limits.max_width, Number.MAX_SAFE_INTEGER);
+    const max_height = makepad_positive_number(limits.max_height, Number.MAX_SAFE_INTEGER);
+    const budget = Number(pixel_budget) > 0 ? Number(pixel_budget) : MAKEPAD_WEBGL_PIXEL_BUDGET;
+    let scale = Number(scale_ceiling) > 0 ? Number(scale_ceiling) : 1.0;
+
+    if (logical_width === 0 || logical_height === 0) {
+        return {
+            logical_width,
+            logical_height,
+            width: 0,
+            height: 0,
+            scale,
+        };
+    }
+
+    // Dividing the square roots avoids overflowing width * height for hostile
+    // or accidentally enormous inputs.
+    const budget_scale = Math.sqrt(budget)
+        / Math.sqrt(logical_width)
+        / Math.sqrt(logical_height);
+    scale = Math.min(
+        scale,
+        budget_scale,
+        max_width / logical_width,
+        max_height / logical_height,
+    );
+    if (!Number.isFinite(scale) || scale <= 0) {
+        return {
+            logical_width,
+            logical_height,
+            width: 0,
+            height: 0,
+            scale: 0,
+        };
+    }
+
+    // Flooring keeps rounding from crossing either the pixel or dimension
+    // ceiling. A visible dimension is kept drawable even for extreme aspect
+    // ratios, where exact aspect preservation is impossible at integer size.
+    const physical_width = Math.max(1, Math.min(max_width, Math.floor(logical_width * scale)));
+    const physical_height = Math.max(1, Math.min(max_height, Math.floor(logical_height * scale)));
+    return {
+        logical_width,
+        logical_height,
+        width: physical_width,
+        height: physical_height,
+        scale,
+    };
+}
+
+// GPU safety (local/agent_state/edits/reports/GPU-SAFETY.md). A page may at
+// worst lose its own context; it must never queue unbounded GPU work, hold a
+// GPU busy for longer than an operating system tolerates, or leak GPU memory
+// unnoticed. Nothing here refuses work or stops drawing, and nothing is a
+// guessed budget: the bounds come from the browser's own frame pipeline, the
+// operating systems' GPU watchdogs and the viewport.
+//
+// Watchdog: one fence per animation frame.
+// - Backpressure: while MAX_FRAMES_IN_FLIGHT frames (the depth of the
+//   browser's own swap chain) are unsignalled, the next animation frame
+//   waits instead of queueing more work, so queued GPU work never grows with
+//   time. The frame is delayed, never dropped.
+// - A frame the GPU ran for longer than HUNG_FRAME_MS (half of the
+//   shortest operating-system GPU watchdog, Windows' 2 s TDR, after which the
+//   driver resets the device for every application) is counted and
+//   reported (`hung_frames`, `worst_frame_ms`); the drawable is never
+//   changed for it. GPU-bound slowness is the app's to handle (it scales its
+//   own targets on measured GPU time).
+export const MAKEPAD_GPU_MAX_FRAMES_IN_FLIGHT = 3;
+export const MAKEPAD_GPU_HUNG_FRAME_MS = 1000;
+
+export function makepad_create_gpu_watchdog() {
+    return {
+        in_flight: [],
+        frames: 0,
+        held_frames: 0,
+        hung_frames: 0,
+        worst_ms: 0,
+    };
+}
+
+// Records one completed frame's latency (as seen running). Returns true for
+// a hung frame (longer than HUNG_FRAME_MS).
+export function makepad_gpu_watchdog_complete(watchdog, latency_ms) {
+    watchdog.frames += 1;
+    if (latency_ms > watchdog.worst_ms) {
+        watchdog.worst_ms = latency_ms;
+    }
+    if (latency_ms > MAKEPAD_GPU_HUNG_FRAME_MS) {
+        watchdog.hung_frames += 1;
+        return true;
+    }
+    return false;
+}
+
+// Ledger: live GPU bytes by object (textures, buffers, renderbuffers), kept
+// by wrapping the context's allocation calls. Accounting only, it never
+// refuses. It reports, once each, with what dominates:
+// - at least one texture allocated per animation frame, on average over two
+//   whole seconds in a row: a steady frame allocates nothing, so this is a target
+//   re-created per frame (a size that changes each frame) instead of reused;
+// - GL_OUT_OF_MEMORY, the driver's own allocation failure, with the live
+//   bytes at that moment.
+// `makepad_gpu_stats()` on the page gives the numbers to harnesses and the
+// export's browser-safety gate.
+export function makepad_gpu_texel_bytes(gl, internal_format, type) {
+    switch (internal_format) {
+        case gl.RGBA32F: case gl.RGBA32UI: case gl.RGBA32I: return 16;
+        case gl.RGB32F: return 12;
+        case gl.RGBA16F: case gl.RG32F: case gl.RGBA16UI: case gl.RGBA16I: case gl.RG32UI: return 8;
+        case gl.RGB16F: return 6;
+        case gl.R32F: case gl.RG16F: case gl.R32UI: case gl.R32I: case gl.RGB10_A2:
+        case gl.R11F_G11F_B10F: case gl.DEPTH_COMPONENT32F: case gl.DEPTH24_STENCIL8:
+        case gl.DEPTH_COMPONENT24: case gl.DEPTH32F_STENCIL8: return 4;
+        case gl.R16F: case gl.RG8: case gl.DEPTH_COMPONENT16: case gl.R16UI: return 2;
+        case gl.R8: case gl.R8UI: case gl.ALPHA: case gl.LUMINANCE: return 1;
+        default:
+            // RGBA8, SRGB8_ALPHA8 and the unsized formats, whose size the
+            // component type gives.
+            if (type === gl.FLOAT) return 16;
+            if (type === gl.HALF_FLOAT) return 8;
+            return 4;
+    }
+}
+
+export function makepad_create_gpu_ledger() {
+    return {
+        objects: new Map(),
+        bytes: { texture: 0, buffer: 0, renderbuffer: 0 },
+        peak_bytes: 0,
+        allocations: 0,
+        // The current one-second window: its start, animation frames and
+        // texture allocations (by size).
+        window_start: -1,
+        window_frames: 0,
+        window_textures: 0,
+        window_sizes: new Map(),
+        warned_churn: false,
+        warned_oom: false,
+    };
+}
+
+export function makepad_gpu_ledger_total(ledger) {
+    return ledger.bytes.texture + ledger.bytes.buffer + ledger.bytes.renderbuffer;
+}
+
+// Sets the bytes `object` (of `kind`) holds under `part` (a cube face or
+// mip level of a texture; 0 for buffers and renderbuffers).
+export function makepad_gpu_ledger_set(ledger, kind, object, part, bytes) {
+    if (!object || !Number.isFinite(bytes) || bytes < 0) {
+        return;
+    }
+    let entry = ledger.objects.get(object);
+    if (!entry) {
+        entry = { kind, parts: new Map(), bytes: 0 };
+        ledger.objects.set(object, entry);
+    }
+    const old = entry.parts.get(part) || 0;
+    entry.parts.set(part, bytes);
+    entry.bytes += bytes - old;
+    ledger.bytes[kind] += bytes - old;
+    ledger.allocations += 1;
+    const total = makepad_gpu_ledger_total(ledger);
+    if (total > ledger.peak_bytes) {
+        ledger.peak_bytes = total;
+    }
+    if (kind === "texture") {
+        ledger.window_textures += 1;
+        const size_key = `${Math.round(bytes / 1024)} KB`;
+        ledger.window_sizes.set(size_key, (ledger.window_sizes.get(size_key) || 0) + 1);
+    }
+}
+
+// Ends one animation frame at `now` (ms). `gl_error` is the context's
+// getError() for the frame (or 0); `report` takes one message.
+export function makepad_gpu_ledger_frame(ledger, now, gl_error, out_of_memory, report) {
+    if (ledger.window_start < 0) {
+        ledger.window_start = now;
+    }
+    ledger.window_frames += 1;
+    if (now - ledger.window_start >= 1000) {
+        // Two whole seconds in a row: a plate loading its targets in one
+        // burst (a few slow frames) is not a frame that allocates.
+        const churning = ledger.window_textures >= ledger.window_frames;
+        ledger.churn_seconds = churning ? (ledger.churn_seconds || 0) + 1 : 0;
+        if (!ledger.warned_churn && ledger.churn_seconds >= 2) {
+            ledger.warned_churn = true;
+            const common = [...ledger.window_sizes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
+                .map(([size, count]) => `${count}x ${size}`).join(", ");
+            report(`makepad: ${ledger.window_textures} textures allocated in ${ledger.window_frames} frames within a second (${common}): a render target re-created each frame (a size that changes every frame?) instead of reused`);
+        }
+        ledger.window_start = now;
+        ledger.window_frames = 0;
+        ledger.window_textures = 0;
+        ledger.window_sizes.clear();
+    }
+    if (gl_error === out_of_memory && out_of_memory !== undefined && !ledger.warned_oom) {
+        ledger.warned_oom = true;
+        const total = makepad_gpu_ledger_total(ledger);
+        report(`makepad: the GPU driver is out of memory (GL_OUT_OF_MEMORY) with ${Math.round(total / 1048576)} MB live on this page (textures ${Math.round(ledger.bytes.texture / 1048576)} MB, buffers ${Math.round(ledger.bytes.buffer / 1048576)} MB, renderbuffers ${Math.round(ledger.bytes.renderbuffer / 1048576)} MB, peak ${Math.round(ledger.peak_bytes / 1048576)} MB)`);
+    }
+}
+
+export function makepad_gpu_ledger_free(ledger, object) {
+    const entry = object && ledger.objects.get(object);
+    if (!entry) {
+        return;
+    }
+    ledger.bytes[entry.kind] -= entry.bytes;
+    ledger.objects.delete(object);
+}
+
+// A lost context took every object with it: nothing is live any more (the
+// peak stays, it is history).
+export function makepad_gpu_ledger_forget_all(ledger) {
+    ledger.objects.clear();
+    ledger.bytes.texture = 0;
+    ledger.bytes.buffer = 0;
+    ledger.bytes.renderbuffer = 0;
+}
+
+export function makepad_gpu_ledger_stats(ledger) {
+    let textures = 0;
+    for (const entry of ledger.objects.values()) {
+        if (entry.kind === "texture") textures += 1;
+    }
+    return {
+        live_bytes: makepad_gpu_ledger_total(ledger),
+        texture_bytes: ledger.bytes.texture,
+        buffer_bytes: ledger.bytes.buffer,
+        renderbuffer_bytes: ledger.bytes.renderbuffer,
+        live_textures: textures,
+        peak_bytes: ledger.peak_bytes,
+        allocations: ledger.allocations,
+    };
+}
+
+// Wraps `gl`'s allocation calls so `ledger` follows every live byte. The
+// wrapped calls behave exactly as before (the ledger never refuses).
+export function makepad_install_gpu_ledger(gl, ledger) {
+    const wrap = (name, before) => {
+        const original = gl[name];
+        if (typeof original !== "function") {
+            return;
+        }
+        gl[name] = function (...args) {
+            try {
+                before(args);
+            } catch (_error) {
+            }
+            return original.apply(gl, args);
+        };
+    };
+    const texture_binding = (target) => {
+        if (target === gl.TEXTURE_2D) return gl.getParameter(gl.TEXTURE_BINDING_2D);
+        if (target === gl.TEXTURE_3D) return gl.getParameter(gl.TEXTURE_BINDING_3D);
+        if (target === gl.TEXTURE_2D_ARRAY) return gl.getParameter(gl.TEXTURE_BINDING_2D_ARRAY);
+        if (target === gl.TEXTURE_CUBE_MAP || (target >= gl.TEXTURE_CUBE_MAP_POSITIVE_X && target <= gl.TEXTURE_CUBE_MAP_NEGATIVE_Z)) {
+            return gl.getParameter(gl.TEXTURE_BINDING_CUBE_MAP);
+        }
+        return null;
+    };
+    const buffer_binding = (target) => {
+        if (target === gl.ARRAY_BUFFER) return gl.getParameter(gl.ARRAY_BUFFER_BINDING);
+        if (target === gl.ELEMENT_ARRAY_BUFFER) return gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING);
+        if (target === gl.UNIFORM_BUFFER) return gl.getParameter(gl.UNIFORM_BUFFER_BINDING);
+        if (target === gl.PIXEL_PACK_BUFFER) return gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+        if (target === gl.PIXEL_UNPACK_BUFFER) return gl.getParameter(gl.PIXEL_UNPACK_BUFFER_BINDING);
+        if (target === gl.COPY_READ_BUFFER) return gl.getParameter(gl.COPY_READ_BUFFER_BINDING);
+        if (target === gl.COPY_WRITE_BUFFER) return gl.getParameter(gl.COPY_WRITE_BUFFER_BINDING);
+        return null;
+    };
+    // Mip levels below the base add a third (texStorage) or their own size.
+    wrap("texStorage2D", ([target, levels, format, width, height]) => {
+        const bytes = width * height * makepad_gpu_texel_bytes(gl, format, 0) * (levels > 1 ? 4 / 3 : 1);
+        const faces = target === gl.TEXTURE_CUBE_MAP ? 6 : 1;
+        makepad_gpu_ledger_set(ledger, "texture", texture_binding(target), "storage", bytes * faces);
+    });
+    wrap("texStorage3D", ([target, levels, format, width, height, depth]) => {
+        const bytes = width * height * depth * makepad_gpu_texel_bytes(gl, format, 0) * (levels > 1 ? 4 / 3 : 1);
+        makepad_gpu_ledger_set(ledger, "texture", texture_binding(target), "storage", bytes);
+    });
+    wrap("texImage2D", (args) => {
+        // The (target, level, internalformat, width, height, ...) forms;
+        // the DOM-source forms (6 arguments) take the source's size.
+        let [target, level, format, width, height] = args;
+        let type = args[7];
+        if (args.length === 6) {
+            const source = args[5];
+            width = source && (source.videoWidth || source.naturalWidth || source.width);
+            height = source && (source.videoHeight || source.naturalHeight || source.height);
+            type = args[4];
+        }
+        if (!Number.isFinite(width) || !Number.isFinite(height)) {
+            return;
+        }
+        const bytes = width * height * makepad_gpu_texel_bytes(gl, format, type);
+        makepad_gpu_ledger_set(ledger, "texture", texture_binding(target), `${target}:${level}`, bytes);
+    });
+    wrap("deleteTexture", ([texture]) => makepad_gpu_ledger_free(ledger, texture));
+    wrap("bufferData", ([target, data_or_size]) => {
+        const bytes = typeof data_or_size === "number" ? data_or_size : (data_or_size ? data_or_size.byteLength : 0);
+        makepad_gpu_ledger_set(ledger, "buffer", buffer_binding(target), 0, bytes);
+    });
+    wrap("deleteBuffer", ([buffer]) => makepad_gpu_ledger_free(ledger, buffer));
+    wrap("renderbufferStorage", ([_target, format, width, height]) => {
+        const bytes = width * height * makepad_gpu_texel_bytes(gl, format, 0);
+        makepad_gpu_ledger_set(ledger, "renderbuffer", gl.getParameter(gl.RENDERBUFFER_BINDING), 0, bytes);
+    });
+    wrap("renderbufferStorageMultisample", ([_target, samples, format, width, height]) => {
+        const bytes = width * height * makepad_gpu_texel_bytes(gl, format, 0) * Math.max(1, samples);
+        makepad_gpu_ledger_set(ledger, "renderbuffer", gl.getParameter(gl.RENDERBUFFER_BINDING), 0, bytes);
+    });
+    wrap("deleteRenderbuffer", ([renderbuffer]) => makepad_gpu_ledger_free(ledger, renderbuffer));
+}
+
+const MAKEPAD_CRASH_MAX_REPORTS = 20;
+const MAKEPAD_CRASH_POST_BYTES = 64 * 1024;
+const MAKEPAD_CRASH_GET_BYTES = 8 * 1024;
+const makepad_page_console = {};
+for (const level of ["log", "warn", "error"]) {
+    const method = typeof console !== "undefined" ? console[level] : undefined;
+    makepad_page_console[level] = typeof method === "function" ? method.bind(console) : () => {};
+}
+
+function makepad_json_replacer(_key, value) {
+    if (typeof value === "bigint") {
+        return value.toString();
+    }
+    if (value instanceof Error) {
+        return {
+            name: value.name,
+            message: value.message,
+            stack: value.stack || ""
+        };
+    }
+    if (typeof value === "function") {
+        return `[function ${value.name || "anonymous"}]`;
+    }
+    return value;
+}
+
+function makepad_safe_json(value) {
+    const seen = new WeakSet();
+    try {
+        const text = JSON.stringify(value, (key, item) => {
+            item = makepad_json_replacer(key, item);
+            if (item && typeof item === "object") {
+                if (seen.has(item)) {
+                    return "[circular]";
+                }
+                seen.add(item);
+            }
+            return item;
+        });
+        return text === undefined ? "null" : text;
+    } catch (_error) {
+        return JSON.stringify("[unserializable]");
+    }
+}
+
+function makepad_json_bytes(text) {
+    if (typeof TextEncoder !== "undefined") {
+        return new TextEncoder().encode(text).byteLength;
+    }
+    return unescape(encodeURIComponent(text)).length;
+}
+
+function makepad_console_text(parts) {
+    const values = Array.isArray(parts) ? parts : [parts];
+    return values.map(value => {
+        if (typeof value === "string") {
+            return value;
+        }
+        if (value instanceof Error) {
+            return value.stack || `${value.name}: ${value.message}`;
+        }
+        if (value && typeof value === "object") {
+            return makepad_safe_json(value);
+        }
+        try {
+            return String(value);
+        } catch (_error) {
+            return "[unprintable]";
+        }
+    }).join(" ").replace(/\s*\r?\n\s*/g, " ");
+}
+
+export function makepad_create_breadcrumb_ring(limit = 30, max_length = 300, started_at = Date.now()) {
+    const entries = [];
+    return {
+        push(level, parts, now = Date.now(), worker_index) {
+            try {
+                const entry = {
+                    ms: Math.max(0, Math.round(now - started_at)),
+                    level: String(level),
+                    text: makepad_console_text(parts).slice(0, max_length)
+                };
+                if (worker_index !== undefined && worker_index !== null) {
+                    entry.worker = worker_index;
+                }
+                entries.push(entry);
+                if (entries.length > limit) {
+                    entries.splice(0, entries.length - limit);
+                }
+            } catch (_error) {
+            }
+        },
+        snapshot() {
+            return entries.map(entry => ({ ...entry }));
+        }
+    };
+}
+
+function makepad_report_message(data) {
+    if (!data || typeof data !== "object") {
+        return data === undefined ? "" : String(data);
+    }
+    for (const key of ["message", "reason_message", "text", "error"]) {
+        if (data[key] !== undefined && data[key] !== null) {
+            return String(data[key]);
+        }
+    }
+    return "";
+}
+
+function makepad_report_stack(data) {
+    if (!data || typeof data !== "object") {
+        return "";
+    }
+    return String(data.stack || data.reason_stack || data.trap_stack || "");
+}
+
+export function makepad_report_key(kind, data) {
+    const stack_lines = makepad_report_stack(data)
+        .split("\n")
+        .map(line => line.trim())
+        .filter(Boolean);
+    const top_frame = stack_lines.find(line => /^(at\s|.*wasm-function|.*\.wasm(?:\?|:|$))/.test(line))
+        || stack_lines[1]
+        || stack_lines[0]
+        || "";
+    return `${kind}\n${makepad_report_message(data)}\n${top_frame}`;
+}
+
+export function makepad_create_report_gate(max_reports = MAKEPAD_CRASH_MAX_REPORTS) {
+    const seen = new Set();
+    let count = 0;
+    return {
+        accept(kind, data) {
+            const key = makepad_report_key(kind, data);
+            if (count >= max_reports || seen.has(key)) {
+                return false;
+            }
+            seen.add(key);
+            count += 1;
+            return true;
+        },
+        count() {
+            return count;
+        }
+    };
+}
+
+export function makepad_truncate_report(report, max_bytes = MAKEPAD_CRASH_GET_BYTES) {
+    const fits = value => makepad_json_bytes(value) <= max_bytes;
+    let candidate = { ...report };
+    let text = makepad_safe_json(candidate);
+    if (fits(text)) {
+        return text;
+    }
+
+    delete candidate.breadcrumbs;
+    text = makepad_safe_json(candidate);
+    if (fits(text)) {
+        return text;
+    }
+
+    const original_data = makepad_safe_json(candidate.data);
+    candidate.data = { truncated: true, text: "" };
+    let low = 0;
+    let high = original_data.length;
+    while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        candidate.data.text = original_data.slice(0, middle);
+        if (fits(makepad_safe_json(candidate))) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    candidate.data.text = original_data.slice(0, low);
+    text = makepad_safe_json(candidate);
+    if (fits(text)) {
+        return text;
+    }
+
+    candidate = {
+        v: report.v,
+        kind: String(report.kind || "").slice(0, 200),
+        app: String(report.app || "").slice(0, 200),
+        href: String(report.href || "").slice(0, 512),
+        user_agent: String(report.user_agent || "").slice(0, 512),
+        time: report.time,
+        wasm_memory_bytes: report.wasm_memory_bytes,
+        hardware_concurrency: report.hardware_concurrency,
+        has_thread_support: report.has_thread_support,
+        data: { truncated: true }
+    };
+    text = makepad_safe_json(candidate);
+    if (fits(text)) {
+        return text;
+    }
+    return makepad_safe_json({ v: 1, kind: "report.truncated", data: { truncated: true } });
+}
+
+function makepad_is_wasm_trap(kind, data) {
+    if (kind !== "window.error" && kind !== "window.unhandledrejection" && kind !== "startup.exception") {
+        return false;
+    }
+    const detail = `${makepad_report_message(data)}\n${makepad_report_stack(data)}`;
+    return /WebAssembly(?:\.|\s)|RuntimeError|wasm-function|\.wasm(?:\?|:|\b)|unreachable|memory access out of bounds|table index is out of bounds|null function/i.test(detail);
+}
+
+function makepad_create_crash_reporter() {
+    const breadcrumbs = makepad_create_breadcrumb_ring();
+    const gate = makepad_create_report_gate();
+    let wasm = null;
+    let page_hiding = false;
+    let pending_panic = null;
+    let dead = false;
+    let dead_error = null;
+    let suppressed_followups = 0;
+
+    const app_name = () => {
+        try {
+            return location.pathname.split("/").filter(Boolean)[0] || "";
+        } catch (_error) {
+            return "";
+        }
+    };
+
+    const memory_bytes = () => {
+        try {
+            const memory = wasm && (wasm._memory || (wasm.exports && wasm.exports.memory));
+            return memory && memory.buffer ? memory.buffer.byteLength : null;
+        } catch (_error) {
+            return null;
+        }
+    };
+
+    const thread_support = () => {
+        try {
+            if (wasm && typeof wasm._has_thread_support === "boolean") {
+                return wasm._has_thread_support;
+            }
+            return typeof SharedArrayBuffer !== "undefined"
+                && (typeof crossOriginIsolated === "undefined" || crossOriginIsolated === true);
+        } catch (_error) {
+            return false;
+        }
+    };
+
+    const build_payload = (kind, data) => ({
+        v: 1,
+        kind,
+        app: app_name(),
+        href: typeof location === "undefined" ? "" : String(location.href),
+        user_agent: typeof navigator === "undefined" ? "" : String(navigator.userAgent || ""),
+        time: Date.now(),
+        wasm_memory_bytes: memory_bytes(),
+        hardware_concurrency: typeof navigator !== "undefined" && Number.isFinite(navigator.hardwareConcurrency)
+            ? navigator.hardwareConcurrency
+            : null,
+        has_thread_support: thread_support(),
+        breadcrumbs: breadcrumbs.snapshot(),
+        data
+    });
+
+    // @section crash-upload
+    const fallback_get = async payload => {
+        try {
+            if (typeof fetch !== "function") {
+                return false;
+            }
+            const text = makepad_truncate_report(payload, MAKEPAD_CRASH_GET_BYTES);
+            await fetch('/$report_error?data=' + encodeURIComponent(text), { cache: 'no-store' });
+            return true;
+        } catch (_error) {
+            return false;
+        }
+    };
+    // @end crash-upload
+
+    const send = async (kind, data) => {
+        try {
+            // Keep one slot available for the terminal wasm.dead diagnostic.
+            if (kind !== "wasm.dead" && gate.count() >= MAKEPAD_CRASH_MAX_REPORTS - 1) {
+                return false;
+            }
+            if (!gate.accept(kind, data)) {
+                return false;
+            }
+            // @section crash-upload
+            const payload = build_payload(kind, data);
+            const text = makepad_truncate_report(payload, MAKEPAD_CRASH_POST_BYTES);
+            if (page_hiding && typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+                try {
+                    if (navigator.sendBeacon('/api/crash', new Blob([text], { type: 'application/json' }))) {
+                        return true;
+                    }
+                } catch (_error) {
+                }
+            }
+            if (typeof fetch !== "function") {
+                return false;
+            }
+            const response = await fetch('/api/crash', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: text,
+                keepalive: true,
+                cache: 'no-store'
+            });
+            if (response.status === 404 || response.status === 405) {
+                return fallback_get(payload);
+            }
+            return response.ok;
+            // @end crash-upload
+        } catch (_error) {
+            return false;
+        }
+    };
+
+    const take_pending_panic = () => {
+        if (!pending_panic || Date.now() - pending_panic.time > 1000) {
+            return null;
+        }
+        const panic = pending_panic;
+        pending_panic = null;
+        clearTimeout(panic.timer);
+        return panic;
+    };
+
+    const reporter = {
+        report(kind, data) {
+            try {
+                kind = String(kind || "unknown");
+                if (kind === "wasm.panic") {
+                    if (pending_panic) {
+                        clearTimeout(pending_panic.timer);
+                        void send("wasm.panic", pending_panic.data);
+                    }
+                    const panic = { data, time: Date.now(), timer: null };
+                    panic.timer = setTimeout(() => {
+                        if (pending_panic === panic) {
+                            pending_panic = null;
+                            void send("wasm.panic", data);
+                        }
+                    }, 1000);
+                    pending_panic = panic;
+                    return Promise.resolve(true);
+                }
+                if (makepad_is_wasm_trap(kind, data)) {
+                    // A build whose panics are plain traps (a published film)
+                    // names no message: the function and code offset look the
+                    // panic up in the build's symbol file.
+                    const site = /wasm-function\[(\d+)\]:0x([0-9a-f]+)/i.exec(makepad_report_stack(data));
+                    if (site) {
+                        console.error(`makepad: wasm trap in function ${site[1]} at 0x${site[2]} (see the build's film.symbols)`);
+                    }
+                    reporter.mark_wasm_dead(data);
+                    const panic = take_pending_panic();
+                    if (panic) {
+                        return send("wasm.panic", {
+                            ...panic.data,
+                            trap_message: makepad_report_message(data),
+                            trap_stack: makepad_report_stack(data)
+                        });
+                    }
+                }
+                return send(kind, data);
+            } catch (_error) {
+                return Promise.resolve(false);
+            }
+        },
+        set_wasm(next_wasm) {
+            try {
+                wasm = next_wasm;
+            } catch (_error) {
+            }
+        },
+        add_breadcrumb(level, parts, worker_index) {
+            breadcrumbs.push(level, parts, Date.now(), worker_index);
+        },
+        mark_wasm_dead(error) {
+            try {
+                if (dead) {
+                    return;
+                }
+                dead = true;
+                dead_error = {
+                    message: makepad_report_message(error),
+                    stack: makepad_report_stack(error)
+                };
+                setTimeout(() => {
+                    void send("wasm.dead", {
+                        suppressed_followups,
+                        first_trap: dead_error
+                    });
+                }, 2000);
+            } catch (_error) {
+            }
+        },
+        is_wasm_dead() {
+            return dead;
+        },
+        suppress_followup() {
+            if (dead) {
+                suppressed_followups += 1;
+            }
+        },
+        set_page_hiding(value) {
+            page_hiding = !!value;
+            if (page_hiding && pending_panic) {
+                const panic = pending_panic;
+                pending_panic = null;
+                clearTimeout(panic.timer);
+                void send("wasm.panic", panic.data);
+            }
+        }
+    };
+    return reporter;
+}
+
+export const makepad_crash_reporter = makepad_create_crash_reporter();
+
+if (typeof window !== "undefined") {
+    window.makepad_crash_reporter = makepad_crash_reporter;
+    for (const level of ["log", "warn", "error"]) {
+        try {
+            const original = console[level];
+            if (typeof original !== "function") {
+                continue;
+            }
+            console[level] = function (...parts) {
+                makepad_crash_reporter.add_breadcrumb(level, parts);
+                return original.apply(console, parts);
+            };
+        } catch (_error) {
+        }
+    }
+    window.addEventListener("pagehide", () => makepad_crash_reporter.set_page_hiding(true));
+    window.addEventListener("pageshow", () => makepad_crash_reporter.set_page_hiding(false));
+}
+
+// ---- audio output without threads
+// A module whose memory is not shared runs no wasm on the audio thread. The UI thread renders
+// the app's audio ahead of the device instead (MakepadAudioFifoOutput.pump, from a timer and
+// from every animation frame, never inside another wasm call) into a FIFO that a worklet
+// without wasm plays (makepad_audio_fifo_worklet). Each block carries when it will be heard,
+// so the app can show what is heard rather than what it rendered last. The export's trace
+// host (wasm-export trace/src/audio.rs) runs the same pump with these constants.
+
+// Frames per render call: the worklet's render quantum.
+export const MAKEPAD_AUDIO_BLOCK_FRAMES = 128;
+// How far ahead of the worklet the UI thread keeps the FIFO (seconds): longer than the
+// main thread's usual stalls between pumps, short enough that a scratch answers the hand.
+export const MAKEPAD_AUDIO_FIFO_LEAD_S = 0.040;
+// The pump's timer (seconds); every animation frame pumps as well.
+export const MAKEPAD_AUDIO_PUMP_INTERVAL_S = 0.010;
+
+// The worklet, run in the AudioWorkletGlobalScope from this function's own source text
+// (makepad_audio_fifo_worklet_url): it uses nothing from outside the function. It plays the
+// stereo blocks the port sends, in order; with too few queued it plays silence for the rest
+// and counts an underrun (once the first block came). It reports what it has played:
+// `consumed` stream frames, of which the next plays at context frame `frame`.
+export function makepad_audio_fifo_worklet() {
+    // Once fed, a report every 8 render quanta, and when a run of underruns starts.
+    const REPORT_QUANTA = 8;
+    class MakepadAudioFifo extends AudioWorkletProcessor {
+        constructor() {
+            super();
+            this.chunks = [];
+            this.read = 0;
+            this.consumed = 0;
+            this.fed = false;
+            this.starved = false;
+            this.underruns = 0;
+            this.underrun_frames = 0;
+            this.quanta = 0;
+            this.stopped = false;
+            this.port.onmessage = e => {
+                const message = e.data;
+                if (message.stop) {
+                    this.stopped = true;
+                    return;
+                }
+                this.chunks.push(message);
+                this.fed = true;
+            };
+        }
+
+        process(_inputs, outputs) {
+            const out = outputs[0];
+            const frames = out[0].length;
+            let at = 0;
+            while (at < frames && this.chunks.length > 0) {
+                const chunk = this.chunks[0];
+                const take = Math.min(frames - at, chunk.left.length - this.read);
+                for (let c = 0; c < out.length; c++) {
+                    if (c < 2) {
+                        const from = c === 0 ? chunk.left : chunk.right;
+                        out[c].set(from.subarray(this.read, this.read + take), at);
+                    } else {
+                        out[c].fill(0, at, at + take);
+                    }
+                }
+                at += take;
+                this.read += take;
+                if (this.read === chunk.left.length) {
+                    this.chunks.shift();
+                    this.read = 0;
+                }
+            }
+            this.consumed += at;
+            const short = frames - at;
+            let starts_starving = false;
+            if (short > 0) {
+                for (let c = 0; c < out.length; c++) {
+                    out[c].fill(0, at);
+                }
+                if (this.fed) {
+                    starts_starving = !this.starved;
+                    this.underruns += 1;
+                    this.underrun_frames += short;
+                }
+            }
+            this.starved = short > 0 && this.fed;
+            this.quanta += 1;
+            if (this.fed && (starts_starving || this.quanta % REPORT_QUANTA === 0)) {
+                this.port.postMessage({
+                    consumed: this.consumed,
+                    frame: currentFrame + frames,
+                    underruns: this.underruns,
+                    underrun_frames: this.underrun_frames,
+                });
+            }
+            return !this.stopped;
+        }
+    }
+    registerProcessor("makepad-audio-fifo", MakepadAudioFifo);
+}
+
+let makepad_audio_fifo_worklet_blob_url = null;
+
+function makepad_audio_fifo_worklet_url() {
+    if (makepad_audio_fifo_worklet_blob_url === null) {
+        const source = `(${makepad_audio_fifo_worklet.toString()})();\n`;
+        makepad_audio_fifo_worklet_blob_url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    }
+    return makepad_audio_fifo_worklet_blob_url;
+}
+
+// The UI thread's side of the FIFO. `render(frames, stream_frame, heard_at)` renders one
+// block of the app's audio and returns its planar stereo samples (2 * frames floats, valid
+// until the next call): `stream_frame` is the block's first frame on this output's stream,
+// `heard_at` when that frame will be heard (seconds of performance.now()).
+export class MakepadAudioFifoOutput {
+    constructor(context, port, render) {
+        this.context = context;
+        this.port = port;
+        this.render = render;
+        this.sample_rate = context.sampleRate;
+        this.lead_frames = Math.ceil(MAKEPAD_AUDIO_FIFO_LEAD_S * this.sample_rate / MAKEPAD_AUDIO_BLOCK_FRAMES) * MAKEPAD_AUDIO_BLOCK_FRAMES;
+        this.written = 0;
+        this.blocks = 0;
+        this.report = { consumed: 0, frame: 0, underruns: 0, underrun_frames: 0 };
+        port.onmessage = e => {
+            const report = e.data;
+            if (report && typeof report.consumed === "number") {
+                this.report = report;
+            }
+        };
+    }
+
+    // The stream frames the worklet has played by now: its last report moved on by the
+    // context's clock since, never past what was sent (a FIFO run dry stops there).
+    consumed() {
+        const report = this.report;
+        const now_frame = this.context.currentTime * this.sample_rate;
+        return Math.min(this.written, Math.max(report.consumed, report.consumed + now_frame - report.frame));
+    }
+
+    // The output's clock: the context's time `context_time` is heard at this performance.now()
+    // (milliseconds). The context's own output timestamp when it has one, else its latencies.
+    heard_ms(context_time) {
+        const context = this.context;
+        const stamp = typeof context.getOutputTimestamp === "function" ? context.getOutputTimestamp() : null;
+        if (stamp && stamp.performanceTime > 0) {
+            return stamp.performanceTime + (context_time - stamp.contextTime) * 1000;
+        }
+        const latency = (context.baseLatency || 0) + (context.outputLatency || 0);
+        return performance.now() + (context_time - context.currentTime + latency) * 1000;
+    }
+
+    // The FIFO topped up to the lead with whole blocks, sent in one message. The number of
+    // blocks rendered; none while the context does not run (it would only grow stale).
+    pump() {
+        if (this.context.state !== "running") {
+            return 0;
+        }
+        if (this.written === 0) {
+            // The stream starts with its first block: the worklet plays it from the quantum
+            // after the one it renders now (the quanta before played silence, unfed).
+            this.report = { consumed: 0, frame: this.context.currentTime * this.sample_rate, underruns: 0, underrun_frames: 0 };
+        }
+        const consumed = this.consumed();
+        const need = this.lead_frames - (this.written - consumed);
+        if (need <= 0) {
+            return 0;
+        }
+        const block = MAKEPAD_AUDIO_BLOCK_FRAMES;
+        const blocks = Math.ceil(need / block);
+        const left = new Float32Array(blocks * block);
+        const right = new Float32Array(blocks * block);
+        // Stream frame `written` plays once what is queued before it has played.
+        const now_time = this.context.currentTime;
+        const heard_ms = this.heard_ms(now_time + (this.written - consumed) / this.sample_rate);
+        for (let b = 0; b < blocks; b++) {
+            const at = b * block;
+            const planes = this.render(block, this.written, (heard_ms + at / this.sample_rate * 1000) / 1000);
+            left.set(planes.subarray(0, block), at);
+            right.set(planes.subarray(block, 2 * block), at);
+            this.written += block;
+        }
+        this.blocks += blocks;
+        this.port.postMessage({ left, right }, [left.buffer, right.buffer]);
+        return blocks;
+    }
+
+    // The stream frame heard now (fractional; negative before the first is heard).
+    heard_frame() {
+        const now_time = this.context.currentTime;
+        const ahead_s = (this.heard_ms(now_time) - performance.now()) / 1000;
+        return this.consumed() - ahead_s * this.sample_rate;
+    }
+
+    stats() {
+        const consumed = this.consumed();
+        return {
+            sample_rate: this.sample_rate,
+            written: this.written,
+            consumed,
+            heard_frame: this.heard_frame(),
+            lead_frames: this.written - consumed,
+            blocks: this.blocks,
+            underruns: this.report.underruns,
+            underrun_frames: this.report.underrun_frames,
+        };
+    }
+
+    stop() {
+        this.port.onmessage = null;
+        try {
+            this.port.postMessage({ stop: true });
+        } catch (_error) {
+        }
+    }
+}
 
 export class WasmWebBrowser extends WasmBridge {
     constructor(wasm, dispatch, canvas) {
@@ -6,48 +1010,235 @@ export class WasmWebBrowser extends WasmBridge {
         if (wasm === undefined) {
             return
         }
-        /*
-        window.onbeforeunload = _ => {
-            this.clear_memory_refs();
-            for (let worker of this.workers) {
-                worker.terminate();
-            }
-        }*/
-
+        makepad_crash_reporter.set_wasm(wasm);
         this.wasm_app = this.wasm_create_app();
 
         this.create_js_message_bridge(this.wasm_app);
 
         this.dispatch = dispatch;
         this.canvas = canvas;
-        this.handlers = {};
+        // The app owns all gestures over its drawable, including pinch and
+        // two-finger pan; never hand them to page zoom/scroll.
+        this.canvas.style.touchAction = 'none';
+        const browser = this;
+        this.handlers = new Proxy({}, {
+            set(target, property, value) {
+                target[property] = typeof value === "function" ? (...args) => {
+                    if (makepad_crash_reporter.is_wasm_dead()) {
+                        makepad_crash_reporter.suppress_followup();
+                        return;
+                    }
+                    return value(...args);
+                } : value;
+                return true;
+            }
+        });
         this.timers = [];
+        // @section clipboard
         this.text_copy_response = "";
+        this.text_copy_html = "";
+        this.text_copy_markdown = "";
+        // @end clipboard
+        // @section websocket
         this.web_sockets = [];
         this.network_web_sockets = {};
+        // @end websocket
         this.network_http_requests = new Map();
+        this.network_http_hosts = new Map();
+        // @section legacy-http
+        this.legacy_http_requests = new Set();
+        // @end legacy-http
+        // @section storage
+        this.storage_db_promise = null;
+        // @end storage
         this.window_info = {}
+        this.physical_device_dpi = makepad_device_pixel_ratio(window.devicePixelRatio);
+        this.render_quality = null;
+        this.webgl_context_lost = false;
         this.xr_capabilities = {
             vr_supported: false,
             ar_supported: false
         };
+        // @section xr
         this.xr_supported = false;
+        // @end xr
         this.signal_timeout = null;
-        this.workers = [];
+        this.workers = new Map();
+        this.worker_console_recent = new Map();
+        this.thread_stack_arena = [];
         this.thread_stack_size = 2 * 1024 * 1024;
+        this.ui_wake_queued = false;
+        this.frame_at = NaN;
+        this.frame_timer = 0;
+        this.frame_timer_at = NaN;
         this.buffer_upload_serial = 0;
         this.loader_removed = false;
         this.loader_seen_animation_frame = false;
         this.loader_quiet_animation_frames = 0;
         this.loader_after_presented_frame_id = 0;
         this.loader_fallback_timer = null;
+        // @section file-dialog
+        this.virtual_file_max_size = 512 * 1024 * 1024;
+        this.virtual_file_max_total_size = 512 * 1024 * 1024;
+        // @end file-dialog
         this.init_detection();
+        // @section midi
         this.midi_inputs = [];
         this.midi_outputs = [];
+        // @end midi
+        this.audio_context = null;
+        this.audio_worklet = null;
+        this.audio_fifo = null;
+        this.audio_pump_timer = null;
+        this.audio_callback_started = false;
+        this.audio_callback_watchdog = null;
+        this.audio_startup_cancel = null;
 
         this.dispatch_first_msg();
     }
 
+    js_monotonic_now() {
+        return performance.now() / 1000.0;
+    }
+
+    js_worker_wait(_timeout_ms) {
+        throw new Error("js_worker_wait may only run in a Web Worker");
+    }
+
+    js_wake_ui() {
+        if (makepad_crash_reporter.is_wasm_dead()) {
+            makepad_crash_reporter.suppress_followup();
+            return;
+        }
+        if (this.ui_wake_queued) {
+            return;
+        }
+        this.ui_wake_queued = true;
+        queueMicrotask(() => {
+            this.ui_wake_queued = false;
+            if (makepad_crash_reporter.is_wasm_dead()) {
+                makepad_crash_reporter.suppress_followup();
+                return;
+            }
+            this.deliver_signals();
+        });
+    }
+
+    // Signals from other threads (finished jobs, loads, the audio thread)
+    // go to the app at once only while no animation frame is coming; with
+    // one requested they wait for it and travel in its message batch, so
+    // the app runs once per frame (a wake right after a frame's callback
+    // was a second full pump in the same task).
+    deliver_signals() {
+        if (this.req_anim_frame_id) {
+            return;
+        }
+        const flags = this.exports.wasm_check_signal();
+        if (flags !== 0) {
+            this.to_wasm.ToWasmSignal({ flags });
+            this.do_wasm_pump();
+        }
+    }
+
+    js_spawn_thread(request_id, context_ptr, stack_size, name_ptr, name_len) {
+        if (!this.wasm._has_thread_support) {
+            return 0;
+        }
+        const name = this.u8_to_string(name_ptr, name_len);
+        this.create_thread({ request_id, context_ptr, stack_size, name });
+        return 1;
+    }
+
+    shutdown_thread_runtime() {
+        // @section threads
+        for (const [request_id, record] of this.workers) {
+            record.closed = true;
+            record.worker.terminate();
+            if (record.started) {
+                this.exports.wasm_thread_worker_lost(request_id);
+            } else {
+                this.exports.wasm_thread_failed_to_start(request_id);
+            }
+            if (!record.thread_info.wasm_bindgen && record.thread_info.tls_ptr) {
+                this.thread_stack_arena.push({
+                    ptr: record.thread_info.tls_ptr,
+                    words: record.thread_info.alloc_words
+                });
+            }
+        }
+        this.workers.clear();
+        for (const block of this.thread_stack_arena) {
+            this.exports.wasm_thread_dealloc_tls_and_stack(block.ptr, block.words);
+        }
+        this.thread_stack_arena.length = 0;
+        // @end threads
+    }
+
+    emit_app_lifecycle(state) {
+        this.to_wasm.ToWasmAppLifecycle({ state });
+    }
+
+    emit_app_inactive() {
+        if (!this.lifecycle_is_visible) {
+            return;
+        }
+        this.lifecycle_is_visible = false;
+        this.emit_app_lifecycle(2);
+        this.emit_app_lifecycle(1);
+    }
+
+    emit_app_active() {
+        if (this.lifecycle_is_visible) {
+            return;
+        }
+        this.lifecycle_is_visible = true;
+        this.lifecycle_shutdown_sent = false;
+        this.emit_app_lifecycle(0);
+        this.emit_app_lifecycle(3);
+    }
+
+    emit_app_shutdown() {
+        if (this.lifecycle_shutdown_sent) {
+            return;
+        }
+        this.lifecycle_shutdown_sent = true;
+        this.emit_app_lifecycle(4);
+    }
+
+    bind_app_lifecycle() {
+        this.lifecycle_is_visible = !document.hidden;
+        this.lifecycle_shutdown_sent = false;
+
+        document.addEventListener("visibilitychange", () => {
+            if (document.hidden) {
+                this.emit_app_inactive();
+            } else {
+                this.emit_app_active();
+            }
+            this.do_wasm_pump();
+        });
+
+        window.addEventListener("pagehide", (event) => {
+            this.emit_app_inactive();
+            if (!event.persisted) {
+                this.emit_app_shutdown();
+            }
+            this.do_wasm_pump();
+            if (!event.persisted) {
+                this.shutdown_thread_runtime();
+            }
+        });
+
+        window.addEventListener("pageshow", (event) => {
+            if (event.persisted) {
+                this.emit_app_active();
+                this.do_wasm_pump();
+            }
+        });
+
+    }
+
+    // @section history
     emit_location_change() {
         this.to_wasm.ToWasmLocationChange({
             pathname: location.pathname + "",
@@ -55,7 +1246,9 @@ export class WasmWebBrowser extends WasmBridge {
             hash: location.hash + "",
         });
     }
+    // @end history
 
+    // @section live-reload
     install_live_reload_bridge() {
         window.makepad_wasm_live_file_change = (file_name, content) => {
             this.to_wasm.ToWasmLiveFileChange({file_name, content});
@@ -68,17 +1261,31 @@ export class WasmWebBrowser extends WasmBridge {
             window.makepad_wasm_live_file_change(file_name, content);
         }
     }
+    // @end live-reload
 
     async load_deps() {
         this.to_wasm = this.new_to_wasm();
+        // @section live-reload
         this.install_live_reload_bridge();
+        // @end live-reload
 
+        // @section xr
         await this.query_xr_capabilities();
+        // @end xr
         this.update_window_info();
 
+        // Pages may opt out before startup with makepadA11yEnabled = false, or ?a11y=0.
+        this.a11y = new MakepadA11y(this, window.makepadA11yEnabled !== false
+            && new URLSearchParams(location.search).get("a11y") !== "0");
+
+        const hardware_concurrency = Number.isFinite(navigator.hardwareConcurrency)
+            ? Math.max(1, Math.floor(navigator.hardwareConcurrency))
+            : 1;
         this.to_wasm.ToWasmInit({
+            a11y_enabled: this.a11y.enabled,
             gpu_info: this.gpu_info,
-            cpu_cores: navigator.hardwareConcurrency,
+            cpu_cores: hardware_concurrency,
+            wasm_memory_max_pages: this.wasm._memory_max_pages || 16384,
             xr_capabilities: this.xr_capabilities,
             browser_info: {
                 protocol: location.protocol + "",
@@ -88,7 +1295,7 @@ export class WasmWebBrowser extends WasmBridge {
                 search: location.search + "",
                 hash: location.hash + "",
                 has_thread_support: this.wasm._has_thread_support,
-                small_font_aliases: window.makepad_small_font_aliases === true
+                is_phone: WasmBridge.is_phone()
             },
             window_info: this.window_info,
         });
@@ -97,8 +1304,13 @@ export class WasmWebBrowser extends WasmBridge {
         // only bind the event handlers now
         // to stop them firing into wasm early
         this.bind_mouse_and_touch();
+        // @section file-dialog
+        this.bind_file_drop();
+        // @end file-dialog
         this.bind_keyboard();
         this.bind_screen_resize();
+        this.bind_app_lifecycle();
+        // @section history
         window.addEventListener("popstate", () => {
             this.emit_location_change();
             this.do_wasm_pump();
@@ -107,6 +1319,7 @@ export class WasmWebBrowser extends WasmBridge {
             this.emit_location_change();
             this.do_wasm_pump();
         });
+        // @end history
         this.focus_keyboard_input();
         this.to_wasm.ToWasmRedrawAll();
         this.start_signal_poll();
@@ -201,6 +1414,7 @@ export class WasmWebBrowser extends WasmBridge {
         }
     }
 
+    // @section history
     FromWasmOpenUrl(args) {
         if (args.in_place) {
             window.location.href = args.url;
@@ -239,9 +1453,16 @@ export class WasmWebBrowser extends WasmBridge {
             window.history.go(args.delta);
         }
     }
+    // @end history
 
     FromWasmStartTimer(args) {
         let timer_id = args.timer_id;
+        const interval_seconds = Number(args.interval);
+        if (!Number.isFinite(interval_seconds) || interval_seconds < 0) {
+            console.error(`Invalid timer interval for ${timer_id}: ${args.interval}`);
+            return;
+        }
+        const interval_ms = Math.min(interval_seconds * 1000.0, 2147483647);
 
         for (let i = 0; i < this.timers.length; i++) {
             if (this.timers[i].timer_id == timer_id) {
@@ -255,7 +1476,7 @@ export class WasmWebBrowser extends WasmBridge {
             timer.sys_id = window.setInterval(e => {
                 this.to_wasm.ToWasmTimerFired({ timer_id });
                 this.do_wasm_pump();
-            }, args.interval * 1000.0);
+            }, Math.max(4, interval_ms));
         }
         else {
             timer.sys_id = window.setTimeout(e => {
@@ -268,7 +1489,7 @@ export class WasmWebBrowser extends WasmBridge {
                 }
                 this.to_wasm.ToWasmTimerFired({ timer_id });
                 this.do_wasm_pump();
-            }, args.interval * 1000.0);
+            }, interval_ms);
         }
         this.timers.push(timer)
     }
@@ -289,6 +1510,47 @@ export class WasmWebBrowser extends WasmBridge {
         }
     }
 
+    // @section geolocation
+    FromWasmStartLocationUpdates() {
+        if (this.geo_watch_id !== undefined) {
+            return; // already watching
+        }
+        if (!navigator.geolocation) {
+            this.to_wasm.ToWasmLocationError({ code: 0, message: "geolocation API unavailable" });
+            this.do_wasm_pump();
+            return;
+        }
+        this.geo_watch_id = navigator.geolocation.watchPosition(
+            (pos) => {
+                let c = pos.coords;
+                // Option<f64> encodes as undefined; browser nulls must convert
+                this.to_wasm.ToWasmLocationUpdate({
+                    lon: c.longitude,
+                    lat: c.latitude,
+                    accuracy_m: c.accuracy,
+                    altitude_m: c.altitude === null ? undefined : c.altitude,
+                    speed_mps: c.speed === null ? undefined : c.speed,
+                    heading_deg: (c.heading === null || isNaN(c.heading)) ? undefined : c.heading,
+                    time: pos.timestamp / 1000.0,
+                });
+                this.do_wasm_pump();
+            },
+            (err) => {
+                this.to_wasm.ToWasmLocationError({ code: err.code, message: err.message });
+                this.do_wasm_pump();
+            },
+            { enableHighAccuracy: true, maximumAge: 1000 }
+        );
+    }
+
+    FromWasmStopLocationUpdates() {
+        if (this.geo_watch_id !== undefined) {
+            navigator.geolocation.clearWatch(this.geo_watch_id);
+            this.geo_watch_id = undefined;
+        }
+    }
+    // @end geolocation
+
     FromWasmFullScreen() {
         if (document.body.requestFullscreen) {
             document.body.requestFullscreen();
@@ -305,37 +1567,271 @@ export class WasmWebBrowser extends WasmBridge {
     }
 
     FromWasmNormalScreen() {
-        if (this.canvas.exitFullscreen) {
-            this.canvas.exitFullscreen();
+        // Exiting is a DOCUMENT call (entering is on the element); nothing
+        // to do unless the page is actually fullscreen.
+        if (!is_fullscreen()) {
             return
         }
-        if (this.canvas.webkitExitFullscreen) {
-            this.canvas.webkitExitFullscreen();
+        if (document.exitFullscreen) {
+            document.exitFullscreen();
             return
         }
-        if (this.canvas.mozExitFullscreen) {
-            this.canvas.mozExitFullscreen();
+        if (document.webkitExitFullscreen) {
+            document.webkitExitFullscreen();
+            return
+        }
+        if (document.mozCancelFullScreen) {
+            document.mozCancelFullScreen();
             return
         }
     }
 
     FromWasmRequestAnimationFrame() {
-        if (this.xr !== undefined || this.req_anim_frame_id) {
+        if (this.webgl_context_lost || this.xr !== undefined || this.req_anim_frame_id) {
             return;
         }
+        // A frame asked for during an animation frame comes a display frame after it.
+        const in_a_row = this.in_animation_frame;
         this.req_anim_frame_id = window.requestAnimationFrame(time => {
-            if (this.wasm == null) {
+            this.req_anim_frame_id = 0;
+            if (this.wasm == null || this.webgl_context_lost) {
                 return
             }
-            this.req_anim_frame_id = 0;
             if (this.xr !== undefined) {
                 return
             }
-            this.to_wasm.ToWasmAnimationFrame({ time: time / 1000.0 });
+            // Without threads the audio FIFO is topped up first: the frame's work may take long.
+            this.pump_audio();
+            this.first_draw_this_frame = false;
+            if (this.gpu_watchdog_hold()) {
+                // The GPU is still on earlier frames: no new work until it
+                // drains (the frame is only delayed, never dropped).
+                this.FromWasmRequestAnimationFrame();
+                return
+            }
+            // Programs whose compile finished are taken up before this
+            // frame's GL work is queued: reading their status and locations
+            // waits for the GPU process, which has least to do now (later in
+            // the frame it was a 15-60 ms stall behind the frame's own work).
+            if (this.pending_webgl_shader_count > 0 && this.poll_pending_webgl_shaders() != 0) {
+                this.to_wasm.ToWasmRedrawAll();
+            }
+            // The signals that waited for this frame (deliver_signals),
+            // before it: what finished is there for its draw.
+            const flags = this.exports.wasm_check_signal();
+            if (flags !== 0) {
+                this.to_wasm.ToWasmSignal({ flags });
+            }
+            this.gpu_timer_poll();
+            const gpu_query = this.gpu_timer_begin();
+            this.to_wasm.ToWasmAnimationFrame({ time: time / 1000.0, in_a_row });
             this.in_animation_frame = true;
             this.do_wasm_pump();
             this.in_animation_frame = false;
+            this.gpu_timer_end(gpu_query);
+            this.gpu_watchdog_submit();
+            // Draws of programs waiting for their first draw were left out
+            // (first draws spread): the next frame draws again.
+            if (this.first_draws_deferred) {
+                this.first_draws_deferred = false;
+                this.to_wasm.ToWasmRedrawAll();
+                this.FromWasmRequestAnimationFrame();
+            }
         })
+    }
+
+    FromWasmRequestAnimationFrameAt(args) {
+        this.frame_at = args.at;
+    }
+
+    clear_frame_timer() {
+        if (this.frame_timer) {
+            window.clearTimeout(this.frame_timer);
+            this.frame_timer = 0;
+        }
+    }
+
+    // GPU watchdog (see makepad_create_gpu_watchdog): polls the frames in
+    // flight; true while too many are, so this animation frame waits.
+    gpu_watchdog_hold() {
+        const gl = this.gl;
+        if (!gl || this.webgl_context_lost || typeof gl.fenceSync !== "function") {
+            return false;
+        }
+        if (!this.gpu_watchdog) {
+            this.gpu_watchdog = makepad_create_gpu_watchdog();
+        }
+        const watchdog = this.gpu_watchdog;
+        const now = performance.now();
+        // A frame's latency is what was SEEN: the last poll that found it
+        // still running, minus its submission. An idle page (no animation
+        // frames for a while) therefore never reads as a slow GPU.
+        while (watchdog.in_flight.length > 0) {
+            const frame = watchdog.in_flight[0];
+            const signalled = gl.getSyncParameter(frame.sync, gl.SYNC_STATUS) === gl.SIGNALED;
+            if (!signalled) {
+                for (const queued of watchdog.in_flight) {
+                    queued.seen_running = now;
+                }
+                break;
+            }
+            watchdog.in_flight.shift();
+            gl.deleteSync(frame.sync);
+            const latency = frame.seen_running > 0 ? frame.seen_running - frame.submitted : 0;
+            if (makepad_gpu_watchdog_complete(watchdog, latency)) {
+                makepad_page_console.error(`makepad: a GPU frame ran ${Math.round(latency)} ms, over the ${MAKEPAD_GPU_HUNG_FRAME_MS} ms that keeps clear of the operating systems' GPU reset`);
+            }
+        }
+        if (watchdog.in_flight.length >= MAKEPAD_GPU_MAX_FRAMES_IN_FLIGHT) {
+            watchdog.held_frames += 1;
+            return true;
+        }
+        return false;
+    }
+
+    gpu_watchdog_submit() {
+        const gl = this.gl;
+        const watchdog = this.gpu_watchdog;
+        if (!gl || this.webgl_context_lost) {
+            return;
+        }
+        if (!watchdog) {
+            // No fences: nothing says when the GPU is idle.
+            this.check_allocations(true, false);
+            return;
+        }
+        const now = performance.now();
+        // getError waits for the GPU process, which behind a busy GPU is a
+        // 25-100 ms stall of this thread: with checks on (gl_checks, never
+        // in a shipped page) the frame's allocations are checked (see
+        // check_allocations) and the driver's own allocation failure read
+        // (at most once a second) only while no earlier frame is still on
+        // the GPU.
+        const idle = watchdog.in_flight.length === 0;
+        let error = this.check_allocations(false, idle);
+        if (this.gpu_ledger) {
+            if (this.gl_checks && !error && idle && !(now - (this.gpu_ledger_error_checked || 0) < 1000)) {
+                this.gpu_ledger_error_checked = now;
+                error = gl.getError();
+            }
+            makepad_gpu_ledger_frame(this.gpu_ledger, now, error, gl.OUT_OF_MEMORY, (message) => makepad_page_console.error(message));
+        }
+        const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (sync) {
+            gl.flush();
+            watchdog.in_flight.push({ sync, submitted: now, seen_running: 0 });
+        }
+    }
+
+    // Follows the context's live GPU bytes from its creation on (see
+    // makepad_install_gpu_ledger), and publishes `makepad_gpu_stats()`.
+    install_gpu_ledger(gl) {
+        if (this.gpu_ledger || !gl) {
+            return;
+        }
+        this.gpu_ledger = makepad_create_gpu_ledger();
+        makepad_install_gpu_ledger(gl, this.gpu_ledger);
+        if (typeof window !== "undefined" && window && !window.makepad_gpu_stats) {
+            window.makepad_gpu_stats = () => this.gpu_safety_stats();
+        }
+        // What holds GPU memory, by owner (the runtime's own view; rows carry
+        // the page's texture slot to join the ledger): a Promise of
+        // {textures: [{texture_id, kind, format, w, h, bytes, owner, dropped}], ...}
+        // (dropped: every handle went; its storage is retired within frames).
+        if (typeof window !== "undefined" && window && !window.makepad_gpu_inventory) {
+            this.gpu_inventory_requests = new Map();
+            this.gpu_inventory_next = 0;
+            window.makepad_gpu_inventory = () => new Promise((resolve) => {
+                const request_id = ++this.gpu_inventory_next;
+                this.gpu_inventory_requests.set(request_id, resolve);
+                this.to_wasm.ToWasmGpuInventory({ request_id });
+                this.do_wasm_pump();
+            });
+        }
+    }
+
+    // A restored context starts without the old one's fences, timer queries
+    // (their extension is enabled again on first use) and objects.
+    forget_lost_gpu_state() {
+        if (this.gpu_watchdog) {
+            this.gpu_watchdog.in_flight = [];
+        }
+        this.gpu_timer_ext = undefined;
+        this.gpu_timer_pending = [];
+        if (this.gpu_ledger) {
+            makepad_gpu_ledger_forget_all(this.gpu_ledger);
+        }
+    }
+
+    // What the GPU safety layer saw: for test harnesses and the export's
+    // browser-safety gate (`makepad_gpu_stats()` on the page).
+    gpu_safety_stats() {
+        const watchdog = this.gpu_watchdog || makepad_create_gpu_watchdog();
+        return {
+            frames: watchdog.frames,
+            held_frames: watchdog.held_frames,
+            hung_frames: watchdog.hung_frames,
+            worst_frame_ms: Math.round(watchdog.worst_ms),
+            // null: no budget (the device's limits only).
+            pixel_budget: Number.isFinite(this.ensure_render_quality().pixel_budget) ? this.ensure_render_quality().pixel_budget : null,
+            ledger: this.gpu_ledger ? makepad_gpu_ledger_stats(this.gpu_ledger) : null,
+        };
+    }
+
+    // Frame GPU time (gpu_frame_timer): one TIME_ELAPSED query around each
+    // animation frame's GL work, read when the GPU has it (a few frames
+    // later). Browsers without EXT_disjoint_timer_query_webgl2 (Safari,
+    // Firefox by default) report nothing.
+    FromWasmGpuFrameTimer(args) {
+        this.gpu_timer_on = args.on;
+    }
+
+    gpu_timer_begin() {
+        const gl = this.gl;
+        if (!this.gpu_timer_on || !gl || this.webgl_context_lost) {
+            return null;
+        }
+        if (this.gpu_timer_ext === undefined) {
+            this.gpu_timer_ext = gl.getExtension("EXT_disjoint_timer_query_webgl2") || null;
+            this.gpu_timer_pending = [];
+        }
+        if (!this.gpu_timer_ext || this.gpu_timer_pending.length >= 4) {
+            return null;
+        }
+        const query = gl.createQuery();
+        gl.beginQuery(this.gpu_timer_ext.TIME_ELAPSED_EXT, query);
+        return { query, start: performance.now() };
+    }
+
+    gpu_timer_end(entry) {
+        if (!entry || this.webgl_context_lost) {
+            return;
+        }
+        this.gl.endQuery(this.gpu_timer_ext.TIME_ELAPSED_EXT);
+        this.gpu_timer_pending.push(entry);
+    }
+
+    gpu_timer_poll() {
+        const gl = this.gl;
+        const pending = this.gpu_timer_pending;
+        if (!pending || pending.length === 0 || this.webgl_context_lost) {
+            return;
+        }
+        const disjoint = gl.getParameter(this.gpu_timer_ext.GPU_DISJOINT_EXT);
+        const starts = [];
+        const times = [];
+        while (pending.length > 0 && gl.getQueryParameter(pending[0].query, gl.QUERY_RESULT_AVAILABLE)) {
+            const entry = pending.shift();
+            const ns = gl.getQueryParameter(entry.query, gl.QUERY_RESULT);
+            gl.deleteQuery(entry.query);
+            if (!disjoint) {
+                starts.push(entry.start);
+                times.push(ns / 1e6);
+            }
+        }
+        if (starts.length > 0) {
+            this.to_wasm.ToWasmGpuFrameTimes({ starts, times });
+        }
     }
 
     FromWasmSetDocumentTitle(args) {
@@ -347,17 +1843,329 @@ export class WasmWebBrowser extends WasmBridge {
         document.body.style.cursor = web_cursor_map[args.web_cursor] || 'default'
     }
 
-    FromWasmTextCopyResponse(args) {
-        this.text_copy_response = args.response
+    FromWasmGpuInventory(args) {
+        const resolve = this.gpu_inventory_requests && this.gpu_inventory_requests.get(args.request_id);
+        if (resolve) {
+            this.gpu_inventory_requests.delete(args.request_id);
+            resolve(JSON.parse(args.json));
+        }
     }
 
+    // @section clipboard
+    FromWasmTextCopyResponse(args) {
+        this.text_copy_response = args.response
+        this.text_copy_html = args.html
+        this.text_copy_markdown = args.markdown
+    }
+
+    // A copy or cut with richer flavours writes them all into the event's clipboard
+    // (text/markdown stays on this browser's clipboard for a paste into a page);
+    // a plain copy leaves the textarea's selected text to the browser.
+    write_copy_flavours(e) {
+        if (!this.text_copy_html && !this.text_copy_markdown) {
+            return;
+        }
+        e.clipboardData.setData('text/plain', this.text_copy_response);
+        if (this.text_copy_html) {
+            e.clipboardData.setData('text/html', this.text_copy_html);
+        }
+        if (this.text_copy_markdown) {
+            e.clipboardData.setData('text/markdown', this.text_copy_markdown);
+        }
+        e.preventDefault();
+    }
+
+    clear_copy_flavours() {
+        this.text_copy_response = "";
+        this.text_copy_html = "";
+        this.text_copy_markdown = "";
+    }
+
+    async FromWasmCopyToClipboard(args) {
+        try {
+            if (args.html) {
+                await navigator.clipboard.write([new ClipboardItem({
+                    'text/plain': new Blob([args.text], {type: 'text/plain'}),
+                    'text/html': new Blob([args.html], {type: 'text/html'})
+                })]);
+            } else {
+                await navigator.clipboard.writeText(args.text);
+            }
+        } catch (error) {
+            console.warn('Clipboard write failed', error);
+        }
+    }
+    // @end clipboard
+
+    // @section storage
+    storage_database() {
+        if (this.storage_db_promise !== null) {
+            return this.storage_db_promise;
+        }
+        this.storage_db_promise = new Promise((resolve, reject) => {
+            const request = indexedDB.open("makepad-storage", 1);
+            request.onupgradeneeded = () => {
+                const db = request.result;
+                const store = db.objectStoreNames.contains("values")
+                    ? request.transaction.objectStore("values")
+                    : db.createObjectStore("values", { keyPath: "id" });
+                if (!store.indexNames.contains("namespace")) {
+                    store.createIndex("namespace", "namespace", { unique: false });
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error("could not open IndexedDB"));
+            request.onblocked = () => reject(new Error("IndexedDB upgrade was blocked"));
+        });
+        return this.storage_db_promise;
+    }
+
+    storage_id(namespace, key) {
+        return namespace + "\u0000" + key;
+    }
+
+    storage_error_text(error) {
+        if (error && error.message) {
+            return error.message;
+        }
+        return String(error || "unknown IndexedDB error");
+    }
+
+    storage_send_result(args, op, result = {}) {
+        this.to_wasm.ToWasmStorageResult({
+            request_id_lo: args.request_id_lo,
+            request_id_hi: args.request_id_hi,
+            op,
+            found: result.found === true,
+            value: result.value || new Uint8Array(0),
+            keys: result.keys || [],
+            has_next: result.next !== undefined,
+            next: result.next || "",
+            length_lo: result.length === undefined ? 0 : result.length >>> 0,
+            length_hi: result.length === undefined ? 0 : Math.floor(result.length / 0x100000000),
+            usage_lo: result.usage === undefined ? 0 : result.usage >>> 0,
+            usage_hi: result.usage === undefined ? 0 : Math.floor(result.usage / 0x100000000),
+            quota_lo: result.quota === undefined ? 0 : result.quota >>> 0,
+            quota_hi: result.quota === undefined ? 0 : Math.floor(result.quota / 0x100000000),
+            error_kind: result.error_kind || 0,
+            error: result.error || ""
+        });
+        this.do_wasm_pump();
+    }
+
+    storage_request(request) {
+        return new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+        });
+    }
+    // @end storage
+
+    // Runtime-generated modules (wasm_link.rs): instantiated against our
+    // memory, their exports placed in our function table and called from
+    // wasm through call_indirect. Emptied slots are reused.
+    FromWasmLinkModule(args) {
+        const bytes = this.clone_data_u8(args.bytes);
+        this.free_data_u8(args.bytes);
+        const reply = (slots, error) => {
+            this.to_wasm.ToWasmModuleLinked({ request_id: args.request_id, slots, error });
+            this.do_wasm_pump();
+        };
+        const table = this.exports.__indirect_function_table;
+        if (!(table instanceof WebAssembly.Table)) {
+            reply([], "the function table is not exported (link with --export-table --growable-table)");
+            return;
+        }
+        WebAssembly.instantiate(bytes, { env: { memory: this.wasm._memory } }).then(({ instance }) => {
+            const free = this.wasm_link_free || (this.wasm_link_free = []);
+            const slots = [];
+            for (const f of Object.values(instance.exports)) {
+                if (typeof f !== "function") {
+                    continue;
+                }
+                const slot = free.length > 0 ? free.pop() : table.grow(1);
+                table.set(slot, f);
+                slots.push(slot);
+            }
+            reply(slots, "");
+        }).catch(error => reply([], String(error && error.message || error)));
+    }
+
+    FromWasmUnlinkSlots(args) {
+        const table = this.exports.__indirect_function_table;
+        const free = this.wasm_link_free || (this.wasm_link_free = []);
+        for (const slot of args.slots) {
+            table.set(slot, null);
+            free.push(slot);
+        }
+    }
+
+    // @section storage
+    FromWasmStorageGet(args) {
+        this.storage_database().then(db => {
+            const request = db.transaction("values", "readonly")
+                .objectStore("values").get(this.storage_id(args.namespace, args.key));
+            return this.storage_request(request);
+        }).then(record => {
+            this.storage_send_result(args, 0, record === undefined
+                ? { found: false }
+                : { found: true, value: record.value });
+        }).catch(error => {
+            this.storage_send_result(args, 0, { error: this.storage_error_text(error) });
+        });
+    }
+
+    FromWasmStorageSet(args) {
+        const value = this.clone_data_u8(args.value);
+        this.free_data_u8(args.value);
+        this.storage_database().then(db => new Promise((resolve, reject) => {
+            const transaction = db.transaction("values", "readwrite");
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error || new Error("IndexedDB write failed"));
+            transaction.onabort = () => reject(transaction.error || new Error("IndexedDB write aborted"));
+            transaction.objectStore("values").put({
+                id: this.storage_id(args.namespace, args.key),
+                namespace: args.namespace,
+                key: args.key,
+                value: value.buffer
+            });
+        })).then(() => {
+            this.storage_send_result(args, 1);
+        }).catch(error => {
+            this.storage_send_result(args, 1, {
+                error: this.storage_error_text(error),
+                error_kind: error && error.name === "QuotaExceededError" ? 1 : 0
+            });
+        });
+    }
+
+    FromWasmStorageDelete(args) {
+        this.storage_database().then(db => new Promise((resolve, reject) => {
+            const transaction = db.transaction("values", "readwrite");
+            transaction.oncomplete = () => resolve();
+            transaction.onerror = () => reject(transaction.error || new Error("IndexedDB delete failed"));
+            transaction.onabort = () => reject(transaction.error || new Error("IndexedDB delete aborted"));
+            transaction.objectStore("values").delete(this.storage_id(args.namespace, args.key));
+        })).then(() => {
+            this.storage_send_result(args, 2);
+        }).catch(error => {
+            this.storage_send_result(args, 2, { error: this.storage_error_text(error) });
+        });
+    }
+
+    FromWasmStorageList(args) {
+        this.storage_database().then(db => new Promise((resolve, reject) => {
+            const keys = [];
+            const request = db.transaction("values", "readonly")
+                .objectStore("values").index("namespace")
+                .openCursor(IDBKeyRange.only(args.namespace));
+            request.onerror = () => reject(request.error || new Error("IndexedDB cursor failed"));
+            request.onsuccess = () => {
+                const cursor = request.result;
+                if (cursor === null) {
+                    resolve(keys);
+                    return;
+                }
+                const key = cursor.value.key;
+                if (key.startsWith(args.prefix) && (!args.has_after || key > args.after)) {
+                    keys.push(key);
+                    if (keys.length > args.limit) {
+                        resolve(keys);
+                        return;
+                    }
+                }
+                cursor.continue();
+            };
+        })).then(keys => {
+            let next;
+            if (keys.length > args.limit) {
+                keys.length = args.limit;
+                next = keys[keys.length - 1];
+            }
+            this.storage_send_result(args, 3, { keys, next });
+        }).catch(error => {
+            this.storage_send_result(args, 3, { error: this.storage_error_text(error) });
+        });
+    }
+
+    FromWasmStorageGetRange(args) {
+        this.storage_database().then(db => {
+            const request = db.transaction("values", "readonly")
+                .objectStore("values").get(this.storage_id(args.namespace, args.key));
+            return this.storage_request(request);
+        }).then(record => {
+            if (record === undefined) {
+                this.storage_send_result(args, 4, { found: false });
+                return;
+            }
+            const value = new Uint8Array(record.value);
+            const offset = args.offset_hi > 0x1fffff
+                ? Number.MAX_SAFE_INTEGER
+                : args.offset_lo + args.offset_hi * 0x100000000;
+            const end = Math.min(value.length, offset + args.len);
+            const range = offset >= value.length ? new Uint8Array(0) : value.slice(offset, end);
+            this.storage_send_result(args, 4, { found: true, value: range });
+        }).catch(error => {
+            this.storage_send_result(args, 4, { error: this.storage_error_text(error) });
+        });
+    }
+
+    FromWasmStorageStat(args) {
+        this.storage_database().then(db => {
+            const request = db.transaction("values", "readonly")
+                .objectStore("values").get(this.storage_id(args.namespace, args.key));
+            return this.storage_request(request);
+        }).then(record => {
+            this.storage_send_result(args, 5, record === undefined
+                ? { found: false }
+                : { found: true, length: record.value.byteLength });
+        }).catch(error => {
+            this.storage_send_result(args, 5, { error: this.storage_error_text(error) });
+        });
+    }
+
+    FromWasmStorageEstimate(args) {
+        const estimate = navigator.storage && navigator.storage.estimate;
+        if (!estimate) {
+            this.storage_send_result(args, 6, { error: "storage estimate is unavailable" });
+            return;
+        }
+        navigator.storage.estimate().then(result => {
+            this.storage_send_result(args, 6, {
+                usage: Math.max(0, Math.floor(result.usage || 0)),
+                quota: Math.max(0, Math.floor(result.quota || 0))
+            });
+        }).catch(error => {
+            this.storage_send_result(args, 6, { error: this.storage_error_text(error) });
+        });
+    }
+    // @end storage
+
+    // @section text-input
     FromWasmShowTextIME(args) {
         this.update_text_area_pos(args);
+    }
+
+    FromWasmA11yUpdate(args) {
+        try {
+            const bytes = new Uint8Array(this.memory.buffer, args.bytes.ptr, args.bytes.len);
+            this.a11y.apply(args.window, this.msg_class.a11y.decodeUpdate(bytes));
+        } finally { this.free_data_u8(args.bytes); }
+    }
+
+    FromWasmA11yActionDone(args) {
+        // Automation can listen without an ever-growing pending-request table in the adapter.
+        window.dispatchEvent(new CustomEvent("makepad-a11y-action-done", {detail: {
+            req: (BigInt(args.req_hi) << 32n) | BigInt(args.req_lo), result: args.result,
+        }}));
     }
 
     FromWasmHideTextIME() {
         this.update_text_area_pos({ x: -3000, y: -3000 });
     }
+    // @end text-input
+
+    // @section websocket
     /*
     FromWasmWebSocketOpen(args) {
         let id_lo = args.id_lo;
@@ -413,43 +2221,281 @@ export class WasmWebBrowser extends WasmBridge {
         }
         this.free_data_u8(args.data);
     }
+    // @end websocket
 
-    FromWasmStopAudioOutput(args) {
-        if (!this.audio_context) {
-            return
+    dispose_audio_worklet(audio_worklet) {
+        if (!audio_worklet) {
+            return;
         }
-        this.audio_context.close();
+        if (audio_worklet.port) {
+            audio_worklet.port.onmessage = null;
+        }
+        audio_worklet.onprocessorerror = null;
+        try {
+            audio_worklet.disconnect();
+        } catch (_error) {
+        }
+    }
+
+    stop_audio_output() {
+        this.audio_start_args = null;
+        if (this.audio_callback_watchdog !== null) {
+            clearTimeout(this.audio_callback_watchdog);
+            this.audio_callback_watchdog = null;
+        }
+        if (this.audio_startup_cancel) {
+            this.audio_startup_cancel();
+            this.audio_startup_cancel = null;
+        }
+        if (this.audio_pump_timer !== null) {
+            clearInterval(this.audio_pump_timer);
+            this.audio_pump_timer = null;
+        }
+        if (this.audio_fifo) {
+            this.audio_fifo.stop();
+            this.audio_fifo = null;
+        }
+        if (this.audio_worklet) {
+            this.dispose_audio_worklet(this.audio_worklet);
+            this.audio_worklet = null;
+        }
+        const audio_context = this.audio_context;
         this.audio_context = null;
+        if (audio_context) {
+            try {
+                const closing = audio_context.close();
+                if (closing && typeof closing.catch === "function") {
+                    closing.catch(error => {
+                        console.error(`web audio: close failed: ${error}`);
+                    });
+                }
+            } catch (error) {
+                console.error(`web audio: close failed: ${error}`);
+            }
+        }
+    }
+
+    FromWasmStopAudioOutput(_args) {
+        this.stop_audio_output();
+    }
+
+    // Without threads: the FIFO topped up (a timer and every animation frame call this,
+    // outside any other wasm call).
+    pump_audio() {
+        const fifo = this.audio_fifo;
+        if (!fifo || makepad_crash_reporter.is_wasm_dead()) {
+            return;
+        }
+        if (fifo.pump() > 0 && !this.audio_callback_started) {
+            this.audio_callback_started = true;
+            if (this.audio_callback_watchdog !== null) {
+                clearTimeout(this.audio_callback_watchdog);
+                this.audio_callback_watchdog = null;
+            }
+            console.log(
+                `web audio: fifo running state=${this.audio_context.state} sample_rate=${fifo.sample_rate} lead=${fifo.lead_frames} frames`,
+            );
+        }
+    }
+
+    // A page opened with ?test=1: the app's media clock and the output's state, for a
+    // test harness: `makepad_test_clock`, and the harness's own hooks where it defined
+    // them (`__bt_film_time`, `__bt_heard_time`, `__bt_audio`). Nothing is logged.
+    FromWasmTestClock(args) {
+        const audio = this.audio_fifo ? this.audio_fifo.stats() : null;
+        const clock = {
+            at: performance.now(),
+            film: args.film,
+            rendered: args.rendered,
+            speed: args.speed,
+            audio,
+            // The media time heard now: the rendered end, moved back by what is still
+            // between it and the ear.
+            heard: audio ? args.rendered - args.speed * (audio.written - audio.heard_frame) / audio.sample_rate : null,
+        };
+        globalThis.makepad_test_clock = clock;
+        globalThis.__bt_film_time?.(clock.film);
+        globalThis.__bt_heard_time?.(clock.heard);
+        globalThis.__bt_audio?.(clock.audio);
+    }
+
+    watch_audio_callback(audio_context) {
+        if (!this.audio_worklet
+            || this.audio_callback_started
+            || this.audio_callback_watchdog !== null) {
+            return;
+        }
+        this.audio_callback_watchdog = setTimeout(() => {
+            this.audio_callback_watchdog = null;
+            if (this.audio_context === audio_context && !this.audio_callback_started) {
+                console.error(
+                    `web audio: callback never called state=${audio_context.state} sample_rate=${audio_context.sampleRate} buffer=pending`,
+                );
+            }
+        }, 3000);
+    }
+
+    resume_audio_from_gesture() {
+        this.had_user_gesture = true;
+        if (!this.audio_context && this.audio_start_args) {
+            const args = this.audio_start_args;
+            this.audio_start_args = null;
+            this.start_audio_output(args, 1);
+            return;
+        }
+        const audio_context = this.audio_context;
+        if (!audio_context) {
+            return;
+        }
+        if (audio_context.state === "running") {
+            this.watch_audio_callback(audio_context);
+            return;
+        }
+        if (audio_context.state === "closed") {
+            return;
+        }
+        // Every gesture asks again while the context is not running. WebKit grants
+        // activation on pointerup/touchend, not on touchstart, and a resume() asked
+        // without activation stays pending (it never settles): waiting for it skipped
+        // the touchend that could start the sound (iOS played silently). Asking again
+        // is harmless: resume() of a running context resolves at once. An iOS context
+        // "interrupted" by a call or another app also comes back this way.
+        audio_context.resume().then(() => {
+            if (this.audio_context !== audio_context) {
+                return;
+            }
+            if (audio_context.state === "running") {
+                this.watch_audio_callback(audio_context);
+            }
+        }).catch(error => {
+            console.error(
+                `web audio: resume failed state=${audio_context.state} sample_rate=${audio_context.sampleRate} buffer=pending: ${error}`,
+            );
+        });
     }
 
     FromWasmStartAudioOutput(args) {
         if (this.audio_context) {
             return
         }
+        // The web's rule: an output is created inside a user gesture. The wasm asks at
+        // start-up; the first click or key press creates the context and the worklet.
+        if (!this.had_user_gesture) {
+            this.audio_start_args = args;
+            return;
+        }
+        this.start_audio_output(args, 1);
+    }
+
+    start_audio_output(args, attempt) {
+        if (this.audio_context) {
+            return
+        }
+        let audio_context;
+        try {
+            audio_context = new AudioContext({
+                latencyHint: "interactive"
+            });
+        } catch (error) {
+            console.error(`web audio: context creation failed: ${error}`);
+            return;
+        }
+        this.audio_context = audio_context;
+        this.audio_callback_started = false;
+        // iOS: Web Audio is an "ambient" session by default, which the ring/silent switch
+        // mutes; a film or app that plays sound is "playback". And the context must be
+        // resumed while the gesture that created it is still on the stack.
+        if (navigator.audioSession) {
+            try { navigator.audioSession.type = "playback"; } catch (_e) {}
+        }
+        if (audio_context.state === "suspended") {
+            audio_context.resume().catch(() => {});
+        }
+
         const start_worklet = async () => {
+            let cancel_startup;
+            const cancelled = new Promise((_, reject) => {
+                cancel_startup = () => reject(new Error("audio startup cancelled"));
+            });
+            this.audio_startup_cancel = cancel_startup;
             if (this.wasm._secondary_ready) {
-                await this.wasm._secondary_ready;
+                await Promise.race([this.wasm._secondary_ready, cancelled]);
             }
-            if (!this.wasm._has_thread_support) {
-                console.warn("FromWasmStartAudioOutput skipped: wasm threading support is unavailable");
-                return;
+            if (this.audio_context !== audio_context) {
+                throw new Error("audio startup cancelled");
             }
-            const thread_info = this.alloc_thread_stack(args.context_ptr);
-            if (!thread_info) {
-                console.warn("FromWasmStartAudioOutput skipped: thread stack allocation prerequisites are unavailable");
-                return;
+            // Shared memory: the wasm renders on the audio thread (audio_worklet.js). Else the
+            // UI thread renders ahead into a FIFO the worklet plays (makepad_audio_fifo_worklet).
+            const threaded = this.wasm._has_thread_support;
+            let thread_info = null;
+            if (threaded) {
+                // alloc_thread_stack(request_id, context_ptr, stack_size): the audio thread has no
+                // spawn request, and its context pointer is the wasm audio access — passing it as
+                // the request id left the worklet reading its audio state from address zero.
+                thread_info = this.alloc_thread_stack(0, args.context_ptr);
+                if (!thread_info) {
+                    throw new Error("thread stack allocation prerequisites are unavailable");
+                }
+            }
+            const module_url = threaded
+                ? (globalThis.makepad_audio_worklet_url || "./makepad_platform/audio_worklet.js")
+                : makepad_audio_fifo_worklet_url();
+
+            // A stalled module load (seen: it never settles until a second context exists)
+            // is not waited on forever — the deadline fails this attempt, and the retry below
+            // starts over on a fresh context.
+            let load_timeout = null;
+            try {
+                await Promise.race([
+                    audio_context.audioWorklet.addModule(module_url, { credentials: 'omit' }),
+                    new Promise((_, reject) => {
+                        load_timeout = setTimeout(() => reject(new Error("worklet module load stalled")), 4000);
+                    }),
+                    cancelled,
+                ]);
+            } finally {
+                if (load_timeout !== null) {
+                    clearTimeout(load_timeout);
+                }
+                if (this.audio_startup_cancel === cancel_startup) {
+                    this.audio_startup_cancel = null;
+                }
+            }
+            if (this.audio_context !== audio_context) {
+                throw new Error("audio startup cancelled");
             }
 
-            await this.audio_context.audioWorklet.addModule("./makepad_platform/audio_worklet.js", { credentials: 'omit' });
+            if (!threaded) {
+                const audio_worklet = new AudioWorkletNode(audio_context, "makepad-audio-fifo", {
+                    numberOfInputs: 0,
+                    numberOfOutputs: 1,
+                    outputChannelCount: [2],
+                });
+                const fifo = new MakepadAudioFifoOutput(audio_context, audio_worklet.port, (frames, stream_frame, heard_at) => {
+                    const ptr = this.exports.wasm_audio_output_entrypoint(
+                        args.context_ptr, frames, 2, audio_context.sampleRate, stream_frame, heard_at,
+                    );
+                    return new Float32Array(this.memory.buffer, ptr, frames * 2);
+                });
+                audio_worklet.onprocessorerror = (err) => {
+                    console.error(`web audio: processor failed: ${err}`);
+                };
+                audio_worklet.connect(audio_context.destination);
+                return { audio_worklet, fifo };
+            }
 
-            const audio_worklet = new AudioWorkletNode(this.audio_context, 'audio-worklet', {
+            const audio_worklet = new AudioWorkletNode(audio_context, 'audio-worklet', {
                 numberOfInputs: 0,
                 numberOfOutputs: 1,
                 outputChannelCount: [2],
-                processorOptions: { thread_info }
+                // The worklet's monotonic clock is the page's (performance.now()).
+                processorOptions: { thread_info, time_origin: performance.timeOrigin }
             });
 
             audio_worklet.port.onmessage = (e) => {
+                if (this.audio_context !== audio_context) {
+                    return;
+                }
                 let data = e.data;
                 switch (data.message_type) {
                     case "console_log":
@@ -459,53 +2505,101 @@ export class WasmWebBrowser extends WasmBridge {
                     case "console_error":
                         console.error(data.value);
                         break;
+
+                    case "wake_ui":
+                        // the audio thread raised the UI signal (meters, transport state): pump like a wake
+                        this.do_wasm_pump();
+                        break;
+
+                    case "audio_callback_started":
+                        this.audio_callback_started = true;
+                        if (this.audio_callback_watchdog !== null) {
+                            clearTimeout(this.audio_callback_watchdog);
+                            this.audio_callback_watchdog = null;
+                        }
+                        console.log(
+                            `web audio: callback running state=${audio_context.state} sample_rate=${data.sample_rate} buffer=${data.frames}x${data.channels}`,
+                        );
+                        break;
                 }
             };
             audio_worklet.onprocessorerror = (err) => {
-                console.error(err);
+                console.error(`web audio: processor failed: ${err}`);
             }
-            audio_worklet.connect(this.audio_context.destination);
+            audio_worklet.connect(audio_context.destination);
 
-            return audio_worklet;
+            return { audio_worklet, fifo: null };
         };
 
-        let user_interact_hook = (arg) => {
-            if (this.audio_context.state === "suspended") {
-                this.audio_context.resume();
+        start_worklet().then(({ audio_worklet, fifo }) => {
+            if (this.audio_context !== audio_context) {
+                if (fifo) {
+                    fifo.stop();
+                }
+                this.dispose_audio_worklet(audio_worklet);
+                return;
             }
-        }
-        this.audio_context = new AudioContext({
-            latencyHint: "interactive",
-            sampleRate: 48000
+            this.audio_worklet = audio_worklet;
+            if (fifo) {
+                this.audio_fifo = fifo;
+                this.audio_pump_timer = setInterval(() => this.pump_audio(), MAKEPAD_AUDIO_PUMP_INTERVAL_S * 1000);
+                this.pump_audio();
+            }
+            if (audio_context.state === "running") {
+                this.watch_audio_callback(audio_context);
+            }
+        }).catch(error => {
+            if (this.audio_context !== audio_context) {
+                return;
+            }
+            console.error(`web audio: start failed (attempt ${attempt}): ${error}`);
+            this.audio_context = null;
+            audio_context.close().catch(() => {});
+            if (attempt < 3) {
+                this.start_audio_output(args, attempt + 1);
+            }
         });
-        start_worklet().catch(err => console.error(err));
-        window.addEventListener('mousedown', user_interact_hook)
-        window.addEventListener('touchstart', user_interact_hook)
     }
 
     FromWasmQueryAudioDevices(args) {
-        navigator.mediaDevices?.enumerateDevices().then((devices_enum) => {
+        const publish_devices = (devices_enum) => {
             let devices = []
             for (let device of devices_enum) {
-                if (device.kind == "audiooutput" || device.kind == "audioinput") {
+                if (device.kind == "audioinput") {
                     devices.push({
                         web_device_id: "" + device.deviceId,
                         label: "" + device.label,
-                        is_output: device.kind == "audiooutput"
+                        is_output: false
                     });
                 }
             }
-            // safari doesnt report any outputs
+            // AudioContext.destination is the browser-selected output. Until
+            // this backend supports setSinkId, expose that one honest route
+            // instead of device choices FromWasmStartAudioOutput cannot use.
+            const output = devices_enum.find(device =>
+                device.kind == "audiooutput" && device.deviceId == "default"
+            ) || devices_enum.find(device => device.kind == "audiooutput");
             devices.push({
-                web_device_id: "",
-                label: "",
+                web_device_id: output ? "" + output.deviceId : "default",
+                label: output && output.label ? "" + output.label : "Browser audio",
                 is_output: true
             });
             this.to_wasm.ToWasmAudioDeviceList({ devices });
             this.do_wasm_pump();
-        })
+        };
+        const query = navigator.mediaDevices?.enumerateDevices();
+        if (!query) {
+            console.warn("web audio: device enumeration unavailable; using browser default");
+            publish_devices([]);
+            return;
+        }
+        query.then(publish_devices).catch(error => {
+            console.warn(`web audio: device enumeration failed; using browser default: ${error}`);
+            publish_devices([]);
+        });
     }
 
+    // @section midi
     FromWasmUseMidiInputs(args) {
         outer:
         for (let input of this.midi_inputs) {
@@ -575,17 +2669,19 @@ export class WasmWebBrowser extends WasmBridge {
                     this.reload_midi_ports();
                 }
                 this.reload_midi_ports();
-            }, () => {
-                console.error("Cannot open midi");
-            });
+            }, () => {});
         }
     }
+    // @end midi
 
+    // @section xr
     FromWasmStartPresentingXR() {
 
     }
+    // @end xr
 
-    alloc_thread_stack(context_ptr, timer = 0) {
+    // @section threads
+    alloc_thread_stack(request_id, context_ptr, requested_stack_size) {
         if (!this.wasm._has_thread_support) {
             console.warn("alloc_thread_stack unavailable: wasm threading support is disabled");
             return null;
@@ -595,13 +2691,17 @@ export class WasmWebBrowser extends WasmBridge {
             return null;
         }
         var ret = {
-            timer,
+            request_id,
             module: this.wasm._module,
             secondary_module: this.wasm._secondary_module,
             memory: this.wasm._memory,
             context_ptr
         };
         if (typeof this.exports.__wbindgen_start !== 'undefined') {
+            if (requested_stack_size && requested_stack_size !== this.thread_stack_size) {
+                console.warn("custom worker stack size is unavailable for wasm-bindgen workers");
+                return null;
+            }
             ret.wasm_bindgen = true;
         } else {
             if (this.exports.__tls_size === undefined) {
@@ -612,15 +2712,25 @@ export class WasmWebBrowser extends WasmBridge {
                 console.warn("alloc_thread_stack unavailable: missing wasm_thread_alloc_tls_and_stack export");
                 return null;
             }
-            let tls_size = this.exports.__tls_size.value;
-            tls_size += 8 - (tls_size & 7); // align it to 8 bytes
-            let stack_size = this.thread_stack_size; // 8mb
-            if ((tls_size + stack_size) & 7 != 0) {
+            const raw_tls_size = this.exports.__tls_size.value;
+            const tls_size = (raw_tls_size + 7) & ~7;
+            // Manual workers use a real 2 MiB default. A validated Rust
+            // ThreadOptions::stack_size can override it per worker.
+            const stack_size = requested_stack_size || this.thread_stack_size;
+            if (((tls_size + stack_size) & 7) !== 0) {
                 console.warn("alloc_thread_stack unavailable: stack size is not 8-byte aligned");
                 return null;
             }
-            ret.tls_ptr = this.exports.wasm_thread_alloc_tls_and_stack((tls_size + stack_size) >> 3);
-            this.update_array_buffer_refs();
+            const alloc_words = (tls_size + stack_size) >> 3;
+            const arena_index = this.thread_stack_arena.findIndex(block => block.words === alloc_words);
+            if (arena_index >= 0) {
+                const block = this.thread_stack_arena.splice(arena_index, 1)[0];
+                ret.tls_ptr = block.ptr;
+            } else {
+                ret.tls_ptr = this.exports.wasm_thread_alloc_tls_and_stack(alloc_words);
+                this.update_array_buffer_refs();
+            }
+            ret.alloc_words = alloc_words;
             ret.stack_ptr = ret.tls_ptr + tls_size + stack_size - 8;
             ret.wasm_bindgen = false;
         }
@@ -633,40 +2743,181 @@ export class WasmWebBrowser extends WasmBridge {
     // And Ingvar Stepanyan for https://web.dev/webassembly-threads/
     // example build command:
     // RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-arg=--export=__stack_pointer" cargo build -p thing_to_compile --target=wasm32-unknown-unknown -Z build-std=panic_abort,std
-    FromWasmCreateThread(args) {
+    create_thread(args) {
+        let allocated_thread_info = null;
         (async () => {
             if (this.wasm._secondary_ready) {
                 await this.wasm._secondary_ready;
             }
             if (!this.wasm._has_thread_support) {
-                console.error("FromWasmCreateThread not available, wasm file not compiled with threading support");
-                return;
+                throw new Error("wasm file was not compiled with threading support");
             }
-            let thread_info = this.alloc_thread_stack(args.context_ptr, args.timer);
+            let thread_info = this.alloc_thread_stack(args.request_id, args.context_ptr, args.stack_size);
             if (!thread_info) {
-                console.error("FromWasmCreateThread not available, thread stack allocation prerequisites are missing");
-                return;
+                throw new Error("thread stack allocation prerequisites are missing");
             }
+            allocated_thread_info = thread_info;
             let worker = new Worker(
-                './makepad_platform/web_worker.js',
-                { type: 'module' }
+                globalThis.makepad_web_worker_url || './makepad_platform/web_worker.js',
+                { type: 'module', name: args.name || `makepad-worker-${args.request_id}` }
             );
+            const record = { worker, thread_info, started: false, closed: false };
+            this.workers.set(args.request_id, record);
+            const release = () => {
+                if (record.closed) {
+                    return;
+                }
+                record.closed = true;
+                worker.terminate();
+                this.workers.delete(args.request_id);
+                if (!thread_info.wasm_bindgen && thread_info.tls_ptr) {
+                    this.thread_stack_arena.push({ ptr: thread_info.tls_ptr, words: thread_info.alloc_words });
+                }
+            };
+            worker.onmessage = event => {
+                if (record.closed) {
+                    return;
+                }
+                const message = event.data || {};
+                const message_kind = message.kind || message.type;
+                if (message_kind === 'breadcrumb') {
+                    const level = ["log", "warn", "error"].includes(message.level)
+                        ? message.level
+                        : "log";
+                    const text = message.text || "";
+                    makepad_crash_reporter.add_breadcrumb(`worker.${level}`, [text], args.request_id);
+                    const key = `${level}\n${text}`;
+                    const now = performance.now();
+                    const previous = this.worker_console_recent.get(key);
+                    this.worker_console_recent.set(key, now);
+                    if (previous === undefined || now - previous > 100) {
+                        makepad_page_console[level](`[worker ${args.request_id}] ${text}`);
+                    }
+                    if (this.worker_console_recent.size > 100) {
+                        for (const [old_key, seen_at] of this.worker_console_recent) {
+                            if (now - seen_at > 100) {
+                                this.worker_console_recent.delete(old_key);
+                            }
+                        }
+                    }
+                } else if (message_kind === 'panic') {
+                    record.last_panic = { text: String(message.text || ""), time: Date.now() };
+                } else if (message_kind === 'spawn_request') {
+                    this.create_thread(message);
+                } else if (message_kind === 'wake_ui') {
+                    this.js_wake_ui();
+                } else if (message_kind === 'started') {
+                    record.started = true;
+                    this.exports.wasm_thread_started(args.request_id);
+                } else if (message_kind === 'finished') {
+                    this.exports.wasm_thread_finished(args.request_id);
+                    release();
+                } else if (message_kind === 'trapped') {
+                    report_browser_issue("worker.error", {
+                        worker_index: args.request_id,
+                        message: message.message || message.error || "worker trapped",
+                        filename: message.filename || "",
+                        lineno: message.lineno || 0,
+                        stack: message.stack || "",
+                        panic: record.last_panic && Date.now() - record.last_panic.time <= 1000
+                            ? record.last_panic.text
+                            : ""
+                    });
+                    this.exports.wasm_thread_worker_lost(args.request_id);
+                    release();
+                } else if (message_kind === 'failed_to_start') {
+                    report_browser_issue("worker.error", {
+                        worker_index: args.request_id,
+                        message: message.message || message.error || "worker failed to start",
+                        filename: message.filename || "",
+                        lineno: message.lineno || 0,
+                        stack: message.stack || ""
+                    });
+                    this.exports.wasm_thread_failed_to_start(args.request_id);
+                    release();
+                }
+            };
+            const on_worker_error = error => {
+                if (record.closed) {
+                    return;
+                }
+                console.error(error);
+                report_browser_issue("worker.error", {
+                    worker_index: args.request_id,
+                    message: error && error.message ? String(error.message) : String(error),
+                    filename: error && error.filename ? String(error.filename) : "",
+                    lineno: error && error.lineno ? error.lineno : 0,
+                    colno: error && error.colno ? error.colno : 0,
+                    stack: error && error.error && error.error.stack ? String(error.error.stack) : "",
+                    panic: record.last_panic && Date.now() - record.last_panic.time <= 1000
+                        ? record.last_panic.text
+                        : ""
+                });
+                if (record.started) {
+                    this.exports.wasm_thread_worker_lost(args.request_id);
+                } else {
+                    this.exports.wasm_thread_failed_to_start(args.request_id);
+                }
+                release();
+            };
+            worker.onerror = on_worker_error;
+            worker.addEventListener("error", on_worker_error);
+            worker.addEventListener("messageerror", error => {
+                if (record.closed) {
+                    return;
+                }
+                report_browser_issue("worker.error", {
+                    worker_index: args.request_id,
+                    message: error && error.message ? String(error.message) : "worker message could not be decoded",
+                    filename: "",
+                    lineno: 0,
+                    stack: ""
+                });
+                if (record.started) {
+                    this.exports.wasm_thread_worker_lost(args.request_id);
+                } else {
+                    this.exports.wasm_thread_failed_to_start(args.request_id);
+                }
+                release();
+            });
             worker.postMessage(thread_info);
-
-            this.workers.push(worker);
-        })().catch(err => console.error(err));
+        })().catch(err => {
+            console.error(err);
+            report_browser_issue("worker.error", {
+                worker_index: args.request_id,
+                message: err && err.message ? String(err.message) : String(err),
+                filename: err && err.fileName ? String(err.fileName) : "",
+                lineno: err && err.lineNumber ? err.lineNumber : 0,
+                stack: err && err.stack ? String(err.stack) : ""
+            });
+            const record = this.workers.get(args.request_id);
+            if (record) {
+                record.closed = true;
+                record.worker.terminate();
+                this.workers.delete(args.request_id);
+            }
+            if (allocated_thread_info && !allocated_thread_info.wasm_bindgen) {
+                this.thread_stack_arena.push({
+                    ptr: allocated_thread_info.tls_ptr,
+                    words: allocated_thread_info.alloc_words
+                });
+            }
+            this.exports.wasm_thread_failed_to_start(args.request_id);
+        });
     }
+
+    // @end threads
 
     start_signal_poll() {
         this.poll_timer = window.setInterval(e => {
-            let flags = this.exports.wasm_check_signal();
-            if (flags != 0) {
-                this.to_wasm.ToWasmSignal({ flags });
-                this.do_wasm_pump();
+            if (makepad_crash_reporter.is_wasm_dead()) {
+                return;
             }
+            this.deliver_signals();
         }, 0.016 * 1000.0);
     }
 
+    // @section legacy-http
     parse_and_set_headers(request, headers_string) {
         let lines = headers_string.split("\r\n");
         for (let line of lines) {
@@ -676,6 +2927,7 @@ export class WasmWebBrowser extends WasmBridge {
             }
         }
     }
+    // @end legacy-http
 
     id_to_key(id_lo, id_hi) {
         return `${id_lo}:${id_hi}`;
@@ -716,16 +2968,16 @@ export class WasmWebBrowser extends WasmBridge {
         headers_ptr,
         headers_len,
         body_ptr,
-        body_len
+        body_len,
+        max_body_lo,
+        max_body_hi
     ) {
         let url = this.u8_to_string(url_ptr, url_len);
         let method = this.u8_to_string(method_ptr, method_len);
         let headers_raw = this.u8_to_string(headers_ptr, headers_len);
         let body = body_len > 0 ? this.u8_to_array(body_ptr, body_len) : undefined;
-        let controller = new AbortController();
         let request_key = this.id_to_key(request_id_lo, request_id_hi);
-        this.network_http_requests.set(request_key, controller);
-
+        let max_body = max_body_lo + max_body_hi * 4294967296;
         let headers = new Headers();
         for (let line of headers_raw.split("\r\n")) {
             if (!line) {
@@ -747,26 +2999,168 @@ export class WasmWebBrowser extends WasmBridge {
             }
         }
 
-        console.log("[makepad][http][req]", method, url);
-        fetch(url, {
+        let parsed_url;
+        try {
+            parsed_url = new URL(url, window.location.href);
+        }
+        catch (_error) {
+            parsed_url = new URL(window.location.href);
+        }
+        const telemetry = new URLSearchParams(parsed_url.hash.slice(1));
+        const is_archive = telemetry.get("makepad-http") === "archive";
+        const is_archive_range = is_archive && telemetry.get("range") === "1";
+        const tile_keys = telemetry.get("tiles") || "-";
+        const priority = Number(telemetry.get("priority") || Number.MAX_SAFE_INTEGER);
+        const range_bytes = Number(telemetry.get("bytes") || 0);
+        parsed_url.hash = "";
+        const fetch_url = parsed_url.href;
+        const host_key = parsed_url.origin;
+        const entry = {
+            request_key,
+            request_id_lo,
+            request_id_hi,
+            metadata_id_lo,
+            metadata_id_hi,
+            fetch_url,
             method,
             headers,
             body,
-            signal: controller.signal,
+            max_body,
+            host_key,
+            is_archive,
+            is_archive_range,
+            tile_keys,
+            priority,
+            range_bytes,
+            state: "queued",
+            controller: null,
+            stall_timer: null,
+            started_at: 0,
+            response_bytes: 0,
+        };
+        this.network_http_requests.set(request_key, entry);
+        if (!is_archive) {
+            this.network_http_dispatch(entry);
+            return;
+        }
+        let host = this.network_http_hosts.get(host_key);
+        if (!host) {
+            host = { active: 0, pending: 0, queue: [], round: null };
+            this.network_http_hosts.set(host_key, host);
+        }
+        host.pending += 1;
+        host.queue.push(entry);
+        host.queue.sort((left, right) =>
+            left.priority - right.priority
+            || right.range_bytes - left.range_bytes
+            || left.fetch_url.localeCompare(right.fetch_url)
+        );
+        this.network_http_pump(host_key);
+    }
+
+    network_http_pump(host_key) {
+        const host = this.network_http_hosts.get(host_key);
+        if (!host) {
+            return;
+        }
+        while (host.active < 5 && host.queue.length > 0) {
+            const entry = host.queue.shift();
+            if (this.network_http_requests.get(entry.request_key) !== entry) {
+                continue;
+            }
+            host.active += 1;
+            this.network_http_dispatch(entry);
+        }
+    }
+
+    network_http_dispatch(entry) {
+        entry.state = "active";
+        entry.controller = new AbortController();
+        entry.started_at = performance.now();
+        if (entry.is_archive_range) {
+            let host = this.network_http_hosts.get(entry.host_key);
+            if (!host.round) {
+                host.round = {
+                    started_at: entry.started_at,
+                    ranges: 0,
+                    bytes: 0,
+                    tiles: new Set(),
+                };
+            }
+            host.round.ranges += 1;
+            for (const key of entry.tile_keys.split(",")) {
+                if (key && key !== "-") {
+                    host.round.tiles.add(key);
+                }
+            }
+        }
+        const arm_stall_timer = () => {
+            if (entry.stall_timer !== null) {
+                window.clearTimeout(entry.stall_timer);
+            }
+            entry.stall_timer = window.setTimeout(() => {
+                entry.controller.abort("HTTP request stalled for 20 seconds after dispatch");
+            }, 20000);
+        };
+        arm_stall_timer();
+        this.exports.wasm_network_http_progress(
+            entry.request_id_lo,
+            entry.request_id_hi,
+            0,
+            0
+        );
+        fetch(entry.fetch_url, {
+            method: entry.method,
+            headers: entry.headers,
+            body: entry.body,
+            signal: entry.controller.signal,
+            redirect: "manual",
         }).then(async response => {
+            arm_stall_timer();
             let response_headers = "";
             response.headers.forEach((value, key) => {
                 response_headers += `${key}: ${value}\r\n`;
             });
-            let response_body = new Uint8Array(await response.arrayBuffer());
+            const declared = response.headers.get("content-length");
+            if (entry.method !== "HEAD" && declared !== null && Number(declared) > entry.max_body) {
+                entry.controller.abort();
+                throw "response body exceeds configured limit";
+            }
+            let chunks = [];
+            let response_body_len = 0;
+            if (response.body !== null) {
+                const reader = response.body.getReader();
+                for (;;) {
+                    const item = await reader.read();
+                    if (item.done) {
+                        break;
+                    }
+                    arm_stall_timer();
+                    response_body_len += item.value.byteLength;
+                    if (response_body_len > entry.max_body) {
+                        entry.controller.abort();
+                        throw "response body exceeds configured limit";
+                    }
+                    chunks.push(item.value);
+                }
+            }
+            let response_body = new Uint8Array(response_body_len);
+            let body_at = 0;
+            for (const chunk of chunks) {
+                response_body.set(chunk, body_at);
+                body_at += chunk.byteLength;
+            }
             let headers_u8 = this.string_to_u8(response_headers);
             let body_u8 = this.array_to_u8(response_body);
-            console.log("[makepad][http][res]", response.status, url, response_body.length);
+            entry.response_bytes = response_body.length;
+            if (response.status >= 400) {
+                console.error("[makepad][http][fail]", response.status, entry.fetch_url);
+            }
             this.exports.wasm_network_http_response(
-                request_id_lo,
-                request_id_hi,
-                metadata_id_lo,
-                metadata_id_hi,
+                entry.request_id_lo,
+                entry.request_id_hi,
+                entry.metadata_id_lo,
+                entry.metadata_id_hi,
                 response.status,
                 headers_u8.ptr,
                 headers_u8.len,
@@ -774,30 +3168,98 @@ export class WasmWebBrowser extends WasmBridge {
                 body_u8.len
             );
         }).catch(error => {
-            console.error("[makepad][http][err]", method, url, "" + error);
+            console.error(
+                "[makepad][http][err]",
+                entry.method,
+                entry.fetch_url,
+                "" + error,
+                `tiles=${entry.tile_keys}`
+            );
             let message_u8 = this.string_to_u8("" + error);
             this.exports.wasm_network_http_error(
-                request_id_lo,
-                request_id_hi,
-                metadata_id_lo,
-                metadata_id_hi,
+                entry.request_id_lo,
+                entry.request_id_hi,
+                entry.metadata_id_lo,
+                entry.metadata_id_hi,
                 message_u8.ptr,
                 message_u8.len
             );
         }).finally(() => {
-            this.network_http_requests.delete(request_key);
+            this.network_http_finish(entry);
         });
+    }
+
+    network_http_finish(entry) {
+        if (entry.stall_timer !== null) {
+            window.clearTimeout(entry.stall_timer);
+            entry.stall_timer = null;
+        }
+        if (this.network_http_requests.get(entry.request_key) === entry) {
+            this.network_http_requests.delete(entry.request_key);
+        }
+        entry.state = "done";
+        if (!entry.is_archive) {
+            return;
+        }
+        const host = this.network_http_hosts.get(entry.host_key);
+        if (!host) {
+            return;
+        }
+        host.active = Math.max(0, host.active - 1);
+        host.pending = Math.max(0, host.pending - 1);
+        if (host.round && entry.is_archive_range) {
+            host.round.bytes += entry.response_bytes;
+        }
+        this.network_http_pump(entry.host_key);
+        if (host.pending === 0) {
+            if (host.round) {
+                host.round = null;
+            }
+            if (host.active === 0 && host.queue.length === 0) {
+                this.network_http_hosts.delete(entry.host_key);
+            }
+        }
     }
 
     js_network_http_cancel(request_id_lo, request_id_hi) {
         let request_key = this.id_to_key(request_id_lo, request_id_hi);
-        let controller = this.network_http_requests.get(request_key);
-        if (controller) {
-            controller.abort();
-            this.network_http_requests.delete(request_key);
+        let entry = this.network_http_requests.get(request_key);
+        if (!entry) {
+            return;
         }
+        if (entry.is_archive && entry.state === "queued") {
+            const host = this.network_http_hosts.get(entry.host_key);
+            if (host) {
+                host.queue = host.queue.filter(item => item !== entry);
+                host.pending = Math.max(0, host.pending - 1);
+                if (host.pending === 0 && host.round) {
+                    host.round = null;
+                }
+            }
+            this.network_http_requests.delete(request_key);
+            entry.state = "cancelled";
+            const message_u8 = this.string_to_u8("HTTP request cancelled before dispatch");
+            this.exports.wasm_network_http_error(
+                entry.request_id_lo,
+                entry.request_id_hi,
+                entry.metadata_id_lo,
+                entry.metadata_id_hi,
+                message_u8.ptr,
+                message_u8.len
+            );
+            if (host && host.pending === 0 && host.active === 0) {
+                this.network_http_hosts.delete(entry.host_key);
+            }
+            return;
+        }
+        if (entry.is_archive && entry.state === "active") {
+            return;
+        }
+        entry.controller.abort();
+        this.network_http_requests.delete(request_key);
     }
 
+    // @section websocket
     js_network_ws_open(socket_id_lo, socket_id_hi, url_ptr, url_len, _headers_ptr, _headers_len) {
         let socket_key = this.id_to_key(socket_id_lo, socket_id_hi);
         let url = this.u8_to_string(url_ptr, url_len);
@@ -864,16 +3326,17 @@ export class WasmWebBrowser extends WasmBridge {
             delete this.network_web_sockets[socket_key];
         }
     }
+    // @end websocket
 
+    // @section legacy-http
     FromWasmHTTPRequest(args) {
         const req = new XMLHttpRequest();
+        this.legacy_http_requests.add(req);
         req.open(args.method, args.url);
         req.responseType = "arraybuffer";
         this.parse_and_set_headers(req, args.headers);
 
-        // TODO decode in appropiate format
-        const decoder = new TextDecoder('UTF-8', { fatal: true });
-        let body = decoder.decode(this.clone_data_u8(args.body));
+        const body = this.clone_data_u8(args.body);
 
         req.addEventListener("load", event => {
             let responseEvent = event.target;
@@ -965,19 +3428,150 @@ export class WasmWebBrowser extends WasmBridge {
                 this.do_wasm_pump();
             }
         });
+        req.addEventListener("loadend", () => {
+            this.legacy_http_requests.delete(req);
+        });
 
-        req.send(body);
-        this.free_data_u8(args.body);
+        try {
+            req.send(body);
+        } finally {
+            this.free_data_u8(args.body);
+        }
     }
 
     FromWasmCancelHTTPRequest(args) {
         // Web doesn't provide a way to cancel XHR requests by ID
         // This would require tracking requests, which we don't currently do
     }
+    // @end legacy-http
 
+    // @section file-dialog
+    FromWasmSetVirtualFileLimits(args) {
+        this.virtual_file_max_size = args.max_file_size;
+        this.virtual_file_max_total_size = args.max_total_size;
+    }
+
+    read_virtual_files(file_list, max_file_size, max_total_size) {
+        const files = Array.from(file_list);
+        let total = 0;
+        for (const file of files) {
+            if (file.size > max_file_size) {
+                return Promise.reject(new Error(
+                    `file '${file.name}' is ${file.size} bytes, exceeding the per-file limit of ${max_file_size} bytes`
+                ));
+            }
+            total += file.size;
+            if (!Number.isSafeInteger(total) || total > max_total_size) {
+                return Promise.reject(new Error(
+                    `selected files total ${total} bytes, exceeding the per-drop limit of ${max_total_size} bytes`
+                ));
+            }
+        }
+        return Promise.all(files.map(async file => {
+            const bytes = await file.arrayBuffer();
+            if (bytes.byteLength > max_file_size) {
+                throw new Error(
+                    `file '${file.name}' grew to ${bytes.byteLength} bytes, exceeding the per-file limit of ${max_file_size} bytes`
+                );
+            }
+            return {
+                name: file.name + "",
+                mime: file.type + "",
+                bytes,
+            };
+        })).then(loaded => {
+            const loaded_total = loaded.reduce((sum, file) => sum + file.bytes.byteLength, 0);
+            if (!Number.isSafeInteger(loaded_total) || loaded_total > max_total_size) {
+                throw new Error(
+                    `loaded files total ${loaded_total} bytes, exceeding the per-drop limit of ${max_total_size} bytes`
+                );
+            }
+            return loaded;
+        });
+    }
+
+    FromWasmSelectFileDialog(args) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.style.display = 'none';
+        input.multiple = args.multiple;
+        if (args.accept) {
+            input.accept = args.accept;
+        }
+        document.body.appendChild(input);
+
+        let settled = false;
+        let selection_started = false;
+        let picker_blurred_window = false;
+        const cleanup = () => {
+            window.removeEventListener('blur', on_blur);
+            window.removeEventListener('focus', on_focus);
+            if (input.parentNode) {
+                input.parentNode.removeChild(input);
+            }
+        };
+        const finish = (cancelled, files, error) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            cleanup();
+            this.to_wasm.ToWasmFileDialogResult({
+                id_lo: args.id_lo,
+                id_hi: args.id_hi,
+                cancelled,
+                error,
+                files,
+            });
+            this.do_wasm_pump();
+        };
+        const cancel = () => finish(true, [], "");
+        const on_blur = () => {
+            picker_blurred_window = true;
+        };
+        const on_focus = () => {
+            if (picker_blurred_window) {
+                window.setTimeout(() => {
+                    if (!selection_started) {
+                        cancel();
+                    }
+                }, 0);
+            }
+        };
+
+        input.addEventListener('change', () => {
+            selection_started = true;
+            if (!input.files || input.files.length === 0) {
+                cancel();
+                return;
+            }
+            this.read_virtual_files(input.files, args.max_file_size, args.max_total_size)
+                .then(files => finish(false, files, ""))
+                .catch(error => finish(true, [], "" + error));
+        });
+        // Modern browsers report picker dismissal directly. The blur/focus
+        // pair below is the fallback for older engines; engines that expose
+        // neither signal cannot report cancellation until another result.
+        input.addEventListener('cancel', cancel);
+        window.addEventListener('blur', on_blur);
+        window.addEventListener('focus', on_focus);
+
+        // This method is dispatched synchronously by do_wasm_pump(), so the
+        // click stays in the button/mouse event task whenever the app queued
+        // the dialog from that handler. Browsers reject later, unprompted calls.
+        try {
+            input.click();
+        }
+        catch (error) {
+            finish(true, [], "browser rejected file picker: " + error);
+        }
+    }
+    // @end file-dialog
+
+    // @section permissions
     async FromWasmCheckPermission(args) {
         try {
-            if (args.permission === 'microphone' || args.permission === 'camera') {
+            if (args.permission === 'microphone' || args.permission === 'camera' || args.permission === 'geolocation') {
                 // Check if Permissions API is available
                 if (navigator.permissions && navigator.permissions.query) {
                     const result = await navigator.permissions.query({ name: args.permission });
@@ -998,6 +3592,13 @@ export class WasmWebBrowser extends WasmBridge {
                         permission: args.permission,
                         request_id: args.request_id,
                         status: status
+                    });
+                } else if (args.permission === 'geolocation') {
+                    // No Permissions API — cannot check without prompting
+                    this.to_wasm.ToWasmPermissionResult({
+                        permission: args.permission,
+                        request_id: args.request_id,
+                        status: 0 // NotDetermined
                     });
                 } else {
                     // Fallback: try to check if we already have a stream
@@ -1074,6 +3675,29 @@ export class WasmWebBrowser extends WasmBridge {
                         status: status
                     });
                 }
+            } else if (args.permission === 'geolocation' && navigator.geolocation) {
+                // One-shot position read triggers the browser prompt;
+                // callbacks pump for themselves.
+                navigator.geolocation.getCurrentPosition(
+                    (_pos) => {
+                        this.to_wasm.ToWasmPermissionResult({
+                            permission: args.permission,
+                            request_id: args.request_id,
+                            status: 1 // Granted
+                        });
+                        this.do_wasm_pump();
+                    },
+                    (err) => {
+                        this.to_wasm.ToWasmPermissionResult({
+                            permission: args.permission,
+                            request_id: args.request_id,
+                            status: err.code === 1 ? 3 : 2 // denied : retryable
+                        });
+                        this.do_wasm_pump();
+                    },
+                    { timeout: 30000 }
+                );
+                return;
             } else {
                 // Unknown permission type
                 this.to_wasm.ToWasmPermissionResult({
@@ -1092,13 +3716,9 @@ export class WasmWebBrowser extends WasmBridge {
         }
         this.do_wasm_pump();
     }
+    // @end permissions
 
     // calling into wasm
-
-
-    wasm_terminate_thread_pools() {
-        this.exports.wasm_terminate_thread_pools(this.wasm_app);
-    }
 
     wasm_create_app() {
         let new_ptr = this.exports.wasm_create_app();
@@ -1120,22 +3740,71 @@ export class WasmWebBrowser extends WasmBridge {
     }
 
     do_wasm_pump() {
+        if (makepad_crash_reporter.is_wasm_dead()) {
+            makepad_crash_reporter.suppress_followup();
+            return;
+        }
         let started = performance.now();
-        this.buffer_upload_serial += 1;
-        let to_wasm = this.to_wasm;
-        this.to_wasm = this.new_to_wasm();
+        let from_wasm = null;
         try {
-            let from_wasm = this.wasm_process_msg(to_wasm);
+            this.buffer_upload_serial += 1;
+            let to_wasm = this.to_wasm;
+            this.to_wasm = this.new_to_wasm();
+            from_wasm = this.wasm_process_msg(to_wasm);
+            // The reply says when the next `time_fps` frame wants its animation frame, if it does.
+            this.frame_at = NaN;
             from_wasm.dispatch_on_app();
-            from_wasm.free();
-        } catch (e) {
+            const dispatched = from_wasm;
+            from_wasm = null;
+            dispatched.free();
+            const at = this.frame_at;
+            if (!Number.isFinite(at) || this.req_anim_frame_id || this.xr !== undefined || this.webgl_context_lost) {
+                this.clear_frame_timer();
+            } else if (!this.frame_timer || this.frame_timer_at !== at) {
+                this.clear_frame_timer();
+                this.frame_timer_at = at;
+                const wait = () => {
+                    this.frame_timer = 0;
+                    const now = this.js_monotonic_now();
+                    if (now >= at) {
+                        this.FromWasmRequestAnimationFrame();
+                        return;
+                    }
+                    // setTimeout counts whole milliseconds, so we round up and check again.
+                    this.frame_timer = window.setTimeout(wait, Math.min(Math.ceil((at - now) * 1000.0), 2147483647));
+                };
+                wait();
+            }
+            this.update_startup_loader(performance.now() - started);
+        } catch (error) {
+            let context_lost = this.webgl_context_lost;
+            if (!context_lost && this.gl && typeof this.gl.isContextLost === "function") {
+                try {
+                    context_lost = this.gl.isContextLost();
+                } catch (_query_error) {
+                }
+            }
+            if (context_lost) {
+                // The context went away under this batch: the rest of it is
+                // dropped (the restore repaints) and the app runs on.
+                if (from_wasm) {
+                    from_wasm.free();
+                }
+                if (typeof this.handle_webgl_context_lost === "function") {
+                    this.handle_webgl_context_lost();
+                }
+                return;
+            }
             // Catch WASM RuntimeError traps (e.g., from corrupt shader mappings
             // after Script VM property resolution failures) to prevent a single
             // bad frame from killing the entire page. Subsequent frames recover
             // because shader compilation is a one-time operation.
-            console.error("do_wasm_pump error (recovering):", e.message);
+            console.error("do_wasm_pump error (recovering):", error && error.message ? error.message : error);
+            void makepad_crash_reporter.report("window.error", {
+                message: error && error.message ? String(error.message) : String(error),
+                stack: error && error.stack ? String(error.stack) : ""
+            });
         }
-        this.update_startup_loader(performance.now() - started);
     }
 
 
@@ -1173,8 +3842,25 @@ export class WasmWebBrowser extends WasmBridge {
         this.detect.is_add_to_homescreen_safari = this.is_mobile_safari && navigator.standalone
     }
 
+    ensure_render_quality() {
+        if (this.render_quality !== null) {
+            return this.render_quality;
+        }
+        const canvas = this.canvas;
+        const read_number = (name, fallback) => {
+            const attribute = canvas.getAttribute(name);
+            return makepad_positive_number(attribute, fallback);
+        };
+        // Optional page-author choices; without them the drawable follows
+        // the device (see MAKEPAD_WEBGL_PIXEL_BUDGET).
+        this.render_quality = {
+            pixel_budget: read_number("renderpixelbudget", MAKEPAD_WEBGL_PIXEL_BUDGET),
+            dpr_ceiling: read_number("maxdpr", Infinity),
+        };
+        return this.render_quality;
+    }
+
     update_window_info() {
-        var dpi_factor = window.devicePixelRatio;
         var w;
         var h;
         var canvas = this.canvas;
@@ -1199,21 +3885,40 @@ export class WasmWebBrowser extends WasmBridge {
             w = canvas.offsetWidth;
             h = canvas.offsetHeight;
         }
-        var sw = canvas.width = w * dpi_factor;
-        var sh = canvas.height = h * dpi_factor;
+        const physical_device_dpi = makepad_device_pixel_ratio(window.devicePixelRatio);
+        this.physical_device_dpi = physical_device_dpi;
+        const quality = this.ensure_render_quality();
+        const size = makepad_compute_webgl_size(
+            w,
+            h,
+            Math.min(physical_device_dpi, quality.dpr_ceiling),
+            this.webgl_limits,
+            quality.pixel_budget,
+        );
+        if (canvas.width !== size.width) {
+            canvas.width = size.width;
+        }
+        if (canvas.height !== size.height) {
+            canvas.height = size.height;
+        }
 
-        this.gl.viewport(0, 0, sw, sh);
+        if (this.gl && !this.webgl_context_lost) {
+            this.gl.viewport(0, 0, size.width, size.height);
+        }
 
-        this.window_info.dpi_factor = dpi_factor;
-        this.window_info.inner_width = canvas.offsetWidth;
-        this.window_info.inner_height = canvas.offsetHeight;
+        this.dpi_factor = size.scale;
+        this.window_info.dpi_factor = size.scale;
+        this.window_info.inner_width = size.logical_width;
+        this.window_info.inner_height = size.logical_height;
         this.window_info.is_fullscreen = is_fullscreen();
         this.window_info.can_fullscreen = can_fullscreen();
     }
 
+    // @section xr
     query_xr_capabilities() {
         return Promise.all([]);
     }
+    // @end xr
 
     bind_screen_resize() {
         this.handlers.on_screen_resize = () => {
@@ -1237,6 +3942,13 @@ export class WasmWebBrowser extends WasmBridge {
 
         window.addEventListener('resize', _ => this.handlers.on_screen_resize())
         window.addEventListener('orientationchange', _ => this.handlers.on_screen_resize())
+        // Fullscreen is part of the window geometry (`is_fullscreen`), and
+        // the browser leaves it on its own Esc without telling the page a
+        // key was pressed — this is how the app learns. A resize does not
+        // always come with it (a viewport already at screen size, or an
+        // emulated one, keeps its size).
+        document.addEventListener('fullscreenchange', _ => this.handlers.on_screen_resize())
+        document.addEventListener('webkitfullscreenchange', _ => this.handlers.on_screen_resize())
     }
 
     bind_mouse_and_touch() {
@@ -1339,12 +4051,17 @@ export class WasmWebBrowser extends WasmBridge {
         }
         //let current_mouse_down = null;
         this.handlers.on_mouse_down = e => {
+            this.resume_audio_from_gesture();
             e.preventDefault();
             this.focus_keyboard_input();
             //if (current_mouse_down === null || current_mouse_down === e.button){
             //    current_mouse_down = e.button;
             this.to_wasm.ToWasmMouseDown({ mouse: mouse_to_wasm_wmouse(e) });
             this.do_wasm_pump();
+            // The gesture can synchronously cause the app to open its first
+            // output. Resume that newly-created context before returning to
+            // the browser and losing user activation.
+            this.resume_audio_from_gesture();
             //}
         }
 
@@ -1381,8 +4098,9 @@ export class WasmWebBrowser extends WasmBridge {
 
         canvas.addEventListener('contextmenu', e => this.handlers.on_contextmenu(e))
 
-        function touch_to_wasm_wtouch(t, state) {
+        function touch_to_wasm_wtouch(t, state, time) {
             return {
+                time,
                 state,
                 x: t.pageX,
                 y: t.pageY,
@@ -1398,7 +4116,7 @@ export class WasmWebBrowser extends WasmBridge {
             let f = [];
 
             for (let i = 0; i < e.changedTouches.length; i++) {
-                f.push(touch_to_wasm_wtouch(e.changedTouches[i], state));
+                f.push(touch_to_wasm_wtouch(e.changedTouches[i], state, e.timeStamp / 1000.0));
             }
 
             touch_loop:
@@ -1409,7 +4127,7 @@ export class WasmWebBrowser extends WasmBridge {
                         continue touch_loop;
                     }
                 }
-                f.push(touch_to_wasm_wtouch(t, 0));
+                f.push(touch_to_wasm_wtouch(t, 0, e.timeStamp / 1000.0));
             }
             /*
             let dump = "";
@@ -1422,6 +4140,7 @@ export class WasmWebBrowser extends WasmBridge {
         }
 
         this.handlers.on_touchstart = e => {
+            this.resume_audio_from_gesture();
             e.preventDefault()
             this.to_wasm.ToWasmTouchUpdate({
                 time: e.timeStamp / 1000.0,
@@ -1429,6 +4148,7 @@ export class WasmWebBrowser extends WasmBridge {
                 touches: touches_to_wasm_wtouches(e, 1)
             });
             this.do_wasm_pump();
+            this.resume_audio_from_gesture();
             return false
         }
 
@@ -1444,21 +4164,30 @@ export class WasmWebBrowser extends WasmBridge {
         }
 
         this.handlers.on_touch_end_cancel_leave = e => {
+            // WebKit lets audio start in a touchend, not in a touchstart.
+            this.resume_audio_from_gesture();
             e.preventDefault();
             this.to_wasm.ToWasmTouchUpdate({
                 time: e.timeStamp / 1000.0,
                 modifiers: pack_key_modifier(e),
-                touches: touches_to_wasm_wtouches(e, 3)
+                touches: touches_to_wasm_wtouches(e, e.type === "touchend" ? 3 : 4)
             });
             this.do_wasm_pump();
             return false
         }
 
-        canvas.addEventListener('touchstart', e => this.handlers.on_touchstart(e))
+        canvas.addEventListener('touchstart', e => this.handlers.on_touchstart(e), { passive: false })
         canvas.addEventListener('touchmove', e => this.handlers.on_touchmove(e), { passive: false })
-        canvas.addEventListener('touchend', e => this.handlers.on_touch_end_cancel_leave(e));
-        canvas.addEventListener('touchcancel', e => this.handlers.on_touch_end_cancel_leave(e));
-        canvas.addEventListener('touchleave', e => this.handlers.on_touch_end_cancel_leave(e));
+        canvas.addEventListener('touchend', e => this.handlers.on_touch_end_cancel_leave(e), { passive: false });
+        canvas.addEventListener('touchcancel', e => this.handlers.on_touch_end_cancel_leave(e), { passive: false });
+        canvas.addEventListener('touchleave', e => this.handlers.on_touch_end_cancel_leave(e), { passive: false });
+        // Audio may start on any gesture the browser grants activation to, wherever on the
+        // page it lands (the credits button, an overlay): WebKit grants it on pointerup,
+        // touchend, mouseup, click and keydown, never on pointerdown/touchstart. Passive and
+        // capturing, so no handler's preventDefault can hide the gesture from the audio.
+        for (const type of ['pointerup', 'touchend', 'mouseup', 'click', 'keydown']) {
+            document.addEventListener(type, () => this.resume_audio_from_gesture(), { capture: true, passive: true });
+        }
 
         var last_wheel_time;
         var last_was_wheel;
@@ -1499,18 +4228,89 @@ export class WasmWebBrowser extends WasmBridge {
         canvas.addEventListener('wheel', e => this.handlers.on_mouse_wheel(e))
     }
 
+    // @section file-dialog
+    bind_file_drop() {
+        const canvas = this.canvas;
+        const file_count = event => {
+            if (event.dataTransfer.files && event.dataTransfer.files.length) {
+                return event.dataTransfer.files.length;
+            }
+            return Array.from(event.dataTransfer.items || [])
+                .filter(item => item.kind === 'file').length;
+        };
+        const position = event => {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: event.clientX - rect.left,
+                y: event.clientY - rect.top,
+            };
+        };
+        const emit_drag = (event, left) => {
+            const pos = position(event);
+            this.to_wasm.ToWasmFileDrag({
+                x: pos.x,
+                y: pos.y,
+                modifiers: pack_key_modifier(event),
+                file_count: file_count(event),
+                left,
+            });
+            this.do_wasm_pump();
+        };
+
+        canvas.addEventListener('dragenter', event => {
+            event.preventDefault();
+            emit_drag(event, false);
+        });
+        canvas.addEventListener('dragover', event => {
+            event.preventDefault();
+            if (event.dataTransfer) {
+                event.dataTransfer.dropEffect = 'copy';
+            }
+            emit_drag(event, false);
+        });
+        canvas.addEventListener('dragleave', event => {
+            event.preventDefault();
+            emit_drag(event, true);
+        });
+        canvas.addEventListener('drop', event => {
+            event.preventDefault();
+            const pos = position(event);
+            const modifiers = pack_key_modifier(event);
+            this.read_virtual_files(
+                event.dataTransfer.files,
+                this.virtual_file_max_size,
+                this.virtual_file_max_total_size,
+            ).then(files => {
+                this.to_wasm.ToWasmFileDrop({
+                    x: pos.x,
+                    y: pos.y,
+                    modifiers,
+                    files,
+                });
+                this.do_wasm_pump();
+            }).catch(error => {
+                this.to_wasm.ToWasmFileDropError({error: "" + error});
+                this.do_wasm_pump();
+            });
+        });
+    }
+    // @end file-dialog
+
     bind_keyboard() {
+        if (this.a11y?.enabled) return;
         if (this.detect.is_mobile_safari || this.detect.is_android) { // mobile keyboards are unusable on a UI like this. Not happening.
             return
         }
 
         var ta = this.text_area = document.createElement('textarea')
+        ta.tabIndex = -1;
+        ta.setAttribute('aria-hidden', 'true');
         ta.className = "cx_webgl_textinput"
         ta.setAttribute('autocomplete', 'off')
         ta.setAttribute('autocorrect', 'off')
         ta.setAttribute('autocapitalize', 'off')
         ta.setAttribute('spellcheck', 'false')
-        var style = document.createElement('style')
+        var style = this.keyboard_style || (this.keyboard_style = document.createElement('style'))
 
         style.innerHTML = "\n"
             + "textarea.cx_webgl_textinput {\n"
@@ -1553,9 +4353,12 @@ export class WasmWebBrowser extends WasmBridge {
         this.neutralize_ime = false;
         var last_len = 0;
 
+        // @section clipboard
         this.handlers.on_cut = e => {
+            this.write_copy_flavours(e);
             setTimeout(_ => {
                 ta.value = "";
+                this.clear_copy_flavours();
                 last_len = 0;
             }, 0)
         }
@@ -1563,8 +4366,10 @@ export class WasmWebBrowser extends WasmBridge {
         ta.addEventListener('cut', e => this.handlers.on_cut(e));
 
         this.handlers.on_copy = e => {
+            this.write_copy_flavours(e);
             setTimeout(_ => {
                 ta.value = "";
+                this.clear_copy_flavours();
                 last_len = 0;
             }, 0)
         }
@@ -1573,10 +4378,21 @@ export class WasmWebBrowser extends WasmBridge {
 
         this.handlers.on_paste = e => {
             was_paste = true;
+            // the reads this paste asks for get what its clipboard holds
+            const data = e.clipboardData;
+            if (data) {
+                this.to_wasm.ToWasmPasteFlavours({
+                    text: data.getData('text/plain'),
+                    html: data.getData('text/html'),
+                    markdown: data.getData('text/markdown'),
+                });
+            }
         }
 
         ta.addEventListener('paste', e => this.handlers.on_paste(e));
+        // @end clipboard
 
+        // @section text-input
         this.handlers.on_select = e => { }
 
         ta.addEventListener('select', e => this.handlers.on_select(e))
@@ -1654,6 +4470,7 @@ export class WasmWebBrowser extends WasmBridge {
             ta.value = "";
             last_len = 0;
         });
+        // @end text-input
 
         ta.addEventListener('mousedown', e => this.handlers.on_mouse_down(e));
         ta.addEventListener('mouseup', e => this.handlers.on_mouse_up(e));
@@ -1668,23 +4485,31 @@ export class WasmWebBrowser extends WasmBridge {
         var ugly_ime_hack = false;
 
         this.handlers.on_keydown = e => {
+            this.resume_audio_from_gesture();
             let code = e.keyCode;
 
             //if (code == 91) {firefox_logo_key = true; e.preventDefault();}
             if (code == 18 || code == 17 || code == 16) e.preventDefault(); // alt
             if (code === 8 || code === 9) e.preventDefault() // backspace/tab
+            if (code === 121 && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                e.preventDefault() // Shift+F10: tweaker
+            }
+            // @section clipboard
             if ((code === 88 || code == 67) && (e.metaKey || e.ctrlKey)) { // copy or cut
                 // we need to request the clipboard
+                this.clear_copy_flavours();
                 this.to_wasm.ToWasmTextCopy();
                 this.do_wasm_pump();
                 ta.value = this.text_copy_response;
                 ta.selectionStart = 0;
                 ta.selectionEnd = ta.value.length;
             }
+            // @end clipboard
             //    this.keyboardCut = true // x cut
             //if(code === 65 && (e.metaKey || e.ctrlKey)) this.keyboardSelectAll = true     // all (select all)
             if (code === 89 && (e.metaKey || e.ctrlKey)) e.preventDefault() // all (select all)
             if (code === 83 && (e.metaKey || e.ctrlKey)) e.preventDefault() // ctrl s
+            // @section text-input
             if (code === 90 && (e.metaKey || e.ctrlKey)) {
                 this.update_text_area_pos();
                 ta.value = "";
@@ -1692,6 +4517,7 @@ export class WasmWebBrowser extends WasmBridge {
                 ta.readOnly = true;
                 e.preventDefault()
             }
+            // @end text-input
             // if we are using arrow keys, home or end
             let key_code = e.keyCode;
 
@@ -1711,6 +4537,7 @@ export class WasmWebBrowser extends WasmBridge {
             })
 
             this.do_wasm_pump();
+            this.resume_audio_from_gesture();
         };
 
         ta.addEventListener('keydown', e => this.handlers.on_keydown(e));
@@ -1720,6 +4547,7 @@ export class WasmWebBrowser extends WasmBridge {
 
             if (code == 18 || code == 17 || code == 16) e.preventDefault(); // alt
             if (code == 91) { e.preventDefault(); }
+            // @section text-input
             var ta = this.text_area;
             if (ugly_ime_hack) {
                 ugly_ime_hack = false;
@@ -1727,6 +4555,7 @@ export class WasmWebBrowser extends WasmBridge {
                 this.bind_keyboard();
                 this.update_text_area_pos();
             }
+            // @end text-input
             this.to_wasm.ToWasmKeyUp({
                 key: {
                     key_code: e.keyCode,
@@ -1747,7 +4576,9 @@ export class WasmWebBrowser extends WasmBridge {
     // internal helper api
 
 
+    // @section text-input
     update_text_area_pos(pos) {
+        if (this.a11y?.enabled) return; // Semantic inputs use their full node bounds.
         if (this.text_area && pos) {
             //this.text_area.style.left = (Math.round(pos.x) -2) + "px";
             //this.text_area.style.top = (Math.round(pos.y) + 4) + "px"
@@ -1755,8 +4586,13 @@ export class WasmWebBrowser extends WasmBridge {
             this.text_area.style.top = (Math.round(pos.y) + 4) + "px"
         }
     }
+    // @end text-input
 
     focus_keyboard_input() {
+        if (this.a11y?.enabled) {
+            this.a11y.focusKeyboard();
+            return;
+        }
         if (!this.text_area) return;
         this.text_area.focus();
     }
@@ -1776,14 +4612,7 @@ function report_browser_issue(kind, data) {
             window.makepad_report_browser_issue(kind, data);
             return;
         }
-        const payload = JSON.stringify({
-            kind,
-            href: location.href,
-            user_agent: navigator.userAgent,
-            data
-        });
-        const encoded = encodeURIComponent(payload.slice(0, 8192));
-        fetch('/$report_error?data=' + encoded, { cache: 'no-store' });
+        makepad_crash_reporter.report(kind, data);
     } catch (_error) {
     }
 }

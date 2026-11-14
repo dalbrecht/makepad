@@ -1,0 +1,1201 @@
+pub extern crate makepad_derive_widget;
+pub extern crate makepad_draw;
+pub use makepad_derive_widget::*;
+pub use makepad_draw::makepad_platform;
+pub use makepad_draw::*;
+pub use makepad_platform::log;
+pub use makepad_platform::makepad_script;
+pub use makepad_script::script_eval;
+pub use makepad_script::{ScriptValue, ScriptVm};
+
+pub use makepad_draw::makepad_zune_jpeg;
+pub use makepad_draw::makepad_zune_png;
+
+pub use makepad_tween;
+pub use makepad_jobs as jobs;
+
+// Core modules (used internally first)
+pub mod animator;
+pub mod tween;
+pub mod tween_inspect;
+pub mod tween_script;
+pub mod font_policy;
+pub mod desktop_style;
+#[cfg(any(test, feature = "sheet-checks"))]
+#[doc(hidden)]
+pub mod sheet_checks;
+pub mod app_icon;
+pub mod theme_desktop_dark;
+pub mod theme_desktop_light;
+pub mod theme_desktop_skeleton;
+pub mod theme_tokens;
+pub mod width_override;
+pub mod widget;
+pub mod semantics;
+pub mod widget_async;
+pub mod splash_host;
+pub mod splash_storage;
+pub mod widget_match_event;
+pub mod widget_tree;
+mod draw_times;
+pub mod ui_checks;
+pub mod scan;
+pub mod widget_hooks;
+pub mod family_api;
+pub mod test_cx;
+
+// Modules ordered to match script_mod calls
+pub mod rubber_view;
+pub mod scroll_bar;
+pub mod scroll_bars;
+pub mod scroll_motion;
+pub mod view;
+pub mod view_ui;
+pub mod grid;
+
+pub mod animated_image_gif;
+pub mod badge;
+pub mod button_group;
+pub mod chip;
+pub mod menu;
+pub mod select;
+pub mod dialog;
+pub mod button;
+pub mod pointer_field;
+pub mod check_box;
+pub mod icon;
+pub mod image;
+pub mod image_blend;
+pub mod image_cache;
+pub mod image_slice;
+pub mod label;
+pub mod link_label;
+pub mod radio_button;
+
+pub mod adaptive_view;
+pub mod divider;
+pub mod desktop_button;
+pub mod gauss_view;
+pub mod gauss_chain;
+mod gauss_stack;
+pub mod backdrop;
+pub mod keyboard_view;
+pub mod nav_control;
+pub mod nav_list;
+pub mod relief;
+pub mod window;
+pub mod cursor;
+pub mod window_menu;
+pub mod field_well;
+pub mod drop_down;
+pub mod popup_menu;
+pub mod slider;
+pub mod text_input;
+pub mod drop_slider;
+pub mod overlay_place;
+pub mod tip;
+pub mod popover;
+pub mod job_strip;
+pub mod overlay_layers;
+pub mod value_input;
+pub mod property;
+pub mod property_controls;
+pub mod focus_order;
+pub mod diagonal_text;
+pub mod splitter;
+
+pub mod fold_button;
+pub mod fold_header;
+
+pub mod loading_spinner;
+pub mod progress;
+pub mod readout;
+pub mod lamp;
+pub mod needle_meter;
+pub mod screen_view;
+pub mod bare_step;
+pub mod turtle_step;
+pub mod kbd;
+pub mod typography;
+pub mod card;
+pub mod timeline;
+pub mod toolbar;
+pub mod scroll_fade;
+pub mod portal_list;
+pub mod reorder_list;
+
+pub mod cached_widget;
+pub mod root;
+
+pub mod tab;
+pub mod tab_bar;
+pub mod tabs;
+pub mod tab_close_button;
+
+
+pub mod splash;
+pub mod svg;
+
+// Touch gesture support (used by expandable_panel)
+pub mod touch_gesture;
+
+// Navigation and panels
+pub mod expandable_panel;
+pub mod scroll_shadow;
+pub mod stack_navigation;
+
+pub mod callout_tooltip;
+pub mod modal;
+pub mod next_frame_gate;
+pub mod page_flip;
+pub mod page_render;
+pub mod held_events;
+pub mod hosted_view;
+pub mod popup_notification;
+pub mod slides_view;
+pub mod tooltip;
+pub mod defer_with_redraw;
+pub mod slide_panel;
+
+pub mod flat_list;
+
+pub mod perf_graph;
+pub mod screen_cap;
+
+// Commented out modules (not yet converted)
+// lets depricate these for now
+// pub mod toggle_panel;
+// pub mod vectorline;
+// pub mod web_view;
+// pub mod rotated_image;
+// pub mod color_picker;
+// pub mod debug_view;
+// pub mod performance_view;
+// pub mod data_binding;
+
+pub use crate::{
+    adaptive_view::*,
+    job_strip::*,
+    divider::*,
+    animated_image_gif::*,
+    badge::*,
+    button_group::*,
+    chip::*,
+    menu::*,
+    select::*,
+    dialog::*,
+    animator::{Animate, Animator, AnimatorAction, AnimatorImpl, Play},
+    // loading_spinner - no public exports
+    bare_step::*,
+    button::*,
+    cached_widget::*,
+    callout_tooltip::*,
+    check_box::*,
+    field_well::*,
+    desktop_button::*,
+
+    drop_down::*,
+    overlay_place::*,
+    popover::*,
+    overlay_layers::*,
+    expandable_panel::*,
+    flat_list::*,
+
+    fold_button::*,
+    fold_header::*,
+    gauss_view::*,
+    relief::*,
+    grid::*,
+
+    icon::*,
+
+    image::*,
+    image_blend::*,
+    image_cache::*,
+    image_slice::*,
+    keyboard_view::*,
+    // view_ui - no public exports
+    label::*,
+    link_label::*,
+    modal::*,
+    nav_control::*,
+    nav_list::*,
+    page_flip::*,
+    page_render::{paginate, PageFormat, PageItem, PageRender, RenderedPage},
+    hosted_view::*,
+    popup_menu::*,
+    popup_notification::*,
+    kbd::*,
+    diagonal_text::*,
+    card::*,
+    timeline::*,
+    toolbar::*,
+    scroll_fade::*,
+    portal_list::*,
+    progress::*,
+    readout::*,
+    lamp::*,
+    needle_meter::*,
+    screen_view::*,
+    reorder_list::*,
+    radio_button::*,
+    root::*,
+
+    rubber_view::*,
+    // Ordered to match script_mod calls
+    scroll_bar::ScrollBar,
+    scroll_bars::{ScrollBars, ScrollExtent},
+    scroll_shadow::*,
+    slide_panel::*,
+    slider::*,
+    slides_view::*,
+    splitter::*,
+
+    stack_navigation::*,
+    tab::*,
+    tab_bar::*,
+    tabs::*,
+    tab_close_button::*,
+
+    text_input::*,
+    value_input::*,
+    property::*,
+    property_controls::*,
+    tooltip::*,
+    // Navigation and panels
+    touch_gesture::*,
+    turtle_step::*,
+
+    view::*,
+    widget::{
+        CreateAt, DrawStateWrap, DrawStep, DrawStepApi, OptionWidgetRefExt, Widget, WidgetAction,
+        WidgetActionCast, WidgetActionCxExt, WidgetActionOptionApi, WidgetActionTrait,
+        WidgetActionsApi, WidgetFactory, WidgetNode, WidgetRef, WidgetRegister, WidgetRegistry,
+        WidgetSet, WidgetSetIterator, WidgetUid,
+    },
+    widget_async::{
+        enter_isolate, leave_isolate, set_splash_theme, set_splash_theme_script,
+        set_widget_async_trace, CxSplashVmExt, CxWidgetToScriptCallExt, IsolateEntry,
+        ScriptAsyncCalls, ScriptAsyncId, ScriptAsyncResult, SplashTheme, SplashThemeScript,
+        SplashVmId, MAIN_SPLASH_VM_ID,
+    },
+    widget_match_event::WidgetMatchEvent,
+    widget_tree::{set_ui_root, CxWidgetExt},
+    widget_hooks::{WidgetHooks, WindowFamilies},
+
+    window::*,
+
+    window_menu::*,
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+pub use crate::theme_tokens::*;
+
+pub use crate::splash::*;
+
+pub use crate::svg::*;
+
+pub use crate::perf_graph::*;
+pub use crate::screen_cap::*;
+/// Which of the three themes the library is written in `theme_mod` leaves in
+/// `mod.theme`. A `desktop_style` sheet is laid OVER one of these rather than
+/// replacing it, so the two are separate choices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BaseTheme {
+    #[default]
+    Dark,
+    Light,
+    Skeleton,
+}
+
+impl BaseTheme {
+    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::Skeleton];
+    /// What a settings file or a remote surface calls it.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Skeleton => "skeleton",
+        }
+    }
+    /// What a picker shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+            Self::Skeleton => "Skeleton",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.id() == s)
+    }
+}
+
+/// One value, not one per heap: every heap's `theme_mod` has to end on the
+/// same base or two windows of one app disagree about what light means.
+/// `desktop_style::Styles` is per-heap because a sheet is installed into the
+/// heap that evaluates it; this is a preference, and nothing about it is
+/// heap-shaped.
+#[derive(Default)]
+struct BaseThemeChoice(BaseTheme);
+
+/// The base theme `theme_mod` will emit. `Dark` until somebody says otherwise,
+/// which is exactly what the module hard-coded before there was a choice.
+pub fn base_theme(cx: &mut Cx) -> BaseTheme {
+    cx.global::<BaseThemeChoice>().0
+}
+
+/// The blend `theme_mod` emits over the base theme, whole, as the script that
+/// makes it current. `None` is the ordinary case: no mix, and `theme_mod` ends
+/// on the base theme exactly as it did before there was a mix.
+///
+/// On the Cx and not in the module, for the same reason the base theme is: a
+/// module run is what would otherwise lose it. Evaluating a blend once into
+/// `mod.theme` moves the library's own theme and nothing an APP built off it,
+/// because an app's templates bake `theme.color_x` into a literal when the
+/// app's own module block runs, and only re-running THAT rebuilds them -- which
+/// is `cx.request_style_reload()`, which is a module run, which would throw the
+/// blend away again. Held here it survives, and the reload that makes an app
+/// wear the mix is the same reload that re-emits it.
+#[derive(Default)]
+struct ThemeMixChoice(Option<String>);
+
+/// The name a blend is evaluated under: the theme lab's equalized mix.
+pub const THEME_MIX_NAME: &str = "equalized";
+
+/// An app's own theme tokens, laid over the base theme (`set_app_theme_tokens`).
+#[derive(Default)]
+struct AppThemeTokens(Option<String>);
+
+/// The app's own theme in tokens: what an app whose look is its own (Stage's house theme)
+/// says the library's widgets are drawn in -- the menus, popups, drop down lists and
+/// tooltips it opens, the controls' faces -- so they wear the app's look rather than the
+/// plain base theme. Splash assignments to `mod.theme.*`, evaluated by `theme_mod` right
+/// after the base theme on every run (before any widget bakes a token), so like
+/// `set_base_theme` a caller follows it with `cx.request_style_reload()` when it changes.
+/// `None` takes it off (a style sheet worn has tokens of its own).
+pub fn set_app_theme_tokens(cx: &mut Cx, code: Option<String>) {
+    cx.global::<AppThemeTokens>().0 = code;
+}
+
+/// The blend in force, if any: the script `theme_mod` re-emits on every run.
+pub fn theme_mix(cx: &mut Cx) -> Option<String> {
+    cx.global::<ThemeMixChoice>().0.clone()
+}
+
+/// Put a blend in force, or take the standing one off with `None`.
+///
+/// Read by `theme_mod`, so like `set_base_theme` it takes effect on the next
+/// module run and no sooner: a caller follows it with
+/// `cx.request_style_reload()`. That is not a detail of this call -- it is the
+/// whole point of it. See the theme lab's `ThemeLab::apply`.
+pub fn set_theme_mix(cx: &mut Cx, code: Option<String>) {
+    cx.global::<ThemeMixChoice>().0 = code;
+}
+
+/// A person's own edits to the theme in force, token by token, as the text
+/// each was set to. Re-emitted on every module run, after the base theme,
+/// the sheet and the mix, so an edit outlives the rebuild that used to
+/// forget it: the heap held the value, and the next reload put the theme
+/// file's own back.
+#[derive(Default)]
+struct ThemeEdits(std::collections::BTreeMap<String, String>);
+
+/// The edits standing over the theme, in token order.
+pub fn theme_edits(cx: &mut Cx) -> Vec<(String, String)> {
+    cx.global::<ThemeEdits>().0.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Put one edit in force, or take it off with `None`. Like the mix it is
+/// read on the next module run: a caller follows it with
+/// `cx.request_style_reload()`, behind whatever settle its gesture wants.
+pub fn set_theme_edit(cx: &mut Cx, name: &str, text: Option<String>) {
+    let edits = &mut cx.global::<ThemeEdits>().0;
+    match text {
+        Some(text) => {
+            edits.insert(name.to_string(), text);
+        }
+        None => {
+            edits.remove(name);
+        }
+    }
+}
+
+/// Every edit off. Picking a theme does this: the edits were made to the
+/// theme that was up, and would otherwise pin its values over the next.
+pub fn clear_theme_edits(cx: &mut Cx) {
+    cx.global::<ThemeEdits>().0.clear();
+}
+
+/// Choose the base theme. It is read by `theme_mod`, so it takes effect on the
+/// next `script_mod` run and no sooner: a caller switching a running app
+/// follows this with `cx.request_style_reload()`, which re-runs `script_mod`
+/// and then re-applies the tree with `Apply::ScriptReapply` (typed text and
+/// running animations survive, which `Apply::Reload` would not).
+///
+/// A standing mix comes off. Picking a theme is somebody saying which theme
+/// the app should be wearing, and a mix stands over the whole app rather than
+/// over the panel that made it -- so the pick wins. Without this the blend
+/// `theme_mod` re-emits on every run would go straight back over the top of
+/// the theme just chosen, and a picker that had worked for years would sit
+/// there doing nothing for as long as a mix was up.
+///
+/// The lab notices it has been stood down and opens again on the theme now in
+/// force; see the theme lab's `ThemeLab::apply`. The one caller that must
+/// not be caught by this is the lab's own install, which sets no base theme --
+/// it writes the blend and asks for the reload, and nothing else.
+pub fn set_base_theme(cx: &mut Cx, theme: BaseTheme) {
+    cx.global::<BaseThemeChoice>().0 = theme;
+    set_theme_mix(cx, None);
+    clear_theme_edits(cx);
+}
+
+/// The `widgets/` directory: the front crate `makepad-widgets`, whose
+/// `themes/` and `resources/` belong to the whole library. This crate lives
+/// in `widgets/core`, so it is the parent of this manifest.
+pub fn widgets_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let core = env!("CARGO_MANIFEST_DIR").trim_start_matches(r"\\?\");
+        // Either separator: a wasm app built on Windows has a `\` path here,
+        // which wasm32's `Path::parent` does not split.
+        core.trim_end_matches(['/', '\\'])
+            .rsplit_once(['/', '\\'])
+            .map(|(dir, _)| dir.to_string())
+            .unwrap_or_else(|| core.to_string())
+    })
+}
+
+/// Resources are named `makepad_widgets/resources/...` (the font policy,
+/// the packagers, `crate_resource("makepad_widgets:...")`), which resolves
+/// through the manifest registered for `makepad_widgets`. The script modules
+/// that register one by being evaluated are all in `makepad_widgets_core`
+/// and the family crates now, so the name is registered here, before the
+/// theme's fonts ask for it.
+fn register_widgets_resource_crate(vm: &mut ScriptVm) {
+    vm.register_crate_manifest("makepad_widgets", widgets_dir());
+}
+
+/// One step of a UI registration: one `script_mod` call or one eval. A registration is a list
+/// of these run in order, whole (`run_units`) or one per call by a host that spreads it.
+#[derive(Clone)]
+pub(crate) struct UiUnit {
+    pub(crate) name: &'static str,
+    pub(crate) run: std::rc::Rc<dyn Fn(&mut ScriptVm)>,
+}
+
+impl UiUnit {
+    /// `run`'s value (a `script_mod`'s) is not kept, as in a registration's plain call.
+    pub(crate) fn new<R>(name: &'static str, run: impl Fn(&mut ScriptVm) -> R + 'static) -> UiUnit {
+        UiUnit {
+            name,
+            run: std::rc::Rc::new(move |vm| {
+                run(vm);
+            }),
+        }
+    }
+}
+
+/// Run a registration's units in order.
+pub(crate) fn run_units(vm: &mut ScriptVm, units: Vec<UiUnit>) {
+    for unit in units {
+        (unit.run)(vm);
+    }
+}
+
+/// The three base themes, built fresh from their own source: every key of
+/// `mod.themes.dark`, `.light` and `.skeleton`, a person's edit to a global
+/// re-derived into its base, and the platform's fonts. `mod.theme` is not
+/// pointed anywhere here; `theme_mod` does that, and a sheet's first line.
+fn build_base_themes_units(units: &mut Vec<UiUnit>) {
+    units.push(UiUnit::new("theme: dark", crate::theme_desktop_dark::script_mod));
+    units.push(UiUnit::new("theme: light", crate::theme_desktop_light::script_mod));
+    units.push(UiUnit::new("theme: skeleton", crate::theme_desktop_skeleton::script_mod));
+    units.push(UiUnit::new("theme: globals, inks and fonts", |vm| {
+        // A person's edit to a GLOBAL -- `space_factor`, `font_size_base` --
+        // builds the base theme again from its own source with that literal in
+        // place, so every rung derived from it moves. Under the base's own name:
+        // the `mod.theme` below and a sheet's first line both point at it by
+        // name. The edits go on again later as pins, in `widgets_mod`; for a
+        // global that is nothing, and for one a base's file does not spell out
+        // it is the only way the value lands at all.
+        let globals: Vec<(String, crate::theme_tokens::TokenValue)> = theme_edits(vm.cx_mut())
+            .into_iter()
+            .filter(|(name, _)| crate::theme_tokens::is_global_key(name))
+            .map(|(name, text)| (name, crate::theme_tokens::TokenValue::Raw(text)))
+            .collect();
+        if !globals.is_empty() {
+            let scheme = match base_theme(vm.cx_mut()) {
+                BaseTheme::Dark => crate::theme_tokens::Scheme::Dark,
+                BaseTheme::Light => crate::theme_tokens::Scheme::Light,
+                BaseTheme::Skeleton => crate::theme_tokens::Scheme::Skeleton,
+            };
+            vm.eval(makepad_platform::ScriptMod::new(widgets_dir(), "theme_globals", &format!("theme_{}_rederived.splash", scheme.theme_name()), 0, 0, &crate::theme_tokens::theme_rederived_script(scheme, &globals), &[]));
+        }
+        crate::theme_tokens::derive_base_property_inks(vm);
+        crate::font_policy::install_theme_fonts(vm);
+    }));
+}
+
+pub fn theme_mod(vm: &mut ScriptVm) {
+    let mut units = Vec::new();
+    theme_mod_units(&mut units);
+    run_units(vm, units);
+}
+
+pub(crate) fn theme_mod_units(units: &mut Vec<UiUnit>) {
+    units.push(UiUnit::new("theme: draw", |vm| {
+        // A Splash isolate's UI modules may still be lazy: register them first, so this run
+        // (a restyle, an appearance) is the second registration it is today, not the first of two.
+        vm.expand_all_lazy();
+        register_widgets_resource_crate(vm);
+        makepad_draw::script_mod(vm);
+        if !vm.is_reload() {
+            makepad_platform::ime::script_mod(vm);
+        }
+
+        vm.heap_mut().new_module(id!(prelude));
+        vm.heap_mut().new_module(id!(themes));
+    }));
+    units.push(UiUnit::new("theme: animator and tween", |vm| {
+        crate::animator::script_mod(vm);
+        // `mod.tween` (GSAP-style tweens from script), once per VM.
+        crate::tween_script::script_mod(vm);
+    }));
+    build_base_themes_units(units);
+    units.push(UiUnit::new("theme: helper and header", |vm| {
+        #[cfg(not(target_arch = "wasm32"))]
+        script_eval!(vm, {
+            mod.helper = {
+                startup: |v|{
+                    mod.res.load_all_resources()
+                    //mod.gc.set_static(mod.prelude.widgets_header);
+                    //mod.gc.set_static(mod.prelude.widgets_internal);
+                    //mod.gc.set_static(mod.prelude.widgets);
+                    v
+                }
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        script_eval!(vm, {
+            mod.helper = {
+                startup: |v|{
+                    v
+                }
+            }
+        });
+        script_eval!(vm, {
+            mod.prelude.widgets_header = {
+                ..mod.res,
+                ..mod.helper,
+                ..mod.std,
+                ..mod.pod,
+                ..mod.math,
+                ..mod.sdf,
+                ..mod.animator,
+                ..mod.turtle,
+                ..mod.text,
+                ..mod.ime,
+                ..mod.shader,
+                ..mod.animator.Play,
+                ..mod.animator.Ease,
+                draw:mod.draw,
+                tween:mod.tween,
+                MouseCursor:mod.draw.MouseCursor
+            }
+        });
+    }));
+    units.push(UiUnit::new("theme: pick", |vm| {
+        // The base theme, last, so everything after it reads the one that was
+        // chosen. `Dark` is the default, so an app that never calls
+        // `set_base_theme` gets precisely what this used to say outright.
+        match base_theme(vm.cx_mut()) {
+            BaseTheme::Dark => {
+                script_eval!(vm, {
+                    mod.theme = mod.themes.dark
+                });
+            }
+            BaseTheme::Light => {
+                script_eval!(vm, {
+                    mod.theme = mod.themes.light
+                });
+            }
+            BaseTheme::Skeleton => {
+                script_eval!(vm, {
+                    mod.theme = mod.themes.skeleton
+                });
+            }
+        }
+        // The app's own tokens over the base, if it has a look of its own.
+        if let Some(code) = vm.cx_mut().global::<AppThemeTokens>().0.clone() {
+            vm.eval(makepad_platform::ScriptMod::new(widgets_dir(), "app_theme_tokens", "app_theme_tokens.splash", 0, 0, &code, &[]));
+        }
+        // ...and the blend over it, if one is in force. Here, and not in
+        // `widgets_mod`, because this is the seam a mix is seen from: after the
+        // themes exist, and before a widget template bakes `theme.color_x` into a
+        // literal it will not evaluate again.
+        if let Some(code) = theme_mix(vm.cx_mut()) {
+            vm.eval(makepad_platform::ScriptMod::new(widgets_dir(), "theme_lab", &format!("{THEME_MIX_NAME}.splash"), 0, 0, &code, &[]));
+        }
+    }));
+}
+
+/// The widget registration an isolate carries in its own heap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum IsolateWidgets {
+    #[default]
+    Library,
+    /// The theme, draw modules, core widget modules `scroll_bar` through `icon`
+    /// in registration order (`scroll_bar`, `scroll_bars`, `view`, `view_ui`,
+    /// `relief`, `grid`, `rubber_view`, `label`, `link_label`, `button`,
+    /// `divider`, `check_box`, `radio_button`, `image`, `animated_image_gif`,
+    /// `image_blend`, `icon`), safe-area inset values and preludes.
+    /// No window, no families, and no core widget modules after `icon`.
+    Base,
+}
+
+/// The core's widgets alone. `makepad_widgets::widgets_mod` is the one an
+/// app calls: it passes the families its features picked.
+pub fn widgets_mod(vm: &mut ScriptVm) {
+    widgets_mod_with(vm, WindowFamilies::default(), &[]);
+}
+
+/// The core's widgets, `window`'s families where the Window names them, and
+/// then `families` in order, before the prelude is made from `mod.widgets`.
+pub fn widgets_mod_with(
+    vm: &mut ScriptVm,
+    window: WindowFamilies,
+    families: &[fn(&mut ScriptVm)],
+) {
+    *vm.cx_mut().global::<Registration>() = Registration { window, families: families.to_vec() };
+    let host_io_only = vm.cx().script_data.std.host_io_only();
+    widgets_mod_with_io(vm, window, families, host_io_only, true, IsolateWidgets::Library);
+}
+
+/// The library for a Splash isolate whose host registers it itself
+/// (`alloc_splash_vm_with_ui`): the core and `families`, ONCE, under the sheet
+/// installed on the isolate (no stock copy registered apart, as an isolate
+/// carries none of the host's chrome). Leaves the app's `Registration` alone.
+pub fn isolate_widgets_mod_with(vm: &mut ScriptVm, families: &[fn(&mut ScriptVm)]) {
+    let host_io_only = vm.cx().script_data.std.host_io_only();
+    widgets_mod_with_io(vm, WindowFamilies::default(), families, host_io_only, false, IsolateWidgets::Library);
+}
+
+/// The families the last `widgets_mod_with` registered. A module rebuild the
+/// library makes on its own -- the theme lab resolving every theme, see
+/// `theme_tokens::resolve_theme` -- registers them again, so the heap it
+/// leaves behind still has the widgets the app's families put there (the
+/// tweaker's panel is built of the fab family's controls after such a
+/// rebuild).
+#[derive(Clone, Default)]
+struct Registration {
+    window: WindowFamilies,
+    families: Vec<fn(&mut ScriptVm)>,
+}
+
+/// `script_mod` with the families the app registered last.
+pub(crate) fn script_mod_as_registered(vm: &mut ScriptVm) {
+    let Registration { window, families } = vm.cx_mut().global::<Registration>().clone();
+    script_mod_with(vm, window, &families);
+}
+
+/// The core's widgets for a Splash isolate being built: `host_io_only` is
+/// the restriction it will run under (its std is restricted only after this).
+pub(crate) fn widgets_mod_with_host_io_units(
+    vm: &mut ScriptVm,
+    units: &mut Vec<UiUnit>,
+    host_io_only: bool,
+    set: IsolateWidgets,
+) {
+    let families = vm.cx_mut().global::<widget_hooks::IsolateFamilies>().0.clone();
+    widgets_mod_with_io_units(vm, units, WindowFamilies::default(), &families, host_io_only, false, set);
+}
+
+/// With `host_io_only` (a guest held to the host service bridge) the modules
+/// that reach past it stay out: the window and its menu bar (a guest must not
+/// replace the app's), screen capture, and cached widgets (their singletons
+/// would reach widgets the host or other isolates cached).
+///
+/// `stock_apart` keeps the stock library apart from the sheet's; an isolate
+/// passes false, see below.
+fn widgets_mod_with_io(
+    vm: &mut ScriptVm,
+    window: WindowFamilies,
+    families: &[fn(&mut ScriptVm)],
+    host_io_only: bool,
+    stock_apart: bool,
+    set: IsolateWidgets,
+) {
+    let mut units = Vec::new();
+    widgets_mod_with_io_units(vm, &mut units, window, families, host_io_only, stock_apart, set);
+    run_units(vm, units);
+}
+
+fn widgets_mod_with_io_units(
+    vm: &mut ScriptVm,
+    units: &mut Vec<UiUnit>,
+    window: WindowFamilies,
+    families: &[fn(&mut ScriptVm)],
+    host_io_only: bool,
+    stock_apart: bool,
+    set: IsolateWidgets,
+) {
+    // With a sheet installed the library is registered twice. First as it
+    // stands without the sheet, which is kept (`desktop_style::keep_stock`)
+    // for the chrome that must look and measure the same under every sheet;
+    // then the base themes are built again, because the sheet's token half
+    // writes into them and the kept library's theme must not change under
+    // it; then with the sheet, which is the library everything else gets.
+    //
+    // A Splash isolate registers once: it carries none of the host's chrome,
+    // and a second pass would be wasted work. Its stock names are the sheet's library.
+    if stock_apart {
+        let sheet = crate::desktop_style::current_name(vm).is_some();
+        register_widgets_units(units, window, families, host_io_only, WithSheet::No, true, set);
+        if sheet {
+            build_base_themes_units(units);
+            register_widgets_units(units, window, families, host_io_only, WithSheet::Yes, false, set);
+        }
+    } else {
+        register_widgets_units(units, window, families, host_io_only, WithSheet::Current, true, set);
+    }
+}
+
+/// Whether a registration applies the installed sheet's token half: decided by the caller,
+/// or read from the VM when the registration's first unit runs (`Current`).
+#[derive(Clone, Copy)]
+pub(crate) enum WithSheet {
+    No,
+    Yes,
+    Current,
+}
+
+/// One registration of every widget template, `window`'s families and then
+/// `families`, with the installed sheet's token half first when
+/// `with_sheet`, and kept as the stock library the chrome is built from when
+/// `keep`.
+fn register_widgets_units(
+    units: &mut Vec<UiUnit>,
+    window: WindowFamilies,
+    families: &[fn(&mut ScriptVm)],
+    host_io_only: bool,
+    with_sheet: WithSheet,
+    keep: bool,
+    set: IsolateWidgets,
+) {
+    units.push(UiUnit::new("widgets: head", move |vm| {
+        vm.expand_all_lazy();
+        let with_sheet = match with_sheet {
+            WithSheet::No => false,
+            WithSheet::Yes => true,
+            WithSheet::Current => crate::desktop_style::current_name(vm).is_some(),
+        };
+        if with_sheet {
+            crate::desktop_style::apply_theme(vm);
+        }
+        // ...and the person's own edits over everything -- base, sheet or mix.
+        // (A global has already rebuilt the base in `theme_mod`; its pin here
+        // is the same value again, and the belt for a base that never named it.)
+        // Here and not beside the mix: a sheet's first line points `mod.theme`
+        // at its own base, so an edit written before `apply_theme` is gone by
+        // now; and before the prelude captures `theme: mod.theme` for every
+        // template, which is the last moment a token is still a token.
+        let edits = theme_edits(vm.cx_mut());
+        if !edits.is_empty() {
+            let mut code = String::from("mod.themes.edited = mod.theme{");
+            for (name, text) in &edits {
+                code.push(' ');
+                code.push_str(name);
+                code.push_str(": ");
+                code.push_str(text);
+            }
+            // The last statement of a script is swallowed; `true` takes the fall.
+            code.push_str(" }
+mod.theme = mod.themes.edited
+true
+");
+            vm.eval(makepad_platform::ScriptMod::new(widgets_dir(), "theme_edits", &"theme_edits.splash".to_string(), 0, 0, &code, &[]));
+        }
+        // make the prelude for our own widgets
+        script_eval!(vm, {
+            mod.prelude.widgets_internal = {
+                ..mod.prelude.widgets_header,
+                theme:mod.theme,
+            }
+        });
+
+        vm.heap_mut().new_module(id!(widgets));
+        // The registration kept as the stock library is kept before anything is
+        // registered into it, so the chrome registered below already names its
+        // templates from it.
+        if keep {
+            crate::desktop_style::keep_stock(vm);
+        }
+    }));
+    register_base_widgets_units(units);
+    if set == IsolateWidgets::Library {
+        register_library_widgets_units(units, window, families, host_io_only);
+    }
+
+    units.push(UiUnit::new("widgets: insets and prelude", |vm| {
+        // Safe area inset values (in Makepad layout points). Populated from the platform's
+        // display_context which is set before Startup on iOS/Android. On desktop
+        // platforms these remain 0.0. Updated at runtime on WindowGeomChange events.
+        {
+            let insets = vm.cx().display_context.safe_area_insets;
+            let widgets = vm.module(id!(widgets));
+            vm.set_value(
+                widgets,
+                id!(SAFE_INSET_PAD_TOP),
+                insets.top,
+            );
+            vm.set_value(
+                widgets,
+                id!(SAFE_INSET_PAD_BOTTOM),
+                insets.bottom,
+            );
+            vm.set_value(
+                widgets,
+                id!(SAFE_INSET_PAD_LEFT),
+                insets.left,
+            );
+            vm.set_value(
+                widgets,
+                id!(SAFE_INSET_PAD_RIGHT),
+                insets.right,
+            );
+        }
+
+        script_eval!(vm, {
+            mod.prelude.widgets = {
+                ..mod.prelude.widgets_header,
+                theme:mod.theme,
+                ..mod.widgets,
+            }
+        });
+    }));
+}
+
+fn register_base_widgets_units(units: &mut Vec<UiUnit>) {
+    units.push(UiUnit::new("widgets: scroll_bar", crate::scroll_bar::script_mod));
+    units.push(UiUnit::new("widgets: scroll_bars", crate::scroll_bars::script_mod));
+    units.push(UiUnit::new("widgets: view", crate::view::script_mod));
+    units.push(UiUnit::new("widgets: view_ui", crate::view_ui::script_mod));
+    units.push(UiUnit::new("widgets: relief", crate::relief::script_mod));
+    units.push(UiUnit::new("widgets: grid", crate::grid::script_mod));
+    units.push(UiUnit::new("widgets: rubber_view", crate::rubber_view::script_mod));
+
+    units.push(UiUnit::new("widgets: label", crate::label::script_mod));
+    units.push(UiUnit::new("widgets: link_label", crate::link_label::script_mod));
+    units.push(UiUnit::new("widgets: button", crate::button::script_mod));
+    units.push(UiUnit::new("widgets: divider", crate::divider::script_mod));
+    units.push(UiUnit::new("widgets: check_box", crate::check_box::script_mod));
+    units.push(UiUnit::new("widgets: radio_button", crate::radio_button::script_mod));
+    units.push(UiUnit::new("widgets: image", crate::image::script_mod));
+    units.push(UiUnit::new("widgets: animated_image_gif", crate::animated_image_gif::script_mod));
+    units.push(UiUnit::new("widgets: image_blend", crate::image_blend::script_mod));
+    units.push(UiUnit::new("widgets: icon", crate::icon::script_mod));
+}
+
+fn register_library_widgets_units(
+    units: &mut Vec<UiUnit>,
+    window: WindowFamilies,
+    families: &[fn(&mut ScriptVm)],
+    host_io_only: bool,
+) {
+    units.push(UiUnit::new("widgets: adaptive_view", crate::adaptive_view::script_mod));
+    units.push(UiUnit::new("widgets: desktop_button", crate::desktop_button::script_mod));
+    units.push(UiUnit::new("widgets: keyboard_view", crate::keyboard_view::script_mod));
+    // Every Window names a `VoiceWave`, a `Tweaker` and an `AiChatSlot`,
+    // so their families register here; without one the name is an empty
+    // hidden view.
+    units.push(UiUnit::new("widgets: voice", move |vm| {
+        match window.voice {
+            Some(register) => register(vm),
+            None => {
+                script_eval!(vm, {
+                    use mod.widgets.View
+                    mod.widgets.VoiceWave = mod.widgets.View {
+                        visible: false
+                    }
+                });
+            }
+        }
+    }));
+    if !host_io_only { units.push(UiUnit::new("widgets: window_menu", crate::window_menu::script_mod)); }
+    units.push(UiUnit::new("widgets: nav_control", crate::nav_control::script_mod));
+    units.push(UiUnit::new("widgets: tweaker", move |vm| {
+        match window.tweaker {
+            Some(register) => register(vm),
+            None => {
+                script_eval!(vm, {
+                    use mod.widgets.View
+                    mod.widgets.Tweaker = mod.widgets.View {
+                        visible: false
+                    }
+                });
+            }
+        }
+    }));
+    units.push(UiUnit::new("widgets: gauss_view", crate::gauss_view::script_mod));
+    if !host_io_only { units.push(UiUnit::new("widgets: screen_cap", crate::screen_cap::script_mod)); }
+    // The AI slot before the window: its DSL names `AiChatSlot`.
+    units.push(UiUnit::new("widgets: ai slot", move |vm| {
+        match window.ai {
+            Some(register) => register(vm),
+            None => {
+                script_eval!(vm, {
+                    use mod.widgets.View
+                    mod.widgets.AiChatSlot = mod.widgets.View {
+                        visible: false
+                    }
+                });
+            }
+        }
+    }));
+    units.push(UiUnit::new("widgets: app_icon", crate::app_icon::script_mod));
+    units.push(UiUnit::new("widgets: cursor", crate::cursor::script_mod));
+    if !host_io_only { units.push(UiUnit::new("widgets: window", crate::window::script_mod)); }
+
+    units.push(UiUnit::new("widgets: popup_menu", crate::popup_menu::script_mod));
+    units.push(UiUnit::new("widgets: drop_down", crate::drop_down::script_mod));
+    units.push(UiUnit::new("widgets: text_input", crate::text_input::script_mod));
+    units.push(UiUnit::new("widgets: slider", crate::slider::script_mod));
+    units.push(UiUnit::new("widgets: drop_slider", crate::drop_slider::script_mod));
+    // The badge first: it owns the role palette and the intent names, and
+    // the tooltip, the chip and the segmented control all read them.
+    units.push(UiUnit::new("widgets: badge", crate::badge::script_mod));
+    units.push(UiUnit::new("widgets: tip", crate::tip::script_mod));
+    units.push(UiUnit::new("widgets: popover", crate::popover::script_mod));
+    units.push(UiUnit::new("widgets: value_input", crate::value_input::script_mod));
+    units.push(UiUnit::new("widgets: property", crate::property::script_mod));
+    // Before the panel kit and the tables: all three turn a heading with the
+    // lean this one declares.
+    units.push(UiUnit::new("widgets: diagonal_text", crate::diagonal_text::script_mod));
+    units.push(UiUnit::new("widgets: field_well", crate::field_well::script_mod));
+    units.push(UiUnit::new("widgets: splitter", crate::splitter::script_mod));
+
+    units.push(UiUnit::new("widgets: fold_button", crate::fold_button::script_mod));
+    units.push(UiUnit::new("widgets: fold_header", crate::fold_header::script_mod));
+    units.push(UiUnit::new("widgets: loading_spinner", crate::loading_spinner::script_mod));
+    units.push(UiUnit::new("widgets: progress", crate::progress::script_mod));
+    // The instruments: the readout and the meter draw on a screen, and
+    // the screen holds them, so the view kit is all it needs above it.
+    units.push(UiUnit::new("widgets: readout", crate::readout::script_mod));
+    units.push(UiUnit::new("widgets: lamp", crate::lamp::script_mod));
+    units.push(UiUnit::new("widgets: needle_meter", crate::needle_meter::script_mod));
+    units.push(UiUnit::new("widgets: screen_view", crate::screen_view::script_mod));
+    units.push(UiUnit::new("widgets: nav_list", crate::nav_list::script_mod));
+    units.push(UiUnit::new("widgets: chip", crate::chip::script_mod));
+    // The menu first: the group's split and menu buttons carry a
+    // `MenuPlace`, and a block's `use` only sees what already exists.
+    units.push(UiUnit::new("widgets: menu", crate::menu::script_mod));
+    units.push(UiUnit::new("widgets: button_group", crate::button_group::script_mod));
+    units.push(UiUnit::new("widgets: property_controls", crate::property_controls::script_mod));
+    units.push(UiUnit::new("widgets: select", crate::select::script_mod));
+    // Only needs a View to derive from; the ladder it uses is Rust.
+    units.push(UiUnit::new("widgets: bare_step", crate::bare_step::script_mod));
+    units.push(UiUnit::new("widgets: turtle_step", crate::turtle_step::script_mod));
+
+    units.push(UiUnit::new("widgets: portal_list", crate::portal_list::script_mod));
+    units.push(UiUnit::new("widgets: kbd", crate::kbd::script_mod));
+    units.push(UiUnit::new("widgets: typography", crate::typography::script_mod));
+    units.push(UiUnit::new("widgets: card", crate::card::script_mod));
+    units.push(UiUnit::new("widgets: timeline", crate::timeline::script_mod));
+    // Before the three that draw with its panel and row surfaces.
+    // After TextInput, Button, KbdGroup and the tip they build on.
+    units.push(UiUnit::new("widgets: toolbar", crate::toolbar::script_mod));
+    units.push(UiUnit::new("widgets: scroll_fade", crate::scroll_fade::script_mod));
+    units.push(UiUnit::new("widgets: reorder_list", crate::reorder_list::script_mod));
+
+    if !host_io_only { units.push(UiUnit::new("widgets: cached_widget", crate::cached_widget::script_mod)); }
+    units.push(UiUnit::new("widgets: root", crate::root::script_mod));
+
+    units.push(UiUnit::new("widgets: tab_close_button", crate::tab_close_button::script_mod));
+    units.push(UiUnit::new("widgets: tab", crate::tab::script_mod));
+    units.push(UiUnit::new("widgets: tab_bar", crate::tab_bar::script_mod));
+    units.push(UiUnit::new("widgets: tabs", crate::tabs::script_mod));
+
+    // Navigation and panels
+    units.push(UiUnit::new("widgets: scroll_shadow", crate::scroll_shadow::script_mod));
+    units.push(UiUnit::new("widgets: stack_navigation", crate::stack_navigation::script_mod));
+    units.push(UiUnit::new("widgets: expandable_panel", crate::expandable_panel::script_mod));
+    units.push(UiUnit::new("widgets: modal", crate::modal::script_mod));
+    units.push(UiUnit::new("widgets: dialog", crate::dialog::script_mod));
+    units.push(UiUnit::new("widgets: tooltip", crate::tooltip::script_mod));
+    units.push(UiUnit::new("widgets: callout_tooltip", crate::callout_tooltip::script_mod));
+    units.push(UiUnit::new("widgets: popup_notification", crate::popup_notification::script_mod));
+    // The job board wakes this UI and tells time by its clock.
+    units.push(UiUnit::new("widgets: makepad_jobs", |_vm| {
+        makepad_jobs::install(makepad_jobs::Hooks { wake: || makepad_platform::SignalToUI::set_ui_signal(), now: makepad_platform::monotonic_seconds, log: |line| makepad_platform::log!("{line}") });
+    }));
+    units.push(UiUnit::new("widgets: job_strip", crate::job_strip::script_mod));
+    units.push(UiUnit::new("widgets: page_flip", crate::page_flip::script_mod));
+    units.push(UiUnit::new("widgets: hosted_view", crate::hosted_view::script_mod));
+    units.push(UiUnit::new("widgets: flat_list", crate::flat_list::script_mod));
+    units.push(UiUnit::new("widgets: slides_view", crate::slides_view::script_mod));
+    units.push(UiUnit::new("widgets: slide_panel", crate::slide_panel::script_mod));
+
+
+    units.push(UiUnit::new("widgets: splash", crate::splash::script_mod));
+    units.push(UiUnit::new("widgets: svg", crate::svg::script_mod));
+    units.push(UiUnit::new("widgets: perf_graph", crate::perf_graph::script_mod));
+    // The overlay layer host registers after every core layer it owns (tip
+    // today; menu layer, toaster and dialog host as they land): a widget
+    // deriving from another must register after it, and Window, which
+    // registers far above tip and modal, cannot own these for the same
+    // reason. Keep it the last core registration in this function.
+    units.push(UiUnit::new("widgets: overlay_layers", crate::overlay_layers::script_mod));
+
+    // The families, after every core widget they may build on.
+    for &register in families {
+        units.push(UiUnit::new("widgets: family", register));
+    }
+}
+
+pub fn script_mod(vm: &mut ScriptVm) {
+    script_mod_with(vm, WindowFamilies::default(), &[]);
+}
+
+/// The theme, the widgets with the given families, and the desktop style
+/// laid over them: what `makepad_widgets::script_mod` runs.
+pub fn script_mod_with(
+    vm: &mut ScriptVm,
+    window: WindowFamilies,
+    families: &[fn(&mut ScriptVm)],
+) {
+    makepad_platform::startup_trace("widgets: theme_mod begin");
+    theme_mod(vm);
+    makepad_platform::startup_trace("widgets: theme_mod done");
+    widgets_mod_with(vm, window, families);
+    crate::desktop_style::apply_widgets(vm);
+    makepad_platform::startup_trace("widgets: widgets_mod done");
+}
+
+// The pooled test contexts (test_cx.rs), registered with the core alone.
+#[cfg(test)]
+pub(crate) use crate::test_cx::PooledCx;
+
+#[cfg(test)]
+pub(crate) fn checkout_test_cx() -> PooledCx {
+    crate::test_cx::checkout_test_cx(script_mod)
+}
+
+#[cfg(test)]
+pub(crate) fn on_test_cx(f: impl FnOnce() + Send + 'static) {
+    crate::test_cx::on_test_cx(f)
+}
+
+#[cfg(test)]
+mod base_theme_tests {
+
+    use super::*;
+
+    /// The base theme is a choice now, and `dark` is still what an app that
+    /// never makes one gets.
+    #[test]
+    fn theme_mod_emits_the_chosen_base_and_still_defaults_to_dark() {
+        fn bg(vm: &mut ScriptVm) -> Option<u32> {
+            let theme = vm.module(id!(theme));
+            vm.value(theme, id!(color_bg_app))
+                .as_color()
+        }
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let dark = bg(vm);
+            assert!(dark.is_some());
+            assert_eq!(base_theme(vm.cx_mut()), BaseTheme::Dark);
+
+            set_base_theme(vm.cx_mut(), BaseTheme::Light);
+            vm.with_reload(crate::script_mod);
+            let light = bg(vm);
+            assert!(light.is_some() && light != dark, "{light:?} vs {dark:?}");
+            assert!(vm.take_errors().is_empty());
+
+            set_base_theme(vm.cx_mut(), BaseTheme::Skeleton);
+            vm.with_reload(crate::script_mod);
+            let skeleton = bg(vm);
+            assert!(skeleton.is_some());
+            assert!(vm.take_errors().is_empty());
+
+            // And back: the choice is a setting, not a one-way door.
+            set_base_theme(vm.cx_mut(), BaseTheme::Dark);
+            vm.with_reload(crate::script_mod);
+            assert_eq!(bg(vm), dark);
+            assert!(vm.take_errors().is_empty());
+        });
+    }
+
+    #[test]
+    fn every_base_theme_has_a_name_and_parses_back() {
+        for base in BaseTheme::ALL {
+            assert_eq!(BaseTheme::parse(base.id()), Some(base));
+            assert!(!base.label().is_empty());
+        }
+        assert_eq!(BaseTheme::parse("omarchy"), None);
+        assert_eq!(BaseTheme::default(), BaseTheme::Dark);
+    }
+}
+
+#[cfg(test)]
+mod module_rebuild_tests {
+    use super::*;
+
+    /// A module rebuild -- a theme switch, a live edit, every settle of a
+    /// drag on the theme lab -- must leave the live heap where it found it.
+    /// It did not: every run registered every type into a fresh slot, and
+    /// each slot rooted its template tree, so a rebuild kept some thousands
+    /// of objects alive for good. Measured through the collector's own
+    /// count, after a collection, so garbage the collector would take
+    /// anyway is not mistaken for a leak.
+    #[test]
+    fn a_module_rebuild_leaves_the_live_heap_where_it_was() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        set_base_theme(&mut cx, BaseTheme::Dark);
+        cx.with_vm(|vm| script_mod(vm));
+        let live_after = |cx: &mut Cx| {
+            cx.with_vm(|vm| {
+                vm.with_reload(script_mod);
+                vm.gc();
+                (vm.heap().gc_live_len(), vm.heap().root_counts())
+            })
+        };
+        // Two runs to settle: the first reload pays for what the first run
+        // only lazily made.
+        live_after(&mut cx);
+        let (mut live, roots) = live_after(&mut cx);
+        let named = ["type slots", "type defaults", "pod types", "object refs", "array refs", "handles"];
+        let mut steps = Vec::new();
+        for _ in 0..5 {
+            let (now, roots_now) = live_after(&mut cx);
+            // Every root holds still, the pod types too: a run's vertex
+            // structs go with the objects that own them once nothing reaches
+            // them (a compiled shader keeps copies of the types it read).
+            for (i, name) in named.iter().enumerate() {
+                assert_eq!(roots_now[i], roots[i], "a rebuild grew a collector root: {name}");
+            }
+            steps.push(now as i64 - live as i64);
+            live = now;
+        }
+        assert!(
+            steps.iter().all(|&s| s == 0),
+            "a rebuild left more live objects than the one before it; per-rebuild steps were {steps:?}"
+        );
+    }
+}

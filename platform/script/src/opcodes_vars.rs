@@ -15,13 +15,40 @@ impl<'a> ScriptVm<'a> {
     // Object/Array begin handlers
 
     pub(crate) fn handle_begin_proto(&mut self) {
+        let ip = self.bx.threads.cur_ref().trap.ip;
         let proto = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         let me = self
             .bx
             .heap
             .new_with_proto_checked(proto, self.bx.threads.cur().trap.pass());
+        // the construction site: cascade view / doc lookup key
+        self.bx.heap.set_made_at(me, ip);
         self.bx.threads.cur().mes.push(ScriptMe::Object(me));
         self.bx.threads.cur().trap.goto_next();
+    }
+
+    /// What `object.field +: {..}` builds on: the instance copy of what `field` holds (a property,
+    /// or a named child), else the type default of a declared property. A name that is neither
+    /// is an error naming the object's named children.
+    fn slot_proto(&mut self, object: ScriptObject, field: ScriptValue) -> ScriptValue {
+        let value =
+            self.bx
+                .heap
+                .proto_field_from_value(object, field, self.bx.threads.cur().trap.pass());
+        if value.is_nil() || value.is_err() {
+            self.bx.threads.cur().trap.err_take();
+            if let Some(field_id) = field.as_id() {
+                self.bx.heap.proto_field_from_type_check(
+                    object,
+                    field_id,
+                    self.bx.threads.cur().trap.pass(),
+                )
+            } else {
+                NIL
+            }
+        } else {
+            value
+        }
     }
 
     /// Part 1 of proto-inherit (+:) operator.
@@ -33,27 +60,27 @@ impl<'a> ScriptVm<'a> {
         };
         let proto = if let ScriptMe::Object(object) = me {
             let object = *object;
-            let value = self.bx.heap.proto_field_from_value(
-                object,
-                field,
-                self.bx.threads.cur().trap.pass(),
-            );
-            if value.is_nil() || value.is_err() {
-                self.bx.threads.cur().trap.err.take();
-                if let Some(field_id) = field.as_id() {
-                    self.bx.heap.proto_field_from_type_check(
-                        object,
-                        field_id,
-                        self.bx.threads.cur().trap.pass(),
-                    )
-                } else {
-                    NIL
-                }
-            } else {
-                value
-            }
+            self.slot_proto(object, field)
         } else {
             NIL
+        };
+        self.bx.threads.cur().push_stack_unchecked(proto);
+        self.bx.threads.cur().trap.goto_next();
+    }
+
+    /// Part 1 of `a.b.c +: {..}`: the parent is on the stack under the name.
+    pub(crate) fn handle_field_slot_read(&mut self) {
+        let field = self.bx.threads.cur().peek_stack_value();
+        let object = self.bx.threads.cur().peek_stack_value_at(1);
+        let proto = if let Some(object) = object.as_object() {
+            self.slot_proto(object, field)
+        } else {
+            script_err_wrong_value!(
+                self.bx.threads.cur_ref().trap,
+                "`{:?} +: {{..}}` target is not an object (got {:?})",
+                field,
+                object.value_type()
+            )
         };
         self.bx.threads.cur().push_stack_unchecked(proto);
         self.bx.threads.cur().trap.goto_next();
@@ -71,7 +98,7 @@ impl<'a> ScriptVm<'a> {
                 }
                 self.bx
                     .heap
-                    .set_value(me_obj, field, object, self.bx.threads.cur().trap.pass());
+                    .set_value_slot(me_obj, field, object, self.bx.threads.cur().trap.pass());
             }
         }
         self.bx.threads.cur().push_stack_unchecked(NIL);
@@ -83,7 +110,7 @@ impl<'a> ScriptVm<'a> {
         let proto = if let Some(id) = id.as_id() {
             let value = self.bx.threads.cur().scope_value(&self.bx.heap, id);
             if value.is_nil() || value.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 NIL
             } else {
                 value
@@ -121,12 +148,9 @@ impl<'a> ScriptVm<'a> {
             object
         };
         let proto = if let Some(obj) = object.as_object() {
-            let value = self
-                .bx
-                .heap
-                .value(obj, field, self.bx.threads.cur().trap.pass());
+            let value = self.bx.heap.value(obj, field, NoTrap);
             if value.is_nil() || value.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 NIL
             } else {
                 value
@@ -148,7 +172,7 @@ impl<'a> ScriptVm<'a> {
             }
             self.bx
                 .heap
-                .set_value(obj, field, built_object, self.bx.threads.cur().trap.pass());
+                .set_value_slot(obj, field, built_object, self.bx.threads.cur().trap.pass());
         }
         self.bx.threads.cur().push_stack_unchecked(NIL);
         self.bx.threads.cur().trap.goto_next();
@@ -167,24 +191,23 @@ impl<'a> ScriptVm<'a> {
             object
         };
         let proto = if let Some(obj) = object.as_object() {
-            let value = self
-                .bx
-                .heap
-                .value(obj, index, self.bx.threads.cur().trap.pass());
+            let value = self.bx.heap.value(obj, index, NoTrap);
             if value.is_nil() || value.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 NIL
             } else {
                 value
             }
         } else if let Some(arr) = object.as_array() {
-            let idx = index.as_index();
+            let Some(idx) = self.checked_array_index(index) else {
+                return;
+            };
             let value = self
                 .bx
                 .heap
                 .array_index(arr, idx, self.bx.threads.cur().trap.pass());
             if value.is_nil() || value.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 NIL
             } else {
                 value
@@ -205,7 +228,9 @@ impl<'a> ScriptVm<'a> {
                 .heap
                 .set_value(obj, index, built_object, self.bx.threads.cur().trap.pass());
         } else if let Some(arr) = object.as_array() {
-            let idx = index.as_index();
+            let Some(idx) = self.checked_array_index(index) else {
+                return;
+            };
             self.bx
                 .heap
                 .set_array_index(arr, idx, built_object, self.bx.threads.cur().trap.pass());
@@ -231,7 +256,9 @@ impl<'a> ScriptVm<'a> {
     }
 
     pub(crate) fn handle_begin_bare(&mut self) {
+        let ip = self.bx.threads.cur_ref().trap.ip;
         let me = self.bx.heap.new_object();
+        self.bx.heap.set_made_at(me, ip);
         self.bx.threads.cur().mes.push(ScriptMe::Object(me));
         self.bx.threads.cur().trap.goto_next();
     }
@@ -267,27 +294,26 @@ impl<'a> ScriptVm<'a> {
         let object = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         if let Some(obj) = object.as_object() {
             if field.as_id() == Some(id!(*)) {
-                let mut items = Vec::new();
+                // `use mod.*` takes every system module: the lazy ones are made first
+                if obj == self.bx.heap.modules {
+                    self.expand_all_lazy();
+                }
                 let obj_data = &self.bx.heap.objects[obj];
-                for (k, v) in obj_data.map.iter() {
-                    items.push((*k, v.value));
-                }
-                for item in &obj_data.vec {
-                    items.push((item.key, item.value));
-                }
-                for (k, v) in items {
-                    if let Some(id) = k.as_id() {
-                        self.bx
-                            .threads
-                            .cur()
-                            .def_scope_value(&mut self.bx.heap, id, v);
-                    }
-                }
+                let mut items: Vec<(LiveId, ScriptValue)> = Vec::with_capacity(obj_data.map.len() + obj_data.vec.len());
+                let named = obj_data.map.iter().map(|(k, v)| (*k, v.value)).chain(obj_data.vec.iter().map(|item| (item.key, item.value)));
+                items.extend(named.filter_map(|(k, v)| Some((k.as_id()?, v))));
+                // A module's private keys (`__forms`, `__tag`) are its own: a glob never brings
+                // them into a file's scope.
+                items.retain(|(id, _)| !self.bx.heap.is_private_name(*id));
+                self.bx.threads.cur().def_scope_values(&mut self.bx.heap, &items);
             } else {
-                let value = self
+                let mut value = self
                     .bx
                     .heap
                     .value(obj, field, self.bx.threads.cur().trap.pass());
+                if value == NIL && self.expand_lazy_pending() {
+                    value = self.bx.heap.value(obj, field, self.bx.threads.cur().trap.pass());
+                }
                 if !value.is_nil() {
                     if let Some(field) = field.as_id() {
                         self.bx
@@ -303,14 +329,53 @@ impl<'a> ScriptVm<'a> {
 
     // Field handlers
 
-    pub(crate) fn handle_field(&mut self) {
+    pub(crate) fn handle_field(&mut self, opargs: OpcodeArgs) {
         let field = self.bx.threads.cur().pop_stack_value();
         let object = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
+        if opargs.without_flags() == OpcodeArgs::OPTIONAL_FIELD {
+            // `a.b ?? d`: absent reads as nil, quietly.
+            let value = if let Some(obj) = object.as_object() {
+                let value = self.bx.heap.value(obj, field, NoTrap);
+                if value == NIL && self.expand_lazy_pending() {
+                    self.bx.heap.value(obj, field, NoTrap)
+                } else {
+                    value
+                }
+            } else if let Some(pod) = object.as_pod() {
+                self.bx.heap.pod_read_field(pod, field, &self.bx.code.builtins.pod, NoTrap)
+            } else if object.is_nil() || object.is_err() {
+                NIL
+            } else {
+                let field = field.as_id().unwrap_or(id!());
+                let type_index = object.value_type().to_redux();
+                let getter = self.bx.code.native.borrow().getters[type_index.to_index()].view();
+                // SAFETY: as in the plain read below
+                let value = unsafe { getter.call(self, object, field) };
+                self.sample_budget_now();
+                value
+            };
+            let value = if value.is_err() { NIL } else { value };
+            self.bx.threads.cur().push_stack_unchecked(value);
+            self.bx.threads.cur().trap.goto_next();
+            return;
+        }
         if let Some(obj) = object.as_object() {
-            let value = self
+            if self.bx.literal_trace.is_some() {
+                if let Some(key) = field.as_id() {
+                    let ip = self.bx.threads.cur_ref().trap.ip;
+                    let made = self.bx.heap.made_at(obj);
+                    if let Some(trace) = &mut self.bx.literal_trace {
+                        trace.field_reads.insert((made, key, ip.body, ip.index));
+                    }
+                }
+            }
+            let mut value = self
                 .bx
                 .heap
                 .value(obj, field, self.bx.threads.cur().trap.pass());
+            if value == NIL && self.expand_lazy_pending() {
+                value = self.bx.heap.value(obj, field, self.bx.threads.cur().trap.pass());
+            }
             self.bx.threads.cur().push_stack_unchecked(value);
         } else if let Some(pod) = object.as_pod() {
             let value = self.bx.heap.pod_read_field(
@@ -324,12 +389,10 @@ impl<'a> ScriptVm<'a> {
             let field = field.as_id().unwrap_or(id!());
             let type_index = object.value_type().to_redux();
             // Get the getter pointer and drop the borrow before calling
-            let getter_ptr: *const dyn Fn(&mut ScriptVm, ScriptValue, LiveId) -> ScriptValue = {
-                let native = self.bx.code.native.borrow();
-                &*native.getters[type_index.to_index()] as *const _
-            };
+            let getter = self.bx.code.native.borrow().getters[type_index.to_index()].view();
             // SAFETY: The getter pointer is valid as long as native getters aren't removed during execution
-            let ret = unsafe { (*getter_ptr)(self, object, field) };
+            let ret = unsafe { getter.call(self, object, field) };
+            self.sample_budget_now();
             self.bx.threads.cur().push_stack_unchecked(ret);
         }
         self.bx.threads.cur().trap.goto_next();
@@ -339,10 +402,13 @@ impl<'a> ScriptVm<'a> {
         let field = self.bx.threads.cur().pop_stack_value();
         let object = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         if let Some(obj) = object.as_object() {
-            let value = self
+            let mut value = self
                 .bx
                 .heap
                 .value(obj, field, self.bx.threads.cur().trap.pass());
+            if value == NIL && self.expand_lazy_pending() {
+                value = self.bx.heap.value(obj, field, self.bx.threads.cur().trap.pass());
+            }
             self.bx.threads.cur().push_stack_unchecked(value);
         } else {
             self.bx.threads.cur().push_stack_unchecked(NIL);
@@ -399,7 +465,7 @@ impl<'a> ScriptVm<'a> {
                     .heap
                     .proto_field_from_value(obj, field, self.bx.threads.cur().trap.pass());
             if value.is_nil() || value.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 if let Some(field_id) = field.as_id() {
                     let value = self.bx.heap.proto_field_from_type_check(
                         obj,
@@ -519,27 +585,91 @@ impl<'a> ScriptVm<'a> {
         self.bx.threads.cur().trap.goto_next();
     }
 
+    /// Validate an array/pod index before touching storage, so rejected reads
+    /// and writes are atomic: only finite, non-negative, integral numbers in
+    /// the representable range are accepted (`as_index` would truncate,
+    /// saturate, or turn a non-number into item zero).
+    pub(crate) fn checked_array_index(&mut self, index: ScriptValue) -> Option<usize> {
+        if let Some(index) = index.checked_index() {
+            return Some(index);
+        }
+        // `int(x)` and the other scalar pod constructors index like the
+        // number they hold.
+        if let Some(index) = self
+            .bx
+            .heap
+            .pod_scalar_number(index)
+            .and_then(|n| ScriptValue::from_f64(n).checked_index())
+        {
+            return Some(index);
+        }
+        let error = script_err_invalid_args!(
+            self.bx.threads.cur_ref().trap,
+            "array index must be a finite nonnegative integer"
+        );
+        self.bx.threads.cur().push_stack_unchecked(error);
+        self.bx.threads.cur().trap.goto_next();
+        None
+    }
+
     // Array index handler
 
-    pub(crate) fn handle_array_index(&mut self) {
+    pub(crate) fn handle_array_index(&mut self, opargs: OpcodeArgs) {
         let index = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         let object = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
+        if opargs.without_flags() == OpcodeArgs::OPTIONAL_FIELD {
+            // `a[i] ?? d`: out of range, not an index, or nothing to index
+            // reads as nil, quietly.
+            let at = index.checked_index().or_else(|| {
+                self.bx.heap.pod_scalar_number(index).and_then(|n| ScriptValue::from_f64(n).checked_index())
+            });
+            let value = if let Some(obj) = object.as_object() {
+                self.bx.heap.value(obj, index, NoTrap)
+            } else if let (Some(arr), Some(at)) = (object.as_array(), at) {
+                self.bx.heap.array_index(arr, at, NoTrap)
+            } else if let (Some(pod), Some(at)) = (object.as_pod(), at) {
+                self.bx.heap.pod_array_index(pod, at, &self.bx.code.builtins.pod, NoTrap)
+            } else {
+                NIL
+            };
+            let value = if value.is_err() { NIL } else { value };
+            self.bx.threads.cur().push_stack_unchecked(value);
+            self.bx.threads.cur().trap.goto_next();
+            return;
+        }
 
         if let Some(obj) = object.as_object() {
-            let value = self
-                .bx
-                .heap
-                .value(obj, index, self.bx.threads.cur().trap.pass());
+            let nil_on_miss = index.is_string_like() || index.is_object() || index.is_color();
+            let value = if nil_on_miss {
+                self.bx.heap.value(obj, index, NoTrap)
+            } else {
+                self.bx
+                    .heap
+                    .value(obj, index, self.bx.threads.cur().trap.pass())
+            };
+            // A map lookup with a missing string/object key yields nil (not an error),
+            // matching dynamic-map semantics (e.g. `map[key] != nil` membership checks).
+            // Integer indexing keeps erroring so index-based iteration still terminates.
+            let value = if value.is_err() && nil_on_miss {
+                self.bx.threads.cur().trap.err_take();
+                NIL
+            } else {
+                value
+            };
             self.bx.threads.cur().push_stack_unchecked(value)
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let value = self
                 .bx
                 .heap
                 .array_index(arr, index, self.bx.threads.cur().trap.pass());
             self.bx.threads.cur().push_stack_unchecked(value)
         } else if let Some(pod) = object.as_pod() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let value = self.bx.heap.pod_array_index(
                 pod,
                 index,
@@ -569,6 +699,7 @@ impl<'a> ScriptVm<'a> {
         };
         let id = self.bx.threads.cur().pop_stack_value();
         let id = id.as_id().unwrap_or(id!());
+        self.bx.notify_let_hook(id, value);
         self.bx
             .threads
             .cur()
@@ -590,6 +721,7 @@ impl<'a> ScriptVm<'a> {
             .pop_stack_value()
             .as_id()
             .unwrap_or(id!());
+        self.bx.notify_let_hook(id, value);
         self.bx
             .threads
             .cur()
@@ -605,6 +737,7 @@ impl<'a> ScriptVm<'a> {
         };
         let id = self.bx.threads.cur().pop_stack_value();
         let id = id.as_id().unwrap_or(id!());
+        self.bx.notify_let_hook(id, value);
         self.bx
             .threads
             .cur()
@@ -626,6 +759,7 @@ impl<'a> ScriptVm<'a> {
             .pop_stack_value()
             .as_id()
             .unwrap_or(id!());
+        self.bx.notify_let_hook(id, value);
         self.bx
             .threads
             .cur()
@@ -642,6 +776,15 @@ impl<'a> ScriptVm<'a> {
     // Log handler
 
     pub(crate) fn handle_log(&mut self) {
+        if !self.bx.allow_debug_output {
+            let error = script_err_not_allowed!(
+                self.bx.threads.cur_ref().trap,
+                "direct script logging is disabled by this host"
+            );
+            self.bx.threads.cur().push_stack_unchecked(error);
+            self.bx.threads.cur().trap.goto_next();
+            return;
+        }
         let value = self.bx.threads.cur().peek_stack_resolved(&self.bx.heap);
         self.log(value);
         self.bx.threads.cur().trap.goto_next();
@@ -673,6 +816,9 @@ impl<'a> ScriptVm<'a> {
             self.bail("scopes empty in scope");
             return;
         };
+        // The scope is now a script value: it escapes, with the scopes it reads through, so no
+        // eager free at loop or call exit takes it while the value lives.
+        self.bx.heap.ref_object_chain(scope);
         self.bx.threads.cur().push_stack_value(scope.into());
         self.bx.threads.cur().trap.goto_next();
     }
@@ -680,11 +826,14 @@ impl<'a> ScriptVm<'a> {
     // Log implementation
 
     pub fn log(&self, value: ScriptValue) {
+        if !self.bx.allow_debug_output {
+            return;
+        }
         if let Some(loc) = self.bx.code.ip_to_loc(self.bx.threads.cur_ref().trap.ip) {
             if value != NIL {
                 if let Some(err_ptr) = value.as_err() {
                     if let Some(loc2) = self.bx.code.ip_to_loc(err_ptr.ip) {
-                        let err_queue = self.bx.threads.cur_ref().trap.err.borrow();
+                        let err_queue = self.bx.threads.cur_ref().trap.err_borrow();
                         if let Some(err) = err_queue.iter().find(|e| e.value == value) {
                             log_with_level(
                                 &loc.file,
@@ -774,14 +923,16 @@ impl<'a> ScriptVm<'a> {
         let source = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
 
         let value = if let Some(arr) = source.as_array() {
-            let idx = index.as_index();
+            let Some(idx) = self.checked_array_index(index) else {
+                return;
+            };
             // Try to get, return NIL if out of bounds or error
             let result = self
                 .bx
                 .heap
                 .array_index(arr, idx, self.bx.threads.cur().trap.pass());
             if result.is_err() {
-                self.bx.threads.cur().trap.err.take(); // Clear the error
+                self.bx.threads.cur().trap.err_take(); // Clear the error
                 NIL
             } else {
                 result
@@ -792,7 +943,7 @@ impl<'a> ScriptVm<'a> {
                 .heap
                 .value(obj, index, self.bx.threads.cur().trap.pass());
             if result.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 NIL
             } else {
                 result
@@ -820,7 +971,7 @@ impl<'a> ScriptVm<'a> {
                 .heap
                 .array_index(arr, index, self.bx.threads.cur().trap.pass());
             if result.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 NIL
             } else {
                 result
@@ -832,7 +983,7 @@ impl<'a> ScriptVm<'a> {
                 self.bx.threads.cur().trap.pass(),
             );
             if result.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 NIL
             } else {
                 result
@@ -863,12 +1014,9 @@ impl<'a> ScriptVm<'a> {
 
         // Extract value from source object using id as key (nil-safe)
         let value = if let Some(obj) = source.as_object() {
-            let result = self
-                .bx
-                .heap
-                .value(obj, id, self.bx.threads.cur().trap.pass());
+            let result = self.bx.heap.value(obj, id, NoTrap);
             if result.is_err() {
-                self.bx.threads.cur().trap.err.take();
+                self.bx.threads.cur().trap.err_take();
                 NIL
             } else {
                 result

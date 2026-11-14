@@ -2,12 +2,10 @@ use {
     crate::{
         code::{CompiledCode, UncompiledCode},
         compile::Compiler,
-        decode::DecodeError,
-        func::{Func, FuncType},
+        config::Extensions,
+        func::Func,
         instance::Instance,
-        module::ModuleBuilder,
         store::Store,
-        validate::Validator,
     },
     std::sync::{Arc, Mutex},
 };
@@ -21,24 +19,23 @@ pub struct Engine {
 impl Engine {
     /// Creates a new [`Engine`].
     pub fn new() -> Engine {
+        Self::new_with_extensions(Extensions::default())
+    }
+
+    /// Creates a new [`Engine`] with the given nonstandard [`Extensions`]
+    /// enabled.
+    pub fn new_with_extensions(extensions: Extensions) -> Engine {
         Engine {
             inner: Arc::new(EngineInner {
-                validators: Mutex::new(Pool::new()),
+                extensions,
                 compilers: Mutex::new(Pool::new()),
             }),
         }
     }
 
-    pub(crate) fn validate(
-        &self,
-        type_: &FuncType,
-        module: &ModuleBuilder,
-        code: &UncompiledCode,
-    ) -> Result<(), DecodeError> {
-        let mut validator = self.inner.validators.lock().unwrap().pop_or_default();
-        let result = validator.validate(type_, module, code);
-        self.inner.validators.lock().unwrap().push(validator);
-        result
+    /// The nonstandard [`Extensions`] enabled for this [`Engine`].
+    pub fn extensions(&self) -> Extensions {
+        self.inner.extensions
     }
 
     pub(crate) fn compile(
@@ -63,7 +60,7 @@ impl Default for Engine {
 
 #[derive(Debug)]
 struct EngineInner {
-    validators: Mutex<Pool<Validator>>,
+    extensions: Extensions,
     compilers: Mutex<Pool<Compiler>>,
 }
 

@@ -1,6 +1,8 @@
+#[cfg(target_arch = "wasm32")]
+use crate::os::web::CxOsUniformBuffer;
 use {
     crate::{
-        cx::Cx, id_pool::*, makepad_error_log::*, makepad_script::*, os::CxOsUniformBuffer,
+        cx::Cx, id_pool::*, makepad_error_log::*, makepad_script::*,
         script::vm::*,
     },
     std::rc::Rc,
@@ -12,7 +14,36 @@ pub struct UniformBuffer(Rc<PoolId>);
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub struct UniformBufferId(pub(crate) usize, u64);
 
+impl UniformBufferId {
+    /// The pool generation of the slot this id names.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn generation(self) -> u64 {
+        self.1
+    }
+}
+
 impl UniformBuffer {
+    pub fn readers(&self) -> usize {
+        Rc::strong_count(&self.0)
+    }
+    /// Release an unreferenced immutable buffer only after the supported
+    /// backend's real queue is complete. Return CPU storage for worker disposal.
+    pub fn release_if_unused(&self, cx: &mut Cx) -> Option<Vec<u8>> {
+        if self.readers() != 1 {
+            return None;
+        }
+        let submitted = cx.frame_submission_serial();
+        if submitted > cx.frame_completion_serial() {
+            return None;
+        }
+        let id = self.uniform_buffer_id();
+        let buffer = &mut cx.uniform_buffers[id];
+        #[cfg(target_arch = "wasm32")]
+        { buffer.os = CxOsUniformBuffer::default(); }
+        buffer.generation = 0;
+        Some(std::mem::take(&mut buffer.data))
+    }
+    #[track_caller]
     pub fn new(cx: &mut Cx) -> Self {
         cx.uniform_buffers.alloc()
     }
@@ -22,11 +53,16 @@ impl UniformBuffer {
     }
 
     pub fn clear(&self, cx: &mut Cx) {
-        cx.uniform_buffers[self.uniform_buffer_id()].data.clear();
+        self.set_bytes(cx, &[]);
     }
 
     pub fn set_bytes(&self, cx: &mut Cx, data: &[u8]) {
+        if cx.uniform_buffers[self.uniform_buffer_id()].data == data {
+            return;
+        }
+        let generation = cx.next_uniform_gen();
         let cx_uniform_buffer = &mut cx.uniform_buffers[self.uniform_buffer_id()];
+        cx_uniform_buffer.generation = generation;
         cx_uniform_buffer.data.clear();
         cx_uniform_buffer.data.extend_from_slice(data);
     }
@@ -49,6 +85,10 @@ impl UniformBuffer {
 impl ScriptHook for UniformBuffer {}
 impl ScriptApply for UniformBuffer {}
 impl ScriptNew for UniformBuffer {
+    fn script_type_id_static() -> ScriptTypeId {
+        const ID: ScriptTypeId = ScriptTypeId::of_path(concat!(module_path!(), "::UniformBuffer"));
+        ID
+    }
     fn script_new(vm: &mut ScriptVm) -> Self {
         Self::new(vm.cx_mut())
     }
@@ -58,11 +98,18 @@ impl ScriptNew for UniformBuffer {
 pub struct CxUniformBufferPool(pub(crate) IdPool<CxUniformBuffer>);
 
 impl CxUniformBufferPool {
+    #[track_caller]
     pub fn alloc(&mut self) -> UniformBuffer {
-        let (new_id, previous_item) = self
+        let item = CxUniformBuffer {
+            #[cfg(not(target_arch = "wasm32"))]
+            origin: crate::gpu_ledger::GpuOrigin::here(),
+            ..Default::default()
+        };
+        let (new_id, _previous_item) = self
             .0
-            .alloc_with_reuse_filter(|_| true, CxUniformBuffer::default());
-        if let Some(previous_item) = previous_item {
+            .alloc_with_reuse_filter(|_| true, item);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(previous_item) = _previous_item {
             self.0.pool[new_id.id].item.os = previous_item.os;
         }
         UniformBuffer(Rc::new(new_id))
@@ -98,6 +145,10 @@ impl std::ops::IndexMut<UniformBufferId> for CxUniformBufferPool {
 
 #[derive(Default)]
 pub struct CxUniformBuffer {
+    pub generation: u64,
     pub data: Vec<u8>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) origin: crate::gpu_ledger::GpuOrigin,
+    #[cfg(target_arch = "wasm32")]
     pub os: CxOsUniformBuffer,
 }

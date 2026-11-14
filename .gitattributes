@@ -1,10 +1,11 @@
 # From https://github.com/gitattributes/gitattributes/blob/master/Rust.gitattributes
 # Auto detect text files and perform normalization
-*          text=auto
+*          text=auto eol=lf
 
 *.rs       text diff=rust
 *.toml     text diff=toml
 Cargo.lock text
+ci.toml merge=ci-proof
 # Taken from https://github.com/gitattributes/gitattributes/blob/master/Common.gitattributes
 # Common settings that generally should always be used with your language specific settings
 
@@ -94,6 +95,8 @@ Cargo.lock text
 
 # Text files where line endings should be preserved
 *.patch    -text
+# Fixtures a test compares byte for byte (include_bytes!)
+platform/tests/fixtures/*.txt text eol=lf
 
 #
 # Exclude files from exporting

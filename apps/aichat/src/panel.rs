@@ -1,0 +1,2944 @@
+//! The chat panel: the one widget every host shows. It owns the engine —
+//! the service registry, the model, the transcript — and draws
+//! `EngineState` as a transcript of user lines, assistant text, tool cards
+//! (running, done, waiting for a confirm), and system lines, over a
+//! composer.
+//!
+//! Hosts talk to it in two ways: they hand it service links
+//! (`registry()`) or bus frames (`on_custom`), and they listen for
+//! [`AiChatPanelAction`]s. The engine runs on the panel's own events: every
+//! event pumps it, and while a turn is in flight the panel asks for the
+//! next frame so streaming, deadlines and the cloud provider's polling all
+//! advance without a host timer.
+
+use crate::attach::{self, Dropped, Source};
+use crate::bus::ServiceBus;
+use crate::pictures::{self, ChatPictures, PictureKept};
+#[cfg(feature = "gen")]
+use crate::gen::GenService;
+use crate::settings::AiSettings;
+#[cfg(feature = "engine")]
+use makepad_ai_services::engine::models::{build_model, fallback_choice, hub_generation, hub_rows, provider_rows};
+use makepad_ai_services::engine::NoModelWithReason;
+use makepad_ai_services::engine::{EngineCore, EngineEvent, ModelImage, SentPicture, ServiceRegistry};
+use makepad_ai_services::mcp::mcpb;
+use makepad_ai_services::provider::{CLAUDE_DESKTOP, PROVIDER_ENV};
+use makepad_ai_services::card::{Card, CardValues, Field, MAX_FIELDS};
+use makepad_ai_services::state::*;
+use makepad_ai_services::progress_eta::ProgressTracker;
+use makepad_ai_services::wire::{api_name, split_name, Risk, ToolDef, ToolOutcome};
+use makepad_widgets::makepad_platform::file_dialogs::{FileDialog, FileDialogAction};
+use makepad_widgets::tip::TipWidgetRefExt;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+use makepad_widgets::ai_slot::AiSlotRequests;
+use makepad_widgets::*;
+
+/// Starting points the empty conversation shows.
+pub const MAX_CHIPS: usize = 4;
+
+/// The picture picker's dialog id.
+const ATTACH_DIALOG: LiveId = live_id!(ai_chat_attach);
+/// The composer's picture chips, in order.
+const ATTACH_PICS: [LiveId; 4] = [live_id!(attach_pic0), live_id!(attach_pic1), live_id!(attach_pic2), live_id!(attach_pic3)];
+/// A sent line's picture slots.
+const USER_PICS: [LiveId; 4] = [live_id!(upic0), live_id!(upic1), live_id!(upic2), live_id!(upic3)];
+
+fn slot_id(slot: usize) -> LiveId {
+    LiveId::from_str(&format!("f{slot}"))
+}
+
+script_mod! {
+    use mod.prelude.widgets_internal.*
+    use mod.widgets.*
+
+    mod.widgets.AiChatPanelBase = #(AiChatPanel::register_widget(vm))
+
+    let Line = Label{
+        width: Fill
+        height: Fit
+        draw_text +: {
+            color: theme.color_text
+            text_style: theme.font_regular{font_size: 9.5}
+        }
+    }
+
+    let Meta = Label{
+        width: Fit
+        height: Fit
+        draw_text +: {
+            color: theme.color_text_meta
+            text_style: theme.font_regular{font_size: 8.5}
+        }
+    }
+
+    let Row = View{
+        width: Fill
+        height: Fit
+        flow: Down
+        padding: Inset{left: 14 right: 14 top: 4 bottom: 4}
+    }
+
+    // A bare icon button whose glyph is drawn by its shader: no picture
+    // files, so every host of the panel gets the same marks.
+    let GlyphButton = ButtonFlatterIcon{
+        width: 26
+        height: 26
+        padding: 0
+        margin: 0
+        draw_bg +: {
+            border_radius: 5.0
+            face_hover: uniform(theme.color_u_1)
+            ink: uniform(theme.color_text_meta)
+            ink_hover: uniform(theme.color_text)
+        }
+    }
+
+    // New conversation: a plus.
+    let NewChatButton = GlyphButton{
+        draw_bg +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(1., 1., self.rect_size.x - 2., self.rect_size.y - 2., self.border_radius)
+                sdf.fill(vec4(self.face_hover.xyz, self.face_hover.w * max(self.hover, self.down)))
+                let mid = self.rect_size * 0.5
+                let h = 5.0
+                sdf.move_to(mid.x - h, mid.y)
+                sdf.line_to(mid.x + h, mid.y)
+                sdf.move_to(mid.x, mid.y - h)
+                sdf.line_to(mid.x, mid.y + h)
+                sdf.stroke(mix(self.ink, self.ink_hover, self.hover), 1.4)
+                return sdf.result
+            }
+        }
+    }
+
+    // One picture waiting in the composer, with its own remove button.
+    let AttachPic = View{
+        visible: false
+        width: Fit
+        height: Fit
+        flow: Overlay
+        align: Align{x: 1.0 y: 0.0}
+        pic := Image{width: 48 height: 36 fit: ImageFit.Smallest}
+        Tip{
+            text: "Remove this picture"
+            pic_remove := CloseButtonSm{}
+        }
+    }
+
+    // Attach a picture: a frame with a hill and a sun.
+    let AttachButton = GlyphButton{
+        draw_bg +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(1., 1., self.rect_size.x - 2., self.rect_size.y - 2., self.border_radius)
+                sdf.fill(vec4(self.face_hover.xyz, self.face_hover.w * max(self.hover, self.down)))
+                let ink = mix(self.ink, self.ink_hover, self.hover)
+                let mid = self.rect_size * 0.5
+                sdf.box(mid.x - 6.5, mid.y - 5., 13., 10., 2.)
+                sdf.stroke(ink, 1.2)
+                sdf.move_to(mid.x - 5., mid.y + 3.5)
+                sdf.line_to(mid.x - 1.5, mid.y - 0.5)
+                sdf.line_to(mid.x + 1., mid.y + 2.)
+                sdf.line_to(mid.x + 2.5, mid.y + 0.5)
+                sdf.line_to(mid.x + 5., mid.y + 3.5)
+                sdf.stroke(ink, 1.2)
+                sdf.circle(mid.x + 2.5, mid.y - 2.2, 1.2)
+                sdf.fill(ink)
+                return sdf.result
+            }
+        }
+    }
+
+    // Annotate: a marker pen, slanted; the lit one has the accent behind it.
+    let AnnotateButton = GlyphButton{
+        draw_bg +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(1., 1., self.rect_size.x - 2., self.rect_size.y - 2., self.border_radius)
+                sdf.fill(vec4(self.face_hover.xyz, self.face_hover.w * max(self.hover, self.down)))
+                let ink = mix(self.ink, self.ink_hover, self.hover)
+                let mid = self.rect_size * 0.5
+                // the barrel, from lower left to upper right, and its tip
+                sdf.move_to(mid.x - 5.5, mid.y + 5.5)
+                sdf.line_to(mid.x + 4.5, mid.y - 4.5)
+                sdf.stroke(ink, 4.0)
+                sdf.move_to(mid.x - 6.5, mid.y + 6.5)
+                sdf.line_to(mid.x - 5.0, mid.y + 5.0)
+                sdf.stroke(ink, 1.6)
+                return sdf.result
+            }
+        }
+    }
+    let AnnotateOnButton = GlyphButton{
+        draw_bg +: {
+            accent: uniform(theme.color_primary)
+            ink_on: uniform(theme.color_on_primary)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(1., 1., self.rect_size.x - 2., self.rect_size.y - 2., self.border_radius)
+                sdf.fill(mix(self.accent, mix(self.accent, #xFFFFFFFF, 0.15), self.hover))
+                let mid = self.rect_size * 0.5
+                sdf.move_to(mid.x - 5.5, mid.y + 5.5)
+                sdf.line_to(mid.x + 4.5, mid.y - 4.5)
+                sdf.stroke(self.ink_on, 4.0)
+                sdf.move_to(mid.x - 6.5, mid.y + 6.5)
+                sdf.line_to(mid.x - 5.0, mid.y + 5.0)
+                sdf.stroke(self.ink_on, 1.6)
+                return sdf.result
+            }
+        }
+    }
+
+    // Send: an arrow on the accent; greyed while there is nothing to send.
+    let SendButton = GlyphButton{
+        width: 28
+        height: 28
+        draw_bg +: {
+            accent: uniform(theme.color_primary)
+            ink_on: uniform(theme.color_on_primary)
+            off: uniform(theme.color_u_2)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let mid = self.rect_size * 0.5
+                let face = mix(mix(self.accent, mix(self.accent, #xFFFFFFFF, 0.15), self.hover), self.off, self.disabled)
+                sdf.circle(mid.x, mid.y, min(mid.x, mid.y) - 1.0)
+                sdf.fill(face)
+                sdf.move_to(mid.x, mid.y + 5.)
+                sdf.line_to(mid.x, mid.y - 5.)
+                sdf.move_to(mid.x - 4.5, mid.y - 0.5)
+                sdf.line_to(mid.x, mid.y - 5.)
+                sdf.line_to(mid.x + 4.5, mid.y - 0.5)
+                sdf.stroke(mix(self.ink_on, self.ink, self.disabled), 1.6)
+                return sdf.result
+            }
+        }
+    }
+
+    // Stop the turn: a square on a ring, in place of Send while it runs.
+    let StopButton = GlyphButton{
+        width: 28
+        height: 28
+        draw_bg +: {
+            ring: uniform(theme.color_u_3)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let mid = self.rect_size * 0.5
+                sdf.circle(mid.x, mid.y, min(mid.x, mid.y) - 1.0)
+                sdf.fill_keep(vec4(self.face_hover.xyz, self.face_hover.w * (0.6 + 0.4 * self.hover)))
+                sdf.stroke(self.ring, 1.0)
+                sdf.box(mid.x - 4., mid.y - 4., 8., 8., 1.5)
+                sdf.fill(mix(self.ink, self.ink_hover, self.hover))
+                return sdf.result
+            }
+        }
+    }
+
+    // Speak to the chat: a microphone. Listening turns it red and a click stops it.
+    let MicButton = GlyphButton{
+        width: 28
+        height: 28
+        draw_bg +: {
+            live: uniform(theme.color_error)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(1., 1., self.rect_size.x - 2., self.rect_size.y - 2., self.border_radius)
+                sdf.fill(vec4(self.face_hover.xyz, self.face_hover.w * max(self.hover, self.down)))
+                let ink = mix(self.ink, self.ink_hover, self.hover)
+                let mid = self.rect_size * 0.5
+                sdf.box(mid.x - 2.5, mid.y - 7., 5., 9., 2.5)
+                sdf.stroke(ink, 1.3)
+                sdf.move_to(mid.x - 5., mid.y - 1.)
+                sdf.line_to(mid.x - 5., mid.y + 0.5)
+                sdf.line_to(mid.x - 3., mid.y + 3.5)
+                sdf.line_to(mid.x + 3., mid.y + 3.5)
+                sdf.line_to(mid.x + 5., mid.y + 0.5)
+                sdf.line_to(mid.x + 5., mid.y - 1.)
+                sdf.move_to(mid.x, mid.y + 3.5)
+                sdf.line_to(mid.x, mid.y + 7.)
+                sdf.stroke(ink, 1.3)
+                return sdf.result
+            }
+        }
+    }
+
+    // Stop listening: the microphone on a red disc, in place of the microphone while it listens.
+    let MicLiveButton = GlyphButton{
+        width: 28
+        height: 28
+        draw_bg +: {
+            live: uniform(theme.color_error)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let mid = self.rect_size * 0.5
+                sdf.circle(mid.x, mid.y, min(mid.x, mid.y) - 1.0)
+                sdf.fill(mix(self.live, #xFFFFFFFF, 0.15 * self.hover))
+                sdf.box(mid.x - 2.5, mid.y - 7., 5., 9., 2.5)
+                sdf.fill_keep(#xFFFFFFFF)
+                sdf.move_to(mid.x - 5., mid.y - 1.)
+                sdf.line_to(mid.x - 5., mid.y + 0.5)
+                sdf.line_to(mid.x - 3., mid.y + 3.5)
+                sdf.line_to(mid.x + 3., mid.y + 3.5)
+                sdf.line_to(mid.x + 5., mid.y + 0.5)
+                sdf.line_to(mid.x + 5., mid.y - 1.)
+                sdf.move_to(mid.x, mid.y + 3.5)
+                sdf.line_to(mid.x, mid.y + 7.)
+                sdf.stroke(#xFFFFFFFF, 1.3)
+                return sdf.result
+            }
+        }
+    }
+
+    // A starting point in the empty conversation: a quiet full-width row.
+    let StarterChip = ButtonFlat{
+        visible: false
+        width: Fill
+        height: 30
+        align: Align{x: 0.0 y: 0.5}
+        padding: Inset{left: 10 right: 10}
+        margin: 0
+        text: ""
+        draw_text +: {
+            color: theme.color_text
+            text_style: theme.font_regular{font_size: 9.0}
+        }
+        draw_bg +: {
+            border_radius: 6.0
+            color: theme.color_u_hidden
+            color_default: theme.color_u_hidden
+            color_hover: theme.color_u_1
+            color_down: theme.color_u_2
+            border_color: theme.color_outline_variant
+            border_color_hover: theme.color_outline
+            border_color_down: theme.color_outline
+            border_color_focus: theme.color_outline
+        }
+    }
+
+    // One row of a settings card: its label and both editors; the panel
+    // shows the one the field needs.
+    let FieldSlot = View{
+        visible: false
+        width: Fill
+        height: Fit
+        flow: Right
+        spacing: 8
+        align: Align{y: 0.5}
+        label := Label{
+            width: 110
+            text: ""
+            draw_text +: {
+                color: theme.color_text_meta
+                text_style: theme.font_regular{font_size: 8.5}
+            }
+        }
+        pick := DropDown{
+            width: Fill
+            labels: ["-"]
+        }
+        line := TextInput{
+            width: Fill
+            height: Fit
+            empty_text: ""
+        }
+    }
+
+    mod.widgets.AiChatPanel = set_type_default() do mod.widgets.AiChatPanelBase{
+        width: Fill
+        height: Fill
+        flow: Down
+        draw_bg +: { color: theme.color_bg_app }
+
+        // Which model answers, how it is doing, and a fresh start.
+        header := View{
+            width: Fill
+            height: 36
+            flow: Right
+            spacing: 2
+            padding: Inset{left: 14 right: 8}
+            align: Align{y: 0.5}
+            // Ready (a green circle), working (a breathing ring), nothing
+            // answers (a red square): a shape as well as a colour.
+            status_dot := StatusDot{width: 10 height: 10 status: StatusKind.Success}
+            provider_pick := DropDownFlat{
+                width: Fit
+                margin: Inset{left: 2}
+                labels: ["Model"]
+                draw_text +: { text_style: theme.font_regular{font_size: 9.0} }
+                popup_menu +: {width: Fit}
+            }
+            View{width: Fill height: 1}
+            Tip{
+                text: "New conversation (clears this one)"
+                place: BottomEnd
+                new_chat := NewChatButton{}
+            }
+        }
+        SolidView{width: Fill height: 1 draw_bg +: { color: theme.color_outline_variant }}
+
+        // A desktop assistant is the provider: this app's tools are served to it.
+        mcp_row := View{
+            visible: false
+            width: Fill
+            height: Fit
+            flow: Down
+            spacing: 4
+            padding: Inset{left: 14 right: 14 top: 8 bottom: 4}
+            mcp_connect := Button{ text: "Connect the desktop assistant" }
+            mcp_status := Label{
+                width: Fill
+                text: "The desktop assistant reaches this app through makepad-remote mcp."
+                draw_text +: {
+                    color: theme.color_text
+                    text_style: theme.font_regular{font_size: 8.5}
+                }
+            }
+            mcp_hint := Label{
+                width: Fill
+                text: "Type in the desktop assistant to use this app's tools."
+                draw_text +: {
+                    color: theme.color_text_meta
+                    text_style: theme.font_regular{font_size: 8.5}
+                }
+            }
+        }
+
+        // Nothing said yet: what the panel can do here, and where to start.
+        empty_state := View{
+            visible: false
+            width: Fill
+            height: Fill
+            flow: Down
+            spacing: 6
+            padding: Inset{left: 12 right: 12 top: 16}
+            empty_hint := Label{
+                width: Fill
+                margin: Inset{left: 2 bottom: 6}
+                text: ""
+                draw_text +: {
+                    color: theme.color_text_meta
+                    text_style: theme.font_regular{font_size: 9.0}
+                }
+            }
+            chip0 := StarterChip{}
+            chip1 := StarterChip{}
+            chip2 := StarterChip{}
+            chip3 := StarterChip{}
+        }
+
+        transcript := PortalList{
+            width: Fill
+            height: Fill
+            auto_tail: true
+            selectable: true
+            select_all_entry_first: true
+
+            UserRow := Row{
+                padding: Inset{left: 12 right: 12 top: 12 bottom: 4}
+                RoundedView{
+                    width: Fill
+                    height: Fit
+                    padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
+                    draw_bg +: { color: theme.color_u_1 border_radius: 6.0 }
+                    flow: Down
+                    spacing: 6
+                    user_pics := View{
+                        visible: false
+                        width: Fill
+                        height: Fit
+                        flow: Right
+                        spacing: 4
+                        upic0 := Image{visible: false width: 64 height: 48 fit: ImageFit.Smallest}
+                        upic1 := Image{visible: false width: 64 height: 48 fit: ImageFit.Smallest}
+                        upic2 := Image{visible: false width: 64 height: 48 fit: ImageFit.Smallest}
+                        upic3 := Image{visible: false width: 64 height: 48 fit: ImageFit.Smallest}
+                    }
+                    user_text := Line{}
+                }
+            }
+            EventRow := Row{
+                padding: Inset{left: 14 right: 14 top: 3 bottom: 3}
+                event_title := Meta{width: Fill}
+                event_text := Line{
+                    draw_text +: { text_style: theme.font_regular{font_size: 9.0} }
+                }
+                event_meta := Label{
+                    visible: false
+                    width: Fill
+                    draw_text +: {
+                        color: theme.color_text_meta
+                        text_style: theme.font_code{font_size: 7.5}
+                    }
+                }
+            }
+            AssistantRow := Row{
+                padding: Inset{left: 14 right: 14 top: 6 bottom: 4}
+                assistant_md := Markdown{
+                    width: Fill
+                    height: Fit
+                    // Lays out what the list's selection asks of it.
+                    selectable: true
+                    body: ""
+                }
+            }
+            // One call: a dot for how it went, the tool and its arguments cut to
+            // the row's width (a click shows them whole, with the answer), and Stop
+            // while it runs. Under it, on a line of its own, what it is doing and,
+            // when the call counts its steps, a bar under that with how far it is.
+            ToolRow := Row{
+                padding: Inset{left: 14 right: 12 top: 0 bottom: 0}
+                tool_head := View{
+                    width: Fill
+                    height: 24
+                    flow: Right
+                    spacing: 8
+                    align: Align{y: 0.5}
+                    cursor: MouseCursor.Hand
+                    // Done calls stay quiet: a grey circle; a failed one is
+                    // a red square, a running one breathes.
+                    tool_dot := StatusDot{
+                        width: 9
+                        height: 9
+                        draw_bg +: { color_success: theme.color_outline }
+                    }
+                    tool_title := Label{
+                        width: Fill
+                        max_lines: 1
+                        text_overflow: TextOverflow.Ellipsis
+                        draw_text +: {
+                            color: theme.color_text_meta
+                            text_style: theme.font_regular{font_size: 8.5}
+                        }
+                    }
+                    tool_stop := ButtonFlat{
+                        visible: false
+                        text: "Stop"
+                        height: 20
+                        margin: 0
+                        padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
+                    }
+                }
+                tool_status := View{
+                    visible: false
+                    width: Fill
+                    height: Fit
+                    flow: Down
+                    spacing: 2
+                    margin: Inset{left: 17 bottom: 4}
+                    tool_note := Label{
+                        width: Fill
+                        max_lines: 1
+                        text_overflow: TextOverflow.Ellipsis
+                        draw_text +: {
+                            color: theme.color_text_meta
+                            text_style: theme.font_regular{font_size: 8.0}
+                        }
+                    }
+                    tool_bar_box := View{
+                        visible: false
+                        width: Fill
+                        height: Fit
+                        tool_bar := ProgressBarFlat{
+                            width: Fill
+                            height: 12
+                            show_percent: true
+                            draw_bg +: { thickness: 2.0 }
+                            draw_text +: {
+                                color: theme.color_text_meta
+                                text_style: theme.font_regular{font_size: 8.0}
+                            }
+                        }
+                    }
+                }
+                tool_problem := Label{
+                    visible: false
+                    width: Fill
+                    max_lines: 2
+                    margin: Inset{left: 17 bottom: 3}
+                    draw_text +: {
+                        color: mix(theme.color_error, theme.color_text_meta, 0.35)
+                        text_style: theme.font_regular{font_size: 8.0}
+                    }
+                }
+                tool_detail := RoundedView{
+                    visible: false
+                    width: Fill
+                    height: Fit
+                    margin: Inset{left: 14 top: 2 bottom: 6}
+                    padding: Inset{left: 8 right: 8 top: 6 bottom: 6}
+                    draw_bg +: { color: theme.color_d_1 border_radius: 4.0 }
+                    tool_detail_text := Label{
+                        width: Fill
+                        draw_text +: {
+                            color: theme.color_text_meta
+                            text_style: theme.font_code{font_size: 7.5}
+                        }
+                    }
+                }
+            }
+            TaskRow := Row{
+                padding: Inset{left: 12 right: 12 top: 4 bottom: 4}
+                task_tip := Tip{
+                    RoundedView{
+                        width: Fill
+                        height: Fit
+                        flow: Right
+                        spacing: 8
+                        align: Align{y: 0.5}
+                        cursor: MouseCursor.Default
+                        padding: Inset{left: 8 right: 8 top: 8 bottom: 8}
+                        draw_bg +: { color: theme.color_u_1 border_color: theme.color_outline_variant border_size: 1.0 border_radius: 6.0 }
+                        task_pic := Image{visible: false width: 44 height: 44 fit: ImageFit.Smallest}
+                        View{
+                            width: Fill
+                            height: Fit
+                            flow: Down
+                            spacing: 3
+                            task_title := Label{
+                                width: Fill
+                                max_lines: 1
+                                text_overflow: TextOverflow.Ellipsis
+                                draw_text +: {
+                                    color: theme.color_text
+                                    text_style: theme.font_regular{font_size: 9.0}
+                                }
+                            }
+                            task_bar_row := View{
+                                width: Fill
+                                height: Fit
+                                task_bar := ProgressBarFlat{
+                                    width: Fill
+                                    height: 4
+                                    value: -1.0
+                                    draw_bg +: { thickness: 2.0 }
+                                }
+                            }
+                            task_meta := Label{
+                                width: Fill
+                                max_lines: 1
+                                text_overflow: TextOverflow.Ellipsis
+                                draw_text +: {
+                                    color: theme.color_text_meta
+                                    text_style: theme.font_regular{font_size: 8.0}
+                                }
+                            }
+                            task_problem := Label{
+                                visible: false
+                                width: Fill
+                                max_lines: 1
+                                text_overflow: TextOverflow.Ellipsis
+                                draw_text +: {
+                                    color: mix(theme.color_error, theme.color_text_meta, 0.35)
+                                    text_style: theme.font_regular{font_size: 8.0}
+                                }
+                            }
+                        }
+                        task_buttons := View{
+                            width: Fit
+                            height: Fit
+                            flow: Down
+                            spacing: 3
+                            task_stop := ButtonFlat{visible: false text: "Stop" width: 60 height: 24}
+                            task_retry := ButtonFlat{visible: false text: "Retry" width: 60 height: 24}
+                            task_act0 := ButtonFlat{visible: false width: 60 height: 24}
+                            task_act1 := ButtonFlat{visible: false width: 60 height: 24}
+                        }
+                    }
+                }
+            }
+            ConfirmRow := Row{
+                padding: Inset{left: 12 right: 12 top: 6 bottom: 6}
+                RoundedView{
+                    width: Fill
+                    height: Fit
+                    flow: Down
+                    padding: Inset{left: 10 right: 10 top: 8 bottom: 8}
+                    draw_bg +: { color: theme.color_u_1 border_color: theme.color_outline_variant border_size: 1.0 border_radius: 6.0 }
+                    confirm_title := Line{
+                        draw_text +: { text_style: theme.font_regular{font_size: 9.0} }
+                    }
+                    confirm_buttons := View{
+                        width: Fill
+                        height: Fit
+                        flow: Right
+                        spacing: 8
+                        margin: Inset{top: 6}
+                        run_button := Button{ text: "Run" }
+                        Tip{
+                            text: "Run this tool without asking again until the chat is cleared"
+                            run_always := ButtonFlat{ text: "Always in this chat" }
+                        }
+                        deny_button := ButtonFlat{ text: "Cancel" }
+                    }
+                }
+            }
+            // A parked request: the tool's arguments as editable fields.
+            RequestRow := Row{
+                padding: Inset{left: 12 right: 12 top: 6 bottom: 6}
+                RoundedView{
+                    width: Fill
+                    height: Fit
+                    flow: Down
+                    spacing: 6
+                    padding: Inset{left: 12 right: 12 top: 10 bottom: 10}
+                    draw_bg +: { color: theme.color_u_1 border_color: theme.color_outline_variant border_size: 1.0 border_radius: 6.0 }
+                    req_title := Line{
+                        draw_text +: { text_style: theme.font_bold{font_size: 9.5} }
+                    }
+                    req_why := Line{
+                        draw_text +: {
+                            color: theme.color_text_meta
+                            text_style: theme.font_regular{font_size: 8.5}
+                        }
+                    }
+                    f0 := FieldSlot{}
+                    f1 := FieldSlot{}
+                    f2 := FieldSlot{}
+                    f3 := FieldSlot{}
+                    f4 := FieldSlot{}
+                    f5 := FieldSlot{}
+                    f6 := FieldSlot{}
+                    f7 := FieldSlot{}
+                    f8 := FieldSlot{}
+                    f9 := FieldSlot{}
+                    f10 := FieldSlot{}
+                    f11 := FieldSlot{}
+                    req_problem := Line{
+                        visible: false
+                        draw_text +: {
+                            color: theme.color_error
+                            text_style: theme.font_regular{font_size: 8.5}
+                        }
+                    }
+                    req_buttons := View{
+                        width: Fill
+                        height: Fit
+                        flow: Right
+                        spacing: 8
+                        margin: Inset{top: 4}
+                        req_run := Button{ text: "Make it" }
+                        Tip{
+                            text: "Run this tool without asking again until the chat is cleared"
+                            req_always := ButtonFlat{ text: "Always in this chat" }
+                        }
+                        req_cancel := ButtonFlat{ text: "Cancel" }
+                    }
+                }
+            }
+            SystemRow := Row{
+                padding: Inset{left: 14 right: 14 top: 4 bottom: 4}
+                system_text := Line{
+                    draw_text +: {
+                        color: theme.color_text_meta
+                        text_style: theme.font_italic{font_size: 8.5}
+                    }
+                }
+            }
+            // What is happening now, as the conversation's last line:
+            // thinking, writing, running a tool, loading the model (with
+            // its bar), or what went wrong.
+            WorkRow := Row{
+                padding: Inset{left: 14 right: 14 top: 6 bottom: 8}
+                spacing: 4
+                work_head := View{
+                    width: Fill
+                    height: Fit
+                    flow: Right
+                    spacing: 8
+                    align: Align{y: 0.5}
+                    work_dot := StatusDot{width: 10 height: 10 status: StatusKind.InProgress}
+                    work_label := Label{
+                        width: Fill
+                        max_lines: 2
+                        text: ""
+                        draw_text +: {
+                            color: theme.color_text_meta
+                            text_style: theme.font_regular{font_size: 8.5}
+                        }
+                    }
+                }
+                load_row := View{
+                    visible: false
+                    width: Fill
+                    height: Fit
+                    padding: Inset{left: 18}
+                    load_bar := ProgressBarFlat{
+                        width: Fill
+                        height: 4
+                        value: -1.0
+                        draw_bg +: { thickness: 2.0 }
+                    }
+                }
+            }
+        }
+
+        // One box: the pictures that go along, the line, and a bar with
+        // attach, what the turn is about, and Send.
+        composer := RoundedView{
+            width: Fill
+            height: Fit
+            flow: Down
+            spacing: 2
+            margin: Inset{left: 10 right: 10 top: 4 bottom: 10}
+            padding: Inset{left: 6 right: 6 top: 6 bottom: 5}
+            draw_bg +: {
+                color: theme.color_inset
+                border_color: theme.color_outline_variant
+                border_size: 1.0
+                border_radius: 8.0
+            }
+
+            // The element picked on the page, under the page's context: the
+            // turn is about it until the person clears it here or on the page.
+            selection_row := RoundedView{
+                visible: false
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 6
+                margin: Inset{bottom: 2}
+                padding: Inset{left: 8 right: 2 top: 2 bottom: 2}
+                align: Align{y: 0.5}
+                draw_bg +: { color: theme.color_u_1 border_radius: 5.0 }
+                selection_kind := Meta{
+                    text: "Selected ·"
+                    draw_text +: { text_style: theme.font_regular{font_size: 8.0} }
+                }
+                selection_label := Label{
+                    width: Fill
+                    max_lines: 1
+                    text: ""
+                    draw_text +: {
+                        color: theme.color_text
+                        text_style: theme.font_regular{font_size: 8.0}
+                    }
+                }
+                Tip{
+                    text: "Clear the selection"
+                    place: TopEnd
+                    selection_clear := CloseButtonSm{}
+                }
+            }
+
+            // Tools the person allowed for this chat: they run without a card.
+            allowed_row := View{
+                visible: false
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 6
+                padding: Inset{left: 4 right: 0 bottom: 2}
+                align: Align{y: 0.5}
+                allowed_label := Label{
+                    width: Fill
+                    text: ""
+                    draw_text +: {
+                        color: theme.color_text_meta
+                        text_style: theme.font_regular{font_size: 8.0}
+                    }
+                }
+                Tip{
+                    text: "Ask again before these run"
+                    allowed_clear := CloseButtonSm{}
+                }
+            }
+
+            // The marks drawn on the page for the next line.
+            marks_row := RoundedView{
+                visible: false
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 6
+                margin: Inset{bottom: 2}
+                padding: Inset{left: 8 right: 2 top: 2 bottom: 2}
+                align: Align{y: 0.5}
+                draw_bg +: { color: theme.color_u_1 border_radius: 5.0 }
+                marks_label := Label{
+                    width: Fill
+                    max_lines: 1
+                    text: ""
+                    draw_text +: {
+                        color: theme.color_text
+                        text_style: theme.font_regular{font_size: 8.0}
+                    }
+                }
+                Tip{
+                    text: "Clear the marks"
+                    place: TopEnd
+                    marks_clear := CloseButtonSm{}
+                }
+            }
+
+            // Pictures that go with the next line.
+            attach_row := View{
+                visible: false
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 8
+                padding: Inset{left: 4 right: 0 bottom: 2}
+                align: Align{y: 0.5}
+                attach_pic0 := AttachPic{}
+                attach_pic1 := AttachPic{}
+                attach_pic2 := AttachPic{}
+                attach_pic3 := AttachPic{}
+                attach_label := Label{
+                    width: Fill
+                    text: ""
+                    draw_text +: {
+                        color: theme.color_text_meta
+                        text_style: theme.font_regular{font_size: 8.5}
+                    }
+                }
+                Tip{
+                    text: "Remove the pictures"
+                    attach_clear := CloseButtonSm{}
+                }
+            }
+
+            input := TextInputFlat{
+                width: Fill
+                height: Fit
+                margin: 0
+                padding: Inset{left: 4 right: 4 top: 3 bottom: 3}
+                is_multiline: true
+                submit_on_enter: true
+                empty_text: "Ask for a change or a question"
+                // No well of its own: the composer box is the field.
+                draw_bg +: {
+                    color: theme.color_u_hidden
+                    color_hover: theme.color_u_hidden
+                    color_focus: theme.color_u_hidden
+                    color_down: theme.color_u_hidden
+                    color_empty: theme.color_u_hidden
+                    border_color: theme.color_u_hidden
+                    border_color_hover: theme.color_u_hidden
+                    border_color_focus: theme.color_u_hidden
+                    border_color_down: theme.color_u_hidden
+                    border_color_empty: theme.color_u_hidden
+                }
+                // The prompt is a hint, not text: the meta grey in every
+                // state, never the typed colour (the composer is always focused).
+                draw_text +: {
+                    text_style: theme.font_regular{font_size: 9.5}
+                    color_empty: mod.theme.color_text_meta
+                    color_empty_hover: mod.theme.color_text_meta
+                    color_empty_focus: mod.theme.color_text_meta
+                }
+            }
+
+            composer_bar := View{
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 4
+                align: Align{y: 0.5}
+                Tip{
+                    text: "Attach a picture (or drop one on the panel)"
+                    place: TopStart
+                    attach_button := AttachButton{}
+                }
+                annotate_tip := Tip{
+                    visible: false
+                    text: "Annotate: draw on the page with a marker for the AI (Esc to stop)"
+                    place: TopStart
+                    annotate_button := AnnotateButton{}
+                }
+                annotate_on_tip := Tip{
+                    visible: false
+                    text: "Annotating: drag on the page to draw (Esc or press to stop; the marks stay)"
+                    place: TopStart
+                    annotate_on_button := AnnotateOnButton{}
+                }
+                // What the turn is about: the page and what is open on it.
+                // It follows the page; it is not removed by hand.
+                target_row := View{
+                    visible: false
+                    width: Fill
+                    height: Fit
+                    flow: Right
+                    spacing: 5
+                    padding: Inset{left: 2 right: 4}
+                    align: Align{y: 0.5}
+                    target_kind := Meta{
+                        text: "Editing ·"
+                        draw_text +: { text_style: theme.font_regular{font_size: 8.0} }
+                    }
+                    target_label := Label{
+                        width: Fill
+                        max_lines: 1
+                        text: ""
+                        draw_text +: {
+                            color: theme.color_text
+                            text_style: theme.font_regular{font_size: 8.0}
+                        }
+                    }
+                }
+                bar_gap := View{width: Fill height: 1}
+                mic_tip := Tip{
+                    text: "Speak to the chat (the headset's microphone)"
+                    place: TopEnd
+                    visible: false
+                    mic_button := MicButton{}
+                }
+                mic_live_tip := Tip{
+                    text: "Stop listening and write what was said"
+                    place: TopEnd
+                    visible: false
+                    mic_live_button := MicLiveButton{}
+                }
+                send_tip := Tip{
+                    text: "Send (Enter; Shift+Enter for a new line)"
+                    place: TopEnd
+                    send_button := SendButton{}
+                }
+                stop_tip := Tip{
+                    text: "Stop (Esc)"
+                    place: TopEnd
+                    stop_button := StopButton{visible: false}
+                }
+            }
+        }
+    }
+}
+
+/// The composer's microphone button, as the host sets it ([`AiChatPanel::set_voice`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VoiceUi {
+    /// No microphone to offer: the button is not shown.
+    #[default]
+    Hidden,
+    /// Ready: a press starts listening.
+    Idle,
+    /// Listening: the button is red and a press stops it.
+    Listening,
+    /// What was said is being turned into text: the button waits.
+    Busy,
+}
+
+/// What the panel tells its host.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum AiChatPanelAction {
+    /// A native tool's whole JSON prefix, for the host's live preview.
+    ToolCallPartial { call_id: String, name: String, partial_json: String },
+    /// A finished task card's action button: the service's action id, for the host to carry out.
+    TaskAction { call_id: String, action: String },
+    /// Esc with an empty composer and no turn in flight: the host may hide
+    /// the pane.
+    Close,
+    /// The person cleared the selected element under the context line: the
+    /// host deselects it on the page (the next target it sets has none).
+    SelectionCleared,
+    /// The microphone button was pressed (shown only while the host offers one,
+    /// [`AiChatPanel::set_voice`]): the host starts or stops listening.
+    VoiceToggled,
+    /// The person switched the marker on (true) or off: the host draws, the panel only asks.
+    Annotate(bool),
+    /// The person cleared the marks from the chip.
+    MarksCleared,
+    /// A line is waiting to go with the marks: the host reads the page's picture and answers
+    /// with [`AiChatPanel::release_marks`].
+    MarksWanted,
+    #[default]
+    None,
+}
+
+/// A line waiting for its marks. The text goes only after the host has every mark resolved and has
+/// read the picture they are drawn in: it is never taken before [`Hold::begin_release`], however
+/// long the host takes to resolve.
+#[derive(Debug, Default, PartialEq)]
+pub struct Hold {
+    text: Option<String>,
+    asked: bool,
+    releasing: bool,
+}
+
+impl Hold {
+    /// The person sent `text` while marks exist.
+    pub fn take_line(&mut self, text: String) {
+        *self = Hold { text: Some(text), asked: false, releasing: false };
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        self.text.is_some()
+    }
+
+    pub fn releasing(&self) -> bool {
+        self.releasing
+    }
+
+    /// Whether the host should be asked for the marks' picture now: once, when the line waits and
+    /// no mark is still being resolved.
+    pub fn wants_picture(&mut self, resolving: usize) -> bool {
+        if self.text.is_some() && !self.asked && !self.releasing && resolving == 0 {
+            self.asked = true;
+            return true;
+        }
+        false
+    }
+
+    /// The host answered with the picture (or none): false when no line waits.
+    pub fn begin_release(&mut self) -> bool {
+        if self.text.is_none() {
+            return false;
+        }
+        self.releasing = true;
+        true
+    }
+
+    /// The line to send now (its marks are in), or to give back.
+    pub fn finish(&mut self) -> Option<String> {
+        self.asked = false;
+        self.releasing = false;
+        self.text.take()
+    }
+}
+
+/// What the panel shows of the host's marks: the Annotate button (when the host offers it), the
+/// marker on, how many marks there are and how many the host is still resolving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct MarksUi {
+    pub offered: bool,
+    pub on: bool,
+    pub count: usize,
+    pub resolving: usize,
+}
+
+#[derive(Script, ScriptHook, Widget)]
+pub struct AiChatPanel {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    /// The host's initial model, by provider slug (`claude-cli`,
+    /// `codex-cli`, `local`, …), until the person picks one: the saved pick
+    /// wins over it. `MAKEPAD_AI_PROVIDER` overrides both.
+    #[live]
+    provider: String,
+    /// The window's F10 overlay made this panel; any other is the app's own chat.
+    #[live(false)]
+    in_overlay: bool,
+    /// Pictures waiting for the next line.
+    #[rust]
+    attachments: Vec<Dropped>,
+    /// The microphone button's state, set by the host.
+    #[rust]
+    voice: VoiceUi,
+    /// Dropped pictures being decoded on the task pool.
+    #[rust]
+    loading: Vec<TaskHandle<Result<Dropped, String>>>,
+    /// Pictures the model asked to see again (`chat.picture`), being fitted to it on the task
+    /// pool, by call id.
+    #[rust]
+    fitting: Vec<(String, TaskHandle<Result<Vec<u8>, String>>)>,
+    /// The small copies of a restored chat's pictures, being made on the task pool.
+    #[rust]
+    thumbs_loading: Option<TaskHandle<Vec<(String, Arc<[u8]>)>>>,
+    /// The attachment chips show this many pictures.
+    #[rust]
+    attach_shown: Option<(usize, usize)>,
+    /// The host's marks on the page, as it last said.
+    #[rust]
+    marks: MarksUi,
+    /// A line waiting for its marks: it goes once the host has them resolved and their picture.
+    #[rust]
+    hold: Hold,
+    /// The line being sent already has its marks.
+    #[rust]
+    marks_through: bool,
+    /// The clipboard read a paste in the composer asked for (a copied
+    /// picture is attached; text is the input's own paste).
+    #[rust]
+    paste_request: Option<u64>,
+    /// Pictures pasted so far (names them apart).
+    #[rust]
+    pasted: usize,
+    /// The small copies of the pictures the person sent, by file, for the transcript's lines
+    /// and the task cards.
+    #[rust]
+    thumbs: HashMap<String, Arc<[u8]>>,
+    /// The entry whose pictures each transcript row last loaded, and how many of them had
+    /// their small copy then.
+    #[rust]
+    pics_filled: HashMap<WidgetUid, (usize, usize)>,
+    /// Result pictures read once per path, including missing files.
+    #[rust]
+    result_pics: HashMap<String, Option<Arc<[u8]>>>,
+    /// The picture each recycled task row last loaded (input/result keys are distinct).
+    #[rust]
+    task_pics_filled: HashMap<WidgetUid, String>,
+    /// Avoid rebuilding labels and the stage-history tooltip on animation-only redraws.
+    #[rust]
+    task_rows_filled: HashMap<WidgetUid, (String, u64)>,
+    /// Each call's row line ([`AiChatPanel::tool_line`]) by call id: its arguments read once.
+    #[rust]
+    tool_lines: HashMap<String, String>,
+    /// Stage + ETA per live task, including calls scrolled out of view.
+    #[rust]
+    task_tracks: HashMap<String, ProgressTracker>,
+    /// Stage + ETA of the model's current load (None unless loading).
+    #[rust]
+    load_track: ProgressTracker,
+    /// The choices the provider menu lists, in its order.
+    #[rust]
+    provider_rows: Vec<ProviderRow>,
+    /// The hub discovery answer the menu rows were built from (only the engine follows the hub).
+    #[cfg(feature = "engine")]
+    #[rust]
+    hub_seen: u64,
+    /// The provider menu shows these labels with this one picked.
+    #[rust]
+    pick_shown: Option<(Vec<String>, usize)>,
+    /// A line for the status row until the next send (a picture that
+    /// could not be read, a provider that is not installed).
+    #[rust]
+    notice: Option<String>,
+    #[rust]
+    engine: Option<EngineCore>,
+    /// The process's registry: the panel shows the services every port of this process opened.
+    #[rust(ServiceRegistry::process())]
+    registry: ServiceRegistry,
+    #[rust]
+    bus: ServiceBus,
+    /// The assistant's own `gen` service (pictures from the fleet), joined
+    /// to the registry with the engine.
+    #[cfg(feature = "gen")]
+    #[rust]
+    gen: Option<GenService>,
+    #[rust]
+    settings: Option<AiSettings>,
+    /// What the person has set on each parked settings card, by call id,
+    /// kept here so a card that scrolls away and back keeps its edits.
+    #[rust]
+    card_edits: HashMap<String, CardValues>,
+    /// The call and slot each field editor was last filled for, by widget.
+    #[rust]
+    slot_filled: HashMap<WidgetUid, (String, usize)>,
+    #[rust]
+    drawn_generation: u64,
+    /// The state generation last published as the bridge's transcript.
+    #[rust]
+    published: Option<u64>,
+    #[rust]
+    next_frame: NextFrame,
+    /// The composer took the keyboard once it existed on screen — a
+    /// focus set before the first draw lands on no area at all.
+    #[rust]
+    composer_focused: bool,
+    /// The host's key for keeping this conversation on disk ([`Self::keep_chat`]);
+    /// `None` keeps nothing.
+    #[rust]
+    chat_key: Option<String>,
+    /// The conversation's pictures moved since the app's tools were shown them ([`Self::share_pictures`]).
+    #[rust]
+    pictures_moved: bool,
+    /// The engine generation last written to the chat file.
+    #[rust]
+    chat_written: Option<u64>,
+    /// What [`Self::publish_unsaved`] last told the platform.
+    #[rust]
+    unsaved_published: Option<String>,
+}
+
+impl AiChatPanel {
+    /// A draft or picture not sent yet, or a reply still coming, is unsaved work
+    /// (`restart::set_unsaved`, per panel): a restart that ends this app waits for it, the WM
+    /// session's restart for a deploy among them (one ended two chats with the WM, 11-06).
+    fn publish_unsaved(&mut self, cx: &mut Cx) {
+        let replying = self.engine.as_ref().is_some_and(|e| matches!(e.state().status, Status::Thinking | Status::Streaming | Status::WaitingForTool));
+        let typed = !self.view.text_input(cx, ids!(input)).text().trim().is_empty() || !self.attachments.is_empty() || self.marks.count > 0;
+        let what = if replying { Some("an AI chat reply still coming") } else if typed { Some("an AI chat message not sent") } else { None };
+        if what != self.unsaved_published.as_deref() {
+            self.unsaved_published = what.map(str::to_string);
+            makepad_widgets::makepad_platform::restart::set_unsaved(&self.unsaved_key(), what);
+        }
+    }
+
+    fn unsaved_key(&self) -> String {
+        format!("aichat-{}", self.widget_uid().0)
+    }
+
+    /// The registry a host plugs in-process links into.
+    pub fn registry(&self) -> &ServiceRegistry {
+        &self.registry
+    }
+
+    /// A studio `Custom` frame that may be a bus frame from the WM.
+    pub fn on_custom(&mut self, json: &str) -> bool {
+        self.bus.on_custom(&self.registry, json)
+    }
+
+    /// The chips over the composer: each opens `tool` of `app` as a
+    /// settings card filled from `prefill`, with no model turn. At most
+    /// [`MAX_CHIPS`] show.
+    pub fn set_suggestions(&mut self, cx: &mut Cx, suggestions: Vec<Suggestion>) {
+        self.ensure_engine().set_suggestions(suggestions);
+        self.view.redraw(cx);
+    }
+
+    /// The context line over the composer ("Editing · DECK — ..."): while
+    /// set, the turn focuses `target.app`'s service and `target.context`
+    /// goes to the model with each line. Hosts keep it current by calling
+    /// this again; `None` removes the line. The person does not remove it:
+    /// it says what the page in front of them is.
+    pub fn set_target(&mut self, cx: &mut Cx, target: Option<Target>) {
+        self.ensure_engine().set_target(target);
+        self.view.redraw(cx);
+    }
+
+    /// A line in the transcript from the host: what happened in the app
+    /// (a render finished, an export started). The model is not told.
+    pub fn announce(&mut self, cx: &mut Cx, text: &str) {
+        self.ensure_engine().announce(text);
+        self.view.redraw(cx);
+    }
+
+    /// Open a settings card for `tool` of `app` now (what a chip does).
+    /// Returns the call id.
+    pub fn propose(&mut self, cx: &mut Cx, app: &str, tool: &str, prefill: &str) -> String {
+        let now = Self::now(cx);
+        let id = self.ensure_engine().propose(app, tool, prefill, now);
+        self.view.redraw(cx);
+        id
+    }
+
+    pub fn state(&self) -> Option<&EngineState> {
+        self.engine.as_ref().map(|e| e.state())
+    }
+
+    /// The transcript JSON for the bridge's `/ai/transcript`, rewritten when
+    /// the engine's state moved: every host of the panel answers it (an
+    /// overlay, Stage's chat column, the WM pane), so a hidden instance's
+    /// conversation can be read.
+    fn publish_transcript(&mut self, cx: &mut Cx) {
+        let Some(state) = self.engine.as_ref().map(|e| e.state()) else { return };
+        if self.published == Some(state.generation) {
+            return;
+        }
+        self.published = Some(state.generation);
+        cx.global::<crate::overlay::AiTranscript>().json = crate::overlay::transcript_json(state);
+    }
+
+    /// Keep this conversation on disk under `key` (the host's product, `fab`):
+    /// it is written after every change once the turn settles, and comes
+    /// back when the app starts again (a crash, a live-patch relaunch) until
+    /// the person starts a new chat. The pictures the person sends are kept
+    /// beside it (`<key>.pictures/`), as they were dropped.
+    pub fn keep_chat(&mut self, key: &str) {
+        let key: String = key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect();
+        if key.is_empty() || self.chat_key.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.chat_key = Some(key);
+        // An engine already up takes the saved chat now if nothing was said yet.
+        self.keep_engine_chat();
+    }
+
+    fn chat_path(&self) -> Option<std::path::PathBuf> {
+        let key = self.chat_key.as_ref()?;
+        AiSettings::path().and_then(|settings| settings.parent().map(|dir| dir.join("chats").join(format!("{key}.json"))))
+    }
+
+    /// The engine keeps the conversation under the chat's key: what was saved comes back (if
+    /// nothing was said yet), with its pictures.
+    fn keep_engine_chat(&mut self) {
+        let Some(path) = self.chat_path() else { return };
+        let Some(engine) = self.engine.as_mut() else { return };
+        let saved = engine.state().entries.is_empty().then(|| std::fs::read_to_string(&path).ok()).flatten();
+        if let Err(e) = engine.keep_chat(path.with_extension("pictures"), saved.as_deref()) {
+            log!("aichat: the saved chat {} did not come back: {e}", path.display());
+        }
+        self.pictures_moved = true;
+    }
+
+    /// The pictures of the conversation moved (sent, restored, cleared): the app's tools see
+    /// them now ([`ChatPictures`]), and the small copies of those the panel has none of yet
+    /// are made on the task pool.
+    fn share_pictures(&mut self, cx: &mut Cx) {
+        self.pictures_moved = false;
+        let Some(engine) = self.engine.as_ref() else { return };
+        *cx.global::<ChatPictures>() = ChatPictures::of(engine);
+        if self.thumbs_loading.is_some() {
+            // The job under way covers what it was given; the rest on its return.
+            self.pictures_moved = true;
+            return;
+        }
+        let missing: Vec<SentPicture> = engine.pictures().iter().filter(|p| !self.thumbs.contains_key(&p.file)).cloned().collect();
+        if missing.is_empty() {
+            return;
+        }
+        let job = move || missing.iter().filter_map(|p| p.data().and_then(|data| attach::thumb(&data, &p.name)).ok().map(|thumb| (p.file.clone(), thumb))).collect();
+        match cx.task_pool().submit(Class::Background, job) {
+            Ok(handle) => self.thumbs_loading = Some(handle),
+            Err(e) => log!("aichat: the chat's pictures are not shown ({e:?})"),
+        }
+    }
+
+    /// Write the conversation when it moved and no turn is running. A temp
+    /// file renamed over the old one: a crash mid-write leaves the last good copy.
+    fn write_chat(&mut self) {
+        let Some(path) = self.chat_path() else { return };
+        let Some(engine) = self.engine.as_ref() else { return };
+        let state = engine.state();
+        if self.chat_written == Some(state.generation) || state.status.is_busy() || matches!(state.status, Status::Loading { .. }) {
+            return;
+        }
+        self.chat_written = Some(state.generation);
+        if state.entries.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let text = engine.saved_chat();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    fn settings(&mut self) -> &AiSettings {
+        if self.settings.is_none() {
+            // The launch names the model outright (Claude Desktop, tests).
+            self.settings = Some(match std::env::var(PROVIDER_ENV).ok().filter(|s| !s.trim().is_empty()) {
+                Some(slug) => AiSettings::for_provider(&slug),
+                None => AiSettings::load_with_provider(&self.provider),
+            });
+        }
+        self.settings.as_ref().unwrap()
+    }
+
+    /// The engine comes up on first use — a local model is a long load
+    /// and no host pays it before the person opens the pane.
+    fn ensure_engine(&mut self) -> &mut EngineCore {
+        if self.engine.is_none() {
+            let lease_id = self.widget_uid().0;
+            let settings = self.settings().clone();
+            // A saved pick wins over the host default; only an unavailable
+            // default Local choice needs the usual provider fallback.
+            #[cfg(feature = "engine")]
+            let settings = {
+                let mut settings = settings;
+                if let Some(choice) = fallback_choice(&settings.provider) {
+                    settings.provider = choice;
+                    settings.local_only = false;
+                }
+                settings
+            };
+            // The real models ride the `engine` feature; a build without a
+            // runtime (the web page) says so and keeps the tool console.
+            #[cfg(feature = "engine")]
+            let (model, rows): (Box<dyn makepad_ai_services::Model>, Vec<ProviderRow>) = (
+                match build_model(&settings.provider, settings.local_only) {
+                    Ok(m) => m,
+                    Err(reason) => Box::new(NoModelWithReason::new(reason)),
+                },
+                provider_rows(settings.local_only),
+            );
+            #[cfg(not(feature = "engine"))]
+            let (model, rows): (Box<dyn makepad_ai_services::Model>, Vec<ProviderRow>) =
+                (Box::new(NoModelWithReason::new("this build has no model runtime")), Vec::new());
+            let mut core = EngineCore::new(self.registry.clone(), model, None, lease_id);
+            // The state is the panel's window into the core; the core owns
+            // it, so provider facts go in through the core.
+            self.provider_rows = rows.clone();
+            core.set_provider_facts(settings.provider.clone(), rows, settings.local_only);
+            self.engine = Some(core);
+            self.keep_engine_chat();
+            #[cfg(feature = "gen")]
+            {
+                self.gen = GenService::open(&self.registry);
+            }
+        }
+        self.engine.as_mut().unwrap()
+    }
+
+    /// The app as Claude Desktop names it: its own service's label (not
+    /// the assistant's built-in ones), else the executable's name.
+    fn app_title(&self, app_id: &str) -> String {
+        self.registry
+            .services()
+            .into_iter()
+            .find(|s| s.connected && !Self::own_service(&s.id))
+            .map(|s| s.label)
+            .unwrap_or_else(|| app_id.to_string())
+    }
+
+    fn own_service(id: &str) -> bool {
+        #[cfg(feature = "gen")]
+        if id == crate::gen::SERVICE_ID {
+            return true;
+        }
+        let _ = id;
+        false
+    }
+
+    /// Write this app's Claude Desktop extension and open it: Claude
+    /// Desktop shows its install dialog.
+    fn connect_claude_desktop(&mut self, cx: &mut Cx) {
+        let written = std::env::current_exe()
+            .map_err(|e| format!("cannot find this app's executable: {e}"))
+            .and_then(|exe| {
+                // Match the name published by the process's remote endpoint.
+                let app_id = std::env::args_os()
+                    .next()
+                    .as_ref()
+                    .and_then(|arg| Path::new(arg).file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("makepad")
+                    .to_string();
+                let tools: Vec<ToolDef> = self.registry
+                    .tool_definitions()
+                    .into_iter()
+                    .map(|def| {
+                        let (service, tool) = split_name(&def.name);
+                        ToolDef::new(api_name(service, tool), def.description, def.parameters, Risk::Read)
+                    })
+                    .collect();
+                let dir = makepad_platform::home::makepad_home().join("mcpb");
+                mcpb::write(&dir, &app_id, &self.app_title(&app_id), &exe, &tools)
+            })
+            .and_then(|path| mcpb::open_in_claude_desktop(&path).map(|_| path));
+        match written {
+            Ok(_) => self.note(cx, "The desktop assistant asks to install it: click Install, then type there".into()),
+            Err(e) => self.note(cx, e),
+        }
+    }
+
+    fn now(cx: &Cx) -> f64 {
+        cx.seconds_since_app_start()
+    }
+
+    /// The microphone button: hidden, ready, listening or waiting ([`VoiceUi`]).
+    pub fn set_voice(&mut self, cx: &mut Cx, voice: VoiceUi) {
+        if self.voice != voice {
+            self.voice = voice;
+            self.view.redraw(cx);
+        }
+    }
+
+    /// What was said, written after what is in the composer (a space between), and the composer
+    /// focused: the person reads it and sends it, or says more.
+    pub fn dictate(&mut self, cx: &mut Cx, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let input = self.view.text_input(cx, ids!(input));
+        let before = input.text();
+        let joined = if before.trim().is_empty() { text.to_string() } else { format!("{} {text}", before.trim_end()) };
+        input.set_text(cx, &joined);
+        input.take_key_focus(cx);
+        self.view.redraw(cx);
+    }
+
+    /// A line the person must read, in the chat's notice style (a microphone that cannot be used).
+    pub fn notify(&mut self, cx: &mut Cx, text: String) {
+        self.note(cx, text);
+    }
+
+    /// A line as if typed and sent — the bridge's `/ai?say=`.
+    pub fn say(&mut self, cx: &mut Cx, text: String) {
+        self.send(cx, text);
+    }
+
+    /// Images the model sees with its next input — for a host's tool that
+    /// captured something while a tool round is in flight (its results
+    /// carry the pictures). `Err` when the model cannot see images.
+    pub fn attach_for_model(&mut self, images: Vec<ModelImage>) -> Result<(), String> {
+        self.ensure_engine().model_mut().attach_images(images)
+    }
+
+    /// A picture for the person's next line, as if dropped on the panel.
+    pub fn attach(&mut self, cx: &mut Cx, source: Source) {
+        match cx.task_pool().submit(Class::Visible, move || attach::load(source)) {
+            Ok(handle) => self.loading.push(handle),
+            Err(e) => self.note(cx, format!("could not read the picture ({e:?})")),
+        }
+    }
+
+    /// Answer every parked card as if clicked (the bridge's `/ai?confirm=`):
+    /// `run`, `always` (run, and allow the tool for the rest of the chat) or
+    /// `cancel`.
+    pub fn answer_cards(&mut self, cx: &mut Cx, how: &str) {
+        let now = Self::now(cx);
+        let parked: Vec<String> = self.ensure_engine().state().entries.iter().filter_map(|e| match e {
+            Entry::Tool(t) if matches!(t.status, ToolStatus::Confirm) => Some(t.call_id.clone()),
+            _ => None,
+        }).collect();
+        for call_id in parked {
+            let engine = self.ensure_engine();
+            match how {
+                "always" => {
+                    let _ = engine.allow_for_chat(&call_id, None, now);
+                }
+                "cancel" => engine.confirm(&call_id, false, now),
+                _ => engine.confirm(&call_id, true, now),
+            }
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Switch the model; the conversation restarts.
+    pub fn set_provider(&mut self, cx: &mut Cx, slug: &str) {
+        let choice = ProviderChoice::from_slug(slug);
+        let local_only = self.ensure_engine().state().local_only;
+        let _ = (&choice, local_only);
+        #[cfg(feature = "engine")]
+        {
+            let model: Box<dyn makepad_ai_services::Model> = match build_model(&choice, local_only) {
+                Ok(m) => m,
+                Err(reason) => Box::new(NoModelWithReason::new(reason)),
+            };
+            let settings = AiSettings { provider: choice.clone(), local_only };
+            if let Err(reason) = settings.allows(&choice) {
+                self.note(cx, reason);
+                return;
+            }
+            let rows = provider_rows(local_only);
+            self.provider_rows = rows.clone();
+            let engine = self.engine.as_mut().unwrap();
+            engine.set_model(model);
+            engine.set_provider_facts(choice, rows, local_only);
+            if let Err(reason) = settings.save() {
+                self.note(cx, format!("Could not save the provider choice: {reason}"));
+            }
+            self.settings = Some(settings);
+        }
+        self.view.redraw(cx);
+    }
+
+    fn note(&mut self, cx: &mut Cx, text: String) {
+        self.notice = Some(text);
+        self.view.redraw(cx);
+    }
+
+    fn poll_loading(&mut self, cx: &mut Cx) {
+        let mut i = 0;
+        while i < self.loading.len() {
+            match self.loading[i].try_take() {
+                Some(result) => {
+                    self.loading.remove(i).detach();
+                    match result {
+                        Ok(Ok(picture)) => {
+                            self.attachments.push(picture);
+                            // At most four pictures ride with one line.
+                            if self.attachments.len() > 4 {
+                                self.attachments.remove(0);
+                            }
+                        }
+                        Ok(Err(e)) => self.note(cx, e),
+                        Err(e) => self.note(cx, format!("could not read the picture ({e:?})")),
+                    }
+                    self.view.redraw(cx);
+                }
+                None => i += 1,
+            }
+        }
+        if self.hold.releasing() && self.loading.is_empty() {
+            self.finish_release(cx);
+        }
+    }
+
+    /// The host's marks changed: the Annotate button and the chip show them, and a held line
+    /// goes on when its marks are resolved.
+    pub fn set_marks(&mut self, cx: &mut Cx, marks: MarksUi) {
+        if self.marks == marks {
+            return;
+        }
+        self.marks = marks;
+        self.view.widget(cx, ids!(annotate_tip)).set_visible(cx, marks.offered && !marks.on);
+        self.view.widget(cx, ids!(annotate_on_tip)).set_visible(cx, marks.offered && marks.on);
+        self.view.widget(cx, ids!(marks_row)).set_visible(cx, marks.count > 0);
+        let words = match (marks.count, marks.resolving) {
+            (1, 0) => "1 mark goes with the next line".to_string(),
+            (n, 0) => format!("{n} marks go with the next line"),
+            (n, r) => format!("{n} marks, {r} still being read"),
+        };
+        self.view.label(cx, ids!(marks_label)).set_text(cx, &words);
+        if self.hold.is_waiting() {
+            if marks.count == 0 && !self.hold.releasing() {
+                // cleared while the line waited: it goes as it was typed
+                let text = self.hold.finish().unwrap_or_default();
+                self.marks_through = true;
+                self.send(cx, text);
+            } else {
+                self.ask_marks(cx);
+            }
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Ask the host for the marks' picture once they are resolved.
+    fn ask_marks(&mut self, cx: &mut Cx) {
+        if self.hold.wants_picture(self.marks.resolving) {
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::MarksWanted);
+        }
+    }
+
+    /// The host has the marks' picture (none: the marks go as text alone): the held line goes
+    /// with it.
+    pub fn release_marks(&mut self, cx: &mut Cx, picture: Option<Source>) {
+        if !self.hold.begin_release() {
+            return;
+        }
+        match picture {
+            Some(source) => self.attach(cx, source),
+            None => self.finish_release(cx),
+        }
+    }
+
+    fn finish_release(&mut self, cx: &mut Cx) {
+        if let Some(text) = self.hold.finish() {
+            self.marks_through = true;
+            self.send(cx, text);
+        }
+    }
+
+    /// The person gave up on the held line: it is back in the composer.
+    fn cancel_held(&mut self, cx: &mut Cx) {
+        if let Some(text) = self.hold.finish() {
+            self.view.text_input(cx, ids!(input)).set_text(cx, &text);
+            self.note(cx, "not sent: the marks were not ready".into());
+        }
+    }
+
+    /// Take what the task pool finished: pictures fitted for the model, and a restored chat's
+    /// small copies.
+    fn poll_pictures(&mut self, cx: &mut Cx) {
+        let mut i = 0;
+        while i < self.fitting.len() {
+            match self.fitting[i].1.try_take() {
+                Some(result) => {
+                    let (call_id, handle) = self.fitting.remove(i);
+                    handle.detach();
+                    let fitted = result.unwrap_or_else(|e| Err(format!("the picture could not be read ({e:?})")));
+                    self.ensure_engine().picture_fitted(&call_id, fitted);
+                    self.view.redraw(cx);
+                }
+                None => i += 1,
+            }
+        }
+        if let Some(result) = self.thumbs_loading.as_mut().and_then(|handle| handle.try_take()) {
+            if let Some(handle) = self.thumbs_loading.take() {
+                handle.detach();
+            }
+            match result {
+                Ok(thumbs) => self.thumbs.extend(thumbs),
+                Err(e) => log!("aichat: the chat's pictures are not shown ({e:?})"),
+            }
+            // Task cards show their input pictures too.
+            self.task_rows_filled.clear();
+            self.view.redraw(cx);
+        }
+    }
+
+    fn handle_drop(&mut self, cx: &mut Cx, event: &Event) {
+        if !matches!(event, Event::Drag(_) | Event::Drop(_)) {
+            return;
+        }
+        match event.drag_hits(cx, self.view.area()) {
+            DragHit::Drag(drag) => {
+                let accept = drag.items.iter().any(|item| Source::from_drag_item(item).is_some());
+                if let Ok(mut response) = drag.response.try_lock() {
+                    *response = if accept { DragResponse::Copy } else { DragResponse::None };
+                }
+            }
+            DragHit::Drop(drop) => {
+                let sources: Vec<Source> = drop.items.iter().filter_map(Source::from_drag_item).collect();
+                if sources.is_empty() {
+                    self.note(cx, "drop a PNG, JPEG or WebP picture".into());
+                }
+                for source in sources.into_iter().take(4) {
+                    self.attach(cx, source);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn send(&mut self, cx: &mut Cx, text: String) {
+        let now = Self::now(cx);
+        self.notice = None;
+        // A pasted path to a picture is an attachment, not a line.
+        if let Some(source) = Source::from_pasted_text(&text) {
+            self.attach(cx, source);
+            self.view.text_input(cx, ids!(input)).set_text(cx, "");
+            return;
+        }
+        // Marks on the page go with the line: it waits until the host has them resolved and
+        // their picture (the host's `MarksWanted`), and the person's text is never sent without.
+        if self.marks.count > 0 && !self.marks_through && !text.trim().starts_with('/') {
+            self.hold.take_line(text);
+            let input = self.view.text_input(cx, ids!(input));
+            input.set_text(cx, "");
+            input.take_key_focus(cx);
+            self.ask_marks(cx);
+            self.view.redraw(cx);
+            return;
+        }
+        self.marks_through = false;
+        let mut sent = false;
+        if !self.attachments.is_empty() && !text.trim().starts_with('/') {
+            let pictures = std::mem::take(&mut self.attachments);
+            self.attach_shown = None;
+            for picture in &pictures {
+                let thumb = picture.sent.thumb.clone().unwrap_or_else(|| picture.sent.png.clone());
+                self.thumbs.insert(picture.file.clone(), thumb);
+            }
+            // The line goes with its pictures; the chat keeps them, and the app's tools take
+            // them by name.
+            match self.ensure_engine().send_pictures(&text, pictures.into_iter().map(Dropped::into_new).collect(), now) {
+                Ok(()) => {
+                    sent = true;
+                    self.share_pictures(cx);
+                }
+                Err(e) => self.note(cx, format!("the pictures were not sent: {e}")),
+            }
+        }
+        if !sent {
+            // Marks whose picture the model cannot take still go, as text.
+            let line = if text.trim().is_empty() && self.marks.count > 0 { "What I marked on the page.".to_string() } else { text };
+            self.ensure_engine().send(&line, now);
+        }
+        let input = self.view.text_input(cx, ids!(input));
+        input.set_text(cx, "");
+        // The widget drops the keyboard on submit; a chat composer keeps
+        // it, so the next line can be typed straight away.
+        input.take_key_focus(cx);
+        self.view.redraw(cx);
+    }
+
+    /// Fill a settings card's row from the card and the person's edits.
+    /// Each editor is filled from scratch only when it was last filled for
+    /// another call or slot (the list recycles rows); after that the
+    /// person's own typing and picks are the truth.
+    fn draw_card(&mut self, cx: &mut Cx2d, row: &WidgetRef, call_id: &str, card: &Card, values: &CardValues) {
+        row.label(cx, ids!(req_title)).set_text(cx, &card.title);
+        let why = row.label(cx, ids!(req_why));
+        why.set_visible(cx, !card.why.is_empty());
+        why.set_text(cx, &card.why);
+        let problem = row.label(cx, ids!(req_problem));
+        problem.set_visible(cx, card.problem.is_some());
+        if let Some(text) = &card.problem {
+            problem.set_text(cx, &format!("Not run: {text}"));
+        }
+        row.button(cx, ids!(req_run)).set_text(cx, &card.confirm);
+        let (mut pick_at, mut line_at) = (0, 0);
+        for slot in 0..MAX_FIELDS {
+            let id = slot_id(slot);
+            let view = row.view(cx, &[id]);
+            let Some(field) = card.fields.get(slot) else {
+                view.set_visible(cx, false);
+                continue;
+            };
+            view.set_visible(cx, true);
+            row.label(cx, &[id, id!(label)]).set_text(cx, match field {
+                Field::Pick { label, .. } | Field::Line { label, .. } => label,
+            });
+            let dropdown = row.drop_down(cx, &[id, id!(pick)]);
+            let line = row.text_input(cx, &[id, id!(line)]);
+            match field {
+                Field::Pick { options, .. } => {
+                    dropdown.set_visible(cx, true);
+                    line.set_visible(cx, false);
+                    let key = (call_id.to_string(), slot);
+                    if self.slot_filled.get(&dropdown.widget_uid()) != Some(&key) {
+                        self.slot_filled.insert(dropdown.widget_uid(), key);
+                        dropdown.set_labels(cx, options.iter().map(|(label, _)| label.clone()).collect());
+                    }
+                    dropdown.set_selected_item(cx, values.picks.get(pick_at).copied().unwrap_or(0));
+                    pick_at += 1;
+                }
+                Field::Line { hint, .. } => {
+                    dropdown.set_visible(cx, false);
+                    line.set_visible(cx, true);
+                    let key = (call_id.to_string(), slot);
+                    if self.slot_filled.get(&line.widget_uid()) != Some(&key) {
+                        self.slot_filled.insert(line.widget_uid(), key);
+                        line.set_empty_text(cx, hint.clone());
+                    }
+                    let want = values.lines.get(line_at).map(String::as_str).unwrap_or("");
+                    if line.text() != want {
+                        line.set_text(cx, want);
+                    }
+                    line_at += 1;
+                }
+            }
+        }
+    }
+
+    /// Observe live tasks once per state change, even when their rows are off screen.
+    fn sync_task_tracks(&mut self, state: &EngineState) {
+        let mut running = HashSet::new();
+        let now = std::time::Instant::now();
+        for entry in &state.entries {
+            let Entry::Tool(t) = entry else { continue };
+            let Some(task) = &t.task else { continue };
+            let (note, permille) = match &t.status {
+                ToolStatus::Running { note, permille } | ToolStatus::NotResponding { note, permille } => (note, *permille),
+                _ => continue,
+            };
+            running.insert(t.call_id.as_str());
+            let stage = if task.stage.is_empty() { note.as_str() } else { &task.stage };
+            // A step counter is progress within a stage, not a new ETA clock on every step.
+            // It also distinguishes a known zero share from an indeterminate stage.
+            let counter = stage.rsplit_once(' ').filter(|(_, count)| {
+                count.split_once('/').is_some_and(|(step, total)| step.parse::<u64>().is_ok() && total.parse::<u64>().is_ok_and(|n| n > 0))
+            });
+            let phase = counter.map(|(phase, _)| phase.trim_end_matches([' ', '·'])).unwrap_or(stage);
+            let fraction = if permille > 0 || counter.is_some() { permille as f64 / 1000.0 } else { -1.0 };
+            self.task_tracks.entry(t.call_id.clone()).or_default().observe(phase, fraction, now);
+        }
+        self.task_tracks.retain(|call_id, _| running.contains(call_id.as_str()));
+    }
+
+    /// The small copy of the picture sent in this chat under `name`.
+    fn named_thumb(&self, name: &str) -> Option<&Arc<[u8]>> {
+        let file = &self.engine.as_ref()?.pictures().iter().find(|p| p.name == name)?.file;
+        self.thumbs.get(file)
+    }
+
+    /// Fill one compact task card; only a changed picture is decoded for a recycled row.
+    fn draw_task(&mut self, cx: &mut Cx2d, row: &WidgetRef, t: &ToolEntry) {
+        let Some(task) = &t.task else { return };
+        let uid = row.widget_uid();
+        if self.task_rows_filled.get(&uid).is_some_and(|(call_id, generation)| call_id == &t.call_id && *generation == self.drawn_generation) {
+            return;
+        }
+        let progress = self.task_tracks.get(&t.call_id).and_then(ProgressTracker::current);
+        let running = matches!(t.status, ToolStatus::Running { .. } | ToolStatus::NotResponding { .. });
+        let done_ok = matches!(t.status, ToolStatus::Done { outcome: ToolOutcome::Ok, .. });
+        let stopped = matches!(t.status, ToolStatus::Done { outcome: ToolOutcome::Cancelled, .. });
+        let failed = matches!(t.status, ToolStatus::Done { .. }) && !done_ok && !stopped;
+        let title = if task.source.is_empty() || (done_ok && !task.result.is_empty()) {
+            task.title.clone()
+        } else {
+            format!("{} · {}", task.title, task.source)
+        };
+        row.label(cx, ids!(task_title)).set_text(cx, &title);
+        // Running: "shape · 7/21 · 18% · a node · about 4 min left" (the time last, so a
+        // narrow card cuts the least useful part).
+        let mut time = String::new();
+        let mut meta = match &t.status {
+            ToolStatus::Running { note, permille } => {
+                let stage = if task.stage.is_empty() { note } else { &task.stage };
+                let mut line = if stage.is_empty() { progress.as_ref().map(|shown| shown.stage.clone()).unwrap_or_default() } else { stage.clone() };
+                if *permille > 0 {
+                    line.push_str(&format!(" · {}%", permille / 10));
+                }
+                if let Some(shown) = &progress {
+                    time = shown.time_note();
+                }
+                line
+            }
+            ToolStatus::NotResponding { note, .. } => {
+                let stage = if task.stage.is_empty() { note } else { &task.stage };
+                if stage.is_empty() { "not responding".into() } else { format!("{stage} · not responding") }
+            }
+            ToolStatus::Done { outcome: ToolOutcome::Cancelled, .. } => "Stopped".into(),
+            ToolStatus::Done { note, .. } if done_ok => if task.result.is_empty() { note.clone() } else { task.result.clone() },
+            // A failure: the card's own reason when the service gave one.
+            ToolStatus::Done { .. } if !task.result.is_empty() => task.result.clone(),
+            ToolStatus::Done { outcome, note, text } => {
+                let reason = if note.is_empty() { text } else { note };
+                reason.lines().next().filter(|line| !line.is_empty()).unwrap_or(outcome.slug()).to_string()
+            }
+            ToolStatus::Confirm => String::new(),
+        };
+        if !task.host.is_empty() && (running || done_ok) {
+            if !meta.is_empty() {
+                meta.push_str(" · ");
+            }
+            meta.push_str(&task.host);
+        }
+        meta.push_str(&time);
+        let meta_label = row.label(cx, ids!(task_meta));
+        meta_label.set_visible(cx, !failed);
+        meta_label.set_text(cx, if failed { "" } else { &meta });
+        let problem = row.label(cx, ids!(task_problem));
+        problem.set_visible(cx, failed);
+        problem.set_text(cx, if failed { &meta } else { "" });
+        let bar = row.progress_bar(cx, ids!(task_bar));
+        row.view(cx, ids!(task_bar_row)).set_visible(cx, running);
+        if running {
+            let value = progress.and_then(|shown| shown.fraction).unwrap_or(-1.0);
+            if bar.value() != value {
+                bar.set_value(cx, value);
+            }
+        }
+        row.button(cx, ids!(task_stop)).set_visible(cx, running);
+        row.button(cx, ids!(task_retry)).set_visible(cx, failed);
+        for (slot, id) in [id!(task_act0), id!(task_act1)].iter().enumerate() {
+            let button = row.button(cx, &[*id]);
+            let action = task.actions.get(slot).filter(|_| done_ok);
+            button.set_visible(cx, action.is_some());
+            button.set_text(cx, action.map(|action| action.label.as_str()).unwrap_or(""));
+        }
+        row.view(cx, ids!(task_buttons)).set_visible(cx, running || failed || (done_ok && !task.actions.is_empty()));
+
+        let mut tip = task.source.clone();
+        if !task.stages.is_empty() {
+            if !tip.is_empty() {
+                tip.push('\n');
+            }
+            tip.push_str(&task.stages.join(" → "));
+        }
+        if !task.host.is_empty() {
+            if !tip.is_empty() {
+                tip.push('\n');
+            }
+            tip.push_str("on ");
+            tip.push_str(&task.host);
+        }
+        row.tip(cx, ids!(task_tip)).set_text(&tip);
+
+        // The input: a picture sent in this chat by name, else a picture file (read once).
+        if !task.picture.is_empty() && self.named_thumb(&task.picture).is_none() && !self.result_pics.contains_key(&task.picture) {
+            let png = Path::new(&task.picture).is_file().then(|| std::fs::read(&task.picture).ok()).flatten().map(Arc::<[u8]>::from);
+            self.result_pics.insert(task.picture.clone(), png);
+        }
+        // A missing result is remembered too, and falls back to the input picture.
+        if done_ok && !task.result_picture.is_empty() && !self.result_pics.contains_key(&task.result_picture) {
+            let png = std::fs::read(&task.result_picture).ok().map(Arc::<[u8]>::from);
+            self.result_pics.insert(task.result_picture.clone(), png);
+        }
+        let result = if done_ok && !task.result_picture.is_empty() {
+            self.result_pics.get(&task.result_picture).and_then(Option::as_ref)
+        } else {
+            None
+        };
+        let input = self.named_thumb(&task.picture).or_else(|| self.result_pics.get(&task.picture).and_then(Option::as_ref));
+        let picture = result.map(|png| ("result:", task.result_picture.as_str(), png)).or_else(|| {
+            input.filter(|_| !task.picture.is_empty()).map(|png| ("input:", task.picture.as_str(), png))
+        });
+        let image = row.image(cx, ids!(task_pic));
+        image.set_visible(cx, picture.is_some());
+        if let Some((prefix, key, png)) = picture {
+            if self.task_pics_filled.get(&uid).and_then(|last| last.strip_prefix(prefix)) != Some(key) {
+                let _ = image.load_image_from_data(cx, png);
+                self.task_pics_filled.insert(uid, format!("{prefix}{key}"));
+            }
+        } else {
+            self.task_pics_filled.remove(&uid);
+        }
+        self.task_rows_filled.insert(uid, (t.call_id.clone(), self.drawn_generation));
+    }
+
+    /// While the model loads, the status row reads "Loading weights · 42% ·
+    /// about 12 s left" and a bar under it fills (a sweep when the stage
+    /// reports no progress). Any other state hides the bar and clears the clock.
+    /// While the model loads, the work line reads "Loading weights · 42% ·
+    /// about 12 s left" and its bar fills (a sweep when the stage reports no
+    /// progress): the line and the bar's value. Any other state keeps the
+    /// plain line, no bar, and clears the clock.
+    fn load_line(&mut self, state: &EngineState, plain: String) -> (String, Option<f64>) {
+        match (&state.status, &self.notice) {
+            (Status::Loading { phase, fraction }, None) => {
+                let shown = self.load_track.observe(phase, if *fraction > 0.0 { *fraction } else { -1.0 }, std::time::Instant::now());
+                (shown.line(), Some(shown.fraction.unwrap_or(-1.0)))
+            }
+            _ => {
+                if self.load_track.current().is_some() {
+                    self.load_track.reset();
+                }
+                (plain, None)
+            }
+        }
+    }
+
+    /// The line at the end of the conversation while something happens:
+    /// `None` when idle.
+    fn work_line(state: &EngineState) -> Option<String> {
+        let rate = state.rate.map(|r| format!(" · {r:.0} tok/s")).unwrap_or_default();
+        match &state.status {
+            Status::Idle | Status::Error(_) => None,
+            Status::Loading { phase, fraction } => Some(format!("Loading the model · {phase} {:.0}%", fraction * 100.0)),
+            Status::Thinking => {
+                let waited = match state.model_secs {
+                    0 => String::new(),
+                    secs if secs < 60 => format!(" {secs} s"),
+                    secs => format!(" {} min {} s", secs / 60, secs % 60),
+                };
+                if !state.model_note.is_empty() {
+                    Some(format!("{}…{waited}", state.model_note))
+                } else if state.thinking.is_empty() {
+                    Some(format!("Thinking…{waited}"))
+                } else {
+                    let tail: String = state.thinking.chars().rev().take(140).collect::<Vec<_>>().into_iter().rev().collect();
+                    Some(format!("Thinking… {}", tail.split_whitespace().collect::<Vec<_>>().join(" ")))
+                }
+            }
+            Status::Streaming => Some(format!("Writing{rate}")),
+            Status::WaitingForTool => state.entries.iter().rev().find_map(|entry| match entry {
+                Entry::Tool(t) => match t.status {
+                    // The newest active call's own row (or card) says it runs, with its
+                    // Stop and how far it is: no second line for it.
+                    ToolStatus::Running { .. } | ToolStatus::NotResponding { .. } => Some(None),
+                    ToolStatus::Confirm => Some(Some(format!("{} waits for your answer", t.tool))),
+                    _ => None,
+                },
+                _ => None,
+            }).flatten(),
+        }
+    }
+
+    /// An entry as plain text, for a copy of a row that is not drawn.
+    fn entry_text(entry: &Entry) -> String {
+        match entry {
+            Entry::User { text, .. } | Entry::Assistant { text, .. } | Entry::System { text } => text.clone(),
+            Entry::Event(e) => e.text.clone(),
+            Entry::Tool(t) => match &t.task {
+                Some(task) => {
+                    let detail = match &t.status {
+                        ToolStatus::Done { note, .. } => if task.result.is_empty() { note } else { &task.result },
+                        ToolStatus::Running { note, .. } | ToolStatus::NotResponding { note, .. } => if task.stage.is_empty() { note } else { &task.stage },
+                        ToolStatus::Confirm => &task.stage,
+                    };
+                    format!("{} · {} — {detail}", task.title, task.source)
+                }
+                None => Self::tool_line(t),
+            },
+        }
+    }
+
+    /// A call in one line: the tool without its service's name (the context
+    /// line already says where it runs), then its arguments ([`args_line`]);
+    /// a row cuts it to its width.
+    fn tool_line(t: &ToolEntry) -> String {
+        let args = args_line(&t.args);
+        if args.is_empty() { t.tool.clone() } else { format!("{}  {args}", t.tool) }
+    }
+
+    /// Open the platform's picture picker; the answer arrives as a
+    /// `FileDialogAction` in `handle_actions`.
+    fn pick_pictures(&mut self, cx: &mut Cx) {
+        let dialog = FileDialog::new()
+            .set_id(ATTACH_DIALOG)
+            .set_title("Attach a picture".to_string())
+            .set_multiple(true)
+            .add_filter("Pictures".to_string(), vec!["png".into(), "jpg".into(), "jpeg".into(), "webp".into(), "heic".into()]);
+        cx.open_select_file_dialog(dialog);
+    }
+}
+
+/// The most of a call's arguments a row's line holds: more than any row is wide.
+const ARGS_LINE_CHARS: usize = 240;
+
+/// A call's arguments as plain `key: value` text on one line: `views: [front,
+/// "35,0"], focus: {object: a/b}`. A string goes bare unless it holds what
+/// separates the values; arguments that are no JSON go as they are.
+fn args_line(args: &str) -> String {
+    use makepad_strict_json::Value;
+    fn value(v: &Value, out: &mut String) {
+        match v {
+            Value::Null => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Int(i) => out.push_str(&i.to_string()),
+            Value::F64(f) => out.push_str(&f.to_string()),
+            Value::Str(s) if s.is_empty() || s.trim() != s || s.contains([',', ':', '[', ']', '{', '}', '"']) => {
+                out.push('"');
+                out.push_str(&s.replace('"', "\\\""));
+                out.push('"');
+            }
+            Value::Str(s) => out.push_str(s),
+            Value::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    value(item, out);
+                }
+                out.push(']');
+            }
+            Value::Obj(fields) => {
+                out.push('{');
+                pairs(fields, out);
+                out.push('}');
+            }
+        }
+    }
+    fn pairs(fields: &[(String, Value)], out: &mut String) {
+        for (i, (key, v)) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(key);
+            out.push_str(": ");
+            value(v, out);
+        }
+    }
+    let mut out = String::new();
+    match makepad_strict_json::parse(args.trim().as_bytes()) {
+        Ok(Value::Obj(fields)) => pairs(&fields, &mut out),
+        Ok(other) => value(&other, &mut out),
+        Err(_) => out.push_str(args.trim()),
+    }
+    let mut line: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some((at, _)) = line.char_indices().nth(ARGS_LINE_CHARS) {
+        line.truncate(at);
+        line.push('…');
+    }
+    line
+}
+
+impl Drop for AiChatPanel {
+    fn drop(&mut self) {
+        // The engine only enqueues Unsubscribe frames. Flush them while the
+        // hosted bus and registry still exist; field destruction is too late.
+        if let Some(engine) = self.engine.as_mut() {
+            engine.shutdown();
+        }
+        self.bus.relay_down(&self.registry);
+        // a closed panel holds no restart
+        if self.unsaved_published.is_some() {
+            makepad_widgets::makepad_platform::restart::set_unsaved(&self.unsaved_key(), None);
+        }
+    }
+}
+
+impl Widget for AiChatPanel {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.bus.set_context(cx);
+        if let Event::Custom(json) = event {
+            self.on_custom(json);
+        }
+        self.handle_drop(cx, event);
+        if !self.loading.is_empty() {
+            self.poll_loading(cx);
+        }
+        // Esc in the composer: stop a running turn; with nothing running
+        // and an empty composer, ask the host to hide the pane. An Esc
+        // meant for the host (leaving a presentation, a menu) is not ours.
+        if let Event::KeyDown(ke) = event {
+            if ke.key_code == KeyCode::KeyV && ke.modifiers.is_primary() && cx.has_key_focus(self.view.text_input(cx, ids!(input)).area()) {
+                self.paste_request = Some(cx.read_clipboard());
+            }
+        }
+        // A copy takes what is selected, rows scrolled away included.
+        if let Event::TextCopy(copy) = event {
+            let list = self.view.portal_list(cx, ids!(transcript));
+            if list.has_selection() && cx.has_key_focus(list.area()) && copy.response.borrow().is_none() {
+                if let Some(engine) = &self.engine {
+                    let state = engine.state();
+                    let text = list.selected_text_with(&|i| state.entries.get(i).map(Self::entry_text));
+                    if !text.is_empty() {
+                        *copy.response.borrow_mut() = Some(text);
+                    }
+                }
+            }
+        }
+        if let Event::Clipboard(reply) = event {
+            if self.paste_request == Some(reply.request) {
+                self.paste_request = None;
+                self.pasted += 1;
+                if let Some(source) = Source::from_clipboard(&reply.content, self.pasted) {
+                    self.attach(cx, source);
+                }
+            }
+        }
+        if let Event::KeyDown(ke) = event {
+            let composing = cx.has_key_focus(self.view.text_input(cx, ids!(input)).area());
+            if ke.key_code == KeyCode::Escape && composing {
+                let busy = self.engine.as_ref().map(|e| e.state().status.is_busy()).unwrap_or(false);
+                let empty = self.view.text_input(cx, ids!(input)).text().trim().is_empty();
+                if self.hold.is_waiting() {
+                    self.cancel_held(cx);
+                    self.view.redraw(cx);
+                } else if self.marks.on {
+                    self.marks.on = false;
+                    cx.widget_action(self.widget_uid(), AiChatPanelAction::Annotate(false));
+                    self.view.widget(cx, ids!(annotate_tip)).set_visible(cx, self.marks.offered);
+                    self.view.widget(cx, ids!(annotate_on_tip)).set_visible(cx, false);
+                    self.view.redraw(cx);
+                } else if busy {
+                    let now = Self::now(cx);
+                    self.ensure_engine().cancel(now);
+                    self.view.redraw(cx);
+                } else if empty {
+                    cx.widget_action(self.widget_uid(), AiChatPanelAction::Close);
+                }
+            }
+        }
+        // The built-in services answer before the engine pumps, so a
+        // finished picture lands in this same event.
+        #[cfg(feature = "gen")]
+        if let Some(gen) = self.gen.as_mut() {
+            gen.handle_event(cx, event);
+        }
+        // An app started for Claude Desktop runs its engine from the start,
+        // with the pane closed.
+        // A panel the app placed itself is the app's one chat: the window's F10 slot makes
+        // no second one (two engines would answer one window).
+        if !self.in_overlay && !cx.global::<AiSlotRequests>().docked {
+            cx.global::<AiSlotRequests>().docked = true;
+        }
+        if self.engine.is_none() && cx.global::<AiSlotRequests>().engine_at_start {
+            self.ensure_engine();
+        }
+        // Discovery of the AI hub landed (or was asked again): the menu's
+        // hub row follows it.
+        #[cfg(feature = "engine")]
+        if self.engine.is_some() && self.hub_seen != hub_generation() {
+            self.hub_seen = hub_generation();
+            let local_only = self.engine.as_ref().is_some_and(|e| e.state().local_only);
+            let rows = hub_rows(local_only);
+            // The hub's rows (the election's and one per other model) are
+            // one run in the menu: replaced together.
+            if let Some(at) = self.provider_rows.iter().position(|r| r.choice.is_hub()) {
+                let end = at + self.provider_rows[at..].iter().take_while(|r| r.choice.is_hub()).count();
+                if self.provider_rows[at..end] != rows[..] {
+                    self.provider_rows.splice(at..end, rows);
+                    let engine = self.engine.as_mut().unwrap();
+                    let (provider, local_only) = (engine.state().provider.clone(), engine.state().local_only);
+                    engine.set_provider_facts(provider, self.provider_rows.clone(), local_only);
+                    self.view.redraw(cx);
+                }
+            }
+        }
+        if self.pictures_moved {
+            self.share_pictures(cx);
+        }
+        self.poll_pictures(cx);
+        // Drive the engine on every event; the bus relays what it sent.
+        let now = Self::now(cx);
+        let mut changed = false;
+        let mut busy = false;
+        let uid = self.widget_uid();
+        let mut wanted = Vec::new();
+        let mut keep = Vec::new();
+        if let Some(engine) = self.engine.as_mut() {
+            for ev in engine.pump(now) {
+                match ev {
+                    EngineEvent::Changed => changed = true,
+                    EngineEvent::Confirm { .. } => changed = true,
+                    EngineEvent::ToolCallPartial { call_id, name, partial_json } => {
+                        cx.widget_action(uid, AiChatPanelAction::ToolCallPartial { call_id, name, partial_json });
+                    }
+                    EngineEvent::PictureWanted { call_id, picture, rect } => wanted.push((call_id, picture, rect)),
+                    EngineEvent::KeepPicture(write) => keep.push(write),
+                }
+            }
+            busy = engine.needs_pump() || engine.state().status.is_busy();
+        }
+        // The pool's picture jobs are polled on the frames they ask for.
+        busy |= self.thumbs_loading.is_some();
+        // A picture the person sent is written to its file on the task pool, and its end wakes
+        // the app: what waits for the file (the app's picture tools) goes on then.
+        for write in keep {
+            let refused = write.clone();
+            match cx.task_pool().submit(Class::Visible, move || {
+                write.run();
+                Cx::post_action(PictureKept);
+            }) {
+                Ok(handle) => handle.detach(),
+                Err(e) => refused.abandon(format!("the task pool did not take its write ({e:?})")),
+            }
+        }
+        // A picture the model asks to see again: read and fitted on the task pool.
+        for (call_id, picture, rect) in wanted {
+            match cx.task_pool().submit(Class::Visible, move || pictures::fit_for_model(&picture, rect)) {
+                Ok(handle) => self.fitting.push((call_id, handle)),
+                Err(e) => self.ensure_engine().picture_fitted(&call_id, Err(format!("the picture could not be read ({e:?})"))),
+            }
+        }
+        self.bus.relay_down(&self.registry);
+        if changed {
+            self.view.redraw(cx);
+        }
+        self.publish_transcript(cx);
+        self.write_chat();
+        if busy {
+            self.next_frame = cx.new_next_frame();
+        }
+        self.view.handle_event(cx, event, scope);
+        self.widget_match_event(cx, event, scope);
+        self.publish_unsaved(cx);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        // The engine exists once the panel is on screen.
+        let _ = self.ensure_engine();
+        let state = self.engine.as_ref().unwrap().state().clone();
+        if self.drawn_generation != state.generation {
+            self.sync_task_tracks(&state);
+        }
+        self.drawn_generation = state.generation;
+        let mcp_row = self.view.view(cx, ids!(mcp_row));
+        mcp_row.set_visible(cx, state.provider.slug() == CLAUDE_DESKTOP);
+
+        // The header's dot: ready, working, or nothing answers.
+        let silent = matches!(state.status, Status::Error(_)) || state.provider_label == "No model";
+        let working = state.status.is_busy();
+        let dot = if silent {
+            StatusKind::Error
+        } else if working {
+            StatusKind::InProgress
+        } else {
+            StatusKind::Success
+        };
+        self.view.widget(cx, ids!(status_dot)).set_text(cx, dot.name());
+
+        // The line at the end of the conversation: what happens now, or
+        // what went wrong.
+        let (line, failed) = match (&self.notice, &state.status) {
+            (Some(notice), _) => (Some(notice.clone()), true),
+            (None, Status::Error(e)) => (Some(e.clone()), true),
+            (None, _) => (Self::work_line(&state), false),
+        };
+        let work = match line {
+            Some(line) => {
+                let (line, bar) = self.load_line(&state, line);
+                Some((line, bar, failed))
+            }
+            None => {
+                let _ = self.load_line(&state, String::new());
+                None
+            }
+        };
+
+        // Send turns into Stop while a turn runs; with nothing typed and no
+        // picture it is greyed.
+        let busy = state.status.is_busy();
+        self.view.button(cx, ids!(send_button)).set_visible(cx, !busy);
+        self.view.button(cx, ids!(stop_button)).set_visible(cx, busy);
+        let typed = !self.view.text_input(cx, ids!(input)).text().trim().is_empty() || !self.attachments.is_empty();
+        self.view.widget(cx, ids!(send_button)).set_disabled(cx, !typed);
+        self.view.widget(cx, ids!(mic_tip)).set_visible(cx, matches!(self.voice, VoiceUi::Idle | VoiceUi::Busy));
+        self.view.widget(cx, ids!(mic_button)).set_disabled(cx, self.voice == VoiceUi::Busy);
+        self.view.widget(cx, ids!(mic_live_tip)).set_visible(cx, self.voice == VoiceUi::Listening);
+
+        let allowed: Vec<String> = self.engine.as_ref().map(|engine| engine.allowed().map(str::to_string).collect()).unwrap_or_default();
+        self.view.view(cx, ids!(allowed_row)).set_visible(cx, !allowed.is_empty());
+        if !allowed.is_empty() {
+            self.view.label(cx, ids!(allowed_label)).set_text(cx, &format!("Runs without asking in this chat: {}", allowed.join(", ")));
+        }
+
+        let shown = (self.attachments.len(), self.loading.len());
+        if self.attach_shown != Some(shown) {
+            self.attach_shown = Some(shown);
+            self.view.view(cx, ids!(attach_row)).set_visible(cx, shown.0 + shown.1 > 0);
+            let mut names: Vec<String> = self.attachments.iter().map(|a| format!("{} ({}×{})", a.sent.name, a.width, a.height)).collect();
+            if !self.loading.is_empty() {
+                names.push("reading…".into());
+            }
+            self.view.label(cx, ids!(attach_label)).set_text(cx, &names.join(", "));
+            for (slot, id) in ATTACH_PICS.iter().enumerate() {
+                let chip = self.view.view(cx, &[*id]);
+                match self.attachments.get(slot) {
+                    Some(picture) => {
+                        chip.set_visible(cx, true);
+                        let thumb = picture.sent.thumb.clone().unwrap_or_else(|| picture.sent.png.clone());
+                        let _ = chip.image(cx, ids!(pic)).load_png_from_data(cx, &thumb);
+                    }
+                    None => chip.set_visible(cx, false),
+                }
+            }
+        }
+
+        // Nothing said yet: a hint and the host's starting points instead
+        // of an empty list.
+        let empty = state.entries.is_empty() && work.is_none();
+        self.view.view(cx, ids!(empty_state)).set_visible(cx, empty);
+        self.view.portal_list(cx, ids!(transcript)).set_visible(cx, !empty);
+        if empty {
+            let hint = match (&state.target, state.suggestions.is_empty()) {
+                (_, false) => "Ask for a change or a question, or start from one of these:",
+                (Some(_), true) => "Ask for a change or a question about what is open here.",
+                (None, true) => "Ask for a change or a question.",
+            };
+            self.view.label(cx, ids!(empty_hint)).set_text(cx, hint);
+            for i in 0..MAX_CHIPS {
+                let chip = self.view.button(cx, &[LiveId::from_str(&format!("chip{i}"))]);
+                match state.suggestions.get(i) {
+                    Some(s) => {
+                        chip.set_visible(cx, true);
+                        chip.set_text(cx, &s.label);
+                    }
+                    None => chip.set_visible(cx, false),
+                }
+            }
+        }
+        self.view.view(cx, ids!(target_row)).set_visible(cx, state.target.is_some());
+        self.view.view(cx, ids!(bar_gap)).set_visible(cx, state.target.is_none());
+        if let Some(target) = &state.target {
+            self.view.label(cx, ids!(target_label)).set_text(cx, &target.label);
+        }
+        let selection = state.target.as_ref().and_then(|target| target.selection.as_deref());
+        self.view.view(cx, ids!(selection_row)).set_visible(cx, selection.is_some());
+        if let Some(selection) = selection {
+            self.view.label(cx, ids!(selection_label)).set_text(cx, selection);
+        }
+        if !self.provider_rows.is_empty() {
+            // A choice with no row (Local in a build without local AI)
+            // answers with no model, so the menu shows that row.
+            let at = self
+                .provider_rows
+                .iter()
+                .position(|r| r.choice == state.provider)
+                .or_else(|| self.provider_rows.iter().position(|r| r.choice.slug() == "none"))
+                .unwrap_or(0);
+            let labels: Vec<String> = self
+                .provider_rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| match &r.unavailable {
+                    Some(why) => format!("{} — {why}", r.label),
+                    // The picked local row says where it runs once it knows
+                    // ("AI hub · 149 (Qwen3.8 27B)"). The elected model can
+                    // differ from this machine's weights in the base row.
+                    None if i == at && r.choice.is_local() && state.provider_label.starts_with("AI hub · ") => state.provider_label.clone(),
+                    None => r.label.clone(),
+                })
+                .collect();
+            if self.pick_shown.as_ref() != Some(&(labels.clone(), at)) {
+                self.pick_shown = Some((labels.clone(), at));
+                let pick = self.view.drop_down(cx, ids!(provider_pick));
+                pick.set_labels(cx, labels);
+                pick.set_disabled_items(cx, self.provider_rows.iter().map(|r| r.unavailable.is_some()).collect());
+                pick.set_selected_item(cx, at);
+            }
+        }
+        while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
+            let Some(mut list) = item.borrow_mut::<PortalList>() else { continue };
+            let total = state.entries.len();
+            list.set_item_range(cx, 0, total + work.is_some() as usize);
+            while let Some(index) = list.next_visible_item(cx) {
+                if index >= total {
+                    // The work line follows the last entry (the list asks
+                    // past its range to fill the view: those stay empty).
+                    let Some((line, bar, failed)) = work.as_ref().filter(|_| index == total) else { continue };
+                    let row = list.item(cx, index, id!(WorkRow));
+                    row.label(cx, ids!(work_label)).set_text(cx, line);
+                    row.widget(cx, ids!(work_dot)).set_text(cx, if *failed { StatusKind::Error } else { StatusKind::InProgress }.name());
+                    row.view(cx, ids!(load_row)).set_visible(cx, bar.is_some());
+                    if let Some(value) = bar {
+                        row.progress_bar(cx, ids!(load_bar)).set_value(cx, *value);
+                    }
+                    row.draw_all(cx, &mut Scope::empty());
+                    continue;
+                }
+                let entry = &state.entries[index];
+                let row = match entry {
+                    Entry::User { text, pictures } => {
+                        let row = list.item(cx, index, id!(UserRow));
+                        row.label(cx, ids!(user_text)).set_text(cx, text);
+                        // The line's pictures that have their small copy (a restored chat's
+                        // come from the task pool a moment later).
+                        let thumbs: Vec<&Arc<[u8]>> = pictures.iter().filter_map(|p| self.thumbs.get(&p.file)).collect();
+                        row.view(cx, ids!(user_pics)).set_visible(cx, !thumbs.is_empty());
+                        if self.pics_filled.get(&row.widget_uid()) != Some(&(index, thumbs.len())) {
+                            self.pics_filled.insert(row.widget_uid(), (index, thumbs.len()));
+                            for (slot, id) in USER_PICS.iter().enumerate() {
+                                let image = row.image(cx, &[*id]);
+                                match thumbs.get(slot) {
+                                    Some(png) => {
+                                        image.set_visible(cx, true);
+                                        let _ = image.load_png_from_data(cx, png);
+                                    }
+                                    None => image.set_visible(cx, false),
+                                }
+                            }
+                        }
+                        row
+                    }
+                    Entry::Event(event) => {
+                        let row = list.item(cx, index, id!(EventRow));
+                        row.label(cx, ids!(event_title)).set_text(cx, &format!("{} · {}", event.service_label, event.topic));
+                        row.label(cx, ids!(event_text)).set_text(cx, &event.text);
+                        let mut meta = Vec::new();
+                        if event.dropped != 0 {
+                            meta.push(format!("{} dropped", event.dropped));
+                        }
+                        if event.final_ {
+                            meta.push("final".to_string());
+                        }
+                        if let Some(data) = &event.data {
+                            meta.push(data.clone());
+                        }
+                        let meta_label = row.label(cx, ids!(event_meta));
+                        meta_label.set_visible(cx, !meta.is_empty());
+                        meta_label.set_text(cx, &meta.join("\n"));
+                        row
+                    }
+                    // Streaming and finished text draw the same way, so the
+                    // last line does not jump when the turn ends.
+                    Entry::Assistant { text, .. } => {
+                        let row = list.item(cx, index, id!(AssistantRow));
+                        // No text, no row: a blank block above a card is a gap.
+                        row.set_visible(cx, !text.trim().is_empty());
+                        if let Some(mut md) = row.widget(cx, ids!(assistant_md)).borrow_mut::<Markdown>() {
+                            md.set_text(cx, text);
+                        }
+                        row
+                    }
+                    Entry::Tool(ToolEntry { status: ToolStatus::Confirm, card: Some(card), call_id, .. }) => {
+                        let row = list.item(cx, index, id!(RequestRow));
+                        let values = self.card_edits.entry(call_id.clone()).or_insert_with(|| card.values()).clone();
+                        self.draw_card(cx, &row, call_id, card, &values);
+                        row
+                    }
+                    Entry::Tool(t) if matches!(t.status, ToolStatus::Confirm) => {
+                        let row = list.item(cx, index, id!(ConfirmRow));
+                        row.label(cx, ids!(confirm_title)).set_text(cx, &format!("{} changes things outside the app. Run it?", Self::tool_line(t)));
+                        row
+                    }
+                    Entry::Tool(t) if t.task.is_some() && !matches!(t.status, ToolStatus::Confirm) => {
+                        let row = list.item(cx, index, id!(TaskRow));
+                        self.draw_task(cx, &row, t);
+                        row
+                    }
+                    Entry::Tool(t) => {
+                        let row = list.item(cx, index, id!(ToolRow));
+                        // the status line: what it is doing now (or a note it ended with), and how
+                        // far, when it counts; a failure's reason in its own words below
+                        let (kind, note, problem, permille, detail) = match &t.status {
+                            ToolStatus::Running { note, permille } => (StatusKind::InProgress, note.clone(), String::new(), *permille, String::new()),
+                            ToolStatus::NotResponding { note, permille } => {
+                                let line = if note.is_empty() { "not responding".to_string() } else { format!("{note} · not responding") };
+                                (StatusKind::Pending, line, String::new(), *permille, note.clone())
+                            }
+                            ToolStatus::Done { outcome, note, text } if outcome.is_ok() => {
+                                let note = if note.is_empty() || note == "ok" { String::new() } else { note.clone() };
+                                (StatusKind::Success, note, String::new(), 0, text.clone())
+                            }
+                            ToolStatus::Done { outcome, note, text } => {
+                                let reason = if note.is_empty() { text.lines().next().unwrap_or("") } else { note.as_str() };
+                                let problem = if reason.is_empty() { outcome.slug().to_string() } else { reason.to_string() };
+                                (StatusKind::Error, String::new(), problem, 0, text.clone())
+                            }
+                            ToolStatus::Confirm => (StatusKind::Pending, String::new(), String::new(), 0, String::new()),
+                        };
+                        let running = matches!(t.status, ToolStatus::Running { .. } | ToolStatus::NotResponding { .. });
+                        row.widget(cx, ids!(tool_dot)).set_text(cx, kind.name());
+                        let line = self.tool_lines.entry(t.call_id.clone()).or_insert_with(|| Self::tool_line(t));
+                        row.label(cx, ids!(tool_title)).set_text(cx, line);
+                        row.button(cx, ids!(tool_stop)).set_visible(cx, running);
+                        let counted = running && permille > 0;
+                        row.view(cx, ids!(tool_status)).set_visible(cx, !note.is_empty() || counted);
+                        row.label(cx, ids!(tool_note)).set_text(cx, &note);
+                        row.view(cx, ids!(tool_bar_box)).set_visible(cx, counted);
+                        let bar = row.progress_bar(cx, ids!(tool_bar));
+                        let value = permille.min(1000) as f64 / 1000.0;
+                        if counted && bar.value() != value {
+                            bar.set_value(cx, value);
+                        }
+                        let problem_label = row.label(cx, ids!(tool_problem));
+                        problem_label.set_visible(cx, !problem.is_empty() && !t.expanded);
+                        problem_label.set_text(cx, &problem);
+                        row.view(cx, ids!(tool_detail)).set_visible(cx, t.expanded);
+                        if t.expanded {
+                            let mut detail = if detail.is_empty() { t.args.clone() } else { format!("{}\n\n{}", t.args, detail) };
+                            // The details stay a glance: a long answer is cut
+                            // (the transcript route keeps it whole).
+                            if let Some((at, _)) = detail.char_indices().nth(1200) {
+                                detail.truncate(at);
+                                detail.push_str(" …");
+                            }
+                            row.label(cx, ids!(tool_detail_text)).set_text(cx, &detail);
+                        }
+                        row
+                    }
+                    Entry::System { text } => {
+                        let row = list.item(cx, index, id!(SystemRow));
+                        row.label(cx, ids!(system_text)).set_text(cx, text);
+                        row
+                    }
+                };
+                row.draw_all(cx, &mut Scope::empty());
+            }
+        }
+        // The composer takes the keyboard the first time it is on screen, not while the panel
+        // is drawn collapsed or hidden: an app that starts with its chat closed has nothing
+        // focused (a focused field blinks its caret, and keeps an idle app drawing).
+        if !self.composer_focused {
+            let shown = self.view.widget(cx, ids!(input)).area().rect(cx.cx).size;
+            if shown.x > 1.0 && shown.y > 1.0 {
+                self.composer_focused = true;
+                self.view.text_input(cx, ids!(input)).take_key_focus(cx);
+            }
+        }
+        DrawStep::done()
+    }
+}
+
+impl AiChatPanel {
+    /// The editors and buttons of a settings card row. True when the row
+    /// was one and something happened.
+    fn card_actions(&mut self, cx: &mut Cx, item: &WidgetRef, actions: &Actions, call_id: &str, now: f64) -> bool {
+        let Some(card) = self.ensure_engine().state().tool(call_id).and_then(|t| t.card.clone()) else { return false };
+        let mut changed = false;
+        let edits = self.card_edits.entry(call_id.to_string()).or_insert_with(|| card.values());
+        let (mut pick_at, mut line_at) = (0, 0);
+        for (slot, field) in card.fields.iter().enumerate() {
+            let id = slot_id(slot);
+            match field {
+                Field::Pick { .. } => {
+                    if let Some(at) = item.drop_down(cx, &[id, id!(pick)]).changed(actions) {
+                        if let Some(pick) = edits.picks.get_mut(pick_at) {
+                            *pick = at;
+                            changed = true;
+                        }
+                    }
+                    pick_at += 1;
+                }
+                Field::Line { .. } => {
+                    if let Some(text) = item.text_input(cx, &[id, id!(line)]).changed(actions) {
+                        if let Some(line) = edits.lines.get_mut(line_at) {
+                            *line = text;
+                            changed = true;
+                        }
+                    }
+                    line_at += 1;
+                }
+            }
+        }
+        if item.button(cx, ids!(req_run)).clicked(actions) {
+            let args = card.args(edits).to_json();
+            // A refusal leaves the card parked with its reasons on it.
+            if self.ensure_engine().confirm_with(call_id, true, Some(args), now).is_ok() {
+                self.card_edits.remove(call_id);
+            }
+            return true;
+        }
+        if item.button(cx, ids!(req_always)).clicked(actions) {
+            let args = card.args(edits).to_json();
+            if self.ensure_engine().allow_for_chat(call_id, Some(args), now).is_ok() {
+                self.card_edits.remove(call_id);
+            }
+            return true;
+        }
+        if item.button(cx, ids!(req_cancel)).clicked(actions) {
+            let _ = self.ensure_engine().confirm_with(call_id, false, None, now);
+            self.card_edits.remove(call_id);
+            return true;
+        }
+        changed
+    }
+}
+
+impl WidgetMatchEvent for AiChatPanel {
+    fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, scope: &mut Scope) {
+        let input = self.view.text_input(cx, ids!(input));
+        let returned = input.returned(actions).map(|(text, _)| text);
+        if let Some(text) = returned {
+            // Enter on an empty line with no picture sends nothing.
+            if !text.trim().is_empty() || !self.attachments.is_empty() || self.marks.count > 0 {
+                self.send(cx, text);
+            }
+        } else if self.view.button(cx, ids!(send_button)).clicked(actions) {
+            let text = input.text();
+            if !text.trim().is_empty() || !self.attachments.is_empty() || self.marks.count > 0 {
+                self.send(cx, text);
+            }
+        }
+        if input.changed(actions).is_some() {
+            // Send greys and lights with the text.
+            self.view.redraw(cx);
+        }
+        if self.view.button(cx, ids!(stop_button)).clicked(actions) {
+            let now = Self::now(cx);
+            self.ensure_engine().cancel(now);
+            self.view.redraw(cx);
+        }
+        let chip_clicked = (0..MAX_CHIPS).find(|i| self.view.button(cx, &[LiveId::from_str(&format!("chip{i}"))]).clicked(actions));
+        if let Some(i) = chip_clicked {
+            let chip = self.ensure_engine().state().suggestions.get(i).cloned();
+            if let Some(chip) = chip {
+                if chip.is_prompt() {
+                    self.send(cx, chip.prefill);
+                } else {
+                    let now = Self::now(cx);
+                    self.ensure_engine().propose(&chip.app, &chip.tool, &chip.prefill, now);
+                }
+                self.view.redraw(cx);
+            }
+        }
+        if self.view.button(cx, ids!(attach_button)).clicked(actions) {
+            self.pick_pictures(cx);
+        }
+        if self.view.button(cx, ids!(mic_button)).clicked(actions) || self.view.button(cx, ids!(mic_live_button)).clicked(actions) {
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::VoiceToggled);
+        }
+        for action in actions {
+            match action.downcast_ref::<FileDialogAction>() {
+                Some(FileDialogAction::FileSelected { id, paths }) if *id == ATTACH_DIALOG => {
+                    for path in paths.iter().take(4) {
+                        self.attach(cx, Source::Path(path.clone()));
+                    }
+                }
+                Some(FileDialogAction::FileLoaded { id, files }) if *id == ATTACH_DIALOG => {
+                    for file in files.iter().take(4) {
+                        self.attach(cx, Source::Bytes { name: file.name.clone(), bytes: file.bytes.clone() });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.view.button(cx, ids!(annotate_button)).clicked(actions) {
+            self.marks.on = true;
+            self.view.widget(cx, ids!(annotate_tip)).set_visible(cx, false);
+            self.view.widget(cx, ids!(annotate_on_tip)).set_visible(cx, true);
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::Annotate(true));
+            self.view.redraw(cx);
+        }
+        if self.view.button(cx, ids!(annotate_on_button)).clicked(actions) {
+            self.marks.on = false;
+            self.view.widget(cx, ids!(annotate_tip)).set_visible(cx, true);
+            self.view.widget(cx, ids!(annotate_on_tip)).set_visible(cx, false);
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::Annotate(false));
+            self.view.redraw(cx);
+        }
+        if self.view.button(cx, ids!(marks_clear)).clicked(actions) {
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::MarksCleared);
+        }
+        if self.view.button(cx, ids!(selection_clear)).clicked(actions) {
+            // Shown cleared at once; the host deselects on the page.
+            let target = self.ensure_engine().state().target.clone();
+            if let Some(mut target) = target {
+                target.selection = None;
+                self.ensure_engine().set_target(Some(target));
+            }
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::SelectionCleared);
+            self.view.redraw(cx);
+        }
+        if self.view.button(cx, ids!(allowed_clear)).clicked(actions) {
+            self.ensure_engine().revoke(None);
+            self.view.redraw(cx);
+        }
+        if self.view.button(cx, ids!(attach_clear)).clicked(actions) {
+            self.attachments.clear();
+            self.attach_shown = None;
+            self.view.redraw(cx);
+        }
+        for (slot, id) in ATTACH_PICS.iter().enumerate() {
+            if self.view.view(cx, &[*id]).button(cx, ids!(pic_remove)).clicked(actions) && slot < self.attachments.len() {
+                self.attachments.remove(slot);
+                self.attach_shown = None;
+                self.view.redraw(cx);
+            }
+        }
+        if let Some(at) = self.view.drop_down(cx, ids!(provider_pick)).changed(actions) {
+            if let Some(row) = self.provider_rows.get(at).cloned() {
+                if let Some(why) = &row.unavailable {
+                    self.note(cx, format!("{}: {why}", row.label));
+                    // The menu goes back to the provider that answers.
+                    self.pick_shown = None;
+                } else {
+                    self.set_provider(cx, &row.choice.slug());
+                }
+            }
+        }
+        if self.view.button(cx, ids!(mcp_connect)).clicked(actions) {
+            self.connect_claude_desktop(cx);
+        }
+        if self.view.button(cx, ids!(new_chat)).clicked(actions) {
+            let now = Self::now(cx);
+            self.notice = None;
+            self.ensure_engine().clear(now);
+            self.thumbs.clear();
+            self.share_pictures(cx);
+            self.pics_filled.clear();
+            self.result_pics.clear();
+            self.task_pics_filled.clear();
+            self.task_rows_filled.clear();
+            self.tool_lines.clear();
+            self.task_tracks.clear();
+            self.view.redraw(cx);
+        }
+        // Cards: confirm buttons and click-to-expand.
+        let list = self.view.portal_list(cx, ids!(transcript));
+        let items = list.items_with_actions(actions);
+        if !items.is_empty() {
+            let now = Self::now(cx);
+            let call_ids: Vec<Option<String>> = {
+                let state = self.ensure_engine().state();
+                items
+                    .iter()
+                    .map(|(index, _)| match state.entries.get(*index) {
+                        Some(Entry::Tool(t)) => Some(t.call_id.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            for ((_, item), call_id) in items.iter().zip(call_ids) {
+                let Some(call_id) = call_id else { continue };
+                if self.card_actions(cx, item, actions, &call_id, now) {
+                    self.view.redraw(cx);
+                } else if item.button(cx, ids!(tool_stop)).clicked(actions) || item.button(cx, ids!(task_stop)).clicked(actions) {
+                    self.ensure_engine().stop_call(&call_id);
+                    self.view.redraw(cx);
+                } else if item.button(cx, ids!(task_retry)).clicked(actions) {
+                    let _ = self.ensure_engine().retry(&call_id, now);
+                    self.view.redraw(cx);
+                } else if let Some(slot) = [id!(task_act0), id!(task_act1)].iter().position(|id| item.button(cx, &[*id]).clicked(actions)) {
+                    let action = self.ensure_engine().state().tool(&call_id)
+                        .filter(|t| matches!(t.status, ToolStatus::Done { outcome: ToolOutcome::Ok, .. }))
+                        .and_then(|t| t.task.as_ref())
+                        .and_then(|task| task.actions.get(slot))
+                        .map(|action| action.id.clone());
+                    if let Some(action) = action {
+                        cx.widget_action(self.widget_uid(), AiChatPanelAction::TaskAction { call_id, action });
+                    }
+                } else if item.button(cx, ids!(run_button)).clicked(actions) {
+                    self.ensure_engine().confirm(&call_id, true, now);
+                    self.view.redraw(cx);
+                } else if item.button(cx, ids!(run_always)).clicked(actions) {
+                    let _ = self.ensure_engine().allow_for_chat(&call_id, None, now);
+                    self.view.redraw(cx);
+                } else if item.button(cx, ids!(deny_button)).clicked(actions) {
+                    self.ensure_engine().confirm(&call_id, false, now);
+                    self.view.redraw(cx);
+                // A press taken away (the list scrolled under it) toggles nothing.
+                } else if item.view(cx, ids!(tool_head)).finger_up(actions).is_some_and(|e| !e.cancelled) {
+                    self.ensure_engine().toggle_tool(&call_id);
+                    self.view.redraw(cx);
+                }
+            }
+        }
+        let _ = scope;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A call's row reads its arguments as `key: value` text, a string that holds a separator in
+    /// quotes; a long one is cut with an ellipsis, short of what a row could hold.
+    /// A line sent with marks still being resolved (the worker is behind a long build) waits: the
+    /// host is not asked for the picture, and the text is not taken, until every mark is in; then
+    /// it is asked once, and the text goes only when released. Giving up returns the text.
+    #[test]
+    fn a_line_waits_for_marks_still_resolving() {
+        let mut hold = Hold::default();
+        hold.take_line("what did I circle?".into());
+        for _ in 0..5 {
+            assert!(!hold.wants_picture(2), "asked for the picture with marks unresolved");
+        }
+        assert!(hold.is_waiting() && !hold.releasing());
+        assert!(!hold.wants_picture(1));
+        assert!(hold.wants_picture(0), "asked once they are all in");
+        assert!(!hold.wants_picture(0), "and only once");
+        assert!(hold.begin_release() && hold.releasing());
+        assert!(!hold.wants_picture(0), "not again while the picture is read");
+        assert_eq!(hold.finish().as_deref(), Some("what did I circle?"));
+        assert!(!hold.is_waiting() && !hold.begin_release(), "nothing left to release");
+        hold.take_line("again".into());
+        assert_eq!(hold.finish().as_deref(), Some("again"), "given up: the text is back");
+    }
+
+    #[test]
+    fn a_call_s_arguments_read_as_one_plain_line() {
+        assert_eq!(args_line(r#"{"views":["front","35,0"],"focus":{"object":"a/b"},"ortho":true}"#), r#"views: [front, "35,0"], focus: {object: a/b}, ortho: true"#);
+        assert_eq!(args_line("{}"), "");
+        assert_eq!(args_line("not json\n at all"), "not json at all");
+        let long = args_line(&format!(r#"{{"source":"{}"}}"#, "let a = 1\\n".repeat(100)));
+        assert!(long.ends_with('…') && long.chars().count() == ARGS_LINE_CHARS + 1, "{long}");
+    }
+}

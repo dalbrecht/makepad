@@ -1,4 +1,145 @@
-import { WasmWebBrowser } from "./web.js";
+import {
+  WasmWebBrowser,
+  makepad_compute_webgl_size,
+  makepad_device_pixel_ratio,
+} from "./web.js";
+
+const MAKEPAD_WEBGL_FALLBACK_DIMENSION = 2048;
+const MAKEPAD_WEBGL_FALLBACK_VERTEX_ATTRIBS = 16;
+// WebGL's largest vertex attribute stride, in bytes.
+const MAKEPAD_WEBGL_MAX_ATTRIB_STRIDE = 255;
+// No byte or triangle caps of the runtime's own (GPU-SAFETY.md): sizes are
+// bounded by the device's reported limits and by the wasm memory a slice
+// must lie in; a driver that cannot allocate says so (GL_OUT_OF_MEMORY,
+// checked where textures and buffers are allocated).
+const MAKEPAD_WEBGL_MAX_SUBMISSION_REPORTS = 64;
+// @section video-playback
+const MAKEPAD_WEBGL_VIDEO_UPLOAD_FORMAT = "video-rgba8";
+// @end video-playback
+// With checks on (see gl_checks), an allocation's GL error is read at the
+// latest this long after it: getError waits for the GPU process, so it runs
+// when no earlier frame is still on the GPU, else at most this often.
+const MAKEPAD_WEBGL_ALLOCATION_CHECK_MS = 2000;
+
+const MAKEPAD_WEBGL_BGRA_IMAGE_UPLOAD = {
+  faces: 1,
+  bytes_per_texel: 4,
+  elements_per_texel: 1,
+  element_size: 4,
+  nearest: false,
+};
+
+// GL error and framebuffer-completeness queries (gl.getError,
+// gl.checkFramebufferStatus) run only when the page sets
+// `window.makepad_gl_checks = true` before the runtime starts: development
+// pages and the export's instrumented safety run do; a shipped page never
+// queries. Each query waits for the GPU process to finish everything
+// queued, behind a busy GPU a stall of whole GPU frames (25-100 ms) on
+// every allocating frame. Without them a failed allocation surfaces as a
+// lost context (webglcontextlost) or draws nothing.
+function makepad_gl_checks_on() {
+  return typeof window !== "undefined" && window.makepad_gl_checks === true;
+}
+
+function makepad_webgl_limit(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 1
+    ? Math.floor(number)
+    : MAKEPAD_WEBGL_FALLBACK_DIMENSION;
+}
+
+function makepad_webgl_vertex_attrib_limit(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 1
+    ? number
+    : MAKEPAD_WEBGL_FALLBACK_VERTEX_ATTRIBS;
+}
+
+function makepad_safe_product(left, right) {
+  if (
+    !Number.isSafeInteger(left) ||
+    left < 0 ||
+    !Number.isSafeInteger(right) ||
+    right < 0
+  ) {
+    return null;
+  }
+  const product = left * right;
+  return Number.isSafeInteger(product) ? product : null;
+}
+
+function makepad_safe_sum(left, right) {
+  if (
+    !Number.isSafeInteger(left) ||
+    left < 0 ||
+    !Number.isSafeInteger(right) ||
+    right < 0
+  ) {
+    return null;
+  }
+  const sum = left + right;
+  return Number.isSafeInteger(sum) ? sum : null;
+}
+
+function makepad_swap_red_blue(value) {
+  return ((value & 0xff) << 16) | (value & 0xff00ff00) | ((value >>> 16) & 0xff);
+}
+
+export function makepad_query_webgl_limits(gl) {
+  const max_texture_size = makepad_webgl_limit(
+    gl.getParameter(gl.MAX_TEXTURE_SIZE),
+  );
+  const max_cube_map_texture_size = makepad_webgl_limit(
+    gl.getParameter(gl.MAX_CUBE_MAP_TEXTURE_SIZE),
+  );
+  const max_renderbuffer_size = makepad_webgl_limit(
+    gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
+  );
+  const viewport = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+  const max_viewport_width = makepad_webgl_limit(viewport && viewport[0]);
+  const max_viewport_height = makepad_webgl_limit(viewport && viewport[1]);
+  return {
+    max_texture_size,
+    max_cube_map_texture_size,
+    max_width: Math.min(
+      max_texture_size,
+      max_renderbuffer_size,
+      max_viewport_width,
+    ),
+    max_height: Math.min(
+      max_texture_size,
+      max_renderbuffer_size,
+      max_viewport_height,
+    ),
+  };
+}
+
+// A render target is bounded by the device's limits only: the drawable's
+// pixel budget (a page author's `renderpixelbudget`) sizes the canvas, never
+// the app's own targets, which it sizes itself.
+export function makepad_render_target_size(width, height, limits) {
+  if (
+    !Number.isSafeInteger(width) ||
+    !Number.isSafeInteger(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return { ok: false, reason: "dimensions must be positive safe integers" };
+  }
+  const size = makepad_compute_webgl_size(width, height, 1.0, limits);
+  if (size.width <= 0 || size.height <= 0) {
+    return { ok: false, reason: "dimensions cannot fit the WebGL limits" };
+  }
+  return {
+    ok: true,
+    requested_width: width,
+    requested_height: height,
+    width: size.width,
+    height: size.height,
+    scale: size.scale,
+    scaled: size.width !== width || size.height !== height,
+  };
+}
 
 export class WasmWebGL extends WasmWebBrowser {
   constructor(wasm, dispatch, canvas) {
@@ -8,22 +149,53 @@ export class WasmWebGL extends WasmWebBrowser {
     }
     this.draw_shaders = [];
     this.array_buffers = [];
+    // Per instance buffer id: the R32UI texture a shader reads instance
+    // data from when they do not fit its vertex attributes (`mp_inst_data`,
+    // shader_glsl.rs), with the upload it mirrors.
+    this.instance_data_textures = new Map();
     this.index_buffers = [];
     this.vaos = [];
     this.textures = [];
     this.framebuffers = [];
+    this.active_render_target_textures = new Set();
     this.xr = undefined;
     this._missing_shader_ids = new Set();
     this._gl_error_reports = new Set();
+    this.gl_checks = makepad_gl_checks_on();
+    this._vertex_submission_reports = new Set();
+    this._texture_upload_reports = new Set();
+    this._invalid_texture_upload_ids = new Set();
+    this._sampler_fallback_textures = new Map();
+    this._sampler_fallback_texture_failures = new Set();
+    this._webgl_shader_version = 0;
+    this.pending_webgl_shader_count = 0;
+    // FromWasmSpreadFirstDraws: a program's first draw goes in a frame of its
+    // own (first_draw_this_frame), the others wait (first_draws_deferred).
+    this.first_draw_spread = false;
+    this.first_draw_this_frame = false;
+    this.first_draws_deferred = false;
+    this.webgl_shader_poll_frame_id = 0;
+    this.webgl_shader_timeline_start = undefined;
+    this.webgl_shader_batch_program_count = 0;
+    this.webgl_shader_batch_failed_count = 0;
+    this.webgl_shader_summary_timer = undefined;
+    // @section video-playback
     this.video_players = {};
-    this.init_webgl_context();
-
-    this.load_deps();
+    // @end video-playback
+    this.pending_render_texture_captures = new Set();
+    this.bgra_upload_scratch = new Uint32Array(0);
+    if (this.init_webgl_context()) {
+      this.load_deps();
+    }
   }
 
   // webGL API
 
+  // @section xr
   on_xr_animation_frame(time, frame) {
+    if (this.webgl_context_lost) {
+      return;
+    }
     function empty_transform() {
       return {
         orientation: {
@@ -140,20 +312,24 @@ export class WasmWebGL extends WasmWebBrowser {
     }
 
     this.to_wasm.ToWasmXRUpdate(xr_update);
-    this.to_wasm.ToWasmAnimationFrame({ time: time / 1000.0 });
+    this.to_wasm.ToWasmAnimationFrame({ time: time / 1000.0, in_a_row: true });
     this.in_animation_frame = true;
     this.do_wasm_pump();
     this.in_animation_frame = false;
   }
 
   FromWasmXrStartPresenting(args) {
-    if (this.xr !== undefined) {
+    if (this.webgl_context_lost || this.xr !== undefined) {
       return;
     }
     // alright lets fire up the xr stuff
     navigator.xr
       .requestSession("immersive-vr", { requiredFeatures: ["local-floor"] })
       .then((session) => {
+        if (this.webgl_context_lost) {
+          session.end();
+          return;
+        }
         let layer = new XRWebGLLayer(session, this.gl, {
           antialias: false,
           depth: true,
@@ -163,6 +339,10 @@ export class WasmWebGL extends WasmWebBrowser {
         });
         session.updateRenderState({ baseLayer: layer });
         session.requestReferenceSpace("local-floor").then((ref_space) => {
+          if (this.webgl_context_lost) {
+            session.end();
+            return;
+          }
           window.localStorage.setItem("xr_presenting", "true");
           this.xr = {
             left_eye: {},
@@ -183,6 +363,7 @@ export class WasmWebGL extends WasmWebBrowser {
   }
 
   FromWasmXrStopPresenting() {}
+  // @end xr
 
   get_uniform_block_binding(program, name) {
     let gl = this.gl;
@@ -194,24 +375,28 @@ export class WasmWebGL extends WasmWebBrowser {
     return index;
   }
 
-  upload_uniform_buffer_from_ptr(gl, gl_buf, ptr_f32) {
+  upload_uniform_buffer_from_ptr(gl, gl_buf, ptr_f32, gen_lo, gen_hi) {
     if (!gl_buf || ptr_f32.ptr == 0 || ptr_f32.len == 0) {
       return;
     }
     if (
-      gl_buf._last_upload_serial === this.buffer_upload_serial &&
-      gl_buf._last_upload_ptr === ptr_f32.ptr &&
-      gl_buf._last_upload_len === ptr_f32.len &&
-      gl_buf._last_upload_memory === this.memory.buffer
+      gl_buf._last_upload_gen_lo === gen_lo &&
+      gl_buf._last_upload_gen_hi === gen_hi
     ) {
       return;
     }
     let data = new Float32Array(this.memory.buffer, ptr_f32.ptr, ptr_f32.len);
     this.upload_uniform_buffer_data(gl, gl_buf, data, gl.DYNAMIC_DRAW);
-    gl_buf._last_upload_serial = this.buffer_upload_serial;
-    gl_buf._last_upload_ptr = ptr_f32.ptr;
-    gl_buf._last_upload_len = ptr_f32.len;
-    gl_buf._last_upload_memory = this.memory.buffer;
+    gl_buf._last_upload_gen_lo = gen_lo;
+    gl_buf._last_upload_gen_hi = gen_hi;
+  }
+
+  reset_uniform_buffer_upload_cache(gl_buf) {
+    if (!gl_buf) {
+      return;
+    }
+    gl_buf._last_upload_gen_lo = undefined;
+    gl_buf._last_upload_gen_hi = undefined;
   }
 
   upload_uniform_buffer_data(gl, gl_buf, data, usage = gl.DYNAMIC_DRAW) {
@@ -240,20 +425,780 @@ export class WasmWebGL extends WasmWebBrowser {
     gl.bindBufferBase(gl.UNIFORM_BUFFER, binding, gl_buf);
   }
 
-  assert_no_gl_error(gl, where) {
-    let err = gl.getError();
-    if (err !== gl.NO_ERROR) {
-      const key = where + ":" + err;
-      if (!this._gl_error_reports.has(key)) {
-        this._gl_error_reports.add(key);
-        const message = "WebGL2 error " + err + " at " + where;
-        console.error(message);
-        if (typeof window.makepad_report_browser_issue === "function") {
-          window.makepad_report_browser_issue("webgl.error", {
-            where: where,
-            error: err,
-            message: message,
-          });
+  // With checks on (gl_checks), allocations are checked for a GL error
+  // later, not where they happen: gl.getError() waits for the GPU process to
+  // finish everything queued, which behind a busy GPU stalls this thread for
+  // whole GPU frames (25-100 ms per allocating frame, every plate change and
+  // resize). `undo` takes back what one allocation made (delete what it
+  // created, invalidate what it re-specified) when a later check finds an
+  // error; until then the resource is used as allocated (a failed texture
+  // samples black, a failed buffer draws nothing). With checks off, nothing.
+  defer_allocation_check(undo) {
+    if (!this.gl_checks) {
+      return;
+    }
+    const pending = this.pending_allocation_checks || (this.pending_allocation_checks = []);
+    if (pending.length === 0) {
+      this.pending_allocation_since = performance.now();
+    }
+    pending.push(undo);
+  }
+
+  // One getError for every allocation since the last check: when `idle`
+  // (no earlier frame on the GPU, so it is cheap), when the oldest is
+  // MAKEPAD_WEBGL_ALLOCATION_CHECK_MS old, or when `force`d. On an error
+  // every allocation since the last clean check is undone (fail closed: the
+  // error cannot say which one failed). Returns the error read (0 if none
+  // or not checked).
+  check_allocations(force, idle) {
+    const pending = this.pending_allocation_checks;
+    if (!pending || pending.length === 0) {
+      return 0;
+    }
+    if (this.webgl_context_lost) {
+      this.pending_allocation_checks = [];
+      return 0;
+    }
+    if (!force && !idle && performance.now() - this.pending_allocation_since < MAKEPAD_WEBGL_ALLOCATION_CHECK_MS) {
+      return 0;
+    }
+    const gl = this.gl;
+    this.pending_allocation_checks = [];
+    const error = gl.getError();
+    if (error === gl.NO_ERROR) {
+      return 0;
+    }
+    const key = "allocation:" + error;
+    const reports = this._gl_error_reports || (this._gl_error_reports = new Set());
+    if (!reports.has(key)) {
+      reports.add(key);
+      const message = `WebGL2 error ${error} after ${pending.length} allocation(s): they are undone`;
+      console.error(message);
+      if (typeof window !== "undefined" && typeof window.makepad_report_browser_issue === "function") {
+        window.makepad_report_browser_issue("webgl.error", { where: "allocation", error, message });
+      }
+    }
+    for (const undo of pending) {
+      try {
+        undo(error);
+      } catch (_error) {
+      }
+    }
+    return error;
+  }
+
+  report_render_target_size_once(kind, detail) {
+    const reports = this._render_target_size_reports ||
+      (this._render_target_size_reports = new Set());
+    if (reports.has(kind)) {
+      return;
+    }
+    reports.add(kind);
+    const message = `makepad: WebGL render target ${kind}`;
+    if (kind === "scaled to safety limits") {
+      console.warn(message, detail);
+    } else {
+      console.error(message, detail);
+    }
+  }
+
+  reset_active_render_target_textures() {
+    if (!this.active_render_target_textures) {
+      this.active_render_target_textures = new Set();
+      return;
+    }
+    this.active_render_target_textures.clear();
+  }
+
+  set_active_render_target_textures(color_attachments, depth_attachment) {
+    this.reset_active_render_target_textures();
+    for (const texture of color_attachments) {
+      this.active_render_target_textures.add(texture);
+    }
+    if (depth_attachment) {
+      this.active_render_target_textures.add(depth_attachment);
+    }
+  }
+
+  reject_render_target(reason, args) {
+    this.reset_active_render_target_textures();
+    this.render_target_rejected = true;
+    if (args && Array.isArray(args.color_targets)) {
+      for (const target of args.color_targets) {
+        const texture = target && this.textures && this.textures[target.texture_id];
+        if (texture) {
+          texture._render_target_valid = false;
+        }
+      }
+    }
+    if (args && args.depth_target && args.depth_target.attached) {
+      const texture = this.textures && this.textures[args.depth_target.texture_id];
+      if (texture) {
+        texture._render_target_valid = false;
+      }
+    }
+    this.report_render_target_size_once("rejected", {
+      reason,
+      width: args && args.width,
+      height: args && args.height,
+      limits: this.webgl_limits,
+    });
+    if (!this.webgl_context_lost && this.gl) {
+      try {
+        this.gl.bindFramebuffer(this.gl.FRAMEBUFFER, null);
+        this.gl.viewport(0, 0, 0, 0);
+      } catch (_error) {
+      }
+    }
+  }
+
+  report_vertex_submission_once(key, reason, detail) {
+    if (this.gl?.isContextLost?.()) throw new Error("WebGL context lost during submission");
+    const reports = this._vertex_submission_reports ||
+      (this._vertex_submission_reports = new Set());
+    if (reports.has(key) || reports.size >= MAKEPAD_WEBGL_MAX_SUBMISSION_REPORTS) {
+      return;
+    }
+    reports.add(key);
+    console.error(`makepad: WebGL vertex submission rejected: ${reason}`, detail);
+  }
+
+  numeric_buffer_for_update(table, buffer_id, kind) {
+    if (!Number.isSafeInteger(buffer_id) || buffer_id < 0) {
+      this.report_vertex_submission_once(
+        `${kind}:invalid-id`,
+        `${kind} buffer id is not a nonnegative safe integer`,
+        { buffer_id },
+      );
+      return null;
+    }
+    let buffer = table[buffer_id];
+    if (!buffer) {
+      buffer = table[buffer_id] = {
+        gl_buf: null,
+        upload_version: 0,
+      };
+    }
+    buffer.upload_version = (buffer.upload_version || 0) + 1;
+    buffer.valid = false;
+    buffer.byte_length = 0;
+    buffer.length = 0;
+    if (kind === "index") {
+      buffer.index_type = null;
+      buffer.index_width = 0;
+      buffer.max_index = -1;
+    } else {
+      buffer.source_kind = null;
+    }
+    return buffer;
+  }
+
+  validate_wasm_slice(slice, element_size, length_is_bytes, label) {
+    if (!slice || !Number.isSafeInteger(slice.ptr) || slice.ptr < 0) {
+      return { ok: false, reason: `${label} pointer is invalid` };
+    }
+    if (!Number.isSafeInteger(slice.len) || slice.len < 0) {
+      return { ok: false, reason: `${label} length is invalid` };
+    }
+    if (slice.ptr % element_size !== 0) {
+      return { ok: false, reason: `${label} pointer is unaligned` };
+    }
+    const byte_length = length_is_bytes
+      ? slice.len
+      : makepad_safe_product(slice.len, element_size);
+    if (byte_length === null || byte_length % element_size !== 0) {
+      return { ok: false, reason: `${label} byte length is invalid` };
+    }
+    const end = makepad_safe_sum(slice.ptr, byte_length);
+    const memory = this.memory && this.memory.buffer;
+    if (
+      (byte_length > 0 && slice.ptr === 0) ||
+      end === null ||
+      !memory ||
+      !Number.isSafeInteger(memory.byteLength) ||
+      end > memory.byteLength
+    ) {
+      return { ok: false, reason: `${label} is outside Wasm memory` };
+    }
+    return {
+      ok: true,
+      byte_length,
+      element_count: byte_length / element_size,
+      memory,
+    };
+  }
+
+  make_validated_wasm_view(slice, element_size, length_is_bytes, label, Type) {
+    const checked = this.validate_wasm_slice(
+      slice,
+      element_size,
+      length_is_bytes,
+      label,
+    );
+    if (!checked.ok) {
+      return checked;
+    }
+    try {
+      return {
+        ...checked,
+        array: new Type(checked.memory, slice.ptr, checked.element_count),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: `${label} view could not be created: ${error && error.message ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  report_texture_upload_once(fault_class, reason, detail) {
+    const reports = this._texture_upload_reports ||
+      (this._texture_upload_reports = new Set());
+    if (
+      reports.has(fault_class) ||
+      reports.size >= MAKEPAD_WEBGL_MAX_SUBMISSION_REPORTS
+    ) {
+      return;
+    }
+    reports.add(fault_class);
+    console.error(`makepad: WebGL texture upload rejected: ${reason}`, detail);
+  }
+
+  clear_texture_upload_allocation(texture) {
+    if (!texture) {
+      return;
+    }
+    texture._texture_upload_width = undefined;
+    texture._texture_upload_height = undefined;
+    texture._texture_upload_format = undefined;
+  }
+
+  clear_render_target_allocation(texture) {
+    if (!texture) {
+      return;
+    }
+    texture._width = undefined;
+    texture._height = undefined;
+    texture._requested_width = undefined;
+    texture._requested_height = undefined;
+    texture._format = undefined;
+    texture._depth = undefined;
+  }
+
+  invalidate_texture_dependencies(texture) {
+    if (!texture) {
+      return;
+    }
+    texture._render_target_valid = false;
+    this.clear_render_target_allocation(texture);
+    for (const framebuffer of this.framebuffers || []) {
+      if (
+        framebuffer &&
+        ((Array.isArray(framebuffer._color_attachments) &&
+          framebuffer._color_attachments.includes(texture)) ||
+          framebuffer._depth_attachment === texture)
+      ) {
+        // The GL attachment is repaired by the next render-pass begin. Drop
+        // the identity cache now so it cannot conceal a replaced object.
+        framebuffer._color_attachments = undefined;
+        framebuffer._depth_attachment = undefined;
+      }
+    }
+    if (
+      this.active_render_target_textures &&
+      this.active_render_target_textures.has(texture)
+    ) {
+      this.active_render_target_textures.clear();
+      this.render_target_rejected = true;
+    }
+  }
+
+  reject_texture_upload(args, fault_class, reason, detail = {}) {
+    const texture_id = args && args.texture_id;
+    if (Number.isSafeInteger(texture_id) && texture_id >= 0) {
+      const texture = this.textures && this.textures[texture_id];
+      this.invalidate_texture_dependencies(texture);
+      const invalid_ids = this._invalid_texture_upload_ids ||
+        (this._invalid_texture_upload_ids = new Set());
+      invalid_ids.add(texture_id);
+    }
+    this.report_texture_upload_once(fault_class, reason, {
+      texture_id,
+      width: args && args.width,
+      height: args && args.height,
+      ...detail,
+    });
+    return null;
+  }
+
+  admit_texture_upload(args, options) {
+    if (!args || !Number.isSafeInteger(args.texture_id) || args.texture_id < 0) {
+      return this.reject_texture_upload(
+        args,
+        "invalid-id",
+        "texture id is not a nonnegative safe integer",
+      );
+    }
+    if (
+      !Number.isSafeInteger(args.width) ||
+      !Number.isSafeInteger(args.height) ||
+      args.width <= 0 ||
+      args.height <= 0
+    ) {
+      return this.reject_texture_upload(
+        args,
+        "invalid-dimensions",
+        "texture dimensions must be positive safe integers",
+      );
+    }
+    if (options.faces === 6 && !options.array && args.width !== args.height) {
+      return this.reject_texture_upload(
+        args,
+        "non-square-cube",
+        "cube texture faces must be square",
+      );
+    }
+
+    const limits = this.webgl_limits || {};
+    const max_dimension = makepad_webgl_limit(
+      options.faces === 6 && !options.array
+        ? limits.max_cube_map_texture_size
+        : limits.max_texture_size,
+    );
+    if (args.width > max_dimension || args.height > max_dimension) {
+      return this.reject_texture_upload(
+        args,
+        "device-dimension-limit",
+        "texture dimensions exceed the cached WebGL device limit",
+        { max_dimension },
+      );
+    }
+
+    const face_texels = makepad_safe_product(args.width, args.height);
+    const texels = face_texels === null
+      ? null
+      : makepad_safe_product(face_texels, options.faces);
+    const allocation_bytes = texels === null
+      ? null
+      : makepad_safe_product(texels, options.bytes_per_texel);
+    const required_elements = texels === null
+      ? null
+      : makepad_safe_product(texels, options.elements_per_texel);
+    if (
+      face_texels === null ||
+      texels === null ||
+      allocation_bytes === null ||
+      required_elements === null
+    ) {
+      return this.reject_texture_upload(
+        args,
+        "unsafe-size",
+        "texture size arithmetic is unsafe",
+      );
+    }
+
+    const data = args.data;
+    if (!data || !Number.isSafeInteger(data.ptr) || data.ptr < 0) {
+      return this.reject_texture_upload(
+        args,
+        "invalid-source-pointer",
+        "texture source pointer is invalid",
+      );
+    }
+    if (!Number.isSafeInteger(data.len) || data.len < 0) {
+      return this.reject_texture_upload(
+        args,
+        "invalid-source-length",
+        "texture source length is invalid",
+      );
+    }
+    if (data.ptr % options.element_size !== 0) {
+      return this.reject_texture_upload(
+        args,
+        "unaligned-source",
+        "texture source pointer is unaligned",
+      );
+    }
+    if (data.len < required_elements) {
+      return this.reject_texture_upload(
+        args,
+        "short-source",
+        "texture source is shorter than the full texel allocation",
+        { required_elements, declared_elements: data.len },
+      );
+    }
+    const declared_bytes = makepad_safe_product(data.len, options.element_size);
+    const end = declared_bytes === null
+      ? null
+      : makepad_safe_sum(data.ptr, declared_bytes);
+    const memory = this.memory && this.memory.buffer;
+    if (
+      data.ptr === 0 ||
+      declared_bytes === null ||
+      end === null ||
+      !memory ||
+      !Number.isSafeInteger(memory.byteLength) ||
+      end > memory.byteLength
+    ) {
+      return this.reject_texture_upload(
+        args,
+        "source-memory-range",
+        "texture source is outside Wasm memory",
+      );
+    }
+    return {
+      args,
+      options,
+      memory,
+      face_texels,
+      texels,
+      allocation_bytes,
+      required_elements,
+    };
+  }
+
+  make_texture_source_view(admission, Type) {
+    try {
+      return new Type(
+        admission.memory,
+        admission.args.data.ptr,
+        admission.required_elements,
+      );
+    } catch (error) {
+      return this.reject_texture_upload(
+        admission.args,
+        "source-view",
+        `texture source view could not be created: ${error && error.message ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  get_bgra_upload_scratch(count) {
+    if (
+      !(this.bgra_upload_scratch instanceof Uint32Array) ||
+      this.bgra_upload_scratch.length < count ||
+      // Not kept at more than twice what uploads need.
+      this.bgra_upload_scratch.length > count * 2
+    ) {
+      this.bgra_upload_scratch = new Uint32Array(count);
+    }
+    return this.bgra_upload_scratch;
+  }
+
+  make_bgra_upload_view(admission) {
+    const source = this.make_texture_source_view(admission, Uint32Array);
+    if (!source) {
+      return null;
+    }
+    try {
+      const converted = this.get_bgra_upload_scratch(admission.required_elements);
+      for (let i = 0; i < admission.required_elements; i++) {
+        converted[i] = makepad_swap_red_blue(source[i]);
+      }
+      return new Uint8Array(
+        converted.buffer,
+        0,
+        admission.required_elements * 4,
+      );
+    } catch (error) {
+      return this.reject_texture_upload(
+        admission.args,
+        "bgra-conversion",
+        `BGRA texture conversion failed: ${error && error.message ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  // The texture target a shader sampler type binds.
+  sampler_target(ty) {
+    const gl = this.gl;
+    if (ty === "samplerCube") return gl.TEXTURE_CUBE_MAP;
+    if (ty === "sampler2DArray") return gl.TEXTURE_2D_ARRAY;
+    return gl.TEXTURE_2D;
+  }
+
+  configure_texture_parameters(gl, target, nearest, cube) {
+    const filter = nearest ? gl.NEAREST : gl.LINEAR;
+    gl.texParameteri(target, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(target, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(target, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(target, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (cube) {
+      gl.texParameteri(target, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    }
+  }
+
+  // A 1x1 texture for a sampler the draw gave none: opaque black RGBA, or
+  // for a shadow sampler (`shadow`) a depth texture at the far plane (a
+  // shadow sampler reading a colour texture is a GL_INVALID_OPERATION that
+  // drops the whole draw), so nothing is shadowed.
+  get_sampler_fallback_texture(target, shadow = false) {
+    const gl = this.gl;
+    if (!gl || this.webgl_context_lost) {
+      return null;
+    }
+    const key = shadow ? "shadow" : target;
+    const textures = this._sampler_fallback_textures ||
+      (this._sampler_fallback_textures = new Map());
+    if (textures.has(key)) {
+      return textures.get(key);
+    }
+    const failures = this._sampler_fallback_texture_failures ||
+      (this._sampler_fallback_texture_failures = new Set());
+    if (failures.has(key)) {
+      return null;
+    }
+
+    let texture = null;
+    try {
+      texture = gl.createTexture();
+      if (!texture) {
+        throw new Error("WebGL sampler fallback allocation returned null");
+      }
+      const cube = target === gl.TEXTURE_CUBE_MAP;
+      gl.bindTexture(target, texture);
+      this.configure_texture_parameters(gl, target, false, cube);
+      const pixel = new Uint8Array(4);
+      const faces = cube
+        ? [
+            gl.TEXTURE_CUBE_MAP_POSITIVE_X,
+            gl.TEXTURE_CUBE_MAP_NEGATIVE_X,
+            gl.TEXTURE_CUBE_MAP_POSITIVE_Y,
+            gl.TEXTURE_CUBE_MAP_NEGATIVE_Y,
+            gl.TEXTURE_CUBE_MAP_POSITIVE_Z,
+            gl.TEXTURE_CUBE_MAP_NEGATIVE_Z,
+          ]
+        : [gl.TEXTURE_2D];
+      if (target === gl.TEXTURE_2D_ARRAY) {
+        gl.texImage3D(target, 0, gl.RGBA, 1, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+      } else if (shadow) {
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.DEPTH_COMPONENT32F,
+          1,
+          1,
+          0,
+          gl.DEPTH_COMPONENT,
+          gl.FLOAT,
+          new Float32Array([1]),
+        );
+      } else {
+        for (const face of faces) {
+          gl.texImage2D(
+            face,
+            0,
+            gl.RGBA,
+            1,
+            1,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            pixel,
+          );
+        }
+      }
+      const allocation_error = this.gl_checks ? gl.getError() : gl.NO_ERROR;
+      if (allocation_error !== gl.NO_ERROR) {
+        throw new Error(`WebGL sampler fallback allocation error ${allocation_error}`);
+      }
+    } catch (_error) {
+      failures.add(key);
+      if (texture) {
+        try {
+          gl.deleteTexture(texture);
+        } catch (_delete_error) {
+        }
+      }
+      return null;
+    }
+
+    texture._texture_target = target;
+    texture._render_target_valid = true;
+    textures.set(key, texture);
+    return texture;
+  }
+
+  // The texture's storage holds a valid `upload_format` image of this size,
+  // so new data can go into it without allocating.
+  can_update_texture_in_place(texture, width, height, upload_format) {
+    return (
+      texture._texture_upload_width === width &&
+      texture._texture_upload_height === height &&
+      texture._texture_upload_format === upload_format &&
+      texture._width === undefined &&
+      texture._height === undefined &&
+      texture._format === undefined &&
+      texture._depth === undefined &&
+      texture._render_target_valid !== false
+    );
+  }
+
+  upload_admitted_texture(admission, upload_format, source, upload) {
+    const gl = this.gl;
+    const args = admission.args;
+    const target = admission.options.array
+      ? gl.TEXTURE_2D_ARRAY
+      : admission.options.faces === 6
+        ? gl.TEXTURE_CUBE_MAP
+        : gl.TEXTURE_2D;
+    const old_texture = this.textures[args.texture_id];
+    const replace = !!old_texture && old_texture._texture_target !== target;
+    let texture = replace ? null : old_texture;
+    let created = false;
+
+    if (!texture) {
+      try {
+        texture = gl.createTexture();
+      } catch (error) {
+        return this.reject_texture_upload(
+          args,
+          "create-texture-exception",
+          `WebGL texture allocation threw: ${error && error.message ? error.message : String(error)}`,
+        );
+      }
+      if (!texture) {
+        return this.reject_texture_upload(
+          args,
+          "create-texture-null",
+          "WebGL texture allocation returned null",
+        );
+      }
+      created = true;
+    }
+
+    const allocation_changed =
+      created ||
+      !this.can_update_texture_in_place(texture, args.width, args.height, upload_format);
+    if (allocation_changed && old_texture) {
+      this.invalidate_texture_dependencies(old_texture);
+    }
+    texture._render_target_valid = false;
+    try {
+      gl.bindTexture(target, texture);
+      if (allocation_changed) {
+        this.configure_texture_parameters(
+          gl,
+          target,
+          admission.options.nearest,
+          admission.options.faces === 6 && !admission.options.array,
+        );
+      }
+      upload(gl, target, allocation_changed, source, admission);
+      if (allocation_changed) {
+        this.defer_allocation_check((allocation_error) => {
+          const current = this.textures[args.texture_id] === texture;
+          if (created && current) {
+            try {
+              gl.deleteTexture(texture);
+            } catch (_delete_error) {
+            }
+            this.textures[args.texture_id] = undefined;
+          }
+          this.invalidate_texture_dependencies(texture);
+          if (current) {
+            this.reject_texture_upload(args, "gl-upload", `WebGL texture upload failed: WebGL texture allocation error ${allocation_error}`);
+          }
+        });
+      }
+    } catch (error) {
+      if (created) {
+        try {
+          gl.deleteTexture(texture);
+        } catch (_delete_error) {
+        }
+      }
+      this.invalidate_texture_dependencies(old_texture);
+      return this.reject_texture_upload(
+        args,
+        "gl-upload",
+        `WebGL texture upload failed: ${error && error.message ? error.message : String(error)}`,
+      );
+    }
+
+    texture._texture_target = target;
+    texture._texture_upload_width = args.width;
+    texture._texture_upload_height = args.height;
+    texture._texture_upload_format = upload_format;
+    this.clear_render_target_allocation(texture);
+    texture._render_target_valid = true;
+    this.textures[args.texture_id] = texture;
+    if (this._invalid_texture_upload_ids) {
+      this._invalid_texture_upload_ids.delete(args.texture_id);
+    }
+
+    if (replace) {
+      // A WebGLTexture cannot change its first-bound target. Publishing only
+      // after success keeps the old object available for invalidation, while
+      // deleting it prevents an attached FBO from retaining stale storage.
+      this.invalidate_texture_dependencies(old_texture);
+      try {
+        gl.deleteTexture(old_texture);
+      } catch (error) {
+        this.report_texture_upload_once(
+          "delete-replaced-texture",
+          `replaced WebGL texture cleanup failed: ${error && error.message ? error.message : String(error)}`,
+          { texture_id: args.texture_id },
+        );
+      }
+    }
+    return texture;
+  }
+
+  upload_numeric_buffer(gl, target, buffer, array) {
+    let bound = false;
+    try {
+      if (!buffer.gl_buf) {
+        buffer.gl_buf = gl.createBuffer();
+      }
+      if (!buffer.gl_buf) {
+        return { ok: false, reason: "WebGL buffer allocation returned null" };
+      }
+      gl.bindBuffer(target, buffer.gl_buf);
+      bound = true;
+      // Storage grows to the next power of two and shrinks below a quarter
+      // (web_gl.rs charges the upload budget the same way): data that changes
+      // size every frame (kernel geometry, animated instances) updates in place
+      // instead of re-specifying the buffer each frame. Draws read the data's
+      // own length (buffer.byte_length), never the storage's.
+      const previous_byte_length = buffer.gl_buf._buffer_byte_length;
+      const needed = array.byteLength;
+      let capacity = 256;
+      while (capacity < needed) capacity *= 2;
+      const allocation_changed = previous_byte_length === undefined
+        || needed > previous_byte_length
+        || needed * 4 < previous_byte_length && capacity !== previous_byte_length;
+      if (allocation_changed) {
+        gl.bufferData(target, capacity, gl.DYNAMIC_DRAW);
+        buffer.gl_buf._buffer_byte_length = capacity;
+      }
+      if (needed !== 0) {
+        gl.bufferSubData(target, 0, array);
+      }
+      if (allocation_changed) {
+        const gl_buf = buffer.gl_buf;
+        this.defer_allocation_check((error) => {
+          gl_buf._buffer_byte_length = undefined;
+          if (buffer.gl_buf === gl_buf) {
+            buffer.valid = false;
+          }
+          this.report_vertex_submission_once(`buffer-allocation:${error}`, `WebGL buffer upload error ${error}`, {});
+        });
+      }
+      return { ok: true };
+    } catch (error) {
+      if (buffer.gl_buf) {
+        buffer.gl_buf._buffer_byte_length = undefined;
+      }
+      return {
+        ok: false,
+        reason: `WebGL buffer upload failed: ${error && error.message ? error.message : String(error)}`,
+      };
+    } finally {
+      if (bound) {
+        try {
+          gl.bindBuffer(target, null);
+        } catch (_error) {
         }
       }
     }
@@ -267,210 +1212,1241 @@ export class WasmWebGL extends WasmWebBrowser {
     console.error("Missing shader in " + where, shader_id, vao_id);
   }
 
-  FromWasmCompileWebGLShader(args) {
-    function get_attrib_locations(gl, program, base, slots) {
-      let attrib_locs = [];
-      let attribs = slots >> 2;
-      let stride = slots * 4;
-      if ((slots & 3) != 0) attribs++;
-      for (let i = 0; i < attribs; i++) {
-        let size = slots - i * 4;
-        if (size > 4) size = 4;
-        let name = base + i;
-        attrib_locs.push({
-          loc: gl.getAttribLocation(program, name),
-          offset: i * 16,
-          size: size,
-          stride: slots * 4,
-          integer: false,
-          gl_type: gl.FLOAT,
-        });
-      }
+  webgl_type_from_code(code) {
+    switch (code) {
+      case 0:
+        return this.gl.FLOAT;
+      case 1:
+        return this.gl.HALF_FLOAT;
+      case 2:
+        return this.gl.UNSIGNED_SHORT;
+      case 3:
+        return this.gl.SHORT;
+      case 4:
+        return this.gl.UNSIGNED_BYTE;
+      case 5:
+        return this.gl.BYTE;
+      case 6:
+        return this.gl.UNSIGNED_INT;
+      case 7:
+        return this.gl.INT;
+      default:
+        return null;
+    }
+  }
+
+  webgl_attrib_locations(program, base, slots) {
+    let attrib_locs = [];
+    if (!Number.isSafeInteger(slots) || slots < 0 || slots * 4 > 255) {
+      attrib_locs.push({
+        invalid_reason: `legacy ${base} slot count ${slots} has an invalid stride`,
+      });
       return attrib_locs;
     }
+    let attribs = slots >> 2;
+    if ((slots & 3) != 0) attribs++;
+    for (let i = 0; i < attribs; i++) {
+      let size = slots - i * 4;
+      if (size > 4) size = 4;
+      attrib_locs.push({
+        loc: this.gl.getAttribLocation(program, base + i),
+        offset: i * 16,
+        size: size,
+        stride: slots * 4,
+        integer: false,
+        normalized: false,
+        gl_type: this.gl.FLOAT,
+        type_code: 0,
+      });
+    }
+    return attrib_locs;
+  }
 
-    var gl = this.gl;
-    var vsh = gl.createShader(gl.VERTEX_SHADER);
+  webgl_typed_attrib_locations(program, table) {
+    let attrib_locs = [];
+    if (!Array.isArray(table)) {
+      attrib_locs.push({ invalid_reason: "typed attribute table is not an array" });
+      return attrib_locs;
+    }
+    for (let i = 0; i < table.length; i++) {
+      let attrib = table[i];
+      if (!attrib || typeof attrib.name !== "string") {
+        attrib_locs.push({ invalid_reason: `attribute ${i} has no valid name` });
+        continue;
+      }
+      attrib_locs.push({
+        loc: this.gl.getAttribLocation(program, attrib.name),
+        offset: attrib.offset,
+        size: attrib.size,
+        stride: attrib.stride,
+        integer: !!attrib.integer,
+        normalized: !!attrib.normalized,
+        gl_type: this.webgl_type_from_code(attrib.gl_type),
+        type_code: attrib.gl_type,
+      });
+    }
+    return attrib_locs;
+  }
 
-    gl.shaderSource(vsh, args.vertex);
-    gl.compileShader(vsh);
-    if (!gl.getShaderParameter(vsh, gl.COMPILE_STATUS)) {
-      let message =
-        "webgl.compile_fail.vertex " +
-        args.shader_id +
-        " " +
-        gl.getShaderInfoLog(vsh);
-      console.error(message);
-      gl.deleteShader(vsh);
-      this.draw_shaders[args.shader_id] = { compile_failed: true };
+  get_max_vertex_attribs() {
+    if (this.max_vertex_attribs === undefined) {
+      this.max_vertex_attribs = makepad_webgl_vertex_attrib_limit(
+        this.gl.getParameter(this.gl.MAX_VERTEX_ATTRIBS),
+      );
+    }
+    return this.max_vertex_attribs;
+  }
+
+  validate_webgl_attrib_layout(shader) {
+    if (shader.attrib_layout) {
+      return shader.attrib_layout;
+    }
+    const locations = new Set();
+    const validate_group = (attribs, label) => {
+      if (!Array.isArray(attribs)) {
+        return { ok: false, reason: `${label} attributes are missing` };
+      }
+      let stride = null;
+      const active = [];
+      for (let i = 0; i < attribs.length; i++) {
+        const attr = attribs[i];
+        if (attr && attr.invalid_reason) {
+          return { ok: false, reason: attr.invalid_reason };
+        }
+        if (!attr) {
+          return { ok: false, reason: `${label} attribute ${i} is missing` };
+        }
+        if (!Number.isSafeInteger(attr.size) || attr.size < 1 || attr.size > 4) {
+          return { ok: false, reason: `${label} attribute ${i} has invalid component count` };
+        }
+        const type = attr.type_code;
+        const element_size = type === 0 || type === 6 || type === 7
+          ? 4
+          : type === 1 || type === 2 || type === 3
+            ? 2
+            : type === 4 || type === 5
+              ? 1
+              : 0;
+        if (element_size === 0 || attr.gl_type === null || attr.gl_type === undefined) {
+          return { ok: false, reason: `${label} attribute ${i} has unsupported type ${type}` };
+        }
+        if (attr.integer && (type === 0 || type === 1)) {
+          return { ok: false, reason: `${label} integer attribute ${i} uses a floating-point type` };
+        }
+        if (attr.integer && attr.normalized) {
+          return { ok: false, reason: `${label} integer attribute ${i} cannot be normalized` };
+        }
+        if (
+          !Number.isSafeInteger(attr.stride) ||
+          attr.stride <= 0 ||
+          attr.stride > 255
+        ) {
+          return { ok: false, reason: `${label} attribute ${i} has invalid stride ${attr.stride}` };
+        }
+        if (stride === null) {
+          stride = attr.stride;
+        } else if (stride !== attr.stride) {
+          return { ok: false, reason: `${label} attributes disagree on record stride` };
+        }
+        if (!Number.isSafeInteger(attr.offset) || attr.offset < 0) {
+          return { ok: false, reason: `${label} attribute ${i} has invalid offset` };
+        }
+        if (attr.offset % element_size !== 0 || attr.stride % element_size !== 0) {
+          return { ok: false, reason: `${label} attribute ${i} is unaligned` };
+        }
+        const span = makepad_safe_product(attr.size, element_size);
+        const end = span === null ? null : makepad_safe_sum(attr.offset, span);
+        if (end === null || end > attr.stride) {
+          return { ok: false, reason: `${label} attribute ${i} extends past its record` };
+        }
+        if (!Number.isSafeInteger(attr.loc) || attr.loc < -1) {
+          return { ok: false, reason: `${label} attribute ${i} has invalid location` };
+        }
+        if (attr.loc === -1) {
+          continue;
+        }
+        if (attr.loc >= this.get_max_vertex_attribs()) {
+          return { ok: false, reason: `${label} attribute ${i} exceeds MAX_VERTEX_ATTRIBS` };
+        }
+        if (locations.has(attr.loc)) {
+          return { ok: false, reason: `duplicate active attribute location ${attr.loc}` };
+        }
+        locations.add(attr.loc);
+        active.push({ ...attr, element_size, span, end });
+      }
+      return { ok: true, stride: stride === null ? 0 : stride, active };
+    };
+
+    const geometry = validate_group(shader.geom_attribs, "geometry");
+    if (!geometry.ok) {
+      shader.attrib_layout = geometry;
+      return geometry;
+    }
+    const instance = validate_group(shader.inst_attribs, "instance");
+    if (!instance.ok) {
+      shader.attrib_layout = instance;
+      return instance;
+    }
+    shader.attrib_layout = { ok: true, geometry, instance };
+    return shader.attrib_layout;
+  }
+
+  schedule_webgl_shader_summary() {
+    if (
+      this.pending_webgl_shader_count != 0 ||
+      this.webgl_shader_timeline_start === undefined ||
+      this.webgl_shader_summary_timer !== undefined
+    ) {
       return;
     }
+    this.webgl_shader_summary_timer = setTimeout(() => {
+      this.webgl_shader_summary_timer = undefined;
+      if (this.pending_webgl_shader_count != 0) {
+        return;
+      }
+      if (this.webgl_shader_batch_failed_count > 0) {
+        console.error(
+          `webgl shaders: ${this.webgl_shader_batch_program_count} programs, ${this.webgl_shader_batch_failed_count} failed, ${(performance.now() - this.webgl_shader_timeline_start).toFixed(1)} ms`,
+        );
+      }
+      this.webgl_shader_timeline_start = undefined;
+      this.webgl_shader_batch_program_count = 0;
+      this.webgl_shader_batch_failed_count = 0;
+    }, 0);
+  }
 
-    // compile pixelshader
-    var fsh = gl.createShader(gl.FRAGMENT_SHADER);
-    gl.shaderSource(fsh, args.pixel);
-    gl.compileShader(fsh);
-    if (!gl.getShaderParameter(fsh, gl.COMPILE_STATUS)) {
-      let message =
-        "webgl.compile_fail.fragment " +
-        args.shader_id +
-        " " +
-        gl.getShaderInfoLog(fsh);
-      console.error(message);
-      gl.deleteShader(vsh);
-      gl.deleteShader(fsh);
-      this.draw_shaders[args.shader_id] = { compile_failed: true };
-      return;
-    }
-    var program = gl.createProgram();
-    gl.attachShader(program, vsh);
-    gl.attachShader(program, fsh);
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      let message =
-        "webgl.compile_fail.link " +
-        args.shader_id +
-        " " +
-        gl.getProgramInfoLog(program);
-      console.error(message);
-      gl.deleteShader(vsh);
-      gl.deleteShader(fsh);
-      gl.deleteProgram(program);
-      this.draw_shaders[args.shader_id] = { compile_failed: true };
-      return;
-    }
+  fail_webgl_shader(shader, stage, info_log) {
+    let gl = this.gl;
+    console.error(
+      "webgl.compile_fail." + stage + " " + shader.shader_id + " " + info_log,
+    );
+    gl.deleteShader(shader.vsh);
+    gl.deleteShader(shader.fsh);
+    gl.deleteProgram(shader.program);
+    this.draw_shaders[shader.shader_id] = { compile_failed: true };
+    this.pending_webgl_shader_count -= shader.pending ? 1 : 0;
+    shader.pending = false;
+    this.webgl_shader_batch_failed_count++;
+    this.to_wasm.ToWasmWebGLShadersDone({ count: 1, waited: 0 });
+    this.schedule_webgl_shader_summary();
+  }
 
-    gl.deleteShader(vsh);
-    gl.deleteShader(fsh);
-    this.assert_no_gl_error(gl, "compile_shader");
+  finish_webgl_shader(shader) {
+    let gl = this.gl;
+    let status_started = performance.now();
+    let vertex_ok = gl.getShaderParameter(shader.vsh, gl.COMPILE_STATUS);
+    let fragment_ok = gl.getShaderParameter(shader.fsh, gl.COMPILE_STATUS);
+    let link_ok = gl.getProgramParameter(shader.program, gl.LINK_STATUS);
+    shader.status_ms += performance.now() - status_started;
+
+    if (!vertex_ok) {
+      this.fail_webgl_shader(shader, "vertex", gl.getShaderInfoLog(shader.vsh));
+      return false;
+    }
+    if (!fragment_ok) {
+      this.fail_webgl_shader(shader, "fragment", gl.getShaderInfoLog(shader.fsh));
+      return false;
+    }
+    if (!link_ok) {
+      this.fail_webgl_shader(shader, "link", gl.getProgramInfoLog(shader.program));
+      return false;
+    }
 
     let texture_locs = [];
-    for (let i = 0; i < args.textures.length; i++) {
-      let tex_name = args.textures[i].name;
-      let loc = gl.getUniformLocation(program, "tex_" + tex_name);
+    for (let i = 0; i < shader.textures.length; i++) {
+      let tex_name = shader.textures[i].name;
+      let loc = gl.getUniformLocation(shader.program, "tex_" + tex_name);
       if (loc === null) {
-        // Keep old fallback names for non-script shaders.
-        loc = gl.getUniformLocation(program, "ds_" + tex_name);
+        loc = gl.getUniformLocation(shader.program, "ds_" + tex_name);
       }
       texture_locs.push({
         name: tex_name,
-        ty: args.textures[i].ty,
+        ty: shader.textures[i].ty,
         loc: loc,
       });
     }
 
-    let pass_uniforms_binding = this.get_uniform_block_binding(
-      program,
-      "passUniforms",
-    );
-    let draw_list_uniforms_binding = this.get_uniform_block_binding(
-      program,
-      "draw_listUniforms",
-    );
-    let draw_call_uniforms_binding = this.get_uniform_block_binding(
-      program,
-      "draw_callUniforms",
-    );
-    let user_uniforms_binding = this.get_uniform_block_binding(
-      program,
-      "userUniforms",
-    );
-    let live_uniforms_binding = this.get_uniform_block_binding(
-      program,
-      "liveUniforms",
-    );
-    this.draw_shaders[args.shader_id] = {
+    // Instance data past the vertex attributes (shader_glsl.rs).
+    const inst_data_loc = gl.getUniformLocation(shader.program, "mp_inst_data");
+
+    let pass_uniform_buf = null;
+    let draw_list_uniform_buf = null;
+    let live_uniform_buf = null;
+    try {
+      pass_uniform_buf = gl.createBuffer();
+      draw_list_uniform_buf = gl.createBuffer();
+      live_uniform_buf = gl.createBuffer();
+    } catch (_error) {
+    }
+    const finished_shader = {
+      vertex: shader.vertex,
+      pixel: shader.pixel,
+      geom_attribs:
+        shader.geom_attribs && shader.geom_attribs.length
+          ? this.webgl_typed_attrib_locations(shader.program, shader.geom_attribs)
+          : this.webgl_attrib_locations(
+              shader.program,
+              "packed_geometry_",
+              shader.geometry_slots,
+            ),
+      // A record wider than an attribute stride is read whole from
+      // `mp_inst_data`: no instance attributes.
+      inst_attribs:
+        inst_data_loc && shader.instance_slots * 4 > MAKEPAD_WEBGL_MAX_ATTRIB_STRIDE
+          ? []
+          : shader.inst_attribs && shader.inst_attribs.length
+          ? this.webgl_typed_attrib_locations(shader.program, shader.inst_attribs)
+          : this.webgl_attrib_locations(
+              shader.program,
+              "packed_instance_",
+              shader.instance_slots,
+            ),
+      inst_data_loc,
+      pass_uniforms_binding: this.get_uniform_block_binding(
+        shader.program,
+        "passUniforms",
+      ),
+      draw_list_uniforms_binding: this.get_uniform_block_binding(
+        shader.program,
+        "draw_listUniforms",
+      ),
+      draw_call_uniforms_binding: this.get_uniform_block_binding(
+        shader.program,
+        "draw_callUniforms",
+      ),
+      user_uniforms_binding: this.get_uniform_block_binding(
+        shader.program,
+        "userUniforms",
+      ),
+      live_uniforms_binding: this.get_uniform_block_binding(
+        shader.program,
+        "liveUniforms",
+      ),
+      clip_y_flip_loc: gl.getUniformLocation(shader.program, "mp_clip_y_flip"),
+      frag_y_loc: gl.getUniformLocation(shader.program, "mp_frag_y"),
+      pass_uniform_buf,
+      draw_list_uniform_buf,
+      live_uniform_buf,
+      uniform_buffers_valid:
+        !!pass_uniform_buf && !!draw_list_uniform_buf && !!live_uniform_buf,
+      texture_locs: texture_locs,
+      geometry_slots: shader.geometry_slots,
+      instance_slots: shader.instance_slots,
+      program: shader.program,
+      version: (this._webgl_shader_version || 0) + 1,
+    };
+    this._webgl_shader_version = finished_shader.version;
+    this.draw_shaders[shader.shader_id] = finished_shader;
+    gl.deleteShader(shader.vsh);
+    gl.deleteShader(shader.fsh);
+    this.pending_webgl_shader_count -= shader.pending ? 1 : 0;
+    shader.pending = false;
+    // (an error here is read with the next allocation check)
+    this.defer_allocation_check(() => {});
+    // The wasm side counts queued compiles; this closes one so
+    // Cx::draw_shaders_pending can tell a bake its draws are no longer dropped.
+    // With first draws spread, it stays open until the program's first draw.
+    if (this.first_draw_spread) {
+      finished_shader.first_draw_waiting = true;
+      this.to_wasm.ToWasmWebGLShadersLinked({ count: 1 });
+    } else {
+      this.to_wasm.ToWasmWebGLShadersDone({ count: 1, waited: 0 });
+    }
+    this.schedule_webgl_shader_summary();
+    return true;
+  }
+
+  poll_pending_webgl_shaders() {
+    if (
+      this.webgl_context_lost ||
+      !this.parallel_shader_compile ||
+      this.pending_webgl_shader_count == 0
+    ) {
+      return 0;
+    }
+    let ready_count = 0;
+    for (let shader of this.draw_shaders) {
+      if (!shader || !shader.pending) {
+        continue;
+      }
+      let status_started = performance.now();
+      let complete = this.gl.getProgramParameter(
+        shader.program,
+        this.parallel_shader_compile.COMPLETION_STATUS_KHR,
+      );
+      shader.status_ms += performance.now() - status_started;
+      if (complete && this.finish_webgl_shader(shader)) {
+        ready_count++;
+      }
+    }
+    return ready_count;
+  }
+
+  schedule_webgl_shader_poll() {
+    if (
+      this.webgl_context_lost ||
+      this.webgl_shader_poll_frame_id ||
+      this.pending_webgl_shader_count == 0
+    ) {
+      return;
+    }
+    this.webgl_shader_poll_frame_id = window.requestAnimationFrame(() => {
+      this.webgl_shader_poll_frame_id = 0;
+      if (this.wasm == null || this.webgl_context_lost) {
+        return;
+      }
+      // An animation frame is coming: it takes the programs up at its start
+      // (see FromWasmRequestAnimationFrame), before its own GL work.
+      if (this.req_anim_frame_id) {
+        this.schedule_webgl_shader_poll();
+        return;
+      }
+      if (this.poll_pending_webgl_shaders() != 0) {
+        this.to_wasm.ToWasmRedrawAll();
+        this.FromWasmRequestAnimationFrame();
+      }
+      this.schedule_webgl_shader_poll();
+    });
+  }
+
+  // Spread programs' first draws one a frame (Cx::spread_first_draws). Off,
+  // the programs still waiting for theirs are released.
+  FromWasmSpreadFirstDraws(args) {
+    this.first_draw_spread = !!args.on;
+    if (this.first_draw_spread) {
+      return;
+    }
+    let released = 0;
+    for (const shader of this.draw_shaders) {
+      if (shader && shader.first_draw_waiting) {
+        shader.first_draw_waiting = false;
+        released++;
+      }
+    }
+    if (released != 0) {
+      this.to_wasm.ToWasmWebGLShadersDone({ count: released, waited: released });
+      this.to_wasm.ToWasmRedrawAll();
+      this.FromWasmRequestAnimationFrame();
+    }
+  }
+
+  FromWasmCompileWebGLShader(args) {
+    let gl = this.gl;
+    let started_at = performance.now();
+    if (this.webgl_shader_timeline_start === undefined) {
+      this.webgl_shader_timeline_start = started_at;
+    }
+    this.webgl_shader_batch_program_count++;
+
+    let vsh = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vsh, args.vertex);
+    let stage_started = performance.now();
+    gl.compileShader(vsh);
+    let vertex_ms = performance.now() - stage_started;
+
+    let fsh = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fsh, args.pixel);
+    stage_started = performance.now();
+    gl.compileShader(fsh);
+    let fragment_ms = performance.now() - stage_started;
+
+    let program = gl.createProgram();
+    gl.attachShader(program, vsh);
+    gl.attachShader(program, fsh);
+    stage_started = performance.now();
+    gl.linkProgram(program);
+    let link_ms = performance.now() - stage_started;
+
+    let shader = {
+      shader_id: args.shader_id,
       vertex: args.vertex,
       pixel: args.pixel,
-      geom_attribs: get_attrib_locations(
-        gl,
-        program,
-        "packed_geometry_",
-        args.geometry_slots,
-      ),
-      inst_attribs: get_attrib_locations(
-        gl,
-        program,
-        "packed_instance_",
-        args.instance_slots,
-      ),
-      pass_uniforms_binding: pass_uniforms_binding,
-      draw_list_uniforms_binding: draw_list_uniforms_binding,
-      draw_call_uniforms_binding: draw_call_uniforms_binding,
-      user_uniforms_binding: user_uniforms_binding,
-      live_uniforms_binding: live_uniforms_binding,
-      pass_uniform_buf: gl.createBuffer(),
-      draw_list_uniform_buf: gl.createBuffer(),
-      draw_call_uniform_buf: gl.createBuffer(),
-      user_uniform_buf: gl.createBuffer(),
-      live_uniform_buf: gl.createBuffer(),
-      texture_locs: texture_locs,
       geometry_slots: args.geometry_slots,
       instance_slots: args.instance_slots,
+      textures: args.textures,
+      geom_attribs: args.geom_attribs,
+      inst_attribs: args.inst_attribs,
+      vsh: vsh,
+      fsh: fsh,
       program: program,
+      pending: !!this.parallel_shader_compile,
+      started_at: started_at,
+      vertex_ms: vertex_ms,
+      fragment_ms: fragment_ms,
+      link_ms: link_ms,
+      status_ms: 0,
     };
-    this.assert_no_gl_error(gl, "compile_shader_end");
+    this.draw_shaders[args.shader_id] = shader;
+
+    if (shader.pending) {
+      this.pending_webgl_shader_count++;
+      this.schedule_webgl_shader_poll();
+    } else {
+      this.finish_webgl_shader(shader);
+    }
   }
 
   FromWasmAllocIndexBuffer(args) {
-    var gl = this.gl;
-
-    let buf = this.index_buffers[args.buffer_id];
-    if (buf === undefined) {
-      buf = this.index_buffers[args.buffer_id] = {
-        gl_buf: gl.createBuffer(),
-      };
-    }
-    let array = new Uint32Array(
-      this.memory.buffer,
-      args.data.ptr,
-      args.data.len,
+    const gl = this.gl;
+    const buffer_id = args && args.buffer_id;
+    const buffer = this.numeric_buffer_for_update(
+      this.index_buffers,
+      buffer_id,
+      "index",
     );
-    buf.length = array.length;
+    if (!buffer) {
+      return;
+    }
+    const reject = (reason) => {
+      this.report_vertex_submission_once(
+        `index-upload:${buffer_id}:${reason}`,
+        reason,
+        { buffer_id, upload_version: buffer.upload_version },
+      );
+    };
+    const index_width = args && args.index_width;
+    if (index_width !== 2 && index_width !== 4) {
+      reject(`unsupported index width ${index_width}`);
+      return;
+    }
+    if (
+      !args.data ||
+      !Number.isSafeInteger(args.data.len) ||
+      args.data.len < 0 ||
+      !args.byte_data ||
+      !Number.isSafeInteger(args.byte_data.len) ||
+      args.byte_data.len < 0
+    ) {
+      reject("index upload descriptors are invalid");
+      return;
+    }
+    if (
+      index_width === 2 &&
+      args.data &&
+      Number.isSafeInteger(args.data.len) &&
+      args.data.len !== 0
+    ) {
+      reject("u16 index upload also contains u32 data");
+      return;
+    }
+    if (
+      index_width === 4 &&
+      args.byte_data &&
+      Number.isSafeInteger(args.byte_data.len) &&
+      args.byte_data.len !== 0
+    ) {
+      reject("u32 index upload also contains byte data");
+      return;
+    }
+    const inactive_index_slice = index_width === 2
+      ? this.validate_wasm_slice(args.data, 4, false, "unused u32 index data")
+      : this.validate_wasm_slice(args.byte_data, 1, true, "unused byte index data");
+    if (!inactive_index_slice.ok) {
+      reject(inactive_index_slice.reason);
+      return;
+    }
 
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf.gl_buf);
-    this.upload_buffer_data(gl, gl.ELEMENT_ARRAY_BUFFER, buf.gl_buf, array, gl.STATIC_DRAW);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
+    const checked = index_width === 2
+      ? this.make_validated_wasm_view(
+          args.byte_data,
+          2,
+          true,
+          "u16 index data",
+          Uint16Array,
+        )
+      : this.make_validated_wasm_view(
+          args.data,
+          4,
+          false,
+          "u32 index data",
+          Uint32Array,
+        );
+    if (!checked.ok) {
+      reject(checked.reason);
+      return;
+    }
+
+    let max_index = -1;
+    const restart_index = index_width === 2 ? 0xffff : 0xffffffff;
+    for (let i = 0; i < checked.array.length; i++) {
+      const index = checked.array[i];
+      if (index === restart_index) {
+        reject(`fixed primitive-restart index 0x${restart_index.toString(16)} is not valid in TRIANGLES data`);
+        return;
+      }
+      if (index > max_index) {
+        max_index = index;
+      }
+    }
+
+    const uploaded = this.upload_numeric_buffer(
+      gl,
+      gl.ELEMENT_ARRAY_BUFFER,
+      buffer,
+      checked.array,
+    );
+    if (!uploaded.ok) {
+      reject(uploaded.reason);
+      return;
+    }
+    buffer.valid = true;
+    buffer.byte_length = checked.byte_length;
+    buffer.length = checked.element_count;
+    buffer.index_width = index_width;
+    buffer.index_type = index_width === 2 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_INT;
+    buffer.max_index = max_index;
+  }
+
+  FromWasmRetainedArrayBuffer(args) {
+    const gl = this.gl;
+    const buffer = this.numeric_buffer_for_update(this.array_buffers, args?.buffer_id, "array");
+    if (!buffer) return;
+    const reject = (reason) => {
+      buffer.retained_capacity = 0;
+      this.report_vertex_submission_once(`retained:${args.buffer_id}:${reason}`, reason, { buffer_id: args.buffer_id });
+    };
+    const checked = this.make_validated_wasm_view(args.data, 4, false, "retained instances", Float32Array);
+    if (!checked.ok || !Number.isSafeInteger(args.first_slot) || args.first_slot < 0 || args.first_slot > args.data.len) {
+      reject(checked.reason || "invalid retained upload range");
+      return;
+    }
+    let bound = false;
+    try {
+      let first = args.first_slot;
+      if (!buffer.gl_buf) buffer.gl_buf = gl.createBuffer();
+      if (!buffer.gl_buf) { reject("retained buffer allocation returned null"); return; }
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer.gl_buf);
+      bound = true;
+      if (first === 0 || !buffer.retained_capacity || checked.byte_length > buffer.retained_capacity) {
+        let capacity = 256;
+        while (capacity < checked.byte_length) capacity *= 2;
+        gl.bufferData(gl.ARRAY_BUFFER, capacity, gl.STATIC_DRAW);
+        const gl_buf = buffer.gl_buf;
+        this.defer_allocation_check(() => {
+          gl_buf._buffer_byte_length = undefined;
+          if (buffer.gl_buf === gl_buf) {
+            buffer.valid = false;
+            reject("retained buffer allocation failed");
+          }
+        });
+        buffer.retained_capacity = capacity;
+        buffer.gl_buf._buffer_byte_length = capacity;
+        first = 0;
+      }
+      for (let offset = first; offset < checked.element_count; offset += 65536) {
+        gl.bufferSubData(gl.ARRAY_BUFFER, offset * 4, checked.array, offset, Math.min(65536, checked.element_count - offset));
+      }
+      buffer.valid = true;
+      buffer.byte_length = checked.byte_length;
+      buffer.length = checked.element_count;
+      buffer.source_kind = "f32";
+      // Browser/driver owns in-flight backing stores. No fabricated completion.
+    } catch (error) {
+      reject(`retained upload failed: ${error?.message || error}`);
+    } finally {
+      if (bound) { try { gl.bindBuffer(gl.ARRAY_BUFFER, null); } catch (_) {} }
+    }
+  }
+
+  FromWasmRetainedArrayUpdate(args) {
+    const gl = this.gl;
+    const validInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+    const reject = (reason) => {
+      this.report_vertex_submission_once(
+        `retained-delta:${args?.buffer_id}:${reason}`, reason, { buffer_id: args?.buffer_id });
+      if (validInteger(args?.buffer_id)) {
+        this.to_wasm.ToWasmRetainedUploadFailed({ buffer_id: args.buffer_id });
+      }
+    };
+    if (!validInteger(args?.buffer_id) || !validInteger(args.slot_count) ||
+        !validInteger(args.capacity_bytes) || args.capacity_bytes < args.slot_count * 4 ||
+        !Array.isArray(args.copies) || !Array.isArray(args.writes)) {
+      reject("invalid retained delta metadata"); return;
+    }
+    const previous = this.array_buffers[args.buffer_id];
+    const byteLength = makepad_safe_product(args.slot_count, 4);
+    if (byteLength === null) { reject("retained delta size overflow"); return; }
+    const writes = [];
+    for (const write of args.writes) {
+      const checked = this.make_validated_wasm_view(write.data, 4, false, "retained segment", Float32Array);
+      if (!checked.ok || !validInteger(write.destination_slot) ||
+          write.destination_slot + checked.element_count > args.slot_count) {
+        reject(checked.reason || "retained segment is outside destination"); return;
+      }
+      if (!args.replace && checked.element_count && write.destination_slot < (previous?.length || 0)) {
+        reject("retained patch requires a replacement backing"); return;
+      }
+      writes.push({ offset: write.destination_slot * 4, data: checked.array });
+    }
+    for (const copy of args.copies) {
+      if (!validInteger(copy.source_slot) || !validInteger(copy.destination_slot) ||
+          !validInteger(copy.slot_count) || !previous?.valid ||
+          copy.source_slot + copy.slot_count > previous.length ||
+          copy.destination_slot + copy.slot_count > args.slot_count ||
+          (!args.replace && copy.source_slot !== copy.destination_slot)) {
+        reject("invalid retained GPU copy range"); return;
+      }
+    }
+    if (!args.replace && (!previous?.valid || args.capacity_bytes > previous.retained_capacity)) {
+      reject("retained update has no compatible backing"); return;
+    }
+    let destination = previous?.gl_buf;
+    let installed = false;
+    try {
+      if (args.replace) {
+        destination = gl.createBuffer();
+        if (!destination) { reject("retained allocation returned null"); return; }
+        gl.bindBuffer(gl.COPY_WRITE_BUFFER, destination);
+        gl.bufferData(gl.COPY_WRITE_BUFFER, args.capacity_bytes, gl.STATIC_DRAW);
+        if (args.copies.length) {
+          gl.bindBuffer(gl.COPY_READ_BUFFER, previous.gl_buf);
+          for (const copy of args.copies) {
+            if (copy.slot_count) gl.copyBufferSubData(gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER,
+              copy.source_slot * 4, copy.destination_slot * 4, copy.slot_count * 4);
+          }
+        }
+      } else {
+        gl.bindBuffer(gl.COPY_WRITE_BUFFER, destination);
+      }
+      for (const write of writes) {
+        if (write.data.length) gl.bufferSubData(gl.COPY_WRITE_BUFFER, write.offset, write.data);
+      }
+      destination._buffer_byte_length = args.capacity_bytes;
+      const installed_buffer = this.array_buffers[args.buffer_id] = {
+        gl_buf: destination, valid: true, byte_length: byteLength, length: args.slot_count,
+        retained_capacity: args.capacity_bytes, source_kind: "f32",
+        upload_version: (previous?.upload_version || 0) + 1,
+      };
+      installed = true;
+      if (args.replace) {
+        // A failed allocation sends the whole list again (the page asks for it).
+        this.defer_allocation_check(() => {
+          if (this.array_buffers[args.buffer_id] === installed_buffer) {
+            installed_buffer.valid = false;
+            reject("retained allocation failed");
+          }
+        });
+      }
+      // The command stream retains storage read by earlier draws and copies.
+      if (args.replace && previous?.gl_buf) gl.deleteBuffer(previous.gl_buf);
+    } catch (error) {
+      reject(`retained delta failed: ${error?.message || error}`);
+    } finally {
+      gl.bindBuffer(gl.COPY_READ_BUFFER, null);
+      gl.bindBuffer(gl.COPY_WRITE_BUFFER, null);
+      if (!installed && args.replace && destination) gl.deleteBuffer(destination);
+    }
   }
 
   FromWasmAllocArrayBuffer(args) {
-    var gl = this.gl;
-
-    let buf = this.array_buffers[args.buffer_id];
-    if (buf === undefined) {
-      buf = this.array_buffers[args.buffer_id] = {
-        gl_buf: gl.createBuffer(),
-      };
+    const gl = this.gl;
+    const buffer_id = args && args.buffer_id;
+    const buffer = this.numeric_buffer_for_update(
+      this.array_buffers,
+      buffer_id,
+      "array",
+    );
+    if (!buffer) {
+      return;
+    }
+    const reject = (reason) => {
+      this.report_vertex_submission_once(
+        `array-upload:${buffer_id}:${reason}`,
+        reason,
+        { buffer_id, upload_version: buffer.upload_version },
+      );
+    };
+    const byte_length = args && args.byte_data && args.byte_data.len;
+    const float_length = args && args.data && args.data.len;
+    if (
+      !args ||
+      !args.byte_data ||
+      !Number.isSafeInteger(byte_length) ||
+      byte_length < 0 ||
+      !args.data ||
+      !Number.isSafeInteger(float_length) ||
+      float_length < 0
+    ) {
+      reject("array upload descriptors are invalid");
+      return;
+    }
+    if (
+      Number.isSafeInteger(byte_length) &&
+      byte_length !== 0 &&
+      Number.isSafeInteger(float_length) &&
+      float_length !== 0
+    ) {
+      reject("array upload contains both byte and f32 data");
+      return;
+    }
+    const compact = Number.isSafeInteger(byte_length) && byte_length !== 0;
+    const inactive_array_slice = compact
+      ? this.validate_wasm_slice(args.data, 4, false, "unused f32 vertex data")
+      : this.validate_wasm_slice(args.byte_data, 1, true, "unused byte vertex data");
+    if (!inactive_array_slice.ok) {
+      reject(inactive_array_slice.reason);
+      return;
+    }
+    const checked = compact
+      ? this.make_validated_wasm_view(
+          args.byte_data,
+          1,
+          true,
+          "byte vertex data",
+          Uint8Array,
+        )
+      : this.make_validated_wasm_view(
+          args && args.data,
+          4,
+          false,
+          "f32 vertex data",
+          Float32Array,
+        );
+    if (!checked.ok) {
+      reject(checked.reason);
+      return;
     }
 
-    let array = new Float32Array(
-      this.memory.buffer,
-      args.data.ptr,
-      args.data.len,
+    // Do not reject NaN f32 words here. Legacy layouts bit-cast integer IDs
+    // through f32 storage, and those payloads can legitimately spell a NaN.
+    const uploaded = this.upload_numeric_buffer(
+      gl,
+      gl.ARRAY_BUFFER,
+      buffer,
+      checked.array,
     );
-    buf.length = array.length;
+    if (!uploaded.ok) {
+      reject(uploaded.reason);
+      return;
+    }
+    buffer.valid = true;
+    buffer.byte_length = checked.byte_length;
+    buffer.length = checked.element_count;
+    buffer.source_kind = compact ? "bytes" : "f32";
+    buffer.retained_capacity = 0;
+  }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, buf.gl_buf);
-    this.upload_buffer_data(gl, gl.ARRAY_BUFFER, buf.gl_buf, array, gl.STATIC_DRAW);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  preflight_webgl_draw(args, vao, shader) {
+    const geometry_buffer = this.array_buffers[vao.geom_vb_id];
+    const instance_buffer = this.array_buffers[vao.inst_vb_id];
+    const index_buffer = this.index_buffers[vao.geom_ib_id];
+    if (!geometry_buffer || !geometry_buffer.valid || !geometry_buffer.gl_buf) {
+      return { ok: false, reason: "geometry buffer is missing or invalid" };
+    }
+    if (!instance_buffer || !instance_buffer.valid || !instance_buffer.gl_buf) {
+      return { ok: false, reason: "instance buffer is missing or invalid" };
+    }
+    if (!index_buffer || !index_buffer.valid || !index_buffer.gl_buf) {
+      return { ok: false, reason: "index buffer is missing or invalid" };
+    }
+    if (!shader.program) {
+      return { ok: false, reason: "shader program allocation failed" };
+    }
+    if (shader.uniform_buffers_valid === false || vao.uniform_buffers_valid === false) {
+      return { ok: false, reason: "uniform buffer allocation failed" };
+    }
+    const layout = this.validate_webgl_attrib_layout(shader);
+    if (!layout.ok) {
+      return layout;
+    }
+    if (
+      (args.index_width !== 2 && args.index_width !== 4) ||
+      args.index_width !== index_buffer.index_width
+    ) {
+      return {
+        ok: false,
+        reason: `draw index width ${args.index_width} does not match uploaded width ${index_buffer.index_width}`,
+      };
+    }
+    if (
+      !Number.isSafeInteger(index_buffer.length) ||
+      index_buffer.length < 0 ||
+      !Number.isSafeInteger(index_buffer.max_index) ||
+      index_buffer.max_index < -1
+    ) {
+      return { ok: false, reason: "index buffer metadata is invalid" };
+    }
+
+    const geometry_stride = layout.geometry.stride;
+    if (
+      geometry_stride > 0 &&
+      geometry_buffer.byte_length % geometry_stride !== 0
+    ) {
+      return { ok: false, reason: "geometry buffer contains a partial record" };
+    }
+    if (index_buffer.max_index >= 0) {
+      for (const attr of layout.geometry.active) {
+        const record_offset = makepad_safe_product(
+          index_buffer.max_index,
+          geometry_stride,
+        );
+        const required = record_offset === null
+          ? null
+          : makepad_safe_sum(record_offset, attr.end);
+        if (required === null || required > geometry_buffer.byte_length) {
+          return {
+            ok: false,
+            reason: `geometry attribute at location ${attr.loc} is out of bounds for index ${index_buffer.max_index}`,
+          };
+        }
+      }
+    }
+
+    // A shader reading instance data from `mp_inst_data` has the record's
+    // whole width as its stride, whichever part of it are attributes.
+    const instance_stride = shader.inst_data_loc
+      ? shader.instance_slots * 4
+      : layout.instance.stride;
+    let instances = 0;
+    if (instance_stride === 0) {
+      if (instance_buffer.byte_length !== 0) {
+        return {
+          ok: false,
+          reason: "instance buffer has data but no physical attribute stride",
+        };
+      }
+    } else {
+      if (instance_buffer.byte_length % instance_stride !== 0) {
+        return { ok: false, reason: "instance buffer contains a partial record" };
+      }
+      instances = instance_buffer.byte_length / instance_stride;
+      if (!Number.isSafeInteger(instances)) {
+        return { ok: false, reason: "instance count is not a safe integer" };
+      }
+    }
+    const expanded_triangles = makepad_safe_product(
+      Math.floor(index_buffer.length / 3),
+      instances,
+    );
+    if (expanded_triangles === null) {
+      return { ok: false, reason: "expanded triangle count is unsafe" };
+    }
+
+    const uniform_slices = [
+      ["pass uniforms", args.pass_uniforms],
+      ["draw-list uniforms", args.draw_list_uniforms],
+      ["draw-call uniforms", args.draw_call_uniforms],
+      ["user uniforms", args.user_uniforms],
+      ["live uniforms", args.live_uniforms],
+    ];
+    for (const [label, slice] of uniform_slices) {
+      const checked = this.validate_wasm_slice(slice, 4, false, label);
+      if (!checked.ok) {
+        return checked;
+      }
+    }
+    if (
+      this.xr !== undefined &&
+      this.xr.in_xr_pass &&
+      args.pass_uniforms.len < 48
+    ) {
+      return { ok: false, reason: "XR pass uniform buffer is shorter than 48 f32 values" };
+    }
+
+    const uniform_blocks = [
+      [shader.pass_uniforms_binding, shader.pass_uniform_buf, "pass"],
+      [shader.draw_list_uniforms_binding, shader.draw_list_uniform_buf, "draw-list"],
+      [shader.draw_call_uniforms_binding, vao.draw_call_uniform_buf, "draw-call"],
+      [shader.user_uniforms_binding, vao.user_uniform_buf, "user"],
+      [shader.live_uniforms_binding, shader.live_uniform_buf, "live"],
+    ];
+    for (const [binding, buffer, label] of uniform_blocks) {
+      if (binding !== null && !buffer) {
+        return { ok: false, reason: `${label} uniform buffer allocation failed` };
+      }
+    }
+
+    if (!Array.isArray(shader.texture_locs)) {
+      return { ok: false, reason: "shader texture metadata is invalid" };
+    }
+    const sampler_textures = new Array(shader.texture_locs.length);
+    for (let i = 0; i < shader.texture_locs.length; i++) {
+      const texture_loc = shader.texture_locs[i];
+      if (!texture_loc || texture_loc.loc == null) {
+        continue;
+      }
+      const texture_id = args.textures && args.textures[i];
+      const expected_target = this.sampler_target(texture_loc.ty);
+      let texture;
+      if (texture_id === undefined) {
+        texture = this.get_sampler_fallback_texture(expected_target, texture_loc.ty === "sampler2DShadow");
+      } else {
+        if (!Number.isSafeInteger(texture_id) || texture_id < 0) {
+          return { ok: false, reason: `texture ${i} has an invalid id` };
+        }
+        texture = this.textures[texture_id];
+        if (!texture) {
+          if (
+            this._invalid_texture_upload_ids &&
+            this._invalid_texture_upload_ids.has(texture_id)
+          ) {
+            return { ok: false, reason: `texture ${texture_id} is invalid` };
+          }
+          texture = this.get_sampler_fallback_texture(expected_target, texture_loc.ty === "sampler2DShadow");
+        } else {
+          if (texture._render_target_valid === false) {
+            return { ok: false, reason: `texture ${texture_id} is invalid` };
+          }
+          if (
+            texture._texture_target !== undefined &&
+            texture._texture_target !== expected_target
+          ) {
+            return {
+              ok: false,
+              reason: `texture ${texture_id} has the wrong sampler target`,
+            };
+          }
+          if (
+            this.active_render_target_textures &&
+            this.active_render_target_textures.has(texture)
+          ) {
+            return {
+              ok: false,
+              reason: `texture ${texture_id} is an active render target`,
+            };
+          }
+        }
+      }
+      if (!texture) {
+        return { ok: false, reason: "sampler fallback texture allocation failed" };
+      }
+      sampler_textures[i] = texture;
+    }
+
+    let instance_data_texture = null;
+    if (shader.inst_data_loc) {
+      const mirrored = this.instance_data_texture(vao.inst_vb_id, instance_buffer);
+      if (!mirrored.ok) {
+        return mirrored;
+      }
+      instance_data_texture = mirrored.texture;
+    }
+
+    return {
+      ok: true,
+      geometry_buffer,
+      instance_buffer,
+      index_buffer,
+      layout,
+      sampler_textures,
+      instance_data_texture,
+      indices: index_buffer.length,
+      instances,
+    };
+  }
+
+  // The instance buffer's words as an R32UI texture (`mp_inst_data`): row
+  // major at the device's widest texture, copied on the GPU from the buffer
+  // (PIXEL_UNPACK_BUFFER) whenever the buffer was uploaded again. Rows grow
+  // to the next power of two and shrink below a quarter, as buffers do, so
+  // instance counts that change every frame update it in place.
+  instance_data_texture(buffer_id, buffer) {
+    const gl = this.gl;
+    if (!this.instance_data_textures) {
+      this.instance_data_textures = new Map();
+    }
+    let entry = this.instance_data_textures.get(buffer_id);
+    if (
+      entry &&
+      entry.buffer === buffer &&
+      entry.upload_version === buffer.upload_version &&
+      entry.gl_buf === buffer.gl_buf &&
+      entry.byte_length === buffer.byte_length
+    ) {
+      return { ok: true, texture: entry.texture };
+    }
+    const words = buffer.byte_length / 4;
+    const max = this.webgl_limits.max_texture_size;
+    const width = max;
+    const rows = Math.max(1, Math.ceil(words / width));
+    if (rows > max) {
+      return { ok: false, reason: `instance data of ${words} words exceed a ${max}x${max} texture` };
+    }
+    let bound_unpack = false;
+    try {
+      if (!entry) {
+        const texture = gl.createTexture();
+        if (!texture) {
+          return { ok: false, reason: "instance data texture allocation returned null" };
+        }
+        entry = { texture, rows: 0 };
+        this.instance_data_textures.set(buffer_id, entry);
+      }
+      gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+      let capacity = 1;
+      while (capacity < rows) capacity *= 2;
+      capacity = Math.min(capacity, max);
+      if (entry.rows < rows || (rows * 4 < entry.rows && capacity !== entry.rows)) {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32UI, width, capacity, 0, gl.RED_INTEGER, gl.UNSIGNED_INT, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        entry.rows = capacity;
+      }
+      if (words > 0) {
+        gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, buffer.gl_buf);
+        bound_unpack = true;
+        const full_rows = Math.floor(words / width);
+        if (full_rows > 0) {
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, full_rows, gl.RED_INTEGER, gl.UNSIGNED_INT, 0);
+        }
+        const rest = words - full_rows * width;
+        if (rest > 0) {
+          gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, full_rows, rest, 1, gl.RED_INTEGER, gl.UNSIGNED_INT, full_rows * width * 4);
+        }
+      }
+    } catch (error) {
+      return { ok: false, reason: `instance data texture upload failed: ${error && error.message ? error.message : String(error)}` };
+    } finally {
+      if (bound_unpack) {
+        try {
+          gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
+        } catch (_error) {
+        }
+      }
+    }
+    entry.buffer = buffer;
+    entry.upload_version = buffer.upload_version;
+    entry.gl_buf = buffer.gl_buf;
+    entry.byte_length = buffer.byte_length;
+    return { ok: true, texture: entry.texture };
+  }
+
+  configure_webgl_vao(vao, shader, preflight) {
+    const gl = this.gl;
+    const layout = preflight.layout;
+    let new_vao = null;
+    try {
+      new_vao = gl.createVertexArray();
+      if (!new_vao) {
+        return false;
+      }
+      gl.bindVertexArray(new_vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, preflight.geometry_buffer.gl_buf);
+      for (const attr of layout.geometry.active) {
+        if (attr.integer) {
+          gl.vertexAttribIPointer(
+            attr.loc,
+            attr.size,
+            attr.gl_type,
+            attr.stride,
+            attr.offset,
+          );
+        } else {
+          gl.vertexAttribPointer(
+            attr.loc,
+            attr.size,
+            attr.gl_type,
+            !!attr.normalized,
+            attr.stride,
+            attr.offset,
+          );
+        }
+        gl.enableVertexAttribArray(attr.loc);
+        gl.vertexAttribDivisor(attr.loc, 0);
+      }
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, preflight.instance_buffer.gl_buf);
+      for (const attr of layout.instance.active) {
+        if (attr.integer) {
+          gl.vertexAttribIPointer(
+            attr.loc,
+            attr.size,
+            attr.gl_type,
+            attr.stride,
+            attr.offset,
+          );
+        } else {
+          gl.vertexAttribPointer(
+            attr.loc,
+            attr.size,
+            attr.gl_type,
+            !!attr.normalized,
+            attr.stride,
+            attr.offset,
+          );
+        }
+        gl.enableVertexAttribArray(attr.loc);
+        gl.vertexAttribDivisor(attr.loc, 1);
+      }
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, preflight.index_buffer.gl_buf);
+      gl.bindVertexArray(null);
+    } catch (error) {
+      try {
+        gl.bindVertexArray(null);
+      } catch (_bind_error) {
+      }
+      if (new_vao && typeof gl.deleteVertexArray === "function") {
+        gl.deleteVertexArray(new_vao);
+      }
+      this.report_vertex_submission_once(
+        `vao-config:${vao.shader_id}:${vao.geom_vb_id}:${vao.inst_vb_id}`,
+        `VAO configuration failed: ${error && error.message ? error.message : String(error)}`,
+        { vao },
+      );
+      return false;
+    }
+
+    const old_gl_vao = vao.gl_vao;
+    vao.gl_vao = new_vao;
+    vao.ready = true;
+    vao.shader_version = shader.version;
+    vao.geometry_gl_buf = preflight.geometry_buffer.gl_buf;
+    vao.instance_gl_buf = preflight.instance_buffer.gl_buf;
+    vao.index_gl_buf = preflight.index_buffer.gl_buf;
+    this.reset_uniform_buffer_upload_cache(vao.draw_call_uniform_buf);
+    this.reset_uniform_buffer_upload_cache(vao.user_uniform_buf);
+    if (old_gl_vao && typeof gl.deleteVertexArray === "function") {
+      gl.deleteVertexArray(old_gl_vao);
+    }
+    return true;
   }
 
   FromWasmAllocVao(args) {
     let gl = this.gl;
+    if (
+      !args ||
+      !Number.isSafeInteger(args.vao_id) ||
+      args.vao_id < 0 ||
+      !Number.isSafeInteger(args.shader_id) ||
+      args.shader_id < 0 ||
+      !Number.isSafeInteger(args.geom_ib_id) ||
+      args.geom_ib_id < 0 ||
+      !Number.isSafeInteger(args.geom_vb_id) ||
+      args.geom_vb_id < 0 ||
+      !Number.isSafeInteger(args.inst_vb_id) ||
+      args.inst_vb_id < 0
+    ) {
+      this.report_vertex_submission_once(
+        "vao:invalid-metadata",
+        "VAO ids are not nonnegative safe integers",
+        { args },
+      );
+      return;
+    }
     let old_vao = this.vaos[args.vao_id];
-    if (old_vao) {
+    if (old_vao && old_vao.gl_vao) {
       gl.deleteVertexArray(old_vao.gl_vao);
     }
-    let gl_vao = gl.createVertexArray();
+    let draw_call_uniform_buf = old_vao && old_vao.draw_call_uniform_buf;
+    let user_uniform_buf = old_vao && old_vao.user_uniform_buf;
+    try {
+      draw_call_uniform_buf = draw_call_uniform_buf || gl.createBuffer();
+      user_uniform_buf = user_uniform_buf || gl.createBuffer();
+    } catch (_error) {
+    }
     let vao = (this.vaos[args.vao_id] = {
-      gl_vao: gl_vao,
+      gl_vao: null,
+      shader_id: args.shader_id,
       geom_ib_id: args.geom_ib_id,
       geom_vb_id: args.geom_vb_id,
       inst_vb_id: args.inst_vb_id,
+      draw_call_uniform_buf,
+      user_uniform_buf,
+      uniform_buffers_valid: !!draw_call_uniform_buf && !!user_uniform_buf,
+      ready: false,
     });
-
-    gl.bindVertexArray(vao.gl_vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.array_buffers[args.geom_vb_id].gl_buf);
 
     let shader = this.draw_shaders[args.shader_id];
     if (!shader || shader.compile_failed) {
@@ -481,75 +2457,111 @@ export class WasmWebGL extends WasmWebBrowser {
       );
       return;
     }
+    // Configuration is deliberately lazy. Draw preflight knows the uploaded
+    // maximum index and can reject bad geometry before any attrib pointer call.
+  }
 
-    for (let i = 0; i < shader.geom_attribs.length; i++) {
-      let attr = shader.geom_attribs[i];
-      if (attr.loc < 0) {
-        continue;
+  FromWasmFreeWebGLResources(args) {
+    const gl = this.gl;
+    const array_buffer_ids = new Set(args.array_buffer_ids || []);
+    const index_buffer_ids = new Set(args.index_buffer_ids || []);
+    const vao_ids = new Set(args.vao_ids || []);
+
+    // Deleting a buffer does not release it while a VAO still references it.
+    // Find all dependants in one table pass (rather than one scan per id) and
+    // retire their private uniform buffers along with the VAO.
+    for (let id = 0; id < this.vaos.length; id++) {
+      const vao = this.vaos[id];
+      if (
+        vao &&
+        (array_buffer_ids.has(vao.geom_vb_id) ||
+          array_buffer_ids.has(vao.inst_vb_id) ||
+          index_buffer_ids.has(vao.geom_ib_id))
+      ) {
+        vao_ids.add(id);
       }
-      if (attr.integer) {
-        gl.vertexAttribIPointer(
-          attr.loc,
-          attr.size,
-          attr.gl_type,
-          attr.stride,
-          attr.offset,
-        );
-      } else {
-        gl.vertexAttribPointer(
-          attr.loc,
-          attr.size,
-          attr.gl_type,
-          false,
-          attr.stride,
-          attr.offset,
-        );
-      }
-      gl.enableVertexAttribArray(attr.loc);
-      gl.vertexAttribDivisor(attr.loc, 0);
     }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.array_buffers[args.inst_vb_id].gl_buf);
-
-    for (let i = 0; i < shader.inst_attribs.length; i++) {
-      let attr = shader.inst_attribs[i];
-      if (attr.loc < 0) {
-        continue;
+    for (const id of vao_ids) {
+      const vao = this.vaos[id];
+      if (!vao) continue;
+      if (vao.gl_vao) gl.deleteVertexArray(vao.gl_vao);
+      if (vao.draw_call_uniform_buf) gl.deleteBuffer(vao.draw_call_uniform_buf);
+      if (vao.user_uniform_buf) gl.deleteBuffer(vao.user_uniform_buf);
+      this.vaos[id] = undefined;
+    }
+    for (const id of array_buffer_ids) {
+      const mirror = this.instance_data_textures && this.instance_data_textures.get(id);
+      if (mirror) {
+        gl.deleteTexture(mirror.texture);
+        this.instance_data_textures.delete(id);
       }
-      if (attr.integer) {
-        gl.vertexAttribIPointer(
-          attr.loc,
-          attr.size,
-          attr.gl_type,
-          attr.stride,
-          attr.offset,
-        );
-      } else {
-        gl.vertexAttribPointer(
-          attr.loc,
-          attr.size,
-          attr.gl_type,
-          false,
-          attr.stride,
-          attr.offset,
-        );
+      const buffer = this.array_buffers[id];
+      if (!buffer) continue;
+      if (buffer.gl_buf) gl.deleteBuffer(buffer.gl_buf);
+      this.array_buffers[id] = undefined;
+    }
+    for (const id of index_buffer_ids) {
+      const buffer = this.index_buffers[id];
+      if (!buffer) continue;
+      if (buffer.gl_buf) gl.deleteBuffer(buffer.gl_buf);
+      this.index_buffers[id] = undefined;
+    }
+    for (const id of new Set(args.texture_ids || [])) {
+      if (this._invalid_texture_upload_ids) {
+        this._invalid_texture_upload_ids.delete(id);
       }
-      gl.enableVertexAttribArray(attr.loc);
-      gl.vertexAttribDivisor(attr.loc, 1);
+      const texture = this.textures[id];
+      if (!texture) continue;
+      gl.deleteTexture(texture);
+      this.textures[id] = undefined;
+    }
+    for (const id of new Set(args.framebuffer_ids || [])) {
+      const framebuffer = this.framebuffers[id];
+      if (!framebuffer) continue;
+      gl.deleteFramebuffer(framebuffer);
+      this.framebuffers[id] = undefined;
     }
 
-    gl.bindBuffer(
-      gl.ELEMENT_ARRAY_BUFFER,
-      this.index_buffers[args.geom_ib_id].gl_buf,
-    );
-    gl.bindVertexArray(null);
-
+    // Sparse ids can be reused directly; trimming only empty tails prevents
+    // the JavaScript tables themselves retaining a repeated-cycle highwater.
+    for (const table of [
+      this.vaos,
+      this.array_buffers,
+      this.index_buffers,
+      this.textures,
+      this.framebuffers,
+    ]) {
+      while (table.length && table[table.length - 1] === undefined) {
+        table.pop();
+      }
+    }
   }
 
   FromWasmDrawCall(args) {
+    if (this.render_target_rejected) {
+      return;
+    }
     var gl = this.gl;
+    if (
+      !args ||
+      !Number.isSafeInteger(args.shader_id) ||
+      args.shader_id < 0 ||
+      !Number.isSafeInteger(args.vao_id) ||
+      args.vao_id < 0
+    ) {
+      this.report_vertex_submission_once(
+        "draw:invalid-ids",
+        "draw shader/VAO ids are not nonnegative safe integers",
+        { args },
+      );
+      return;
+    }
 
     let shader = this.draw_shaders[args.shader_id];
+    if (shader && shader.pending) {
+      return;
+    }
     if (!shader || shader.compile_failed) {
       this.report_missing_shader_once(
         "FromWasmDrawCall",
@@ -559,307 +2571,642 @@ export class WasmWebGL extends WasmWebBrowser {
       return;
     }
 
-    gl.useProgram(shader.program);
-    gl.depthMask(!!args.depth_write);
-    if (args.backface_culling) {
-      gl.enable(gl.CULL_FACE);
-      gl.cullFace(gl.BACK);
-    } else {
-      gl.disable(gl.CULL_FACE);
+    let vao = this.vaos[args.vao_id];
+    if (!vao) {
+      this.report_vertex_submission_once(
+        `draw:${args.vao_id}:missing-vao`,
+        "VAO is missing",
+        { shader_id: args.shader_id, vao_id: args.vao_id },
+      );
+      return;
+    }
+    if (vao.shader_id !== args.shader_id) {
+      vao.shader_id = args.shader_id;
+      vao.ready = false;
+    }
+    const preflight = this.preflight_webgl_draw(args, vao, shader);
+    if (!preflight.ok) {
+      if (preflight.not_ready) {
+        return;
+      }
+      this.report_vertex_submission_once(
+        `draw:${args.vao_id}:${preflight.reason}`,
+        preflight.reason,
+        { shader_id: args.shader_id, vao_id: args.vao_id },
+      );
+      return;
+    }
+    const needs_configuration =
+      !vao.ready ||
+      !vao.gl_vao ||
+      vao.shader_version !== shader.version ||
+      vao.geometry_gl_buf !== preflight.geometry_buffer.gl_buf ||
+      vao.instance_gl_buf !== preflight.instance_buffer.gl_buf ||
+      vao.index_gl_buf !== preflight.index_buffer.gl_buf;
+    if (
+      needs_configuration &&
+      !this.configure_webgl_vao(vao, shader, preflight)
+    ) {
+      this.report_vertex_submission_once(
+        `draw:${args.vao_id}:vao-allocation`,
+        "VAO is missing or invalid",
+        { shader_id: args.shader_id, vao_id: args.vao_id },
+      );
+      return;
     }
 
-    let vao = this.vaos[args.vao_id];
+    // A program's first draw is where the driver builds it for this draw (on
+    // Direct3D, ANGLE compiles the shader variant then: up to seconds of the
+    // GPU process for a big one, whatever the link did). Spread, it is the
+    // frame's only first draw; another program's waits for the next frame.
+    if (shader.first_draw_waiting) {
+      if (this.first_draw_this_frame) {
+        this.first_draws_deferred = true;
+        return;
+      }
+      this.first_draw_this_frame = true;
+      shader.first_draw_waiting = false;
+      this.to_wasm.ToWasmWebGLShadersDone({ count: 1, waited: 1 });
+    }
 
-    gl.bindVertexArray(vao.gl_vao);
-
-    let index_buffer = this.index_buffers[vao.geom_ib_id];
-    let instance_buffer = this.array_buffers[vao.inst_vb_id];
-
-    this.upload_uniform_buffer_from_ptr(
-      gl,
-      shader.draw_list_uniform_buf,
-      args.draw_list_uniforms,
-    );
-    this.upload_uniform_buffer_from_ptr(
-      gl,
-      shader.draw_call_uniform_buf,
-      args.draw_call_uniforms,
-    );
-    this.upload_uniform_buffer_from_ptr(
-      gl,
-      shader.user_uniform_buf,
-      args.user_uniforms,
-    );
-    this.upload_uniform_buffer_from_ptr(
-      gl,
-      shader.live_uniform_buf,
-      args.live_uniforms,
-    );
-
-    this.bind_uniform_block(
-      gl,
-      shader.pass_uniforms_binding,
-      shader.pass_uniform_buf,
-    );
-    this.bind_uniform_block(
-      gl,
-      shader.draw_list_uniforms_binding,
-      shader.draw_list_uniform_buf,
-    );
-    this.bind_uniform_block(
-      gl,
-      shader.draw_call_uniforms_binding,
-      shader.draw_call_uniform_buf,
-    );
-    this.bind_uniform_block(
-      gl,
-      shader.user_uniforms_binding,
-      shader.user_uniform_buf,
-    );
-    this.bind_uniform_block(
-      gl,
-      shader.live_uniforms_binding,
-      shader.live_uniform_buf,
-    );
-
-    let indices = index_buffer.length;
-    let instances = instance_buffer.length / shader.instance_slots;
-
-    let texture_slots = shader.texture_locs.length;
-
-    for (let i = 0; i < texture_slots; i++) {
-      let tex_loc = shader.texture_locs[i];
-      let texture_id = args.textures[i];
-      let target =
-        tex_loc.ty === "samplerCube" ? gl.TEXTURE_CUBE_MAP : gl.TEXTURE_2D;
-      if (texture_id !== undefined) {
-        let tex_obj = this.textures[texture_id];
-        gl.activeTexture(gl.TEXTURE0 + i);
-        gl.bindTexture(target, tex_obj);
-        gl.uniform1i(tex_loc.loc, i);
+    let vao_bound = false;
+    try {
+      gl.useProgram(shader.program);
+      gl.depthMask(!!args.depth_write);
+      gl.depthFunc(args.depth_test_greater ? gl.GREATER : gl.LEQUAL);
+      // Blending is the pass default (FromWasmSetDefaultDepthAndBlendMode);
+      // only an alpha_blend=false call turns it off, and restores it in the
+      // finally block, so the default path issues no extra GL calls.
+      if (!args.alpha_blend) {
+        gl.disable(gl.BLEND);
+      } else if (args.blend_max) {
+        gl.blendEquationSeparate(gl.MAX, gl.MAX);
+      }
+      if (args.backface_culling) {
+        gl.enable(gl.CULL_FACE);
+        gl.cullFace(gl.BACK);
       } else {
+        gl.disable(gl.CULL_FACE);
+      }
+      // A framebuffer's rows are stored bottom-up: texture passes invert
+      // every vertex shader's clip-space Y (`mp_clip_y_flip`, applied after
+      // the shader's own vertex code, see shader_glsl.rs), so the texels land
+      // in the top-left row order Metal and D3D produce and every consumer
+      // plain-samples. The inversion reverses triangle winding: front faces
+      // are clockwise there and counter-clockwise on the canvas, matching Metal.
+      const clip_y_flip = this.texture_pass_front_face_cw ? 1 : 0;
+      if (shader.clip_y_flip_loc && shader._clip_y_flip !== clip_y_flip) {
+        gl.uniform1f(shader.clip_y_flip_loc, clip_y_flip);
+        shader._clip_y_flip = clip_y_flip;
+      }
+      // `fragment_position()` counts rows from the target's top: a texture pass already stores
+      // them top-down, the canvas bottom-up (y = height - gl_FragCoord.y).
+      if (shader.frag_y_loc) {
+        const frag_y0 = clip_y_flip ? 0 : gl.drawingBufferHeight;
+        const frag_y1 = clip_y_flip ? 1 : -1;
+        if (shader._frag_y0 !== frag_y0 || shader._frag_y1 !== frag_y1) {
+          gl.uniform2f(shader.frag_y_loc, frag_y0, frag_y1);
+          shader._frag_y0 = frag_y0;
+          shader._frag_y1 = frag_y1;
+        }
+      }
+      gl.frontFace(this.texture_pass_front_face_cw ? gl.CW : gl.CCW);
+      gl.bindVertexArray(vao.gl_vao);
+      vao_bound = true;
+
+      if (args.reset_draw_uniforms) {
+        this.reset_uniform_buffer_upload_cache(vao.draw_call_uniform_buf);
+        this.reset_uniform_buffer_upload_cache(vao.user_uniform_buf);
+      }
+
+      this.upload_uniform_buffer_from_ptr(
+        gl,
+        shader.draw_list_uniform_buf,
+        args.draw_list_uniforms,
+        args.draw_list_uniforms_gen_lo,
+        args.draw_list_uniforms_gen_hi,
+      );
+      this.upload_uniform_buffer_from_ptr(
+        gl,
+        vao.draw_call_uniform_buf,
+        args.draw_call_uniforms,
+        args.draw_call_uniforms_gen_lo,
+        args.draw_call_uniforms_gen_hi,
+      );
+      this.upload_uniform_buffer_from_ptr(
+        gl,
+        vao.user_uniform_buf,
+        args.user_uniforms,
+        args.user_uniforms_gen_lo,
+        args.user_uniforms_gen_hi,
+      );
+      this.upload_uniform_buffer_from_ptr(
+        gl,
+        shader.live_uniform_buf,
+        args.live_uniforms,
+        args.live_uniforms_gen_lo,
+        args.live_uniforms_gen_hi,
+      );
+
+      if (!shader.custom_uniform_buffers) shader.custom_uniform_buffers = [];
+      for (let slot = 0; slot < (args.custom_uniforms || []).length; slot++) {
+        const input = args.custom_uniforms[slot];
+        let entry = shader.custom_uniform_buffers[slot];
+        if (!entry) {
+          entry = { buffer: gl.createBuffer(), binding: this.get_uniform_block_binding(shader.program, input.block_name) };
+          shader.custom_uniform_buffers[slot] = entry;
+        }
+        const checked = this.make_validated_wasm_view(input.data, 1, true, "custom uniforms", Uint8Array);
+        if (!checked.ok || !entry.buffer) continue;
+        if (entry.lo !== input.generation_lo || entry.hi !== input.generation_hi) {
+          this.upload_uniform_buffer_data(gl, entry.buffer, checked.array, gl.DYNAMIC_DRAW);
+          entry.lo = input.generation_lo;
+          entry.hi = input.generation_hi;
+        }
+        this.bind_uniform_block(gl, entry.binding, entry.buffer);
+      }
+      this.bind_uniform_block(gl, shader.pass_uniforms_binding, shader.pass_uniform_buf);
+      this.bind_uniform_block(gl, shader.draw_list_uniforms_binding, shader.draw_list_uniform_buf);
+      this.bind_uniform_block(gl, shader.draw_call_uniforms_binding, vao.draw_call_uniform_buf);
+      this.bind_uniform_block(gl, shader.user_uniforms_binding, vao.user_uniform_buf);
+      this.bind_uniform_block(gl, shader.live_uniforms_binding, shader.live_uniform_buf);
+
+      for (let i = 0; i < shader.texture_locs.length; i++) {
+        const tex_loc = shader.texture_locs[i];
+        if (!tex_loc || tex_loc.loc == null) {
+          continue;
+        }
+        const target = this.sampler_target(tex_loc.ty);
         gl.activeTexture(gl.TEXTURE0 + i);
-        gl.bindTexture(target, null);
+        gl.bindTexture(target, preflight.sampler_textures[i]);
+        const texture = preflight.sampler_textures[i];
+        if (tex_loc.ty === "sampler2DShadow") {
+          gl.texParameteri(target, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+          gl.texParameteri(target, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+          gl.texParameteri(target, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(target, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          texture._compare_ref = true;
+        } else if (texture._compare_ref) {
+          // A depth texture an earlier draw compared in a shadow sampler:
+          // a plain sampler reads its values, which needs comparison off.
+          gl.texParameteri(target, gl.TEXTURE_COMPARE_MODE, gl.NONE);
+          texture._compare_ref = false;
+        }
+        gl.uniform1i(tex_loc.loc, i);
+      }
+      if (shader.inst_data_loc) {
+        const unit = shader.texture_locs.length;
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, preflight.instance_data_texture);
+        gl.uniform1i(shader.inst_data_loc, unit);
+      }
+
+      const xr = this.xr;
+      if (xr !== undefined && xr.in_xr_pass) {
+        const pass_uniforms = new Float32Array(
+          this.memory.buffer,
+          args.pass_uniforms.ptr,
+          args.pass_uniforms.len,
+        );
+        const draw_eye = (eye) => {
+          const viewport = eye.viewport;
+          gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+          for (let i = 0; i < 16; i++) pass_uniforms[i] = eye.projection_matrix[i];
+          for (let i = 0; i < 16; i++) pass_uniforms[i + 16] = eye.transform_matrix[i];
+          for (let i = 0; i < 16; i++) pass_uniforms[i + 32] = eye.invtransform_matrix[i];
+          this.upload_uniform_buffer_data(gl, shader.pass_uniform_buf, pass_uniforms);
+          gl.drawElementsInstanced(
+            gl.TRIANGLES,
+            preflight.indices,
+            preflight.index_buffer.index_type,
+            0,
+            preflight.instances,
+          );
+        };
+        draw_eye(xr.left_eye);
+        draw_eye(xr.right_eye);
+      } else {
+        this.upload_uniform_buffer_from_ptr(
+          gl,
+          shader.pass_uniform_buf,
+          args.pass_uniforms,
+          args.pass_uniforms_gen_lo,
+          args.pass_uniforms_gen_hi,
+        );
+        gl.drawElementsInstanced(
+          gl.TRIANGLES,
+          preflight.indices,
+          preflight.index_buffer.index_type,
+          0,
+          preflight.instances,
+        );
+      }
+    } catch (error) {
+      this.report_vertex_submission_once(
+        `draw:${args.vao_id}:exception`,
+        `draw setup failed: ${error && error.message ? error.message : String(error)}`,
+        { shader_id: args.shader_id, vao_id: args.vao_id },
+      );
+    } finally {
+      if (vao_bound) {
+        try {
+          gl.bindVertexArray(null);
+        } catch (_error) {
+        }
+      }
+      try {
+        gl.depthMask(true);
+      } catch (_error) {
+      }
+      if (!args.alpha_blend) {
+        try {
+          gl.enable(gl.BLEND);
+        } catch (_error) {
+        }
+      } else if (args.blend_max) {
+        try {
+          gl.blendEquationSeparate(gl.FUNC_ADD, gl.FUNC_ADD);
+        } catch (_error) {
+        }
       }
     }
-
-    let xr = this.xr;
-    let pass_uniforms = new Float32Array(
-      this.memory.buffer,
-      args.pass_uniforms.ptr,
-      args.pass_uniforms.len,
-    );
-    if (xr !== undefined && xr.in_xr_pass) {
-      let left = xr.left_eye;
-      let lvp = left.viewport;
-      gl.viewport(lvp.x, lvp.y, lvp.width, lvp.height);
-      let mlp = left.projection_matrix;
-      for (let i = 0; i < 16; i++) pass_uniforms[i] = mlp[i];
-      let mlt = left.transform_matrix;
-      for (let i = 0; i < 16; i++) pass_uniforms[i + 16] = mlt[i];
-      let mli = left.invtransform_matrix;
-      for (let i = 0; i < 16; i++) pass_uniforms[i + 32] = mli[i];
-      this.upload_uniform_buffer_data(
-        gl,
-        shader.pass_uniform_buf,
-        pass_uniforms,
-      );
-      gl.drawElementsInstanced(
-        gl.TRIANGLES,
-        indices,
-        gl.UNSIGNED_INT,
-        0,
-        instances,
-      );
-
-      let right = xr.right_eye;
-      let rvp = right.viewport;
-      gl.viewport(rvp.x, rvp.y, rvp.width, rvp.height);
-      let mrp = right.projection_matrix;
-      for (let i = 0; i < 16; i++) pass_uniforms[i] = mrp[i];
-      let mrt = right.transform_matrix;
-      for (let i = 0; i < 16; i++) pass_uniforms[i + 16] = mrt[i];
-      let mri = right.invtransform_matrix;
-      for (let i = 0; i < 16; i++) pass_uniforms[i + 32] = mri[i];
-      this.upload_uniform_buffer_data(
-        gl,
-        shader.pass_uniform_buf,
-        pass_uniforms,
-      );
-      gl.drawElementsInstanced(
-        gl.TRIANGLES,
-        indices,
-        gl.UNSIGNED_INT,
-        0,
-        instances,
-      );
-    } else {
-      this.upload_uniform_buffer_data(
-        gl,
-        shader.pass_uniform_buf,
-        pass_uniforms,
-      );
-      gl.drawElementsInstanced(
-        gl.TRIANGLES,
-        indices,
-        gl.UNSIGNED_INT,
-        0,
-        instances,
-      );
-    }
-
-    gl.bindVertexArray(null);
-    gl.depthMask(true);
   }
 
   FromWasmAllocTextureImage2D_BGRAu8_32(args) {
-    var gl = this.gl;
-    var gl_tex = this.textures[args.texture_id] || gl.createTexture();
+    const admission = this.admit_texture_upload(args, MAKEPAD_WEBGL_BGRA_IMAGE_UPLOAD);
+    if (!admission) return;
+    const source = this.make_bgra_upload_view(admission);
+    if (!source) return;
+    this.upload_admitted_texture(
+      admission,
+      "bgra8",
+      source,
+      (gl, target, allocate, data, checked) => {
+        if (allocate) {
+          gl.texImage2D(
+            target,
+            0,
+            gl.RGBA,
+            checked.args.width,
+            checked.args.height,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            data,
+          );
+        } else {
+          gl.texSubImage2D(
+            target,
+            0,
+            0,
+            0,
+            checked.args.width,
+            checked.args.height,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            data,
+          );
+        }
+      },
+    );
+  }
 
-    gl.bindTexture(gl.TEXTURE_2D, gl_tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    //gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    let data_array = new Uint8Array(
-      this.memory.buffer,
-      args.data.ptr,
-      args.width * args.height * 4,
-    );
-    //agdconsole.log(args.width, args.height);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA,
-      args.width,
-      args.height,
-      0,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      data_array,
-    );
-    this.textures[args.texture_id] = gl_tex;
+  // Only the changed rect goes up while the texture holds this image at this
+  // size, otherwise the whole image does.
+  FromWasmUpdateTextureRect_BGRAu8_32(args) {
+    const image = {
+      texture_id: args.texture_id,
+      width: args.image_width,
+      height: args.image_height,
+      data: args.data,
+    };
+    const admission = this.admit_texture_upload(image, MAKEPAD_WEBGL_BGRA_IMAGE_UPLOAD);
+    if (!admission) return;
+    const texture = this.textures[args.texture_id];
+    const right = makepad_safe_sum(args.x, args.width);
+    const bottom = makepad_safe_sum(args.y, args.height);
+    const rect_fits =
+      args.width > 0 &&
+      args.height > 0 &&
+      right !== null &&
+      right <= args.image_width &&
+      bottom !== null &&
+      bottom <= args.image_height;
+    if (
+      !texture ||
+      !rect_fits ||
+      !this.can_update_texture_in_place(texture, args.image_width, args.image_height, "bgra8")
+    ) {
+      return this.FromWasmAllocTextureImage2D_BGRAu8_32(image);
+    }
+    const source = this.make_texture_source_view(admission, Uint32Array);
+    if (!source) return;
+    const gl = this.gl;
+    try {
+      const count = args.width * args.height;
+      const converted = this.get_bgra_upload_scratch(count);
+      let out = 0;
+      for (let y = args.y; y < args.y + args.height; y++) {
+        const row = y * args.image_width + args.x;
+        for (let x = 0; x < args.width; x++) {
+          converted[out++] = makepad_swap_red_blue(source[row + x]);
+        }
+      }
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        args.x,
+        args.y,
+        args.width,
+        args.height,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        new Uint8Array(converted.buffer, 0, count * 4),
+      );
+    } catch (error) {
+      this.reject_texture_upload(
+        image,
+        "gl-upload",
+        `WebGL texture upload failed: ${error && error.message ? error.message : String(error)}`,
+      );
+    }
   }
 
   FromWasmAllocTextureImage2D_Ru8(args) {
-    var gl = this.gl;
-    var gl_tex = this.textures[args.texture_id] || gl.createTexture();
-
-    gl.bindTexture(gl.TEXTURE_2D, gl_tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    //gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    let data_array = new Uint8Array(
-      this.memory.buffer,
-      args.data.ptr,
-      args.width * args.height,
+    const admission = this.admit_texture_upload(args, {
+      faces: 1,
+      bytes_per_texel: 1,
+      elements_per_texel: 1,
+      element_size: 1,
+      nearest: false,
+    });
+    if (!admission) return;
+    const source = this.make_texture_source_view(admission, Uint8Array);
+    if (!source) return;
+    this.upload_admitted_texture(
+      admission,
+      "r8",
+      source,
+      (gl, target, allocate, data, checked) => {
+        try {
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+          if (allocate) {
+            gl.texImage2D(
+              target,
+              0,
+              gl.R8,
+              checked.args.width,
+              checked.args.height,
+              0,
+              gl.RED,
+              gl.UNSIGNED_BYTE,
+              data,
+            );
+          } else {
+            gl.texSubImage2D(
+              target,
+              0,
+              0,
+              0,
+              checked.args.width,
+              checked.args.height,
+              gl.RED,
+              gl.UNSIGNED_BYTE,
+              data,
+            );
+          }
+        } finally {
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+        }
+      },
     );
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.R8,
-      args.width,
-      args.height,
-      0,
-      gl.RED,
-      gl.UNSIGNED_BYTE,
-      data_array,
-    );
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-    this.textures[args.texture_id] = gl_tex;
   }
 
   FromWasmAllocTextureImage2D_RGBAf32(args) {
-    let gl = this.gl;
-    let gl_tex = this.textures[args.texture_id] || gl.createTexture();
-
-    gl.bindTexture(gl.TEXTURE_2D, gl_tex);
-    // Data textures are sampled as lookup tables; avoid interpolation artifacts.
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    let data_array = new Float32Array(
-      this.memory.buffer,
-      args.data.ptr,
-      args.width * args.height * 4,
+    const admission = this.admit_texture_upload(args, {
+      faces: 1,
+      bytes_per_texel: 16,
+      elements_per_texel: 4,
+      element_size: 4,
+      nearest: true,
+    });
+    if (!admission) return;
+    const source = this.make_texture_source_view(admission, Float32Array);
+    if (!source) return;
+    this.upload_admitted_texture(
+      admission,
+      "rgba32f",
+      source,
+      (gl, target, allocate, data, checked) => {
+        if (allocate) {
+          gl.texImage2D(
+            target,
+            0,
+            gl.RGBA32F,
+            checked.args.width,
+            checked.args.height,
+            0,
+            gl.RGBA,
+            gl.FLOAT,
+            data,
+          );
+        } else {
+          gl.texSubImage2D(
+            target,
+            0,
+            0,
+            0,
+            checked.args.width,
+            checked.args.height,
+            gl.RGBA,
+            gl.FLOAT,
+            data,
+          );
+        }
+      },
     );
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA32F,
-      args.width,
-      args.height,
-      0,
-      gl.RGBA,
-      gl.FLOAT,
-      data_array,
-    );
-    this.textures[args.texture_id] = gl_tex;
   }
 
   FromWasmAllocTextureCube_BGRAu8_32(args) {
-    var gl = this.gl;
-    var gl_tex = this.textures[args.texture_id] || gl.createTexture();
-
-    gl.bindTexture(gl.TEXTURE_CUBE_MAP, gl_tex);
-    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-
-    let face_size = args.width * args.height * 4;
-    let all_faces = new Uint8Array(
-      this.memory.buffer,
-      args.data.ptr,
-      face_size * 6,
+    const admission = this.admit_texture_upload(args, {
+      faces: 6,
+      bytes_per_texel: 4,
+      elements_per_texel: 1,
+      element_size: 4,
+      nearest: false,
+    });
+    if (!admission) return;
+    const source = this.make_bgra_upload_view(admission);
+    if (!source) return;
+    this.upload_admitted_texture(
+      admission,
+      "cube-bgra8",
+      source,
+      (gl, _target, allocate, data, checked) => {
+        const faces = [
+          gl.TEXTURE_CUBE_MAP_POSITIVE_X,
+          gl.TEXTURE_CUBE_MAP_NEGATIVE_X,
+          gl.TEXTURE_CUBE_MAP_POSITIVE_Y,
+          gl.TEXTURE_CUBE_MAP_NEGATIVE_Y,
+          gl.TEXTURE_CUBE_MAP_POSITIVE_Z,
+          gl.TEXTURE_CUBE_MAP_NEGATIVE_Z,
+        ];
+        const face_bytes = checked.face_texels * 4;
+        for (let i = 0; i < faces.length; i++) {
+          const face = new Uint8Array(data.buffer, i * face_bytes, face_bytes);
+          if (allocate) {
+            gl.texImage2D(
+              faces[i],
+              0,
+              gl.RGBA,
+              checked.args.width,
+              checked.args.height,
+              0,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              face,
+            );
+          } else {
+            gl.texSubImage2D(
+              faces[i],
+              0,
+              0,
+              0,
+              checked.args.width,
+              checked.args.height,
+              gl.RGBA,
+              gl.UNSIGNED_BYTE,
+              face,
+            );
+          }
+        }
+      },
     );
-    let faces = [
-      gl.TEXTURE_CUBE_MAP_POSITIVE_X,
-      gl.TEXTURE_CUBE_MAP_NEGATIVE_X,
-      gl.TEXTURE_CUBE_MAP_POSITIVE_Y,
-      gl.TEXTURE_CUBE_MAP_NEGATIVE_Y,
-      gl.TEXTURE_CUBE_MAP_POSITIVE_Z,
-      gl.TEXTURE_CUBE_MAP_NEGATIVE_Z,
-    ];
-    for (let i = 0; i < 6; i++) {
-      let begin = i * face_size;
-      let end = begin + face_size;
-      let data_array = all_faces.subarray(begin, end);
-      gl.texImage2D(
-        faces[i],
-        0,
-        gl.RGBA,
-        args.width,
-        args.height,
-        0,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        data_array,
-      );
+  }
+
+  // A 2D array's level 0 (layer-major BGRA), sampled as sampler2DArray.
+  FromWasmAllocTextureArray_BGRAu8_32(args) {
+    if (!args || !Number.isSafeInteger(args.layers) || args.layers <= 0) {
+      return this.reject_texture_upload(args, "invalid-layers", "array texture layer count must be a positive safe integer");
     }
-    this.textures[args.texture_id] = gl_tex;
+    const admission = this.admit_texture_upload(args, {
+      faces: args.layers,
+      array: true,
+      bytes_per_texel: 4,
+      elements_per_texel: 1,
+      element_size: 4,
+      nearest: false,
+    });
+    if (!admission) return;
+    const source = this.make_bgra_upload_view(admission);
+    if (!source) return;
+    this.upload_admitted_texture(
+      admission,
+      // the layer count is part of the allocation
+      `array-bgra8x${args.layers}`,
+      source,
+      (gl, target, allocate, data, checked) => {
+        const w = checked.args.width;
+        const h = checked.args.height;
+        if (allocate) {
+          gl.texImage3D(target, 0, gl.RGBA, w, h, args.layers, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        } else {
+          gl.texSubImage3D(target, 0, 0, 0, 0, w, h, args.layers, gl.RGBA, gl.UNSIGNED_BYTE, data);
+        }
+      },
+    );
   }
 
   FromWasmBeginRenderTexture(args) {
     if (this.xr !== undefined) {
       this.xr.in_xr_pass = false;
     }
+    this.texture_pass_front_face_cw = true;
 
     let gl = this.gl;
+    if (
+      !args ||
+      !Array.isArray(args.color_targets) ||
+      !args.depth_target
+    ) {
+      this.reject_render_target("missing color/depth target metadata", args);
+      return;
+    }
+    const render_targets = args.color_targets.slice();
+    if (args.depth_target.attached) {
+      render_targets.push(args.depth_target);
+    }
+    for (const target of render_targets) {
+      const texture = target && this.textures[target.texture_id];
+      if (
+        texture &&
+        texture._texture_target !== undefined &&
+        texture._texture_target !== gl.TEXTURE_2D
+      ) {
+        this.reject_render_target(
+          `texture ${target.texture_id} was created for a non-2D target`,
+          args,
+        );
+        return;
+      }
+    }
+    const has_r32f_target = args.color_targets.some(
+      (target) => target && target.format >= 1 && target.format <= 4,
+    );
+    if (has_r32f_target && !this.ext_color_buffer_float) {
+      this.reject_render_target(
+        "Float target requires EXT_color_buffer_float",
+        args,
+      );
+      return;
+    }
+    const size = makepad_render_target_size(
+      args.width,
+      args.height,
+      this.webgl_limits,
+    );
+    if (!size.ok) {
+      this.reject_render_target(
+        size.reason,
+        args,
+      );
+      return;
+    }
+    if (has_r32f_target && size.scaled) {
+      this.reject_render_target(
+        "Float data targets cannot be downscaled",
+        args,
+      );
+      return;
+    }
+    const render_width = size.width;
+    const render_height = size.height;
+    if (size.scaled) {
+      this.report_render_target_size_once("scaled to safety limits", {
+        requested: [size.requested_width, size.requested_height],
+        allocated: [render_width, render_height],
+        scale: size.scale,
+        limits: this.webgl_limits,
+      });
+    }
+    this.render_target_rejected = false;
+    try {
     var gl_framebuffer =
       this.framebuffers[args.pass_id] ||
       (this.framebuffers[args.pass_id] = gl.createFramebuffer());
+    if (!gl_framebuffer) {
+      throw new Error("WebGL framebuffer allocation returned null");
+    }
     gl.bindFramebuffer(gl.FRAMEBUFFER, gl_framebuffer);
 
     let clear_flags = 0;
     let clear_depth = 0.0;
-    let clear_color;
+    let clear_color = { r: 0, g: 0, b: 0, a: 0 };
+    let allocation_changed = false;
+    const color_attachments = [];
+    // Several color targets (MRT): each clears to its own color.
+    const color_clears = [];
 
     for (let i = 0; i < args.color_targets.length; i++) {
       let tgt = args.color_targets[i];
@@ -867,55 +3214,419 @@ export class WasmWebGL extends WasmWebBrowser {
       var gl_tex =
         this.textures[tgt.texture_id] ||
         (this.textures[tgt.texture_id] = gl.createTexture());
+      if (!gl_tex) {
+        throw new Error(`WebGL color texture ${tgt.texture_id} allocation returned null`);
+      }
+      color_attachments.push(gl_tex);
       // resize or create texture
       clear_color = tgt.clear_color;
-      if (gl_tex._width != args.width || gl_tex._height != args.height) {
+      if (
+        gl_tex._width != render_width ||
+        gl_tex._height != render_height ||
+        gl_tex._format != tgt.format ||
+        gl_tex._render_target_valid === false
+      ) {
+        gl_tex._texture_target = gl.TEXTURE_2D;
         gl.bindTexture(gl.TEXTURE_2D, gl_tex);
+        allocation_changed = true;
+        this.clear_texture_upload_allocation(gl_tex);
 
         clear_flags |= gl.COLOR_BUFFER_BIT;
+        color_clears.push(i);
 
-        gl_tex._width = args.width;
-        gl_tex._height = args.height;
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texImage2D(
-          gl.TEXTURE_2D,
-          0,
-          gl.RGBA,
-          gl_tex._width,
-          gl_tex._height,
-          0,
-          gl.RGBA,
-          gl.UNSIGNED_BYTE,
-          null,
-        );
+        gl_tex._width = render_width;
+        gl_tex._height = render_height;
+        gl_tex._requested_width = args.width;
+        gl_tex._requested_height = args.height;
+        gl_tex._format = tgt.format;
+        gl_tex._depth = false;
+        if (tgt.format >= 1 && tgt.format <= 5) {
+          // Data targets: 1 R32F (RenderRf32), 2 RGBA32F, 3 RGBA16F,
+          // 4 R16F (RenderRf16), 5 R8 (RenderRu8). Float targets are
+          // color-renderable only with EXT_color_buffer_float; 32-bit float
+          // filtering is a separate extension, so those stay NEAREST, while
+          // R16F and R8 filter natively in WebGL2.
+          const filter = tgt.format >= 4 ? gl.LINEAR : gl.NEAREST;
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          const internal = [0, gl.R32F, gl.RGBA32F, gl.RGBA16F, gl.R16F, gl.R8][tgt.format];
+          const upload = tgt.format === 1 || tgt.format >= 4 ? gl.RED : gl.RGBA;
+          const type = tgt.format === 5 ? gl.UNSIGNED_BYTE : (tgt.format === 3 || tgt.format === 4 ? gl.HALF_FLOAT : gl.FLOAT);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            internal,
+            gl_tex._width,
+            gl_tex._height,
+            0,
+            upload,
+            type,
+            null,
+          );
+        } else {
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            gl_tex._width,
+            gl_tex._height,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            null,
+          );
+        }
       } else if (!tgt.init_only) {
         clear_flags |= gl.COLOR_BUFFER_BIT;
+        color_clears.push(i);
       }
 
       gl.framebufferTexture2D(
         gl.FRAMEBUFFER,
-        gl.COLOR_ATTACHMENT0,
+        gl.COLOR_ATTACHMENT0 + i,
         gl.TEXTURE_2D,
         gl_tex,
         0,
       );
     }
-    // TODO implement depth target
-    gl.viewport(0, 0, args.width, args.height);
+    // Attachments a previous use of this framebuffer had beyond this pass's.
+    const previous_count = Array.isArray(gl_framebuffer._color_attachments)
+      ? gl_framebuffer._color_attachments.length
+      : 0;
+    for (let i = args.color_targets.length; i < previous_count; i++) {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, null, 0);
+    }
+    if (args.color_targets.length !== 1 || previous_count > 1) {
+      gl.drawBuffers(args.color_targets.map((_, i) => gl.COLOR_ATTACHMENT0 + i));
+    }
+    // Depth target: a real depth/stencil texture, so a texture pass
+    // depth-tests exactly like the canvas and like Metal. Without it every
+    // 3D scene rendered into a texture (the tilted map under its tilt-shift
+    // blur, effect thumbnails) was draw-order only: roofs overpainted by
+    // the walls drawn after them, buildings hollow, landmarks buried.
+    let dt = args.depth_target;
+    if (dt.attached) {
+      var gl_dtex =
+        this.textures[dt.texture_id] ||
+        (this.textures[dt.texture_id] = gl.createTexture());
+      if (!gl_dtex) {
+        throw new Error(`WebGL depth texture ${dt.texture_id} allocation returned null`);
+      }
+      if (
+        gl_dtex._width != render_width ||
+        gl_dtex._height != render_height ||
+        !gl_dtex._depth ||
+        gl_dtex._format != -1 ||
+        gl_dtex._render_target_valid === false
+      ) {
+        gl_dtex._texture_target = gl.TEXTURE_2D;
+        gl.bindTexture(gl.TEXTURE_2D, gl_dtex);
+        allocation_changed = true;
+        this.clear_texture_upload_allocation(gl_dtex);
+        gl_dtex._width = render_width;
+        gl_dtex._height = render_height;
+        gl_dtex._requested_width = args.width;
+        gl_dtex._requested_height = args.height;
+        gl_dtex._depth = true;
+        gl_dtex._format = -1;
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.DEPTH24_STENCIL8,
+          render_width,
+          render_height,
+          0,
+          gl.DEPTH_STENCIL,
+          gl.UNSIGNED_INT_24_8,
+          null,
+        );
+        clear_flags |= gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT;
+      } else if (!dt.init_only) {
+        clear_flags |= gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT;
+      }
+      clear_depth = dt.clear_depth;
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.DEPTH_STENCIL_ATTACHMENT,
+        gl.TEXTURE_2D,
+        gl_dtex,
+        0,
+      );
+    } else {
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.DEPTH_STENCIL_ATTACHMENT,
+        gl.TEXTURE_2D,
+        null,
+        0,
+      );
+    }
+    const depth_attachment = dt.attached ? gl_dtex : null;
+    const previous_color_attachments = gl_framebuffer._color_attachments;
+    const attachments_changed =
+      !Array.isArray(previous_color_attachments) ||
+      previous_color_attachments.length !== color_attachments.length ||
+      color_attachments.some(
+        (texture, index) => previous_color_attachments[index] !== texture,
+      ) ||
+      gl_framebuffer._depth_attachment !== depth_attachment;
+    if (allocation_changed) {
+      // A failed target allocates again on its next use.
+      const allocated = depth_attachment ? [...color_attachments, depth_attachment] : color_attachments.slice();
+      this.defer_allocation_check(() => {
+        for (const texture of allocated) {
+          this.invalidate_texture_dependencies(texture);
+        }
+        this.report_render_target_size_once("allocation failed", { width: render_width, height: render_height });
+      });
+    }
+    if (
+      (allocation_changed || attachments_changed) &&
+      this.gl_checks &&
+      gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE
+    ) {
+      throw new Error("WebGL framebuffer is incomplete");
+    }
+    gl_framebuffer._color_attachments = color_attachments;
+    gl_framebuffer._depth_attachment = depth_attachment;
+    for (const texture of color_attachments) {
+      texture._texture_target = gl.TEXTURE_2D;
+      texture._render_target_valid = true;
+    }
+    if (depth_attachment) {
+      depth_attachment._texture_target = gl.TEXTURE_2D;
+      depth_attachment._render_target_valid = true;
+    }
+    if (this._invalid_texture_upload_ids) {
+      for (const target of render_targets) {
+        this._invalid_texture_upload_ids.delete(target.texture_id);
+      }
+    }
+    this.set_active_render_target_textures(
+      color_attachments,
+      depth_attachment,
+    );
+    // The viewport uses the same uniform downscale as the attachments, so
+    // normalized texture coordinates retain their meaning across passes.
+    gl.viewport(0, 0, render_width, render_height);
 
     if (clear_flags !== 0) {
-      gl.clearColor(clear_color.r, clear_color.g, clear_color.b, clear_color.a);
+      // glClear honours the depth mask; the previous draw call may have
+      // left it off.
+      gl.depthMask(true);
       gl.clearDepth(clear_depth);
-      gl.clear(clear_flags);
+      if (args.color_targets.length > 1) {
+        for (const i of color_clears) {
+          const c = args.color_targets[i].clear_color;
+          gl.clearBufferfv(gl.COLOR, i, [c.r, c.g, c.b, c.a]);
+        }
+        if ((clear_flags & ~gl.COLOR_BUFFER_BIT) !== 0) {
+          gl.clear(clear_flags & ~gl.COLOR_BUFFER_BIT);
+        }
+      } else {
+        gl.clearColor(clear_color.r, clear_color.g, clear_color.b, clear_color.a);
+        gl.clear(clear_flags);
+      }
+    }
+    } catch (error) {
+      this.reject_render_target(
+        error && error.message ? error.message : String(error),
+        args,
+      );
     }
   }
 
+  FromWasmPollGpuCompletion(args) {
+    const gl = this.gl;
+    let fence = null;
+    const finish = success => {
+      if (fence && !gl.isContextLost()) gl.deleteSync(fence);
+      fence = null;
+      if (this.wasm == null) return;
+      this.to_wasm.ToWasmGpuCompletion({ ...args, success });
+      this.do_wasm_pump();
+    };
+    try {
+      if (this.webgl_context_lost || gl.isContextLost()) { finish(false); return; }
+      fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (!fence) { finish(false); return; }
+      gl.flush();
+    } catch (_) { finish(false); return; }
+    const started = performance.now();
+    const poll = () => {
+      if (this.wasm == null || this.webgl_context_lost || gl.isContextLost()) { finish(false); return; }
+      let status;
+      try { status = gl.clientWaitSync(fence, 0, 0); }
+      catch (_) { finish(false); return; }
+      if (status === gl.TIMEOUT_EXPIRED) {
+        if (performance.now() - started > 10000) { finish(false); return; }
+        setTimeout(poll, 16);
+      } else { finish(status !== gl.WAIT_FAILED); }
+    };
+    poll();
+  }
+
+  FromWasmRequestRenderTextureCapture(args) {
+    const ticket_lo = args.ticket_lo || 0;
+    const ticket_hi = args.ticket_hi || 0;
+    if (ticket_lo || ticket_hi) this.readback_api_active = true;
+    if (args.register_only) return;
+    const send = (error, data = new Uint8Array(0), offset = 0, complete = true,
+                  width = 0, height = 0) => {
+      if (this.wasm == null || this.webgl_context_lost) return;
+      this.to_wasm.ToWasmRenderTextureCapture({
+        texture_id: args.texture_id, ticket_lo, ticket_hi,
+        width, height, offset, complete, data, error,
+      });
+      this.do_wasm_pump();
+    };
+    if (this.webgl_context_lost) return; // loss notification already failed all tickets
+    const gl = this.gl;
+    const texture = this.textures[args.texture_id];
+    if (!texture || texture._render_target_valid === false ||
+        !texture._width || !texture._height) {
+      send("render target is not allocated");
+      return;
+    }
+    const width = texture._width;
+    const height = texture._height;
+    const byteLength = width * height * 4;
+    if ((args.width && args.width !== width) || (args.height && args.height !== height)) {
+      send("allocation changed");
+      return;
+    }
+    this.readback_reserved_bytes ||= 0;
+    if (!Number.isSafeInteger(byteLength) || byteLength <= 0 ||
+        byteLength > 32 * 1024 * 1024 - this.readback_reserved_bytes ||
+        this.pending_render_texture_captures.size >= 256) {
+      send("readback capacity exceeded");
+      return;
+    }
+    const framebuffer = gl.createFramebuffer();
+    const pixelBuffer = gl.createBuffer();
+    if (!framebuffer || !pixelBuffer) {
+      if (pixelBuffer) gl.deleteBuffer(pixelBuffer);
+      if (framebuffer) gl.deleteFramebuffer(framebuffer);
+      send("could not allocate WebGL readback objects");
+      return;
+    }
+    const oldFramebuffer = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
+    const oldPixelBuffer = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+    const packState = [gl.PACK_ALIGNMENT, gl.PACK_ROW_LENGTH, gl.PACK_SKIP_ROWS, gl.PACK_SKIP_PIXELS]
+      .filter(value => value !== undefined).map(name => [name, gl.getParameter(name)]);
+    let fence = null;
+    let queueError = "";
+    try {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, framebuffer);
+      gl.framebufferTexture2D(gl.READ_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+      if (gl.checkFramebufferStatus(gl.READ_FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+        throw new Error("render target framebuffer is incomplete");
+      }
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pixelBuffer);
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, byteLength, gl.STREAM_READ);
+      for (const [name] of packState) gl.pixelStorei(name, name === gl.PACK_ALIGNMENT ? 1 : 0);
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+      fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (!fence || gl.getError() !== gl.NO_ERROR) throw new Error("could not queue WebGL2 readPixels");
+      gl.flush();
+    } catch (error) {
+      queueError = String(error);
+    } finally {
+      for (const [name, value] of packState) gl.pixelStorei(name, value);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, oldPixelBuffer);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, oldFramebuffer);
+    }
+    const capture = { frame_id: 0, done: false };
+    this.pending_render_texture_captures.add(capture);
+    this.readback_reserved_bytes += byteLength;
+    const finish = (error, release_gl = !this.webgl_context_lost) => {
+      if (capture.done) return false;
+      capture.done = true;
+      if (capture.frame_id) window.cancelAnimationFrame(capture.frame_id);
+      capture.frame_id = 0;
+      this.pending_render_texture_captures.delete(capture);
+      this.readback_reserved_bytes -= byteLength;
+      if (release_gl) {
+        if (fence) gl.deleteSync(fence);
+        gl.deleteBuffer(pixelBuffer);
+        gl.deleteFramebuffer(framebuffer);
+      }
+      if (error) send(error);
+      return true;
+    };
+    capture.finish = finish;
+    if (queueError) { finish(queueError); return; }
+    let offset = 0;
+    let ready = false;
+    const pollStarted = performance.now();
+    const poll = frameTime => {
+      capture.frame_id = 0;
+      if (capture.done) return;
+      if (this.wasm == null) { finish(); return; }
+      if (this.webgl_context_lost || gl.isContextLost()) {
+        this.handle_webgl_context_lost();
+        return;
+      }
+      if (!ready) {
+        const status = gl.clientWaitSync(fence, 0, 0);
+        if (status === gl.TIMEOUT_EXPIRED) {
+          if (performance.now() - pollStarted > 10000) {
+            finish("WebGL readback fence timed out");
+          } else { capture.frame_id = window.requestAnimationFrame(poll); }
+          return;
+        }
+        if (status === gl.WAIT_FAILED) { finish("WebGL readback fence failed"); return; }
+        ready = true;
+      }
+      // One shared budget across ALL captures, not one budget per ticket.
+      // Both getBufferSubData and the JS->wasm bridge receive only this chunk.
+      if (this.readback_copy_frame !== frameTime) {
+        this.readback_copy_frame = frameTime;
+        this.readback_copy_bytes = 0;
+      }
+      const count = Math.min(byteLength - offset, 256 * 1024 - (this.readback_copy_bytes || 0));
+      if (count > 0) {
+        const data = new Uint8Array(count);
+        const previousBuffer = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+        try {
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pixelBuffer);
+          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, offset, data);
+          if (gl.getError() !== gl.NO_ERROR) throw new Error("getBufferSubData failed");
+        } catch (error) {
+          finish(`WebGL readback copy failed: ${error}`);
+          return;
+        } finally {
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, previousBuffer);
+        }
+        const start = offset;
+        offset += count;
+        this.readback_copy_bytes = (this.readback_copy_bytes || 0) + count;
+        const complete = offset === byteLength;
+        if (complete && !finish()) return;
+        send("", data, start, complete, width, height);
+        if (complete) return;
+      }
+      capture.frame_id = window.requestAnimationFrame(poll);
+    };
+    capture.frame_id = window.requestAnimationFrame(poll);
+  }
+
   FromWasmBeginRenderCanvas(args) {
+    this.reset_active_render_target_textures();
+    this.render_target_rejected = false;
     let gl = this.gl;
     let xr = this.xr;
+    this.texture_pass_front_face_cw = false;
 
     if (xr !== undefined) {
       xr.in_xr_pass = true;
@@ -926,6 +3637,7 @@ export class WasmWebGL extends WasmWebBrowser {
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     }
     let c = args.clear_color;
+    gl.depthMask(true);
     gl.clearColor(c.r, c.g, c.b, c.a);
     gl.clearDepth(args.clear_depth);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -947,6 +3659,7 @@ export class WasmWebGL extends WasmWebBrowser {
 
   // Video Playback API
 
+  // @section video-playback
   FromWasmPrepareVideoPlayback(args) {
     let key = args.video_id_lo + "_" + args.video_id_hi;
     let video = document.createElement("video");
@@ -963,12 +3676,20 @@ export class WasmWebGL extends WasmWebBrowser {
       video_id_hi: args.video_id_hi,
       playing: false,
       texture_initialized: false,
+      disposed: false,
+      handlers: {},
     };
 
     this.video_players[key] = player;
 
-    video.addEventListener("loadedmetadata", () => {
+    player.handlers.loadedmetadata = () => {
+      if (player.disposed) {
+        return;
+      }
       let duration_ms = Math.round(video.duration * 1000);
+      // An audio-only source has no picture: its position is reported
+      // every frame while it plays, for a host that follows its clock.
+      player.audio_only = video.videoWidth === 0 && video.videoHeight === 0;
       this.to_wasm.ToWasmVideoPlaybackPrepared({
         video_id_lo: args.video_id_lo,
         video_id_hi: args.video_id_hi,
@@ -978,32 +3699,61 @@ export class WasmWebGL extends WasmWebBrowser {
         duration_hi: Math.floor(duration_ms / 0x100000000),
       });
       this.do_wasm_pump();
-    });
+    };
 
-    video.addEventListener("ended", () => {
+    player.handlers.ended = () => {
+      if (player.disposed) {
+        return;
+      }
       player.playing = false;
       this.to_wasm.ToWasmVideoPlaybackCompleted({
         video_id_lo: args.video_id_lo,
         video_id_hi: args.video_id_hi,
       });
       this.do_wasm_pump();
-    });
+    };
 
-    video.addEventListener("play", () => {
+    player.handlers.play = () => {
+      if (player.disposed) {
+        return;
+      }
       player.playing = true;
       this.ensure_video_animation_frame();
-    });
+    };
 
-    video.addEventListener("pause", () => {
+    player.handlers.pause = () => {
       player.playing = false;
-    });
+    };
+    for (const [name, handler] of Object.entries(player.handlers)) {
+      video.addEventListener(name, handler);
+    }
 
     video.src = args.source_url;
 
     if (args.autoplay) {
       video.play().catch(e => {
-        console.warn("Video autoplay failed:", e);
+        if (!player.disposed) {
+          console.warn("Video autoplay failed:", e);
+        }
       });
+    }
+  }
+
+  dispose_video_player(player) {
+    if (!player || player.disposed) {
+      return;
+    }
+    player.disposed = true;
+    player.playing = false;
+    for (const [name, handler] of Object.entries(player.handlers || {})) {
+      player.video.removeEventListener(name, handler);
+    }
+    player.handlers = {};
+    try {
+      player.video.pause();
+      player.video.removeAttribute("src");
+      player.video.load();
+    } catch (_error) {
     }
   }
 
@@ -1012,7 +3762,9 @@ export class WasmWebGL extends WasmWebBrowser {
     let player = this.video_players[key];
     if (player) {
       player.video.play().catch(e => {
-        console.warn("Video play failed:", e);
+        if (!player.disposed) {
+          console.warn("Video play failed:", e);
+        }
       });
     }
   }
@@ -1030,7 +3782,9 @@ export class WasmWebGL extends WasmWebBrowser {
     let player = this.video_players[key];
     if (player) {
       player.video.play().catch(e => {
-        console.warn("Video resume failed:", e);
+        if (!player.disposed) {
+          console.warn("Video resume failed:", e);
+        }
       });
     }
   }
@@ -1064,10 +3818,7 @@ export class WasmWebGL extends WasmWebBrowser {
     let key = args.video_id_lo + "_" + args.video_id_hi;
     let player = this.video_players[key];
     if (player) {
-      player.video.pause();
-      player.video.removeAttribute("src");
-      player.video.load();
-      player.playing = false;
+      this.dispose_video_player(player);
       delete this.video_players[key];
 
       this.to_wasm.ToWasmVideoPlaybackResourcesReleased({
@@ -1079,55 +3830,223 @@ export class WasmWebGL extends WasmWebBrowser {
   }
 
   ensure_video_animation_frame() {
-    if (this.video_anim_frame_id) {
+    if (this.webgl_context_lost || this.video_anim_frame_id) {
       return;
     }
     this.video_anim_frame_id = window.requestAnimationFrame(() => {
       this.video_anim_frame_id = 0;
+      if (this.webgl_context_lost) {
+        return;
+      }
       this.update_video_textures();
     });
   }
 
   update_video_textures() {
+    if (this.webgl_context_lost) {
+      return;
+    }
     let gl = this.gl;
     let any_playing = false;
     let any_updated = false;
 
     for (let key in this.video_players) {
       let player = this.video_players[key];
-      if (!player.playing) continue;
+      // A paused player uploads once after a context restore (needs_upload).
+      if (!player.playing && !player.needs_upload) continue;
 
-      any_playing = true;
+      if (player.playing) {
+        any_playing = true;
+      }
 
       let video = player.video;
       if (video.readyState < 2) continue;
 
-      any_updated = true;
-
-      let gl_tex = this.textures[player.texture_id];
-      if (!gl_tex) {
-        gl_tex = gl.createTexture();
-        this.textures[player.texture_id] = gl_tex;
+      if (!Number.isSafeInteger(player.texture_id) || player.texture_id < 0) {
+        this.report_texture_upload_once(
+          "invalid-video-texture-id",
+          "video texture id is not a nonnegative safe integer",
+          { texture_id: player.texture_id },
+        );
+        continue;
       }
 
-      gl.bindTexture(gl.TEXTURE_2D, gl_tex);
-
-      if (!player.texture_initialized) {
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        player.texture_initialized = true;
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+      if (
+        Number.isSafeInteger(width) &&
+        Number.isSafeInteger(height) &&
+        width >= 0 &&
+        height >= 0 &&
+        (width === 0 || height === 0)
+      ) {
+        if (player.audio_only) {
+          const ms = Math.round(video.currentTime * 1000);
+          this.to_wasm.ToWasmVideoTextureUpdated({
+            video_id_lo: player.video_id_lo,
+            video_id_hi: player.video_id_hi,
+            current_position_lo: ms & 0xFFFFFFFF,
+            current_position_hi: Math.floor(ms / 0x100000000),
+          });
+          any_updated = true;
+        }
+        // Metadata can become ready before the decoder exposes dimensions.
+        continue;
       }
-
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        video,
+      const video_args = {
+        texture_id: player.texture_id,
+        width,
+        height,
+      };
+      if (
+        !Number.isSafeInteger(width) ||
+        !Number.isSafeInteger(height) ||
+        width <= 0 ||
+        height <= 0
+      ) {
+        this.reject_texture_upload(
+          video_args,
+          "invalid-video-dimensions",
+          "video dimensions must be positive safe integers",
+        );
+        continue;
+      }
+      const max_dimension = makepad_webgl_limit(
+        (this.webgl_limits || {}).max_texture_size,
       );
+      if (width > max_dimension || height > max_dimension) {
+        this.reject_texture_upload(
+          video_args,
+          "video-device-dimension-limit",
+          "video dimensions exceed the cached WebGL device limit",
+          { max_dimension },
+        );
+        continue;
+      }
+      const texels = makepad_safe_product(width, height);
+      const allocation_bytes = texels === null
+        ? null
+        : makepad_safe_product(texels, 4);
+      if (allocation_bytes === null) {
+        this.reject_texture_upload(
+          video_args,
+          "unsafe-video-size",
+          "video texture size arithmetic is unsafe",
+        );
+        continue;
+      }
+
+      const old_texture = this.textures[player.texture_id];
+      let gl_tex = old_texture;
+      if (
+        gl_tex &&
+        gl_tex._texture_target !== undefined &&
+        gl_tex._texture_target !== gl.TEXTURE_2D
+      ) {
+        this.report_texture_upload_once(
+          "video-texture-target",
+          "video cannot replace a non-2D texture",
+          { texture_id: player.texture_id },
+        );
+        continue;
+      }
+      let created = false;
+      if (!gl_tex) {
+        try {
+          gl_tex = gl.createTexture();
+        } catch (error) {
+          this.reject_texture_upload(
+            video_args,
+            "video-create-texture-exception",
+            `WebGL video texture allocation threw: ${error && error.message ? error.message : String(error)}`,
+          );
+          continue;
+        }
+        if (!gl_tex) {
+          this.reject_texture_upload(
+            video_args,
+            "video-create-texture-null",
+            "WebGL video texture allocation returned null",
+          );
+          continue;
+        }
+        created = true;
+      }
+
+      const allocation_changed =
+        created ||
+        gl_tex._texture_upload_width !== width ||
+        gl_tex._texture_upload_height !== height ||
+        gl_tex._texture_upload_format !== MAKEPAD_WEBGL_VIDEO_UPLOAD_FORMAT ||
+        gl_tex._width !== undefined ||
+        gl_tex._height !== undefined ||
+        gl_tex._format !== undefined ||
+        gl_tex._depth !== undefined ||
+        gl_tex._render_target_valid === false;
+      if (allocation_changed && old_texture) {
+        this.invalidate_texture_dependencies(old_texture);
+      }
+
+      try {
+        gl_tex._texture_target = gl.TEXTURE_2D;
+        gl.bindTexture(gl.TEXTURE_2D, gl_tex);
+
+        if (allocation_changed) {
+          this.configure_texture_parameters(gl, gl.TEXTURE_2D, false, false);
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            video,
+          );
+          this.defer_allocation_check(() => {
+            this.invalidate_texture_dependencies(gl_tex);
+            player.texture_initialized = false;
+          });
+        } else {
+          gl.texSubImage2D(
+            gl.TEXTURE_2D,
+            0,
+            0,
+            0,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            video,
+          );
+        }
+        player.texture_initialized = true;
+        player.needs_upload = false;
+        gl_tex._texture_upload_width = width;
+        gl_tex._texture_upload_height = height;
+        gl_tex._texture_upload_format = MAKEPAD_WEBGL_VIDEO_UPLOAD_FORMAT;
+        if (allocation_changed) {
+          this.clear_render_target_allocation(gl_tex);
+        }
+        gl_tex._render_target_valid = true;
+        if (created) {
+          this.textures[player.texture_id] = gl_tex;
+        }
+        if (this._invalid_texture_upload_ids) {
+          this._invalid_texture_upload_ids.delete(player.texture_id);
+        }
+      } catch (error) {
+        if (created) {
+          try {
+            gl.deleteTexture(gl_tex);
+          } catch (_delete_error) {
+          }
+        }
+        this.reject_texture_upload(
+          video_args,
+          "video-texture-upload",
+          `WebGL video texture upload failed: ${error && error.message ? error.message : String(error)}`,
+        );
+        continue;
+      }
+
+      any_updated = true;
 
       let current_ms = Math.round(video.currentTime * 1000);
       this.to_wasm.ToWasmVideoTextureUpdated({
@@ -1145,34 +4064,246 @@ export class WasmWebGL extends WasmWebBrowser {
       this.ensure_video_animation_frame();
     }
   }
+  // @end video-playback
+
+  handle_device_pixel_ratio_change() {
+    const next = makepad_device_pixel_ratio(window.devicePixelRatio);
+    if (next === this.physical_device_dpi) {
+      return false;
+    }
+    // This must track the physical DPR, not the budgeted effective DPR. The
+    // latter can intentionally differ forever and would make polling resize
+    // continuously.
+    this.physical_device_dpi = next;
+    if (typeof this.handlers.on_screen_resize === "function") {
+      this.handlers.on_screen_resize();
+    }
+    return true;
+  }
+
+  release_device_pixel_ratio_media_query() {
+    const mq = this._dpr_media_query;
+    const listener = this._dpr_media_query_listener;
+    if (mq && listener) {
+      if (typeof mq.removeEventListener === "function") {
+        mq.removeEventListener("change", listener);
+      } else if (typeof mq.removeListener === "function") {
+        mq.removeListener(listener);
+      }
+    }
+    this._dpr_media_query = null;
+    this._dpr_media_query_listener = null;
+  }
+
+  arm_device_pixel_ratio_media_query() {
+    if (typeof window.matchMedia !== "function") {
+      return false;
+    }
+    const mq = window.matchMedia(
+      `(resolution: ${this.physical_device_dpi}dppx)`,
+    );
+    if (
+      !mq ||
+      (typeof mq.addEventListener !== "function" &&
+        typeof mq.addListener !== "function")
+    ) {
+      return false;
+    }
+    const listener = () => {
+      this.release_device_pixel_ratio_media_query();
+      this.handle_device_pixel_ratio_change();
+      this.arm_device_pixel_ratio_media_query();
+    };
+    this._dpr_media_query = mq;
+    this._dpr_media_query_listener = listener;
+    if (typeof mq.addEventListener === "function") {
+      mq.addEventListener("change", listener);
+    } else {
+      mq.addListener(listener);
+    }
+    return true;
+  }
+
+  bind_device_pixel_ratio_change() {
+    this.physical_device_dpi = makepad_device_pixel_ratio(
+      window.devicePixelRatio,
+    );
+    if (this.arm_device_pixel_ratio_media_query()) {
+      return;
+    }
+    this._dpr_poll_timer = window.setInterval(() => {
+      this.handle_device_pixel_ratio_change();
+    }, 1000);
+  }
+
+  // A lost context (webglcontextlost) pauses the graphics, not the app:
+  // timers, network, audio, threads and media keep running and the app keeps
+  // handling events, while its GL commands do nothing (MAKEPAD_WEBGL_COMMANDS)
+  // and no animation frame runs. The browser is asked to give the context
+  // back (preventDefault). When it does (webglcontextrestored) every table of
+  // the old context's objects is emptied and the app is told
+  // (ToWasmGpuReset): it uploads again what it keeps on the CPU side and
+  // repaints, so the picture goes on from where the app is.
+  show_webgl_context_lost_message() {
+    if (this._webgl_context_lost_message || typeof document === "undefined") {
+      return;
+    }
+    const message = document.createElement("div");
+    const text = document.createElement("span");
+    const reload = document.createElement("button");
+    message.setAttribute("role", "alert");
+    message.style.cssText =
+      "position:absolute;inset:0;display:flex;gap:12px;align-items:center;" +
+      "justify-content:center;padding:24px;background:#181818;color:white;" +
+      "font:14px sans-serif;text-align:center;z-index:2147483647";
+    text.textContent =
+      "Graphics paused: the WebGL context was lost. They come back when the browser restores it.";
+    reload.type = "button";
+    reload.textContent = "Reload";
+    reload.addEventListener("click", () => {
+      if (window.location && typeof window.location.reload === "function") {
+        window.location.reload();
+      }
+    }, { once: true });
+    message.appendChild(text);
+    message.appendChild(reload);
+    const parent = this.canvas.parentNode || document.body;
+    if (parent) {
+      parent.appendChild(message);
+      this._webgl_context_lost_message = message;
+    }
+  }
+
+  hide_webgl_context_lost_message() {
+    const message = this._webgl_context_lost_message;
+    this._webgl_context_lost_message = null;
+    if (message && message.parentNode) {
+      message.parentNode.removeChild(message);
+    }
+  }
+
+  handle_webgl_context_lost(event) {
+    // Without preventDefault the browser never restores the context.
+    if (event && typeof event.preventDefault === "function") {
+      event.preventDefault();
+    }
+    if (this.webgl_context_lost) {
+      return;
+    }
+    this.webgl_context_lost = true;
+    for (const field of [
+      "req_anim_frame_id",
+      "webgl_shader_poll_frame_id",
+      "video_anim_frame_id",
+    ]) {
+      if (this[field]) {
+        window.cancelAnimationFrame(this[field]);
+        this[field] = 0;
+      }
+    }
+    this.clear_frame_timer();
+    // Readbacks in flight read objects of the lost context: they end here
+    // (their objects went with it) and every ticket fails as device lost.
+    for (const capture of this.pending_render_texture_captures || []) {
+      if (capture.finish) {
+        capture.finish(undefined, false);
+        continue;
+      }
+      capture.done = true;
+      if (capture.frame_id) {
+        window.cancelAnimationFrame(capture.frame_id);
+        capture.frame_id = 0;
+      }
+    }
+    if (this.pending_render_texture_captures) {
+      this.pending_render_texture_captures.clear();
+    }
+    if (this.readback_api_active && this.to_wasm && this.to_wasm.ToWasmRenderTextureCapture) {
+      this.to_wasm.ToWasmRenderTextureCapture({
+        texture_id: 0, ticket_lo: 0xffffffff, ticket_hi: 0xffffffff,
+        width: 0, height: 0, offset: 0, complete: true,
+        data: new Uint8Array(0), error: "device lost",
+      });
+      // The loss can be found inside a message batch (a GL command that
+      // threw): the app hears of it after that batch.
+      queueMicrotask(() => this.do_wasm_pump());
+    }
+    this.reset_active_render_target_textures();
+    this.render_target_rejected = true;
+    console.warn(
+      "makepad: WebGL context lost; graphics paused until the browser restores it",
+      {
+        physical_dpr: this.physical_device_dpi,
+        effective_dpr: this.window_info && this.window_info.dpi_factor,
+        canvas_width: this.canvas.width,
+        canvas_height: this.canvas.height,
+      },
+    );
+    this.show_webgl_context_lost_message();
+  }
+
+  // Forgets every object of a lost context: the restored one starts empty.
+  reset_webgl_objects() {
+    this.draw_shaders = [];
+    this.array_buffers = [];
+    this.instance_data_textures = new Map();
+    this.index_buffers = [];
+    this.vaos = [];
+    this.textures = [];
+    this.framebuffers = [];
+    this.reset_active_render_target_textures();
+    this._missing_shader_ids = new Set();
+    this._invalid_texture_upload_ids = new Set();
+    this._sampler_fallback_textures = new Map();
+    this._sampler_fallback_texture_failures = new Set();
+    this.pending_webgl_shader_count = 0;
+    this.pending_allocation_checks = [];
+    this.forget_lost_gpu_state();
+  }
+
+  handle_webgl_context_restored() {
+    if (!this.webgl_context_lost) {
+      return;
+    }
+    this.reset_webgl_objects();
+    // Extensions are enabled per context: ask again.
+    this.setup_webgl_context();
+    this.webgl_context_lost = false;
+    this.render_target_rejected = false;
+    this.hide_webgl_context_lost_message();
+    console.warn("makepad: WebGL context restored; rebuilding the GPU resources");
+    // A paused video's frame is uploaded again too, not only playing ones.
+    for (const player of Object.values(this.video_players || {})) {
+      player.texture_initialized = false;
+      player.needs_upload = true;
+    }
+    // The app forgets its GPU state, redraws everything and asks for a frame.
+    this.to_wasm.ToWasmGpuReset({});
+    this.do_wasm_pump();
+    if (Object.keys(this.video_players || {}).length !== 0) {
+      this.ensure_video_animation_frame();
+    }
+  }
 
   init_webgl_context() {
-    let mqString = "(resolution: " + window.devicePixelRatio + "dppx)";
-    let mq = matchMedia(mqString);
-    if (mq && mq.addEventListener) {
-      mq.addEventListener("change", this.handlers.on_screen_resize);
-    } else {
-      // poll for it. yes. its terrible
-      window.setInterval((_) => {
-        if (window.devicePixelRatio != this.dpi_factor) {
-          this.handlers.on_screen_resize();
-        }
-      }, 1000);
+    if (this._webgl_context_initialized) {
+      return !!this.gl;
     }
-
+    this._webgl_context_initialized = true;
     var canvas = this.canvas;
+    const has_attribute = (name) => typeof canvas.hasAttribute === "function"
+      ? canvas.hasAttribute(name)
+      : canvas.getAttribute(name) !== null;
     var options = {
-      alpha: canvas.getAttribute("noalpha") ? false : true,
-      depth: canvas.getAttribute("nodepth") ? false : true,
-      stencil: canvas.getAttribute("nostencil") ? false : true,
-      antialias: canvas.getAttribute("noantialias") ? false : true,
-      premultipliedAlpha: canvas.getAttribute("premultipliedAlpha")
-        ? true
-        : false,
-      preserveDrawingBuffer: canvas.getAttribute("preserveDrawingBuffer")
-        ? true
-        : false,
-      preferLowPowerToHighPerformance: true,
+      alpha: !has_attribute("noalpha"),
+      depth: !has_attribute("nodepth"),
+      stencil: !has_attribute("nostencil"),
+      // Offscreen composition already performs its own passes. Browser MSAA
+      // duplicates the default framebuffer cost, so it is explicit opt-in.
+      antialias: has_attribute("antialias") && !has_attribute("noantialias"),
+      premultipliedAlpha: has_attribute("premultipliedAlpha"),
+      preserveDrawingBuffer: has_attribute("preserveDrawingBuffer"),
+      powerPreference: "default",
       //xrCompatible: true
     };
 
@@ -1184,7 +4315,56 @@ export class WasmWebGL extends WasmWebBrowser {
       canvas.parentNode.replaceChild(span, canvas);
       span.innerHTML =
         "Sorry, makepad needs browser support for WebGL2 to run.<br/>Please update your browser or GPU drivers and try again.";
-      return;
+      return false;
+    }
+
+    canvas.addEventListener(
+      "webglcontextlost",
+      (event) => this.handle_webgl_context_lost(event),
+      false,
+    );
+    canvas.addEventListener(
+      "webglcontextrestored",
+      () => this.handle_webgl_context_restored(),
+      false,
+    );
+    // Live GPU bytes from the first allocation on (GPU-SAFETY.md).
+    if (typeof this.install_gpu_ledger === "function") {
+      this.install_gpu_ledger(gl);
+    }
+    this.setup_webgl_context();
+    this.bind_device_pixel_ratio_change();
+    return true;
+  }
+
+  // What is read or enabled per context: once at start and again after a
+  // restore (a restored context has no extensions enabled).
+  setup_webgl_context() {
+    const gl = this.gl;
+    // Query immutable hardware ceilings once per context, then share the
+    // cached values with canvas and targets.
+    this.webgl_limits = makepad_query_webgl_limits(gl);
+    this.max_vertex_attribs = makepad_webgl_vertex_attrib_limit(
+      gl.getParameter(gl.MAX_VERTEX_ATTRIBS),
+    );
+
+    // With this extension compileShader/linkProgram only enqueue driver work.
+    // Querying COMPILE_STATUS or LINK_STATUS before completion would turn the
+    // operation synchronous again, so completion is polled from animation
+    // frames and unfinished draws are skipped.
+    this.parallel_shader_compile = gl.getExtension(
+      "KHR_parallel_shader_compile",
+    );
+
+    // Float color targets (RenderRf32): WebGL2 needs this extension for
+    // R32F to be color-renderable. Requested up front so a missing GPU
+    // capability is one hard, greppable error instead of a silent black
+    // texture deep in a bake.
+    this.ext_color_buffer_float = gl.getExtension("EXT_color_buffer_float");
+    if (!this.ext_color_buffer_float) {
+      console.error(
+        "makepad: EXT_color_buffer_float unavailable — float render targets (GPU lightmap bake) will not work on this device",
+      );
     }
 
     // check uniform count
@@ -1195,18 +4375,68 @@ export class WasmWebGL extends WasmWebBrowser {
 
     this.gpu_info = {
       min_uniforms: Math.min(max_vertex_uniforms, max_fragment_uniforms),
-      vendor: "unknown",
-      renderer: "unknown",
+      min_uniform_vectors: Math.min(max_vertex_uniforms, max_fragment_uniforms),
+      float_color_targets: !!this.ext_color_buffer_float,
+      max_texture_size: gl.getParameter(gl.MAX_TEXTURE_SIZE),
+      vendor: gl.getParameter(gl.VENDOR) || "unknown",
+      renderer: gl.getParameter(gl.RENDERER) || "unknown",
     };
-    let debug_info = gl.getExtension("WEBGL_debug_renderer_info");
-
-    if (debug_info) {
-      this.gpu_info.vendor = gl.getParameter(debug_info.UNMASKED_VENDOR_WEBGL);
-      this.gpu_info.renderer = gl.getParameter(
-        debug_info.UNMASKED_RENDERER_WEBGL,
-      );
+    // Firefox reports the real (sanitized) GPU through RENDERER and warns
+    // that WEBGL_debug_renderer_info is deprecated, so the extension is only
+    // asked for when RENDERER is the masked "WebKit WebGL" placeholder
+    // (Chrome, Safari).
+    if (/^(webkit webgl|unknown)$/i.test(this.gpu_info.renderer)) {
+      let debug_info = gl.getExtension("WEBGL_debug_renderer_info");
+      if (debug_info) {
+        this.gpu_info.vendor = gl.getParameter(debug_info.UNMASKED_VENDOR_WEBGL);
+        this.gpu_info.renderer = gl.getParameter(
+          debug_info.UNMASKED_RENDERER_WEBGL,
+        );
+      }
     }
   }
+}
+
+// The GL commands of the from-wasm protocol. While the context is lost they
+// do nothing (after the restore the app's ToWasmGpuReset redoes what they
+// would have made), and one that throws because the context went away
+// inside a batch marks the loss instead of taking the rest of the batch
+// (the app's other commands) down with it.
+const MAKEPAD_WEBGL_COMMANDS = [
+  "FromWasmCompileWebGLShader",
+  "FromWasmAllocIndexBuffer",
+  "FromWasmRetainedArrayBuffer",
+  "FromWasmRetainedArrayUpdate",
+  "FromWasmAllocArrayBuffer",
+  "FromWasmAllocVao",
+  "FromWasmFreeWebGLResources",
+  "FromWasmDrawCall",
+  "FromWasmAllocTextureImage2D_BGRAu8_32",
+  "FromWasmUpdateTextureRect_BGRAu8_32",
+  "FromWasmAllocTextureImage2D_Ru8",
+  "FromWasmAllocTextureImage2D_RGBAf32",
+  "FromWasmAllocTextureCube_BGRAu8_32",
+  "FromWasmAllocTextureArray_BGRAu8_32",
+  "FromWasmBeginRenderTexture",
+  "FromWasmBeginRenderCanvas",
+  "FromWasmSetDefaultDepthAndBlendMode",
+];
+for (const name of MAKEPAD_WEBGL_COMMANDS) {
+  const command = WasmWebGL.prototype[name];
+  WasmWebGL.prototype[name] = function (args) {
+    if (this.webgl_context_lost) {
+      return;
+    }
+    try {
+      return command.call(this, args);
+    } catch (error) {
+      if (this.gl && typeof this.gl.isContextLost === "function" && this.gl.isContextLost()) {
+        this.handle_webgl_context_lost();
+        return;
+      }
+      throw error;
+    }
+  };
 }
 
 function add_line_numbers_to_string(code) {

@@ -8,21 +8,23 @@ use {
         draw_list::DrawListId,
         //midi::{Midi1InputData, MidiInputInfo},
         event::{
-            drag_drop::*, finger::*, game_input::*, keyboard::*, network::*, video_playback::*,
-            window::*, xr::*,
+            app_open::*, domain::*, drag_drop::*, finger::*, game_input::*, keyboard::*, location::*, network::*,
+            video_playback::*, window::*, xr::*,
         },
         //makepad_live_compiler::LiveEditEvent,
         makepad_live_id::LiveId,
+        makepad_math::Vec2Index,
         makepad_script::*,
         midi::MidiPortsEvent,
         permission::PermissionResult,
+        print::PrintResultEvent,
+        storage::StorageResponsesEvent,
         video::VideoInputsEvent,
         window::WindowId,
     },
     std::{
         cell::Cell,
         collections::{HashMap, HashSet},
-        f64::consts::PI,
         rc::Rc,
     },
 };
@@ -43,6 +45,8 @@ pub enum Event {
     ///
     /// [`onCreate`]: https://developer.android.com/reference/android/app/Activity#onCreate(android.os.Bundle)
     Startup,
+    /// A semantic request addressed to one widget uid.
+    A11yAction(makepad_a11y::ActionRequest),
     /// The application is being shut down is about to close and be destroyed.
     ///
     /// * This event may not be sent at all, so you should not rely on it.
@@ -57,6 +61,14 @@ pub enum Event {
     ///
     /// [`onDestroy`]: https://developer.android.com/reference/android/app/Activity#onDestroy()
     Shutdown,
+
+    /// The application has been asked to quit.
+    ///
+    /// This is sent before [`Event::Shutdown`] for graceful quit requests such
+    /// as application-menu Quit and polite process termination signals.
+    /// Handlers may set `handled` to `true` to defer or cancel the quit, for
+    /// example while showing a confirmation dialog.
+    QuitRequested(QuitRequestedEvent),
 
     /// The application has been started in the foreground and is now visible to the user,
     /// but is not yet actively receiving user input.
@@ -124,6 +136,20 @@ pub enum Event {
 
     Draw(DrawEvent),
     LiveEdit,
+    /// Request from `Cx::request_script_reapply()` to re-apply the widget
+    /// tree via `Apply::ScriptReapply` *without* re-running `script_mod!`.
+    ///
+    /// This is useful when something like a Splash-level script object
+    /// has been modified at runtime (e.g., `script_eval!`) and the application
+    /// wants every widget in the widget tree to pick up that new modified object value.
+    ///
+    /// Unlike `Event::LiveEdit`, this preserves any heap object values that have
+    /// already been modified at runtime. It also walks the tree with
+    /// `Apply::ScriptReapply` (rather than `Apply::Reload`) so that field
+    /// types whose canonical mutation path is an imperative setter
+    /// (e.g. `Label::set_text`) can early-return and keep their runtime
+    /// value instead of being clobbered by the stale DSL literal.
+    ScriptReapply,
     /// A window has gained focus and is now the active window receiving user input.
     WindowGotFocus(WindowId),
     /// A window has lost focus and is no longer the active window receiving user input.
@@ -140,6 +166,29 @@ pub enum Event {
     WindowGeomChange(WindowGeomChangeEvent),
     VirtualKeyboard(VirtualKeyboardEvent),
     ClearAtlasses,
+    /// The GPU device was lost and has been replaced (a WebGL context the
+    /// browser took away and gave back; the HAL's DeviceReset after the
+    /// driver's VK_ERROR_DEVICE_LOST or a device removal). Every GPU object
+    /// was recreated from what the CPU side keeps: vec textures, geometries,
+    /// instance data and shaders are uploaded again and every pass is
+    /// repainted. Contents only the GPU held are gone (a render target drawn
+    /// once and not redrawn, data whose CPU copy was dropped after upload,
+    /// results of GPU work read back later, shared images a host lent its
+    /// child): handle this to redo that work. Delivered once per reset, after
+    /// the uploads were queued and before the repaint.
+    GpuReset,
+    /// The GPU device was lost. Fail in-flight work now; replacement may not
+    /// succeed immediately. GpuReset announces when new work can be submitted.
+    GpuLost,
+    /// A draw shader that [`Cx::draw_shader_ready`](crate::cx::Cx::draw_shader_ready)
+    /// said cannot draw yet may have an answer now: a pipeline was made, or failed
+    /// for good, since. Ask again. Sent only after such a "not yet", at most once per
+    /// batch of the GPU's answers, so a caller that waits on a pipeline waits for this
+    /// event instead of asking every frame.
+    DrawShadersReady,
+    /// Clear all hover/pressed visual state, e.g. after an overlay that
+    /// swallowed the hover-outs (a context menu) has closed.
+    ClearHover,
 
     /// The raw event that occurs when the user presses a mouse button down.
     ///
@@ -169,6 +218,13 @@ pub enum Event {
     /// Do not match upon or handle this event directly; instead, use the family of
     /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit`].
     TouchUpdate(TouchUpdateEvent),
+    /// A press taken away before it lifted (see [`FingerCancelEvent`]):
+    /// dispatched by the owner of a claimed gesture to its children, or by
+    /// a host that cancels a finger (for a touch, right after the `TouchUpdate`
+    /// that shows it as `TouchState::Cancel`). Handle it through `hits()`, which
+    /// turns it into the capture's terminal `Hit::FingerUp` with
+    /// `cancelled: true`.
+    FingerCancel(FingerCancelEvent),
     /// The raw event that occurs when the user finishes a long press touch/click.
     ///
     /// Do not match upon or handle this event directly; instead, use the family of
@@ -180,9 +236,18 @@ pub enum Event {
     /// Do not match upon or handle this event directly; instead use the family of
     /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit::FingerScroll`].
     Scroll(ScrollEvent), // this is the MouseWheel / touch scroll event sent by the OS
+    /// The raw event of a trackpad pinch (macOS magnify, Wayland pointer gestures).
+    ///
+    /// Do not match upon or handle this event directly; instead use the family of
+    /// `hit` functions ([`Event::hits()`]) and handle the returned [`Hit::FingerPinch`].
+    Pinch(PinchEvent),
 
     Timer(TimerEvent),
 
+    /// An app-facing channel has something for the UI thread: a `ToUISender`
+    /// sent, a task-pool job finished, a texture readback completed. This is a
+    /// broadcast to every widget with no payload, so each handler polls its
+    /// own queue. Makepad's own machinery never raises it.
     Signal,
     Trigger(TriggerEvent),
     MacosMenuCommand(LiveId),
@@ -190,7 +255,13 @@ pub enum Event {
     KeyFocusLost(KeyFocusEvent),
     KeyDown(KeyEvent),
     KeyUp(KeyEvent),
+    PhysicalKeyboard(PhysicalKeyboardEvent),
     TextInput(TextInputEvent),
+    /// A reply to `Cx::read_clipboard`, routed by its request id.
+    Clipboard(crate::clipboard_read::ClipboardEvent),
+    /// Acceptance/error from a queued direct-display control request.
+    #[cfg(target_os = "linux")]
+    LinuxDisplayResult(crate::linux_display::LinuxDisplayResultEvent),
     TextRangeReplace(TextRangeReplaceEvent),
     TextCopy(TextClipboardEvent),
     TextCut(TextClipboardEvent),
@@ -201,6 +272,11 @@ pub enum Event {
     Drop(DropEvent),
     DragEnd,
 
+    /// The app is asked to open files or URLs: its launch arguments, a
+    /// second launch of a single-instance app, or an OS open request.
+    /// See [`AppOpenEvent`].
+    AppOpen(AppOpenEvent),
+
     /// Application-defined event sent via the studio/debug control protocol.
     /// Respond with `Cx::send_studio_message(AppToStudio::Custom(..))`.
     Custom(String),
@@ -209,7 +285,12 @@ pub enum Event {
     AudioDevices(AudioDevicesEvent),
     MidiPorts(MidiPortsEvent),
     VideoInputs(VideoInputsEvent),
+    NativeLayer(crate::native_layer::NativeLayerEvent),
     NetworkResponses(NetworkResponsesEvent),
+    /// Results of asynchronous operations submitted through [`Cx::storage`].
+    Storage(StorageResponsesEvent),
+    /// The system print UI completed a request from `Cx::print_pdf`.
+    PrintResult(PrintResultEvent),
 
     VideoPlaybackPrepared(VideoPlaybackPreparedEvent),
     VideoTextureUpdated(VideoTextureUpdatedEvent),
@@ -220,10 +301,11 @@ pub enum Event {
     VideoYuvTexturesReady(VideoYuvTexturesReady),
     VideoSeekableRanges(VideoSeekableRangesEvent),
     VideoBufferedRanges(VideoBufferedRangesEvent),
+    VideoTracksChanged(VideoTracksChangedEvent),
 
     /// The "go back" navigational button or gesture was performed.
     ///
-    /// Tip: use the [`Event::consume_back_pressed()`] method to handle this event
+    /// Tip: use the [`Event::back_pressed()`] method to handle this event
     /// instead of matching on it directly.
     ///
     /// Once a widget has handled this event, it should set the `handled` flag to `true`
@@ -231,12 +313,58 @@ pub enum Event {
     BackPressed {
         handled: Cell<bool>,
     },
+    /// The system back gesture while the user is still making it (Android's predictive back, API 34+).
+    /// If they complete it, an `Event::BackPressed` follows; otherwise it ends with a `Cancel`.
+    BackGesture(BackGestureEvent),
 
     /// Permission check or request result
     PermissionResult(PermissionResult),
 
+    /// A position fix from the platform location service
+    /// (see [`Cx::start_location_updates`]).
+    LocationUpdate(LocationUpdateEvent),
+    /// Location updates cannot be delivered (permission denied / no service).
+    LocationError(LocationErrorEvent),
+
+    /// A collect run's scan (`MAKEPAD_RUN=collect-web`, see
+    /// [`crate::collect`]): sent once. Every widget forwards it to its
+    /// children and emits what it needs on the web through it; widgets that
+    /// create children from data spawn their variants and forward into them.
+    Scan(crate::collect::ScanEvent),
+
+    /// A child domain's window is there or changed (see [`ChildWindowEvent`]). HAL client only.
+    ChildWindow(ChildWindowEvent),
+    ChildWindowClosed(ChildWindowClosedEvent),
+    /// A domain this app started changed state. HAL client only.
+    DomainState(DomainStateEvent),
+    DomainList(DomainListEvent),
+    ChildFrame(ChildFrameEvent),
+    ChildWindowAction(ChildWindowActionEvent),
+    ChildMessage { child: u32, message: String },
+    /// The GPU is short of memory (see [`GpuPressureEvent`]); the session that owns the
+    /// desktop frees what other GPU users hold for the UI. HAL client only.
+    GpuPressure(GpuPressureEvent),
+    /// An item of one of the app's tray menus was chosen (see [`crate::tray`]).
+    TrayMenu(crate::tray::TrayMenuEvent),
+    /// A primary click on one of the app's tray icons (Windows; macOS opens the menu).
+    TrayClick(crate::tray::TrayClickEvent),
+
     #[cfg(target_arch = "wasm32")]
     ToWasmMsg(ToWasmMsgEvent),
+}
+
+/// The device's free memory fell under the UI's reserve, or a GPU allocation failed for
+/// lack of room (`failed`). `wanted_mb` is how much would bring the free memory back to
+/// the reserve (plus the failed allocation); 0 means the shortage is over. `free_mb` and
+/// `budget_mb` are the device's numbers when it was raised; `reserve_mb` is what the UI
+/// keeps free. All in MiB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuPressureEvent {
+    pub wanted_mb: u32,
+    pub free_mb: u32,
+    pub budget_mb: u32,
+    pub reserve_mb: u32,
+    pub failed: bool,
 }
 
 impl Event {
@@ -246,8 +374,10 @@ impl Event {
 
     pub fn name_from_u32(v: u32) -> &'static str {
         match v {
+            94 => "A11yAction",
             1 => "Startup",
             2 => "Shutdown",
+            67 => "QuitRequested",
 
             3 => "Foreground",
             4 => "Background",
@@ -261,7 +391,7 @@ impl Event {
             10 => "WindowLostFocus",
             11 => "GameInputConnected",
             12 => "NextFrame",
-            13 => "XRUpdate",
+            13 => "XrUpdate",
 
             14 => "WindowDragQuery",
             15 => "WindowCloseRequested",
@@ -269,14 +399,20 @@ impl Event {
             17 => "WindowGeomChange",
             18 => "VirtualKeyboard",
             19 => "ClearAtlasses",
+            78 => "GpuReset",
+            95 => "GpuLost",
+            97 => "DrawShadersReady",
+            72 => "ClearHover",
 
             20 => "MouseDown",
             21 => "MouseMove",
             59 => "TweakRay",
             22 => "MouseUp",
             23 => "TouchUpdate",
+            75 => "FingerCancel",
             24 => "LongPress",
             25 => "Scroll",
+            74 => "Pinch",
 
             26 => "Timer",
 
@@ -287,7 +423,10 @@ impl Event {
             31 => "KeyFocusLost",
             32 => "KeyDown",
             33 => "KeyUp",
+            68 => "PhysicalKeyboard",
             34 => "TextInput",
+            85 => "Clipboard",
+            86 => "LinuxDisplayResult",
             35 => "TextRangeReplace",
             36 => "TextCopy",
             37 => "TextCut",
@@ -295,11 +434,14 @@ impl Event {
             38 => "Drag",
             39 => "Drop",
             40 => "DragEnd",
+            76 => "AppOpen",
 
             41 => "AudioDevices",
             42 => "MidiPorts",
             43 => "VideoInputs",
             44 => "NetworkResponses",
+            73 => "Storage",
+            96 => "PrintResult",
 
             45 => "VideoPlaybackPrepared",
             46 => "VideoTextureUpdated",
@@ -310,9 +452,11 @@ impl Event {
             63 => "VideoSeekableRanges",
             64 => "VideoBufferedRanges",
             65 => "VideoYuvTexturesReady",
+            71 => "VideoTracksChanged",
             51 => "MouseLeave",
             52 => "Actions",
             53 => "BackPressed",
+            87 => "BackGesture",
             54 => "PermissionResult",
 
             #[cfg(target_arch = "wasm32")]
@@ -323,14 +467,31 @@ impl Event {
             60 => "Custom",
             61 => "PopupDismissed",
             62 => "SelectionHandleDrag",
+            66 => "ScriptReapply",
+            69 => "LocationUpdate",
+            70 => "LocationError",
+            77 => "Scan",
+            80 => "ChildWindow",
+            81 => "ChildWindowClosed",
+            82 => "DomainState",
+            83 => "DomainList",
+            84 => "ChildFrame",
+            88 => "ChildWindowAction",
+            89 => "ChildMessage",
+            90 => "GpuPressure",
+            91 => "TrayMenu",
+            92 => "TrayClick",
+            93 => "NativeLayer",
             _ => panic!(),
         }
     }
 
     pub fn to_u32(&self) -> u32 {
         match self {
+            Self::A11yAction(_) => 94,
             Self::Startup => 1,
             Self::Shutdown => 2,
+            Self::QuitRequested(_) => 67,
 
             Self::Foreground => 3,
             Self::Background => 4,
@@ -352,6 +513,10 @@ impl Event {
             Self::WindowGeomChange(_) => 17,
             Self::VirtualKeyboard(_) => 18,
             Self::ClearAtlasses => 19,
+            Self::GpuReset => 78,
+            Self::GpuLost => 95,
+            Self::DrawShadersReady => 97,
+            Self::ClearHover => 72,
             Self::PopupDismissed(_) => 61,
 
             Self::MouseDown(_) => 20,
@@ -359,8 +524,10 @@ impl Event {
             Self::TweakRay(_) => 59,
             Self::MouseUp(_) => 22,
             Self::TouchUpdate(_) => 23,
+            Self::FingerCancel(_) => 75,
             Self::LongPress(_) => 24,
             Self::Scroll(_) => 25,
+            Self::Pinch(_) => 74,
 
             Self::Timer(_) => 26,
 
@@ -371,7 +538,11 @@ impl Event {
             Self::KeyFocusLost(_) => 31,
             Self::KeyDown(_) => 32,
             Self::KeyUp(_) => 33,
+            Self::PhysicalKeyboard(_) => 68,
             Self::TextInput(_) => 34,
+            Self::Clipboard(_) => 85,
+            #[cfg(target_os = "linux")]
+            Self::LinuxDisplayResult(_) => 86,
             Self::TextRangeReplace(_) => 35,
             Self::TextCopy(_) => 36,
             Self::TextCut(_) => 37,
@@ -381,11 +552,14 @@ impl Event {
             Self::Drag(_) => 38,
             Self::Drop(_) => 39,
             Self::DragEnd => 40,
+            Self::AppOpen(_) => 76,
 
             Self::AudioDevices(_) => 41,
             Self::MidiPorts(_) => 42,
             Self::VideoInputs(_) => 43,
             Self::NetworkResponses(_) => 44,
+            Self::Storage(_) => 73,
+            Self::PrintResult(_) => 96,
 
             Self::VideoPlaybackPrepared(_) => 45,
             Self::VideoTextureUpdated(_) => 46,
@@ -396,16 +570,33 @@ impl Event {
             Self::VideoSeekableRanges(_) => 63,
             Self::VideoBufferedRanges(_) => 64,
             Self::VideoYuvTexturesReady(_) => 65,
+            Self::VideoTracksChanged(_) => 71,
             Self::MouseLeave(_) => 51,
             Self::Actions(_) => 52,
             Self::BackPressed { .. } => 53,
+            Self::BackGesture(_) => 87,
             Self::PermissionResult(_) => 54,
+            Self::LocationUpdate(_) => 69,
+            Self::LocationError(_) => 70,
+            Self::Scan(_) => 77,
+            Self::ChildWindow(_) => 80,
+            Self::ChildWindowClosed(_) => 81,
+            Self::DomainState(_) => 82,
+            Self::DomainList(_) => 83,
+            Self::ChildFrame(_) => 84,
+            Self::ChildWindowAction(_) => 88,
+            Self::ChildMessage { .. } => 89,
+            Self::GpuPressure(_) => 90,
+            Self::TrayMenu(_) => 91,
+            Self::TrayClick(_) => 92,
+            Self::NativeLayer(_) => 93,
 
             #[cfg(target_arch = "wasm32")]
             Self::ToWasmMsg(_) => 55,
 
             Self::XrLocal(_) => 57,
             Self::Custom(_) => 60,
+            Self::ScriptReapply => 66,
         }
     }
 
@@ -422,6 +613,94 @@ impl Event {
         }
         false
     }
+
+    /// Whether a scroll view already moved by this [`Scroll`](Self::Scroll)
+    /// event's delta along `axis`. Always `false` for any other event.
+    ///
+    /// A scroll event reaches the widgets nearest the pointer first and the
+    /// scroll views around them after, so a scroll view that checks this
+    /// before applying a delta leaves alone a wheel an inner one has used.
+    pub fn scroll_handled(&self, axis: Vec2Index) -> bool {
+        match self {
+            Self::Scroll(e) => match axis {
+                Vec2Index::X => e.handled_x.get(),
+                Vec2Index::Y => e.handled_y.get(),
+            },
+            _ => false,
+        }
+    }
+
+    /// Marks this [`Scroll`](Self::Scroll) event's delta along `axis` as used,
+    /// so the scroll views around the caller leave it alone.
+    ///
+    /// Call it only after moving by the delta. A scroll view pinned at the
+    /// edge the delta points past leaves the delta for the views around it,
+    /// the way a `ScrollBar` at its limit does. Does nothing for any other
+    /// event.
+    pub fn set_scroll_handled(&self, axis: Vec2Index) {
+        if let Self::Scroll(e) = self {
+            match axis {
+                Vec2Index::X => e.handled_x.set(true),
+                Vec2Index::Y => e.handled_y.set(true),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuitReason {
+    /// The app requested a quit programmatically.
+    App,
+    /// The user chose a native/application menu Quit command.
+    Menu,
+    /// The process received a polite termination signal, such as Ctrl+C or SIGTERM.
+    Signal,
+}
+
+#[derive(Debug)]
+pub struct QuitRequestedEvent {
+    pub reason: QuitReason,
+    pub handled: Cell<bool>,
+}
+
+impl QuitRequestedEvent {
+    pub fn new(reason: QuitReason) -> Self {
+        Self {
+            reason,
+            handled: Cell::new(false),
+        }
+    }
+
+    pub fn handle(&self) {
+        self.handled.set(true);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BackGestureEvent {
+    pub state: BackGestureState,
+    /// Where the finger is, or `None` if this gesture doesn't come from a touch (e.g. a held back button).
+    pub abs: Option<crate::makepad_math::Vec2d>,
+    /// How far along the system thinks the gesture is, from 0 to 1.
+    pub progress: f64,
+    /// Which screen edge the gesture started from.
+    pub edge: BackGestureEdge,
+    /// Seconds, on the same clock as this platform's touch times.
+    pub time: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackGestureState {
+    Start,
+    Move,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackGestureEdge {
+    Left,
+    Right,
+    None,
 }
 
 #[derive(Debug)]
@@ -438,6 +717,7 @@ pub enum Hit {
     ImeAction(ImeActionEvent),
 
     FingerScroll(FingerScrollEvent),
+    FingerPinch(FingerPinchEvent),
     FingerDown(FingerDownEvent),
     FingerMove(FingerMoveEvent),
     FingerHoverIn(FingerHoverEvent),
@@ -465,7 +745,11 @@ impl Event {
             | Self::MouseMove(_)
             | Self::TweakRay(_)
             | Self::TouchUpdate(_)
-            | Self::Scroll(_) => true,
+            | Self::Scroll(_)
+            | Self::Pinch(_)
+            | Self::BackPressed { .. }
+            | Self::BackGesture(_) => true,
+            Self::KeyDown(key) | Self::KeyUp(key) if key.key_code == KeyCode::Escape => true,
             _ => false,
         }
     }
@@ -496,12 +780,16 @@ impl DrawEvent {
         self.redraw_all || self.draw_lists.len() != 0 || self.draw_lists_and_children.len() != 0
     }
 
+    /// The list records in this drawing: it, or a list drawn inside it, was asked to redraw
+    /// before the frame began or during its draw before the list's turn (`Cx::redraw_list`).
     pub fn draw_list_will_redraw(&self, cx: &Cx, draw_list_id: DrawListId) -> bool {
         if self.redraw_all {
             return true;
         }
+        let asked = cx.in_draw_redraws.iter().filter(|r| !r.children).map(|r| &r.list);
+        let asked_with_children = cx.in_draw_redraws.iter().filter(|r| r.children).map(|r| &r.list);
         // figure out if areas are in some way a child of view_id, then we need to redraw
-        for check_draw_list_id in &self.draw_lists {
+        for check_draw_list_id in self.draw_lists.iter().chain(asked) {
             let mut next = Some(*check_draw_list_id);
             while let Some(vw) = next {
                 if vw == draw_list_id {
@@ -516,7 +804,7 @@ impl DrawEvent {
             }
         }
         // figure out if areas are in some way a parent of view_id, then redraw
-        for check_draw_list_id in &self.draw_lists_and_children {
+        for check_draw_list_id in self.draw_lists_and_children.iter().chain(asked_with_children) {
             let mut next = Some(draw_list_id);
             while let Some(vw) = next {
                 if vw == *check_draw_list_id {
@@ -617,325 +905,74 @@ pub enum Ease {
 }
 
 impl Ease {
+    /// The ease curve at `t`. It runs through `makepad_tween::Easing` like the Animator's `Ease`,
+    /// so there's one copy of the math.
     pub fn map(&self, t: f64) -> f64 {
-        match self {
-            Self::ExpDecay { d1, d2, max } => {
-                // there must be a closed form for this
-                if t > 0.999 {
-                    return 1.0;
-                }
+        use makepad_tween::Easing as E;
+        let easing = match *self {
+            Self::Linear => E::Linear,
+            Self::None => E::Instant,
+            Self::Constant(c) => E::Constant(c),
+            Self::InQuad => E::InQuad,
+            Self::OutQuad => E::OutQuad,
+            Self::InOutQuad => E::InOutQuad,
+            Self::InCubic => E::InCubic,
+            Self::OutCubic => E::OutCubic,
+            Self::InOutCubic => E::InOutCubic,
+            Self::InQuart => E::InQuart,
+            Self::OutQuart => E::OutQuart,
+            Self::InOutQuart => E::InOutQuart,
+            Self::InQuint => E::InQuint,
+            Self::OutQuint => E::OutQuint,
+            Self::InOutQuint => E::InOutQuint,
+            Self::InSine => E::InSine,
+            Self::OutSine => E::OutSine,
+            Self::InOutSine => E::InOutSine,
+            Self::InExp => E::InExp,
+            Self::OutExp => E::OutExp,
+            Self::InOutExp => E::InOutExp,
+            Self::InCirc => E::InCirc,
+            Self::OutCirc => E::OutCirc,
+            Self::InOutCirc => E::InOutCirc,
+            Self::InElastic => E::InElastic,
+            Self::OutElastic => E::OutElastic,
+            Self::InOutElastic => E::InOutElastic,
+            Self::InBack => E::InBack,
+            Self::OutBack => E::OutBack,
+            Self::InOutBack => E::InOutBack,
+            Self::InBounce => E::InBounce,
+            Self::OutBounce => E::OutBounce,
+            Self::InOutBounce => E::InOutBounce,
+            Self::ExpDecay { d1, d2, max } => E::exp_decay(d1, d2, max),
+            Self::Pow { begin, end } => E::pow(begin, end),
+            Self::Bezier { cp0, cp1, cp2, cp3 } => E::Bezier {
+                x1: cp0,
+                y1: cp1,
+                x2: cp2,
+                y2: cp3,
+            },
+        };
+        easing.map(t)
+    }
+}
 
-                // first we count the number of steps we'd need to decay
-                let mut di = *d1;
-                let mut dt = 1.0;
-                let max_steps = (*max).min(1000);
-                let mut steps = 0;
-                // for most of the settings we use this takes max 15 steps or so
-                while dt > 0.001 && steps < max_steps {
-                    steps = steps + 1;
-                    dt = dt * di;
-                    di *= d2;
-                }
-                // then we know how to find the step, and lerp it
-                let step = t * (steps as f64);
-                let mut di = *d1;
-                let mut dt = 1.0;
-                let max_steps = max_steps as f64;
-                let mut steps = 0.0;
-                while dt > 0.001 && steps < max_steps {
-                    steps += 1.0;
-                    if steps >= step {
-                        // right step
-                        let fac = steps - step;
-                        return 1.0 - (dt * fac + (dt * di) * (1.0 - fac));
-                    }
-                    dt = dt * di;
-                    di *= d2;
-                }
-                1.0
-            }
-            Self::Linear => {
-                return t.max(0.0).min(1.0);
-            }
-            Self::Constant(t) => {
-                return t.max(0.0).min(1.0);
-            }
-            Self::None => {
-                return 1.0;
-            }
-            Self::Pow { begin, end } => {
-                if t < 0. {
-                    return 0.;
-                }
-                if t > 1. {
-                    return 1.;
-                }
-                let a = -1. / (begin * begin).max(1.0);
-                let b = 1. + 1. / (end * end).max(1.0);
-                let t2 = (((a - 1.) * -b) / (a * (1. - b))).powf(t);
-                return (-a * b + b * a * t2) / (a * t2 - b);
-            }
+#[cfg(test)]
+mod ease_tests {
+    use super::*;
 
-            Self::InQuad => {
-                return t * t;
-            }
-            Self::OutQuad => {
-                return t * (2.0 - t);
-            }
-            Self::InOutQuad => {
-                let t = t * 2.0;
-                if t < 1. {
-                    return 0.5 * t * t;
-                } else {
-                    let t = t - 1.;
-                    return -0.5 * (t * (t - 2.) - 1.);
-                }
-            }
-            Self::InCubic => {
-                return t * t * t;
-            }
-            Self::OutCubic => {
-                let t2 = t - 1.0;
-                return t2 * t2 * t2 + 1.0;
-            }
-            Self::InOutCubic => {
-                let t = t * 2.0;
-                if t < 1. {
-                    return 0.5 * t * t * t;
-                } else {
-                    let t = t - 2.;
-                    return 1. / 2. * (t * t * t + 2.);
-                }
-            }
-            Self::InQuart => return t * t * t * t,
-            Self::OutQuart => {
-                let t = t - 1.;
-                return -(t * t * t * t - 1.);
-            }
-            Self::InOutQuart => {
-                let t = t * 2.0;
-                if t < 1. {
-                    return 0.5 * t * t * t * t;
-                } else {
-                    let t = t - 2.;
-                    return -0.5 * (t * t * t * t - 2.);
-                }
-            }
-            Self::InQuint => {
-                return t * t * t * t * t;
-            }
-            Self::OutQuint => {
-                let t = t - 1.;
-                return t * t * t * t * t + 1.;
-            }
-            Self::InOutQuint => {
-                let t = t * 2.0;
-                if t < 1. {
-                    return 0.5 * t * t * t * t * t;
-                } else {
-                    let t = t - 2.;
-                    return 0.5 * (t * t * t * t * t + 2.);
-                }
-            }
-            Self::InSine => {
-                return -(t * PI * 0.5).cos() + 1.;
-            }
-            Self::OutSine => {
-                return (t * PI * 0.5).sin();
-            }
-            Self::InOutSine => {
-                return -0.5 * ((t * PI).cos() - 1.);
-            }
-            Self::InExp => {
-                if t < 0.001 {
-                    return 0.;
-                } else {
-                    return 2.0f64.powf(10. * (t - 1.));
-                }
-            }
-            Self::OutExp => {
-                if t > 0.999 {
-                    return 1.;
-                } else {
-                    return -(2.0f64.powf(-10. * t)) + 1.;
-                }
-            }
-            Self::InOutExp => {
-                if t < 0.001 {
-                    return 0.;
-                }
-                if t > 0.999 {
-                    return 1.;
-                }
-                let t = t * 2.0;
-                if t < 1. {
-                    return 0.5 * 2.0f64.powf(10. * (t - 1.));
-                } else {
-                    let t = t - 1.;
-                    return 0.5 * (-(2.0f64.powf(-10. * t)) + 2.);
-                }
-            }
-            Self::InCirc => {
-                return -((1. - t * t).sqrt() - 1.);
-            }
-            Self::OutCirc => {
-                let t = t - 1.;
-                return (1. - t * t).sqrt();
-            }
-            Self::InOutCirc => {
-                let t = t * 2.;
-                if t < 1. {
-                    return -0.5 * ((1. - t * t).sqrt() - 1.);
-                } else {
-                    let t = t - 2.;
-                    return 0.5 * ((1. - t * t).sqrt() + 1.);
-                }
-            }
-            Self::InElastic => {
-                let p = 0.3;
-                let s = p / 4.0; // c = 1.0, b = 0.0, d = 1.0
-                if t < 0.001 {
-                    return 0.;
-                }
-                if t > 0.999 {
-                    return 1.;
-                }
-                let t = t - 1.0;
-                return -(2.0f64.powf(10.0 * t) * ((t - s) * (2.0 * PI) / p).sin());
-            }
-            Self::OutElastic => {
-                let p = 0.3;
-                let s = p / 4.0; // c = 1.0, b = 0.0, d = 1.0
-
-                if t < 0.001 {
-                    return 0.;
-                }
-                if t > 0.999 {
-                    return 1.;
-                }
-                return 2.0f64.powf(-10.0 * t) * ((t - s) * (2.0 * PI) / p).sin() + 1.0;
-            }
-            Self::InOutElastic => {
-                let p = 0.3;
-                let s = p / 4.0; // c = 1.0, b = 0.0, d = 1.0
-                if t < 0.001 {
-                    return 0.;
-                }
-                if t > 0.999 {
-                    return 1.;
-                }
-                let t = t * 2.0;
-                if t < 1. {
-                    let t = t - 1.0;
-                    return -0.5 * (2.0f64.powf(10.0 * t) * ((t - s) * (2.0 * PI) / p).sin());
-                } else {
-                    let t = t - 1.0;
-                    return 0.5 * 2.0f64.powf(-10.0 * t) * ((t - s) * (2.0 * PI) / p).sin() + 1.0;
-                }
-            }
-            Self::InBack => {
-                let s = 1.70158;
-                return t * t * ((s + 1.) * t - s);
-            }
-            Self::OutBack => {
-                let s = 1.70158;
-                let t = t - 1.;
-                return t * t * ((s + 1.) * t + s) + 1.;
-            }
-            Self::InOutBack => {
-                let s = 1.70158;
-                let t = t * 2.0;
-                if t < 1. {
-                    let s = s * 1.525;
-                    return 0.5 * (t * t * ((s + 1.) * t - s));
-                } else {
-                    let t = t - 2.;
-                    return 0.5 * (t * t * ((s + 1.) * t + s) + 2.);
-                }
-            }
-            Self::InBounce => {
-                return 1.0 - Self::OutBounce.map(1.0 - t);
-            }
-            Self::OutBounce => {
-                if t < (1. / 2.75) {
-                    return 7.5625 * t * t;
-                }
-                if t < (2. / 2.75) {
-                    let t = t - (1.5 / 2.75);
-                    return 7.5625 * t * t + 0.75;
-                }
-                if t < (2.5 / 2.75) {
-                    let t = t - (2.25 / 2.75);
-                    return 7.5625 * t * t + 0.9375;
-                }
-                let t = t - (2.625 / 2.75);
-                return 7.5625 * t * t + 0.984375;
-            }
-            Self::InOutBounce => {
-                if t < 0.5 {
-                    return Self::InBounce.map(t * 2.) * 0.5;
-                } else {
-                    return Self::OutBounce.map(t * 2. - 1.) * 0.5 + 0.5;
-                }
-            }
-            Self::Bezier { cp0, cp1, cp2, cp3 } => {
-                if t < 0. {
-                    return 0.;
-                }
-                if t > 1. {
-                    return 1.;
-                }
-
-                if (cp0 - cp1).abs() < 0.001 && (cp2 - cp3).abs() < 0.001 {
-                    return t;
-                }
-
-                let epsilon = 1.0 / 200.0 * t;
-                let cx = 3.0 * cp0;
-                let bx = 3.0 * (cp2 - cp0) - cx;
-                let ax = 1.0 - cx - bx;
-                let cy = 3.0 * cp1;
-                let by = 3.0 * (cp3 - cp1) - cy;
-                let ay = 1.0 - cy - by;
-                let mut u = t;
-
-                for _i in 0..6 {
-                    let x = ((ax * u + bx) * u + cx) * u - t;
-                    if x.abs() < epsilon {
-                        return ((ay * u + by) * u + cy) * u;
-                    }
-                    let d = (3.0 * ax * u + 2.0 * bx) * u + cx;
-                    if d.abs() < 1e-6 {
-                        break;
-                    }
-                    u = u - x / d;
-                }
-
-                if t > 1. {
-                    return (ay + by) + cy;
-                }
-                if t < 0. {
-                    return 0.0;
-                }
-
-                let mut w = 0.0;
-                let mut v = 1.0;
-                u = t;
-                for _i in 0..8 {
-                    let x = ((ax * u + bx) * u + cx) * u;
-                    if (x - t).abs() < epsilon {
-                        return ((ay * u + by) * u + cy) * u;
-                    }
-
-                    if t > x {
-                        w = u;
-                    } else {
-                        v = u;
-                    }
-                    u = (v - w) * 0.5 + w;
-                }
-
-                return ((ay * u + by) * u + cy) * u;
+    #[test]
+    fn keyboard_curves_match_the_precise_bezier() {
+        // UIKit's ease-in-out, ease-in and ease-out, which `hal_intake` sends as the keyboard's ease
+        for [x1, y1, x2, y2] in [[0.42, 0.0, 0.58, 1.0], [0.42, 0.0, 1.0, 1.0], [0.0, 0.0, 0.58, 1.0]] {
+            let ease = Ease::Bezier { cp0: x1, cp1: y1, cp2: x2, cp3: y2 };
+            let precise = makepad_tween::Easing::css(x1, y1, x2, y2);
+            let mut prev = 0.0;
+            for i in 0..=100_000 {
+                let t = i as f64 / 100_000.0;
+                let mix = ease.map(t);
+                assert!((mix - precise.map(t)).abs() < 1e-6, "{ease:?} is off at t = {t}");
+                assert!(mix >= prev, "{ease:?} steps backwards at t = {t}");
+                prev = mix;
             }
         }
     }
@@ -945,18 +982,21 @@ impl Ease {
 pub enum VirtualKeyboardEvent {
     WillShow {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
         duration: f64,
         ease: Ease,
     },
     WillHide {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
         duration: f64,
         ease: Ease,
     },
     DidShow {
         time: f64,
+        /// Keyboard bottom occlusion in Makepad layout points.
         height: f64,
     },
     DidHide {
@@ -1003,6 +1043,10 @@ pub struct NextFrame(pub u64);
 
 impl NextFrame {
     pub fn is_event(&self, event: &Event) -> Option<NextFrameEvent> {
+        // Ids start at 1, so the default id never fires.
+        if self.0 == 0 {
+            return None;
+        }
         if let Event::NextFrame(ne) = event {
             if ne.set.contains(&self) {
                 return Some(ne.clone());
@@ -1084,5 +1128,29 @@ pub struct ToWasmMsgEvent {
 impl ToWasmMsgEvent {
     pub fn as_ref(&self) -> ToWasmMsgRef<'_> {
         self.msg.as_ref_at(self.offset)
+    }
+}
+
+#[cfg(test)]
+mod event_id_tests {
+    /// Every `to_u32` arm has its own id, and `name_from_u32` names that id after the same
+    /// variant: event names, recordings, the flight recorder and inspect events key on it.
+    #[test]
+    fn every_event_id_is_unique_and_named_after_its_variant() {
+        let src = include_str!("event.rs");
+        let body = src.split("pub fn to_u32(&self) -> u32 {").nth(1).unwrap().split("\n    }\n").next().unwrap();
+        let mut seen = std::collections::HashMap::new();
+        let mut gated = false;
+        for line in body.lines().map(str::trim) {
+            // an arm under a #[cfg(..)] is unique like any other; its name only exists on that target
+            if line.starts_with("#[cfg") { gated = true; continue; }
+            if !line.starts_with("Self::") { continue; }
+            let (pattern, id) = line.split_once("=>").unwrap();
+            let name: String = pattern["Self::".len()..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            let id: u32 = id.trim().trim_end_matches(',').parse().unwrap();
+            if let Some(other) = seen.insert(id, name.clone()) { panic!("event id {id} is used by both {other} and {name}"); }
+            if !std::mem::take(&mut gated) { assert_eq!(super::Event::name_from_u32(id), name, "event id {id}"); }
+        }
+        assert!(seen.len() > 90, "parsed only {} to_u32 arms", seen.len());
     }
 }

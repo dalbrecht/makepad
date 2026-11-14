@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::clock::Instant;
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
@@ -8,13 +9,15 @@ use std::{
         mpsc, Arc,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Debug)]
 pub(super) enum XrNetUdpOutgoing {
     State(XrNetStateFrame),
     SharedObjectStates(Vec<XrNetSharedObjectState>),
+    /// One more address the discovery hellos go to ([`super::XrNetNode::add_discovery_target`]).
+    DiscoveryTarget(SocketAddr),
     Break,
 }
 
@@ -252,6 +255,8 @@ struct XrNetUdpWorker {
     discovery_targets: Vec<SocketAddr>,
     discovery_interval: Duration,
     peer_timeout: Duration,
+    // (the browser never reaches the socket loops that read it)
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     poll_interval: Duration,
     bound_data_port: u16,
     bound_sync_port: u16,
@@ -264,7 +269,7 @@ struct XrNetUdpWorker {
 }
 
 impl XrNetUdpWorker {
-    fn run(self) {
+    fn run(mut self) {
         let mut peers = HashMap::<XrNetPeerId, UdpWorkerPeerState>::new();
         let mut cached_state = None;
         let mut next_discovery_at = Instant::now();
@@ -285,6 +290,8 @@ impl XrNetUdpWorker {
             if should_break {
                 break;
             }
+            // Browser workers cannot create the UDP socket that reaches this loop.
+            #[cfg(not(target_arch = "wasm32"))]
             thread::sleep(self.poll_interval);
         }
 
@@ -316,7 +323,7 @@ impl XrNetUdpWorker {
     }
 
     fn drain_outgoing_messages(
-        &self,
+        &mut self,
         peers: &mut HashMap<XrNetPeerId, UdpWorkerPeerState>,
         cached_state: &mut Option<XrNetStateFrame>,
     ) -> bool {
@@ -335,6 +342,11 @@ impl XrNetUdpWorker {
                         for peer in peers.values() {
                             let _ = self.data_socket.send_to(buf, peer.peer.addr);
                         }
+                    }
+                }
+                Ok(XrNetUdpOutgoing::DiscoveryTarget(target)) => {
+                    if !self.discovery_targets.contains(&target) {
+                        self.discovery_targets.push(target);
                     }
                 }
                 Ok(XrNetUdpOutgoing::Break) => return true,
@@ -644,6 +656,7 @@ impl XrNetUdpWorker {
 
 struct XrNetSyncWorker {
     node_id: XrNetPeerId,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     poll_interval: Duration,
     sync_listener: TcpListener,
     incoming_sender: mpsc::Sender<XrNetIncoming>,
@@ -690,6 +703,8 @@ impl XrNetSyncWorker {
             if should_break {
                 break;
             }
+            // Browser workers cannot create the TCP listener that reaches this loop.
+            #[cfg(not(target_arch = "wasm32"))]
             thread::sleep(self.poll_interval);
         }
 

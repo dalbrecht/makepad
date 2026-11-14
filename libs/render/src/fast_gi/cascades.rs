@@ -1,0 +1,253 @@
+//! Probe cascades and the per-frame update schedule (UI thread, O(budget)).
+//!
+//! Each cascade is a camera-centred lattice (`grid` probes at `spacing`)
+//! stored TOROIDALLY: world cell `c` lives in slot `c mod grid`, so moving
+//! the window only re-targets the slots of the slab it newly covers. Those
+//! slots are queued for tracing; every other probe keeps its value. The
+//! shaders reject a slot whose stored probe does not belong to the cell
+//! they expect, so a not-yet-traced slot can never show stale light.
+//!
+//! Schedule, per frame, `budget` probes: queued work first (new slab
+//! probes, probes near an edit), then a round-robin refresh, both split
+//! 2:1:1 between the fine and coarser cascades.
+use std::collections::VecDeque;
+
+/// History weight of an ordinary refresh (rotated ray set each time).
+pub(crate) const REFRESH_HYSTERESIS: f32 = 0.85;
+/// History weight right after an edit near the probe: show it quickly.
+pub(crate) const DIRTY_HYSTERESIS: f32 = 0.2;
+/// Settle mode: updates per probe, each a rotated ray set averaged equally
+/// with the ones before it; then the probe stops. Enough for the noise to
+/// go and for the bounces to come through the field.
+pub(crate) const SETTLE_UPDATES: u8 = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BatchItem {
+    pub cascade: usize,
+    pub slot: usize,
+    pub cell: [i32; 3],
+    pub hysteresis: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Queued { No, New, Dirty }
+
+pub(crate) struct Cascade {
+    pub grid: [usize; 3],
+    pub spacing: f32,
+    /// Min cell of the window; None until the first voxels arrived.
+    pub origin: Option<[i32; 3]>,
+    queued: Vec<Queued>,
+    queue: VecDeque<u32>,
+    cursor: usize,
+    /// The refresh's step through the slots (see [`refresh_stride`]).
+    stride: usize,
+    /// Frame stamp of each slot's last scheduling: one update per frame.
+    stamp: Vec<u32>,
+    frame: u32,
+    /// Settle mode: updates each slot had since it last changed, and whether
+    /// a surface can read it (no surface near: never traced).
+    settle: bool,
+    updates: Vec<u8>,
+    needed: Vec<bool>,
+}
+
+/// The round-robin refresh's step: slot `(step * stride) % count` visits every slot once per
+/// `count` steps (stride and count coprime), spread through the volume so a refresh wave never
+/// sweeps visibly through space.
+fn refresh_stride(count: usize) -> usize {
+    let mut s = (count * 5 / 8) | 1;
+    while gcd(s, count) != 1 { s += 2; }
+    s
+}
+fn gcd(a: usize, b: usize) -> usize { if b == 0 { a } else { gcd(b, a % b) } }
+
+impl Cascade {
+    pub fn new(grid: [usize; 3], spacing: f32, settle: bool) -> Self {
+        let count = grid.iter().product();
+        Self { grid, spacing, origin: None, queued: vec![Queued::No; count], queue: VecDeque::with_capacity(count), cursor: 0, stride: refresh_stride(count), stamp: vec![0; count], frame: 0, settle, updates: vec![0; count], needed: vec![!settle; count] }
+    }
+    /// Which probes of the window a surface can read (window-local cells,
+    /// x + grid.x (y + grid.y z)). A probe newly needed is traced.
+    pub fn set_needed(&mut self, local: &[bool]) {
+        let Some(o) = self.origin else { return };
+        let (gx, gy) = (self.grid[0], self.grid[1]);
+        for (i, &now) in local.iter().enumerate() {
+            let (x, y, z) = (i % gx, (i / gx) % gy, i / (gx * gy));
+            let slot = self.slot([o[0] + x as i32, o[1] + y as i32, o[2] + z as i32]);
+            if now && !self.needed[slot] { self.enqueue(slot, Queued::Dirty); }
+            self.needed[slot] = now;
+        }
+    }
+    /// Settle mode: every needed probe settles again from what it holds.
+    pub fn restart(&mut self) {
+        if self.settle { self.updates.iter_mut().for_each(|u| *u = (*u).min(1)); }
+    }
+
+    pub fn count(&self) -> usize { self.queued.len() }
+    pub fn pending(&self) -> usize { self.queue.len() }
+    /// Diagnostic cadence only: an empty queue alone also describes a new
+    /// cascade, or settle mode's unneeded slots that were never issued.
+    pub fn full_sweep_issued(&self) -> bool {
+        self.origin.is_some() && self.pending() == 0 && self.updates.iter().all(|&n| n > 0)
+    }
+    pub fn slot(&self, cell: [i32; 3]) -> usize {
+        let m = [0, 1, 2].map(|a| cell[a].rem_euclid(self.grid[a] as i32) as usize);
+        m[0] + self.grid[0] * (m[1] + self.grid[1] * m[2])
+    }
+    /// The world cell `slot` holds in the current window.
+    pub fn cell(&self, slot: usize) -> Option<[i32; 3]> {
+        let o = self.origin?;
+        let m = [slot % self.grid[0], (slot / self.grid[0]) % self.grid[1], slot / (self.grid[0] * self.grid[1])];
+        Some([0, 1, 2].map(|a| o[a] + (m[a] as i32 - o[a]).rem_euclid(self.grid[a] as i32)))
+    }
+    fn enqueue(&mut self, slot: usize, why: Queued) {
+        match self.queued[slot] {
+            Queued::No => { self.queued[slot] = why; self.queue.push_back(slot as u32); }
+            Queued::New => {}
+            Queued::Dirty => if why == Queued::New { self.queued[slot] = Queued::New; },
+        }
+    }
+    /// Move the window; returns the slots that now hold another cell (their
+    /// old probe must be cleared, the new one traced).
+    pub fn scroll(&mut self, origin: [i32; 3]) -> Vec<usize> {
+        let old = self.origin.replace(origin);
+        let mut exposed = Vec::new();
+        if old == Some(origin) { return exposed; }
+        for slot in 0..self.count() {
+            let c = self.cell(slot).unwrap();
+            let kept = old.is_some_and(|o| (0..3).all(|a| c[a] >= o[a] && c[a] < o[a] + self.grid[a] as i32));
+            if !kept { self.updates[slot] = 0; self.enqueue(slot, Queued::New); exposed.push(slot); }
+        }
+        exposed
+    }
+    /// Queue the probes near a changed world box; returns how many.
+    pub fn invalidate(&mut self, lo: [f32; 3], hi: [f32; 3], home: [f32; 3]) -> usize {
+        let Some(o) = self.origin else { return 0; };
+        let pad = 1.5;
+        let r = [0, 1, 2].map(|a| {
+            let l = ((lo[a] / self.spacing - home[a] - pad).ceil() as i32).max(o[a]);
+            let h = ((hi[a] / self.spacing - home[a] + pad).floor() as i32).min(o[a] + self.grid[a] as i32 - 1);
+            (l, h)
+        });
+        let mut n = 0;
+        for z in r[2].0..=r[2].1 { for y in r[1].0..=r[1].1 { for x in r[0].0..=r[0].1 {
+            let s = self.slot([x, y, z]);
+            self.enqueue(s, Queued::Dirty); n += 1;
+        }}}
+        n
+    }
+    fn take_queued(&mut self, index: usize, n: usize, out: &mut Vec<BatchItem>) -> usize {
+        let mut taken = 0;
+        while taken < n {
+            let Some(slot) = self.queue.pop_front() else { break };
+            let slot = slot as usize;
+            let why = std::mem::replace(&mut self.queued[slot], Queued::No);
+            if !self.needed[slot] { continue; }
+            let Some(cell) = self.cell(slot) else { continue };
+            let hysteresis = if why == Queued::Dirty { DIRTY_HYSTERESIS } else { 0.0 };
+            self.stamp[slot] = self.frame;
+            self.updates[slot] = 1;
+            out.push(BatchItem { cascade: index, slot, cell, hysteresis });
+            taken += 1;
+        }
+        taken
+    }
+    fn take_refresh(&mut self, index: usize, n: usize, out: &mut Vec<BatchItem>) -> usize {
+        let count = self.count();
+        let mut taken = 0;
+        // Settle mode looks past the probes that are done for ones that are not.
+        for _ in 0..count {
+            if taken == n { break; }
+            let slot = (self.cursor * self.stride) % count;
+            self.cursor = (self.cursor + 1) % count;
+            if self.queued[slot] != Queued::No || self.stamp[slot] == self.frame { continue; }
+            let hysteresis = if self.settle {
+                let done = self.updates[slot];
+                if !self.needed[slot] || done >= SETTLE_UPDATES { continue; }
+                self.updates[slot] = done + 1;
+                // an equal average of this probe's updates so far
+                (done as f32 / (done as f32 + 1.0)).min(REFRESH_HYSTERESIS)
+            } else {
+                REFRESH_HYSTERESIS
+            };
+            self.stamp[slot] = self.frame;
+            let Some(cell) = self.cell(slot) else { break };
+            out.push(BatchItem { cascade: index, slot, cell, hysteresis });
+            taken += 1;
+        }
+        taken
+    }
+}
+
+/// Shares of the budget: the finest cascade covers what the eye sees.
+fn shares(budget: usize, cascades: usize) -> [usize; super::MAX_CASCADES] {
+    let mut s = [0; super::MAX_CASCADES];
+    let total = cascades + 1;
+    for (i, share) in s[..cascades].iter_mut().enumerate() {
+        *share = budget * if i == 0 { 2 } else { 1 } / total;
+    }
+    s[0] += budget - s.iter().sum::<usize>();
+    s
+}
+
+/// Largest batch whose 2:1:1 refresh shares fit without repeating a slot.
+/// Queued work may borrow those shares, but never raises this ceiling.
+pub(crate) fn batch_capacity(count: usize, cascades: usize) -> usize {
+    count * (cascades + 1) / 2
+}
+
+/// This frame's updates, in the existing queue/stride order. Storage belongs
+/// to the caller; no catch-up work or allocation on an ordinary frame.
+pub(crate) fn schedule(cascades: &mut [Cascade], budget: usize, out: &mut Vec<BatchItem>) {
+    out.clear();
+    let mut ready = [0; super::MAX_CASCADES];
+    let mut nready = 0;
+    for (i, cascade) in cascades.iter_mut().enumerate() {
+        if cascade.origin.is_some() {
+            ready[nready] = i;
+            nready += 1;
+            cascade.frame = cascade.frame.wrapping_add(1).max(1);
+        }
+    }
+    let ready = &ready[..nready];
+    if ready.is_empty() || budget == 0 { return; }
+    let mut left = budget;
+    loop {
+        let mut busy = [0; super::MAX_CASCADES];
+        let mut nbusy = 0;
+        for &i in ready {
+            if cascades[i].pending() > 0 {
+                busy[nbusy] = i;
+                nbusy += 1;
+            }
+        }
+        if left == 0 || nbusy == 0 { break; }
+        let s = shares(left, nbusy);
+        let mut taken = 0;
+        for (k, &i) in busy[..nbusy].iter().enumerate() {
+            taken += cascades[i].take_queued(i, s[k], out);
+        }
+        if taken == 0 { break; }
+        left -= taken;
+    }
+    // Look past already queued/stamped slots, retaining the same stride.
+    // An edit must not leave a short frame followed by a full-frame burst.
+    let mut exhausted = [false; super::MAX_CASCADES];
+    while left > 0 {
+        let mut refresh = [0; super::MAX_CASCADES];
+        let mut nrefresh = 0;
+        for &i in ready {
+            if !exhausted[i] { refresh[nrefresh] = i; nrefresh += 1; }
+        }
+        if nrefresh == 0 { break; }
+        let s = shares(left, nrefresh);
+        let mut taken = 0;
+        for (k, &i) in refresh[..nrefresh].iter().enumerate() {
+            let n = cascades[i].take_refresh(i, s[k], out);
+            if n < s[k] { exhausted[i] = true; }
+            taken += n;
+        }
+        left -= taken;
+    }
+}

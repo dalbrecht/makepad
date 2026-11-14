@@ -7,75 +7,42 @@
     target_os = "tvos",
     target_os = "windows"
 ))]
+// Native clock backend: this is the implementation behind Cx's portable clock.
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod cx_native;
 
 #[macro_use]
 pub mod cx_shared;
 
 pub mod shared_framebuf;
+#[cfg(target_os = "linux")]
+pub(crate) mod hosted_gpu;
+#[cfg(target_os = "linux")]
+pub(crate) mod hosted_gpu_sender;
 
-#[cfg(headless)]
-pub mod headless;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) mod termination_signal;
 
-#[cfg(headless)]
-pub use crate::os::headless::*;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+// Native-only: the launch handoff runs before any Cx (and its clock) exists.
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+pub(crate) mod single_instance;
 
-#[cfg(all(
-    not(headless),
-    any(target_os = "macos", target_os = "ios", target_os = "tvos")
-))]
-pub mod apple;
+#[cfg(not(target_arch = "wasm32"))]
+// Every native target uses the HAL command/event client.
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+pub mod hal;
 
-#[cfg(all(
-    not(headless),
-    any(target_os = "macos", target_os = "ios", target_os = "tvos")
-))]
-pub use crate::os::apple::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::os::hal::*;
 
-#[cfg(all(
-    not(headless),
-    any(target_os = "macos", target_os = "ios", target_os = "tvos")
-))]
-pub use crate::os::apple::apple_media::*;
+/// The GL function table of the GL interop API (`Cx::with_gl`).
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+pub mod gl_sys;
 
-#[cfg(all(not(headless), target_os = "windows"))]
-pub mod windows;
 
-#[cfg(all(not(headless), target_os = "windows"))]
-pub use crate::os::windows::*;
-
-//#[cfg(target_os = "windows")]
-//pub use crate::os::windows::windows_media::*;
-
-#[cfg(all(not(headless), any(target_os = "android", target_os = "linux")))]
-pub mod linux;
-
-#[cfg(all(not(headless), any(target_os = "android", target_os = "linux")))]
-pub use crate::os::linux::*;
-
-#[cfg(all(test, not(headless), target_os = "macos"))]
-pub mod linux_test_stub;
-
-#[cfg(all(test, not(headless), target_os = "macos"))]
-pub use crate::os::linux_test_stub as linux;
-
-#[cfg(all(not(headless), target_os = "android"))]
-pub use crate::os::linux::android::android_media::*;
-
-#[cfg(all(not(headless), target_os = "linux", not(target_env = "ohos")))]
-pub use crate::os::linux::linux_media::*;
-
-#[cfg(all(not(headless), target_env = "ohos"))]
-pub use crate::os::linux::open_harmony::oh_media::*;
-
-//#[cfg(target_os = "linux")]
-//pub use crate::os::linux::*;
-
-//#[cfg(target_os = "linux")]
-//pub use crate::os::linux::linux_media::*;
-
-#[cfg(all(not(headless), target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 pub mod web;
 
-#[cfg(all(not(headless), target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 pub use crate::os::web::*;

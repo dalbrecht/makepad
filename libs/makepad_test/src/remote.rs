@@ -1,0 +1,932 @@
+//! Client side of the app's `--remote` endpoint (`platform/src/remote_core.rs`).
+//!
+//! Every call is one `cmd` request over the app's makepad-remote Unix socket;
+//! the answer lines are JSON decoded with `makepad-micro-serde`. Every
+//! `{"err":...}` line becomes a [`TestError`] so callers never see a fake
+//! success. Images are written by this client (`makepad_remote::app`), never by
+//! the app.
+
+use crate::error::{TestError, TestResult};
+use makepad_micro_serde::{DeJson, JsonValue};
+use makepad_studio_protocol::{KeyCode, KeyModifiers};
+use makepad_remote::conn::Event;
+use makepad_remote::Client;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// Longer than every internal `ask` timeout in the app's remote thread (grabs
+/// wait up to 10 s for the GPU), so a wedged app still answers with its own
+/// diagnostic instead of a bare socket timeout.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowInfo {
+    pub id: usize,
+    pub title: String,
+    pub width: f64,
+    pub height: f64,
+    pub dpi: f64,
+    /// The scale its main pass last rasterised at; 0 before it first drew.
+    pub pass_dpi: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogTail {
+    pub last_seq: u64,
+    pub lines: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseKind {
+    Move,
+    Down,
+    Up,
+    Click,
+    Scroll,
+    /// One finger on a touch screen; `MouseInput::phase` is `start`, `move`, `stop` or `cancel`.
+    Touch,
+}
+
+impl MouseKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::Down => "down",
+            Self::Up => "up",
+            Self::Click => "click",
+            Self::Scroll => "scroll",
+            Self::Touch => "touch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyKind {
+    Press,
+    Down,
+    Up,
+}
+
+impl KeyKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Press => "press",
+            Self::Down => "down",
+            Self::Up => "up",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MouseInput {
+    pub kind: MouseKind,
+    pub window: Option<usize>,
+    pub x: f64,
+    pub y: f64,
+    pub button: u32,
+    pub dx: f64,
+    pub dy: f64,
+    pub modifiers: KeyModifiers,
+    pub wait: bool,
+    /// A scroll's trackpad gesture phase (`began`, `changed`, `ended`, `momentum`,
+    /// `momentum_ended`, `touched`; `None` is a mouse wheel), or a touch's phase.
+    pub phase: Option<&'static str>,
+    /// The event's own time in seconds, for a gesture that goes by its speed; `None` is when it
+    /// arrives.
+    pub time: Option<f64>,
+}
+
+impl MouseInput {
+    pub fn at(kind: MouseKind, window: Option<usize>, x: f64, y: f64) -> Self {
+        Self {
+            kind,
+            window,
+            x,
+            y,
+            button: 0,
+            dx: 0.0,
+            dy: 0.0,
+            modifiers: KeyModifiers::default(),
+            wait: true,
+            phase: None,
+            time: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteClient {
+    socket: PathBuf,
+    client: Client,
+    pub(crate) jit: bool,
+}
+
+impl std::fmt::Debug for RemoteClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteClient").field("socket", &self.socket).finish()
+    }
+}
+
+/// CPU time an app ran: a thread that waits (for a core on a loaded box, for the JIT to compile
+/// code it runs for the first time, for an event) spends none. And at a look, what its threads
+/// waited for a core.
+pub(crate) struct AppCpu {
+    pub(crate) main: Duration,
+    /// The whole process's but what its threads serving remote peers ran (answering a test's
+    /// snapshots and log reads among it) and what the runtime's own threads ran (under the JIT,
+    /// its background checks, tier-ups and monitor): the app's own work.
+    pub(crate) own: Duration,
+    /// The process's major page faults so far: pages it waited on from disk (swap, or a mapped
+    /// file's), what an app that runs no CPU while it waits on memory shows.
+    pub(crate) faults: u64,
+    /// What its threads that run now have spent runnable, waiting for a core (`waited`; zero when
+    /// not asked): CPU they wanted and a loaded box did not give them. Not its UI thread's (its CPU
+    /// says its work), nor its serving threads' or the runtime's (under the JIT, its compiles).
+    pub(crate) waited: Duration,
+}
+
+/// Why the app would still change if time moved on (`settled`), as the idle rule reads it.
+pub(crate) struct AppSettled {
+    /// Nothing is pending.
+    pub(crate) settled: bool,
+    /// Only the app pool's queued jobs are (a starved pool runs nothing, and its app no CPU).
+    pub(crate) only_pool: bool,
+    /// The app pool's jobs queued per class (interactive, visible, background), on its workers,
+    /// and taken by its workers so far; None before the pool started.
+    pub(crate) pool: Option<([u64; 3], u64, u64)>,
+    /// While pool jobs wait: who holds the process's CPU budget slots (`slots`), the longest first.
+    pub(crate) slots: Vec<BudgetSlot>,
+}
+
+/// Holders of the CPU budget's slots alike in class, client (app, jit, hal), label and lent (its
+/// thread sleeps, its token back in the budget): how many, and the longest any has held its slot.
+pub(crate) struct BudgetSlot {
+    pub(crate) class: String,
+    pub(crate) client: String,
+    pub(crate) label: String,
+    pub(crate) lent: bool,
+    pub(crate) n: u64,
+    pub(crate) held: Duration,
+}
+
+impl std::fmt::Display for BudgetSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}x {} {} \"{}\" held {:.1} s", self.n, self.class, self.client, self.label, self.held.as_secs_f64())?;
+        if self.lent {
+            write!(f, " (lent: its thread sleeps)")?;
+        }
+        Ok(())
+    }
+}
+
+impl RemoteClient {
+    /// Dials the app's makepad-remote Unix socket (the path of its startup line).
+    pub fn connect(socket: impl AsRef<Path>) -> TestResult<Self> {
+        let socket = socket.as_ref().to_path_buf();
+        let client = Client::connect(&socket.display().to_string()).map_err(|err| {
+            TestError::new(format!(
+                "connect to app remote {} failed: {err}",
+                socket.display()
+            ))
+        })?;
+        Ok(Self { socket, client, jit: false })
+    }
+
+    /// The program is waiting on the JIT right now. Background work (the queues ahead of the
+    /// program, tier-ups, the cache's writes) goes on beside a test and is not a reason to wait.
+    pub(crate) fn jit_foreground(&self) -> TestResult<bool> {
+        Ok(owner_queue(&self.get_text("owner", &[])?)?.queued)
+    }
+
+    /// Under the JIT, the app's state captured before teardown (the host's `capture`: stacks
+    /// with tiers, compile queue, waits, flight recording): its likely cause and the report's
+    /// path. None for a native app or without an answer.
+    pub(crate) fn jit_capture(&self, why: &str) -> Option<String> {
+        if !self.jit {
+            return None;
+        }
+        let line = makepad_remote::app::request_line(&["capture".to_string()], &[("why".to_string(), why.to_string())]);
+        for line in self.client.cmd(&line).ok()? {
+            let Ok(json) = JsonValue::deserialize_json(line.ok()?.trim()) else { continue };
+            if let (Some(cause), Some(path)) = (json.key("cause").and_then(JsonValue::string), json.key("path").and_then(JsonValue::string)) {
+                return Some(format!("{cause} [report {path}]"));
+            }
+        }
+        None
+    }
+
+    /// The app's CPU so far (`uicounts`): its main thread's, and its whole process's but what
+    /// serving remote peers ran (its serving threads, and its UI thread answering their asks) and
+    /// what the runtime's own threads ran; and its process's major page faults. With `waited`,
+    /// what its other threads waited for a core too: a file or two a thread, for a look only.
+    pub(crate) fn cpu(&self, waited: bool) -> TestResult<AppCpu> {
+        let params: &[(&str, &str)] = if waited { &[("waited", "1")] } else { &[] };
+        let json = self.get_json("uicounts", params)?;
+        let ns = |key: &str| {
+            json_f64(json.key(key))
+                .map(|ns| Duration::from_nanos(ns as u64))
+                .ok_or_else(|| TestError::new(format!("app remote uicounts: no {key}: {json:?}")))
+        };
+        let faults = json_f64(json.key("faults")).ok_or_else(|| TestError::new(format!("app remote uicounts: no faults: {json:?}")))? as u64;
+        let waited = if waited { ns("waited_ns")? } else { Duration::ZERO };
+        Ok(AppCpu { main: ns("cpu_ns")?, own: ns("process_cpu_ns")?.saturating_sub(ns("served_cpu_ns")?).saturating_sub(ns("runtime_cpu_ns")?), faults, waited })
+    }
+
+    /// Under the JIT, the program waits for code it is about to run: a request of it queued on the
+    /// owner (`jit_foreground`), or a thread of it inside a demand compile (`OwnerQueue::waits`).
+    /// Natively never.
+    pub(crate) fn waits_on_jit(&self) -> TestResult<bool> {
+        if !self.jit {
+            return Ok(false);
+        }
+        Ok(owner_queue(&self.get_text("owner", &[])?)?.waits())
+    }
+
+    /// Whether anything would change the app if time moved on (`settled`): a frame, redraw,
+    /// load or queued pool job pending.
+    pub(crate) fn settled(&self) -> TestResult<AppSettled> {
+        let json = self.get_json("settled", &[])?;
+        let bad = || TestError::new(format!("app remote settled: no answer: {json:?}"));
+        let settled = match json.key("settled") {
+            Some(JsonValue::Bool(settled)) => *settled,
+            _ => return Err(bad()),
+        };
+        let reasons = json_array(json.key("reasons")).ok_or_else(bad)?;
+        let only_pool = !reasons.is_empty() && reasons.iter().all(|r| r.string().is_some_and(|r| r == "pool"));
+        let pool = match json.key("pool") {
+            None => None,
+            Some(pool) => {
+                let n = |v: Option<&JsonValue>| json_f64(v).map(|n| n as u64).ok_or_else(bad);
+                let queued = json_array(pool.key("queued")).filter(|q| q.len() == 3).ok_or_else(bad)?;
+                Some(([n(queued.first())?, n(queued.get(1))?, n(queued.get(2))?], n(pool.key("running"))?, n(pool.key("taken"))?))
+            }
+        };
+        let slots = json_array(json.key("slots")).map_or_else(Vec::new, |slots| {
+            slots
+                .iter()
+                .map(|slot| BudgetSlot {
+                    class: json_str(slot.key("class")).unwrap_or_default(),
+                    client: json_str(slot.key("client")).unwrap_or_default(),
+                    label: json_str(slot.key("label")).unwrap_or_default(),
+                    lent: matches!(slot.key("lent"), Some(JsonValue::Bool(true))),
+                    n: json_f64(slot.key("n")).unwrap_or(0.0) as u64,
+                    held: Duration::from_millis(json_f64(slot.key("held_ms")).unwrap_or(0.0) as u64),
+                })
+                .collect()
+        });
+        Ok(AppSettled { settled, only_pool, pool, slots })
+    }
+
+    /// The socket path this client dials, for diagnostics.
+    pub fn socket(&self) -> String {
+        self.socket.display().to_string()
+    }
+
+    /// `help` -- the running binary's own command sheet.
+    pub fn help(&self) -> TestResult<String> {
+        self.get_text("help", &[])
+    }
+
+    pub fn windows(&self) -> TestResult<Vec<WindowInfo>> {
+        let json = self.get_json("status", &[])?;
+        parse_windows(&json)
+    }
+
+    pub fn snapshot(&self) -> TestResult<UiSnapshot> {
+        let json = self.get_json("ui", &[("json", "1")])?;
+        parse_snapshot(&json)
+    }
+    pub fn find(&self, selector: &crate::Selector, extra: &str) -> TestResult<Vec<NodeMatch>> {
+        let q = format!("{} {extra}", selector.as_query());
+        makepad_a11y::query::Query::parse(&q).map_err(TestError::new)?;
+        let mut params = vec![("q",q.as_str()), ("json","1")];
+        if let Some(w) = selector.window_arg() { params.push(("w",w)); }
+        let json = self.get_json("ui find", &params)?;
+        parse_nodes(&json)
+    }
+    pub fn dump(&self) -> TestResult<String> { self.get_text("ui", &[]) }
+
+    /// Grab one window to a PNG on disk (written by this client) and return
+    /// its absolute path.
+    pub fn grab(&self, window: Option<usize>, scale: f64) -> TestResult<PathBuf> {
+        let window = window.map(|w| w.to_string());
+        let scale = format_num(scale);
+        let mut params: Vec<(&str, &str)> = vec![("scale", scale.as_str())];
+        if let Some(window) = &window {
+            params.push(("w", window.as_str()));
+        }
+        let lines = self.run_client_side("grab", &params)?;
+        let json = parse_json(lines.first().map(String::as_str).unwrap_or_default())?;
+        let path = json
+            .key("png")
+            .and_then(JsonValue::string)
+            .ok_or_else(|| TestError::new(format!("grab reply carries no png path: {json:?}")))?;
+        Ok(PathBuf::from(path))
+    }
+
+    /// Log lines after `since` (sequence numbers start at 1; `0` is everything
+    /// the ring still holds).
+    pub fn log_since(&self, since: u64) -> TestResult<LogTail> {
+        let since = since.to_string();
+        let json = self.get_json("log", &[("since", since.as_str())])?;
+        parse_log(&json)
+    }
+
+    pub fn mouse(&self, input: &MouseInput) -> TestResult<()> {
+        let command = if input.kind == MouseKind::Click {
+            "click"
+        } else {
+            "mouse"
+        };
+        let (x, y, dx, dy, button) = (
+            format_num(input.x),
+            format_num(input.y),
+            format_num(input.dx),
+            format_num(input.dy),
+            input.button.to_string(),
+        );
+        let window = input.window.map(|w| w.to_string());
+        let mut params: Vec<(&str, &str)> = Vec::new();
+        if input.kind != MouseKind::Click {
+            params.push(("k", input.kind.as_str()));
+        }
+        params.push(("x", x.as_str()));
+        params.push(("y", y.as_str()));
+        params.push(("b", button.as_str()));
+        if input.kind == MouseKind::Scroll {
+            params.push(("dx", dx.as_str()));
+            params.push(("dy", dy.as_str()));
+        }
+        if let Some(phase) = input.phase {
+            params.push(("phase", phase));
+        }
+        let time = input.time.map(format_num);
+        if let Some(time) = &time {
+            params.push(("time", time.as_str()));
+        }
+        push_modifier_params(&mut params, &input.modifiers);
+        if let Some(window) = &window {
+            params.push(("w", window.as_str()));
+        }
+        if input.wait {
+            params.push(("wait", "1"));
+        }
+        self.get_json(command, &params).map(|_| ())
+    }
+
+    pub fn key(
+        &self,
+        window: Option<usize>,
+        kind: KeyKind,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        wait: bool,
+    ) -> TestResult<()> {
+        let code = key_code_name(code);
+        let window = window.map(|w| w.to_string());
+        let mut params: Vec<(&str, &str)> = vec![("k", kind.as_str()), ("c", code.as_str())];
+        push_modifier_params(&mut params, &modifiers);
+        if let Some(window) = &window {
+            params.push(("w", window.as_str()));
+        }
+        if wait {
+            params.push(("wait", "1"));
+        }
+        self.get_json("key", &params).map(|_| ())
+    }
+
+    pub fn text(&self, window: Option<usize>, text: &str, wait: bool) -> TestResult<()> {
+        let window = window.map(|w| w.to_string());
+        let mut params: Vec<(&str, &str)> = vec![("t", text)];
+        if let Some(window) = &window {
+            params.push(("w", window.as_str()));
+        }
+        if wait {
+            params.push(("wait", "1"));
+        }
+        self.get_json("text", &params).map(|_| ())
+    }
+
+    /// Graceful shutdown (`gq`: a frame of every window, written by this
+    /// client, then `quit`); the caller confirms the process actually exits.
+    pub fn grab_and_quit(&self) -> TestResult<()> {
+        self.run_client_side("gq", &[]).map(|_| ())
+    }
+
+    /// Graceful shutdown without a grab, for backends without capture support.
+    pub fn quit(&self) -> TestResult<()> {
+        self.get_json("quit", &[]).map(|_| ())
+    }
+
+    /// One command; the first answer line decoded as JSON.
+    pub fn get_json(&self, command: &str, params: &[(&str, &str)]) -> TestResult<JsonValue> {
+        let lines = self.command_lines(command, params)?;
+        parse_json(lines.first().map(String::as_str).unwrap_or_default())
+    }
+
+    /// One command; every answer line, newline-terminated. An `{"err":..}`
+    /// line is an error.
+    pub fn get_text(&self, command: &str, params: &[(&str, &str)]) -> TestResult<String> {
+        let lines = self.command_lines(command, params)?;
+        let mut text = String::new();
+        for line in &lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        Ok(text)
+    }
+
+    /// The answer lines of one `cmd` request, with the response timeout. The
+    /// answer must end with its `end` line; an `{"err":..}` line is an error.
+    fn command_lines(&self, command: &str, params: &[(&str, &str)]) -> TestResult<Vec<String>> {
+        let fail = |what: String| TestError::new(format!("app remote {command}: {what}"));
+        let words = [command.to_string()];
+        let kv: Vec<(String, String)> = params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let line = makepad_remote::app::request_line(&words, &kv);
+        let channel = self.client.open("cmd", "").map_err(|err| fail(err.to_string()))?;
+        channel
+            .send(line.into_bytes())
+            .map_err(|err| fail(format!("link lost: {err}")))?;
+        let mut pending = String::new();
+        let mut lines = Vec::new();
+        let mut jit_wait = makepad_remote::jit::Wait::default();
+        loop {
+            let event = match channel.recv_timeout(RESPONSE_TIMEOUT) {
+                Err(true) if self.jit => {
+                    let wait = jit_wait.keep_waiting(&self.client).map_err(|err| fail(err.to_string()))?;
+                    // The app may have answered while inspect sampled the JIT.
+                    match channel.try_recv() {
+                        Err(true) if wait => continue,
+                        event => event,
+                    }
+                }
+                event => event,
+            };
+            match event {
+                Ok(Event::Data(data)) => {
+                    pending.push_str(&String::from_utf8_lossy(&data));
+                    let mut ended = false;
+                    while let Some(newline) = pending.find('\n') {
+                        let answer: String = pending.drain(..=newline).collect();
+                        let answer = answer.trim_end();
+                        if answer.starts_with("{\"end\":") {
+                            ended = true;
+                            break;
+                        }
+                        if !answer.is_empty() {
+                            lines.push(answer.to_string());
+                        }
+                    }
+                    if ended {
+                        break;
+                    }
+                }
+                Ok(Event::Closed(code, why)) => {
+                    return Err(fail(format!("connection closed without an answer ({code}: {why})")));
+                }
+                Ok(Event::Opened(_)) => {}
+                Err(true) => {
+                    return Err(fail(format!(
+                        "no answer within {} s (app busy or not running its event loop)",
+                        RESPONSE_TIMEOUT.as_secs()
+                    )));
+                }
+                Err(false) => return Err(fail("link lost: channel closed".to_string())),
+            }
+        }
+        check_answer(command, lines)
+    }
+
+    /// A command answered client side (`grab`, `gq`): `makepad_remote::app`
+    /// opens the `frames` service and writes the PNG files. Returns the
+    /// answer lines; an `{"err":..}` first line is an error.
+    fn run_client_side(&self, command: &str, params: &[(&str, &str)]) -> TestResult<Vec<String>> {
+        let argv: Vec<String> = std::iter::once(command.to_string())
+            .chain(params.iter().map(|(k, v)| format!("{k}={v}")))
+            .collect();
+        let mut lines = Vec::new();
+        makepad_remote::app::run(&self.client, &argv, &mut |line| {
+            lines.push(line.to_string());
+            true
+        })
+        .map_err(|err| TestError::new(format!("app remote {command}: {err}")))?;
+        check_answer(command, lines)
+    }
+}
+
+fn check_answer(command: &str, lines: Vec<String>) -> TestResult<Vec<String>> {
+    for line in &lines {
+        if let Some(err) = response_error(line) {
+            return Err(TestError::new(format!("app remote {command}: {err}")));
+        }
+    }
+    Ok(lines)
+}
+
+/// The `err` field of a JSON object line, if the line is an error answer.
+fn response_error(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("{\"err\":") {
+        return None;
+    }
+    let json = JsonValue::deserialize_json(trimmed).ok()?;
+    json.key("err").and_then(JsonValue::string).cloned()
+}
+
+pub fn parse_json(body: &str) -> TestResult<JsonValue> {
+    JsonValue::deserialize_json(body.trim())
+        .map_err(|err| TestError::new(format!("bad JSON from app remote: {err:?}\n{body}")))
+}
+
+/// The JIT owner's queue state, from its `owner` reply.
+#[derive(Debug, PartialEq)]
+struct OwnerQueue {
+    /// a request of the program (its main thread's or another of its threads') is queued
+    queued: bool,
+    /// a thread of the program is inside a demand compile: its first call of a fn, from its first
+    /// request until it runs the code
+    demand: bool,
+}
+
+impl OwnerQueue {
+    /// The program waits on the JIT: a queued request is only part of a demand compile's wait.
+    /// Once the owner served it, the thread still waits until it runs again, and on a
+    /// loaded box that is most of it. (A load's worker spent 9 s in lazy compiles at 0.1-1 s a
+    /// round trip, the owner idle 91% of it with nothing queued at the looks: read as "sat idle
+    /// 10.6 s", 11-11.)
+    fn waits(&self) -> bool {
+        self.queued || self.demand
+    }
+}
+
+fn owner_queue(reply: &str) -> TestResult<OwnerQueue> {
+    let fail = |what: &str| TestError::new(format!("app remote JIT state: {what}"));
+    let json = reply.lines().find(|line| line.contains("\"queued\"")).ok_or_else(|| fail("the owner's reply carries no queue state"))?;
+    let json = parse_json(json)?;
+    let queued = json.key("queued");
+    let count = |key: &str| json_f64(queued.and_then(|queued| queued.key(key))).ok_or_else(|| fail(&format!("the owner's queue state has no count `{key}`")));
+    Ok(OwnerQueue { queued: count("foreground")? + count("main")? > 0.0, demand: count("demand")? > 0.0 })
+}
+
+fn json_f64(value: Option<&JsonValue>) -> Option<f64> {
+    match value? {
+        JsonValue::U64(v) => Some(*v as f64),
+        JsonValue::I64(v) => Some(*v as f64),
+        JsonValue::F64(v) => Some(*v),
+        JsonValue::U128(v) => Some(*v as f64),
+        JsonValue::I128(v) => Some(*v as f64),
+        _ => None,
+    }
+}
+
+fn json_str(value: Option<&JsonValue>) -> Option<String> {
+    value.and_then(JsonValue::string).cloned()
+}
+
+fn json_array(value: Option<&JsonValue>) -> Option<&Vec<JsonValue>> {
+    match value? {
+        JsonValue::Array(items) => Some(items),
+        _ => None,
+    }
+}
+
+pub fn parse_windows(json: &JsonValue) -> TestResult<Vec<WindowInfo>> {
+    let items = json_array(json.key("w"))
+        .ok_or_else(|| TestError::new(format!("status reply carries no window list: {json:?}")))?;
+    let mut windows = Vec::with_capacity(items.len());
+    for item in items {
+        let id = json_f64(item.key("i")).map(|v| v as usize);
+        let size = json_array(item.key("sz"));
+        let (Some(id), Some(size)) = (id, size) else {
+            return Err(TestError::new(format!("malformed window entry: {item:?}")));
+        };
+        windows.push(WindowInfo {
+            id,
+            title: json_str(item.key("t")).unwrap_or_default(),
+            width: json_f64(size.first()).unwrap_or(0.0),
+            height: json_f64(size.get(1)).unwrap_or(0.0),
+            dpi: json_f64(item.key("dpi")).unwrap_or(1.0),
+            pass_dpi: json_f64(item.key("pass_dpi")).unwrap_or(0.0),
+        });
+    }
+    Ok(windows)
+}
+
+/// A semantic node and its owning window/session. No flattened widget-state schema.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeMatch {
+    pub window: u64,
+    pub node: makepad_a11y::Node,
+}
+impl std::ops::Deref for NodeMatch {
+    type Target = makepad_a11y::Node;
+    fn deref(&self) -> &Self::Target { &self.node }
+}
+impl NodeMatch {
+    pub fn window_index(&self) -> usize { self.window as u32 as usize }
+    pub fn window_arg(&self) -> String { format!("{}:{}", self.window >> 32, self.window as u32) }
+    pub fn visible(&self) -> bool { !self.states.intersects(makepad_a11y::States::HIDDEN | makepad_a11y::States::OFFSCREEN) && !self.bounds.is_empty() }
+    pub fn enabled(&self) -> bool { !self.states.contains(makepad_a11y::States::DISABLED) }
+    pub fn checked(&self) -> Option<bool> { match self.toggle { makepad_a11y::Toggle::On => Some(true), makepad_a11y::Toggle::Off => Some(false), _ => None } }
+    pub fn x(&self) -> i64 { self.bounds.x.round() as i64 }
+    pub fn y(&self) -> i64 { self.bounds.y.round() as i64 }
+    pub fn width(&self) -> i64 { self.bounds.w.round() as i64 }
+    pub fn height(&self) -> i64 { self.bounds.h.round() as i64 }
+}
+#[derive(Clone, Debug, Default)]
+pub struct UiSnapshot { pub windows: Vec<(u64, makepad_a11y::mirror::Tree)> }
+impl UiSnapshot {
+    pub fn nodes(&self) -> Vec<NodeMatch> {
+        let mut nodes = Vec::new();
+        for (window,tree) in &self.windows { tree.walk(|node,_| nodes.push(NodeMatch { window: *window, node: node.clone() })); }
+        nodes
+    }
+}
+fn updates(json: &JsonValue) -> TestResult<Vec<(u64, makepad_a11y::TreeUpdate)>> {
+    let trees = json_array(json.key("trees")).ok_or_else(|| TestError::new("ui reply carries no trees"))?;
+    trees.iter().map(|tree| {
+        let key = json_str(tree.key("window")).ok_or_else(|| TestError::new("ui tree missing window"))?;
+        let (s,w) = key.split_once(':').ok_or_else(|| TestError::new("ui window wants session:index"))?;
+        let key = ((s.parse::<u32>().map_err(|_| TestError::new("invalid session"))? as u64) << 32) | w.parse::<u32>().map_err(|_| TestError::new("invalid window"))? as u64;
+        let hex = json_str(tree.key("wire")).ok_or_else(|| TestError::new("ui tree missing canonical wire payload"))?;
+        if !hex.is_ascii() || hex.len() % 2 != 0 { return Err(TestError::new("invalid semantic wire hex")); }
+        let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2],16).map_err(|_| TestError::new("invalid semantic wire hex"))).collect::<TestResult<_>>()?;
+        let update = makepad_a11y::wire::decode_update(&bytes).map_err(|e| TestError::new(e.to_string()))?;
+        Ok((key,update))
+    }).collect()
+}
+pub fn parse_nodes(json: &JsonValue) -> TestResult<Vec<NodeMatch>> {
+    Ok(updates(json)?.into_iter().flat_map(|(window,update)| update.nodes.into_iter().map(move |node| NodeMatch {window,node})).collect())
+}
+pub fn parse_snapshot(json: &JsonValue) -> TestResult<UiSnapshot> {
+    Ok(UiSnapshot { windows: updates(json)?.into_iter().map(|(k,u)| {
+        let mut tree = makepad_a11y::mirror::Tree::new(); tree.apply(u); (k,tree)
+    }).collect() })
+}
+
+pub fn parse_log(json: &JsonValue) -> TestResult<LogTail> {
+    let lines = json_array(json.key("l"))
+        .ok_or_else(|| TestError::new(format!("log reply carries no lines: {json:?}")))?;
+    Ok(LogTail {
+        last_seq: json_f64(json.key("n")).unwrap_or(0.0) as u64,
+        lines: lines
+            .iter()
+            .filter_map(|line| line.string().cloned())
+            .collect(),
+    })
+}
+
+/// The remote's key-code parser lowercases the variant name, so the `Debug`
+/// spelling is the wire spelling (`KeyA`, `ReturnKey`, `ArrowLeft`, ...).
+pub fn key_code_name(code: KeyCode) -> String {
+    format!("{code:?}")
+}
+
+fn push_modifier_params<'a>(params: &mut Vec<(&'a str, &'a str)>, modifiers: &KeyModifiers) {
+    if modifiers.shift {
+        params.push(("shift", "1"));
+    }
+    if modifiers.control {
+        params.push(("ctrl", "1"));
+    }
+    if modifiers.alt {
+        params.push(("alt", "1"));
+    }
+    if modifiers.logo {
+        // Not `cmd`: a JSON request line already uses that key for the command.
+        params.push(("logo", "1"));
+    }
+}
+
+
+fn format_num(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1.0e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A thread inside a demand compile waits on the JIT with nothing queued (its request served,
+    /// the thread not running yet): the idle rule must not read that app as idle.
+    #[test]
+    fn a_demand_compile_waits_on_the_jit_with_nothing_queued() {
+        let reply = |queue: &str| format!("{{\"seq\":3,\"serving\":\"idle\",\"queued\":{queue}}}\n{{\"holds\":\"...\"}}");
+        let served = owner_queue(&reply(r#"{"total":0,"foreground":0,"main":0,"demand":1}"#)).unwrap();
+        assert_eq!(served, OwnerQueue { queued: false, demand: true });
+        assert!(served.waits(), "a demand compile whose request was served still waits on the JIT");
+        let quiet = owner_queue(&reply(r#"{"total":2,"foreground":0,"main":0,"demand":0}"#)).unwrap();
+        assert!(!quiet.waits(), "background requests alone are no wait of the program");
+        assert!(owner_queue(&reply(r#"{"total":1,"foreground":1,"main":0,"demand":0}"#)).unwrap().waits(), "a queued program request waits");
+        assert!(owner_queue(&reply(r#"{"total":0,"foreground":0,"main":0}"#)).is_err(), "a reply without the demand count is an error, not a quiet app");
+    }
+
+    #[test]
+    fn key_names_match_the_remote_spelling() {
+        assert_eq!(key_code_name(KeyCode::KeyA), "KeyA");
+        assert_eq!(key_code_name(KeyCode::ReturnKey), "ReturnKey");
+        assert_eq!(key_code_name(KeyCode::ArrowLeft), "ArrowLeft");
+        assert_eq!(key_code_name(KeyCode::Backspace), "Backspace");
+    }
+
+    fn semantic_reply() -> String {
+        use makepad_a11y::*;
+        let root = Node { id: NodeId(1), role: Role::Window, path: "main_window".into(), children: vec![NodeId(2),NodeId(3),NodeId(4),NodeId(5)], ..Default::default() };
+        let label = Node { id: NodeId(2), role: Role::StaticText, name: "Count: 1".into(), bounds: Rect { x:10.5, y:20.0, w:100.0, h:30.0 }, ..Default::default() };
+        let input = Node { id: NodeId(3), role: Role::TextField, states: States::DISABLED, text: Some(TextInfo::default()), ..Default::default() };
+        let hidden = Node { id: NodeId(4), states: States::HIDDEN, ..Default::default() };
+        let toggle = Node { id: NodeId(5), role: Role::CheckBox, toggle: Toggle::On,  name: "Go".into(), ..Default::default() };
+        let update = TreeUpdate { full:true, root: root.id, nodes:vec![root,label,input,hidden,toggle], ..Default::default() };
+        let mut bytes = Vec::new(); wire::encode_update(&update, &mut bytes);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{{\"trees\":[{{\"window\":\"7:0\",\"wire\":\"{hex}\"}}],\"count\":5}}")
+    }
+    #[test]
+    fn semantic_wire_becomes_typed_tree_with_window_identity() {
+        let json = parse_json(&semantic_reply()).unwrap();
+        let snapshot = parse_snapshot(&json).unwrap();
+        let widgets = snapshot.nodes();
+        assert_eq!(widgets.len(),5);
+        assert_eq!(widgets[1].window,7 << 32);
+        assert_eq!((widgets[1].x(),widgets[1].y(),widgets[1].width(),widgets[1].height()),(11,20,100,30));
+        assert_eq!(widgets[1].name,"Count: 1");
+        assert!(widgets[1].visible());
+        assert_eq!(widgets[2].text.as_ref().unwrap().content, "");
+        assert!(!widgets[2].enabled());
+        assert!(!widgets[3].visible());
+        assert_eq!(widgets[4].checked(),Some(true));
+        assert_eq!(snapshot.windows[0].1.children(makepad_a11y::NodeId(1)).count(),4);
+    }
+    #[test]
+    fn snapshots_reject_missing_or_corrupt_canonical_data() {
+        for row in [r#"{}"#, r#"{"window":"7:0"}"#, r#"{"window":"bad","wire":"00"}"#, r#"{"window":"7:0","wire":"00"}"#, r#"{"window":"7:0","wire":"zz"}"#] {
+            assert!(parse_snapshot(&parse_json(&format!("{{\"trees\":[{row}]}}")).unwrap()).is_err(), "accepted {row}");
+        }
+    }
+
+    #[test]
+    fn windows_and_logs_parse() {
+        let json = parse_json(
+            r#"{"app":"x","pid":1,"w":[{"i":0,"t":"Counter [remote]","sz":[800,600],"px":[1600,1200],"dpi":2,"pos":[0,0]}]}"#,
+        )
+        .unwrap();
+        let windows = parse_windows(&json).unwrap();
+        assert_eq!(
+            windows,
+            vec![WindowInfo {
+                id: 0,
+                title: "Counter [remote]".to_string(),
+                width: 800.0,
+                height: 600.0,
+                dpi: 2.0,
+                pass_dpi: 0.0,
+            }]
+        );
+        let json = parse_json(r#"{"n":7,"pool":"","l":["a","b"]}"#).unwrap();
+        let tail = parse_log(&json).unwrap();
+        assert_eq!(tail.last_seq, 7);
+        assert_eq!(tail.lines, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn error_lines_are_recognised_and_other_lines_are_not() {
+        assert_eq!(
+            response_error("{\"err\":\"nope\"}").as_deref(),
+            Some("nope")
+        );
+        assert!(response_error("{\"ok\":1}").is_none());
+        assert!(response_error("{\"s\":[{\"t\":\"{\\\"err\\\":1}\"}]}").is_none());
+        assert!(response_error("root View 0 0 640 480").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_drives_the_remote_commands_over_the_socket() {
+        let server = crate::fixture::FixtureServer::start();
+        server.route("help", "makepad-remote  app=fake pid=1\nstatus  this sheet");
+        server.route(
+            "status",
+            r#"{"app":"fake","pid":1,"w":[{"i":0,"t":"Fake [remote]","sz":[640,480],"px":[1280,960],"dpi":2,"pass_dpi":2,"pos":[0,0]}]}"#,
+        );
+        server.route("ui", &semantic_reply());
+        server.route("click", r#"{"ok":1,"f":12}"#);
+        server.route("key", r#"{"ok":1,"f":13}"#);
+        server.route("text", r#"{"ok":1,"f":14}"#);
+        server.route("mouse", r#"{"ok":1}"#);
+        server.route("log", r#"{"n":3,"pool":"","l":["a","Count: 1"]}"#);
+        server.route("quit", r#"{"ok":1}"#);
+
+        let client = RemoteClient::connect(server.socket()).unwrap();
+        assert_eq!(client.socket(), server.socket().display().to_string());
+        assert!(client.help().unwrap().contains("this sheet"));
+        let windows = client.windows().unwrap();
+        assert_eq!(windows[0].dpi, 2.0);
+        let widgets = client.snapshot().unwrap().nodes();
+        assert_eq!(widgets[1].window, 7 << 32);
+        assert_eq!(widgets[1].name, "Count: 1");
+        assert!(!widgets[2].enabled());
+        assert_eq!(widgets[4].checked(), Some(true));
+
+        client
+            .mouse(&MouseInput::at(MouseKind::Click, Some(0), 50.0, 22.0))
+            .unwrap();
+        client
+            .key(
+                Some(0),
+                KeyKind::Press,
+                KeyCode::KeyA,
+                KeyModifiers {
+                    logo: true,
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        client.text(None, "hello world", true).unwrap();
+        client
+            .mouse(&MouseInput {
+                dx: 0.0,
+                dy: -3.5,
+                wait: false,
+                ..MouseInput::at(MouseKind::Scroll, Some(1), 5.0, 6.0)
+            })
+            .unwrap();
+        server.route("ui", "#1 window\n  #2 button \"Go\"");
+        assert_eq!(client.dump().unwrap(), "#1 window\n  #2 button \"Go\"\n");
+
+        // Images never come from the app as files: this client writes the PNG.
+        let png = client.grab(Some(0), 0.5).unwrap();
+        assert!(png.starts_with(std::env::temp_dir().join("makepad-remote")));
+        assert_eq!(std::fs::read(&png).unwrap(), b"PNG0-0");
+        assert!(png.file_name().unwrap().to_string_lossy().starts_with("grab-w0-"));
+
+        let tail = client.log_since(0).unwrap();
+        assert_eq!(tail.last_seq, 3);
+        assert!(tail.lines.iter().any(|line| line == "Count: 1"));
+        client.grab_and_quit().unwrap();
+        client.quit().unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests[0], "help");
+        assert_eq!(requests[1], "status");
+        assert_eq!(requests[2], "ui json=1");
+        assert_eq!(requests[3], "click x=50 y=22 b=0 w=0 wait=1");
+        assert_eq!(requests[4], "key k=press c=KeyA logo=1 w=0 wait=1");
+        assert_eq!(requests[5], "text t=hello world wait=1");
+        assert_eq!(requests[6], "mouse k=scroll x=5 y=6 b=0 dx=0 dy=-3.5 w=1");
+        assert_eq!(requests[7], "ui");
+        assert_eq!(requests[8], "frames window=0 scale=0.5 codec=png once=1");
+        assert_eq!(requests[9], "ping");
+        assert_eq!(requests[10], "log since=0");
+        // gq: the window list, a frame of each window (client side), then quit.
+        assert_eq!(requests[11], "status");
+        assert_eq!(requests[12], "frames window=0 scale=1 codec=png once=1");
+        assert_eq!(requests[13], "ping");
+        assert_eq!(requests[14], "quit");
+        assert_eq!(requests[15], "quit");
+        assert_eq!(requests.len(), 16);
+        let _ = std::fs::remove_file(png);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_errors_surface_as_test_errors() {
+        let server = crate::fixture::FixtureServer::start();
+        server.route("status", r#"{"err":"window 3 closed by user"}"#);
+        server.route("ui", r#"{"err":"timeout (app busy or not running its event loop)"}"#);
+        server.disconnect("log");
+        let client = RemoteClient::connect(server.socket()).unwrap();
+
+        let err = client.windows().unwrap_err();
+        assert!(err.message().contains("closed by user"), "{}", err.message());
+        let err = client.snapshot().unwrap_err();
+        assert!(err.message().contains("app busy"), "{}", err.message());
+        server.route("ui", "not json");
+        assert_eq!(client.dump().unwrap(), "not json\n");
+        let err = client.get_json("ui", &[]).unwrap_err();
+        assert!(err.message().contains("bad JSON"), "{}", err.message());
+        let err = client.get_json("nope", &[]).unwrap_err();
+        assert!(err.message().contains("unknown command"), "{}", err.message());
+        // A command cut off without its end line is an error, never a result.
+        let err = client.log_since(0).unwrap_err();
+        assert!(err.message().contains("without an answer"), "{}", err.message());
+        // The link survives a command that was cut off.
+        server.route("ui", "not json");
+        assert_eq!(client.dump().unwrap(), "not json\n");
+
+        drop(server);
+        let err = client.help().unwrap_err();
+        assert!(err.message().contains("link lost"), "{}", err.message());
+        assert!(RemoteClient::connect("/nonexistent/makepad-remote.sock")
+            .unwrap_err()
+            .message()
+            .contains("connect"));
+    }
+}

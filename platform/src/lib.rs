@@ -1,6 +1,25 @@
-//#![cfg_attr(all(unix), feature(unix_socket_ancillary_data))]
+#[cfg(not(target_os = "android"))]
 pub mod gl_render_bridge;
+pub mod home;
+/// Allocator swaps (before/after loading something that replaces the process allocator).
+pub use makepad_alloc_epoch as alloc_epoch;
+pub mod archive_cache;
+pub mod folder_access;
 pub mod os;
+#[cfg(all(not(target_arch = "wasm32"), feature = "web-protocol"))]
+pub mod web_protocol;
+
+#[cfg(any(
+    test,
+    all(target_arch = "wasm32", target_feature = "atomics")
+))]
+#[path = "os/web/alloc.rs"]
+mod web_alloc;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[global_allocator]
+static WEB_GLOBAL_ALLOCATOR: web_alloc::ThreadCachingAllocator =
+    web_alloc::ThreadCachingAllocator::new();
 
 #[macro_use]
 pub mod log;
@@ -12,27 +31,68 @@ mod cx_api;
 mod shared_bytes;
 
 pub mod action;
+pub mod a11y;
+pub use makepad_a11y as a11y_tree;
 pub mod game_input;
+pub mod frame_trace;
+pub mod frame_sources;
+pub mod present_trace;
 
 pub mod audio;
 pub mod midi;
+pub mod midi_inject;
 pub mod script;
 pub mod thread;
+pub mod storage;
 pub mod video;
+pub mod native_layer;
+pub use native_layer::{NativeContent, NativeLayer, NativeLayerId, NativeLayerStyle, NativeLayerMode, NativeLayerHandle, NativeLayerEvent, NativeLayerEventKind};
+pub mod gpu_texture;
+#[cfg(target_os = "linux")]
+pub mod foreign_dmabuf;
+pub mod gpu_inventory;
+pub mod gpu_ledger;
+pub mod resource_resolver;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod video_decode;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod video_encode;
+pub mod video_file;
 
 mod draw_list;
+pub mod draw_owners;
+pub mod retained_instances;
+pub mod recording_buffer;
+pub mod shared_instances;
 mod draw_matrix;
 mod draw_pass;
 mod draw_shader;
+pub mod draw_shader_layout;
 mod draw_vars;
+#[cfg(not(target_arch = "wasm32"))]
+mod frame_build;
+#[cfg(not(target_arch = "wasm32"))]
+mod draw_damage;
+pub mod shader_pack;
+pub mod collect;
+pub mod splash_blank;
+/// The Splash use record (a web trace host's, or `MAKEPAD_SPLASH_TRACE=<file>` natively).
+pub mod splash_trace;
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+// Native Linux services are owned by the HAL.
+#[cfg(target_os = "linux")]
+pub mod linux_display;
+#[cfg(target_os = "linux")]
+#[path = "os/hal/input.rs"]
+pub mod linux_input;
+#[cfg(target_os = "linux")]
+pub use makepad_hal::wide_desktop as linux_wide_desktop;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod app_icon;
+pub mod app_meta;
+pub mod app_open;
 mod area;
 pub mod component;
 mod component_list;
@@ -44,20 +104,35 @@ mod geometry;
 mod gpu_info;
 mod id_pool;
 pub mod ime;
-mod live_reload;
+pub mod live_reload;
 mod macos_menu;
+pub mod tray;
 mod performance_stats;
+pub mod memory_watchdog;
+pub mod perf_monitor;
+pub mod thread_counters;
+pub mod gpu_frame_timer;
+pub mod pass_load;
+#[cfg(not(target_arch = "wasm32"))]
+mod first_draw;
+pub mod gpu_admission;
+pub mod sploded;
+pub mod pick;
 pub mod permission;
+mod screen;
 mod texture;
 mod uniform_buffer;
 mod window;
-mod xr_tsdf;
+/// The XR room field (surfaces as a signed distance field): `makepad_tsdf`, its process-wide store.
+pub mod xr_tsdf;
 
 pub mod web_socket;
 
 pub mod audio_stream;
 
 pub mod file_dialogs;
+pub mod print;
+pub mod hosted_relay;
 
 mod media_api;
 mod media_host;
@@ -68,16 +143,82 @@ mod video_session;
 pub mod ui_runner;
 
 pub mod display_context;
+pub mod font_policy;
 
 #[macro_use]
 mod app_main;
-pub use crate::app_main::{resolve_studio_http, should_run_stdin_loop_from_env};
-pub use crate::cx_api::{can_play_type, CxSystemBrowser, SystemBrowserId};
+pub mod remote;
+// The remote's commands as the AI services' manifest describes them: native, as the remote
+// (makepad-remote) is; the web has neither.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod remote_schema;
+// the profiler stream of a native build (a `makepad run` app serves it from relax inspect)
+#[cfg(all(not(relax), any(target_os = "macos", target_os = "linux")))]
+pub mod prof_native;
+// `prof` / `why-slow` of a native build (inspect's sampler and buckets; a `makepad run` app gets them from relax inspect)
+#[cfg(all(not(relax), target_os = "macos"))]
+pub mod prof_sampler;
+pub mod devtools;
+pub mod pixel_probe;
+pub mod screen_capture;
+pub mod system_info;
+pub mod clipboard_read;
+pub mod window_snapshot;
+pub mod audio_output_tap;
+pub mod log_ring;
+
+/// Seconds on a monotonic clock, from an arbitrary start. Portable where
+/// `std::time::Instant` is not: on wasm32-unknown-unknown std has no clock
+/// (`Instant::now()` panics, "time not implemented on this platform"), so
+/// code that runs in a web build measures time with this instead.
+pub fn monotonic_seconds() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::Cx::monotonic_now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f64()
+    }
+}
+pub mod audio_output_fence;
+pub mod audio_deadline;
+pub mod shader_error;
+pub use makepad_script::shader_reflection::DrawShaderDesc;
+/// Whether the host system is in dark mode, when the host can say: the HAL's
+/// latest window-system answer, readable from any thread. Web returns `None`.
+pub fn host_dark() -> Option<bool> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        makepad_hal::host_dark()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+#[cfg(all(target_os = "android", not(relax)))]
+pub use crate::app_main::android_on_load;
+pub use crate::app_main::{
+    admitted_by_window_manager, attach_parent_console, discover_window_manager, hosted_by_window_manager, is_window_manager, launched_by_host, set_menu_bar_app, set_outlives_window_manager,
+    new_cx_with_font_set, resolve_studio_http, run_app, set_window_manager, should_run_stdin_loop_from_env, WmAdmission,
+};
+// Working-tree startup instrumentation (`MAKEPAD_TRACE=startup`).
+pub use crate::cx::{
+    first_present_seen, launched_hidden_until_first_present, relax_app_main, startup_trace_first_present,
+    startup_acc, startup_since_exec_ms, startup_trace, startup_trace_enabled, startup_trace_flush,
+};
+pub use crate::cx_api::can_play_type;
 pub use crate::xr_tsdf::{
     XrDepthAlignHeightMap, XrTsdfCooperativeStepResult, XrTsdfCooperativeStepStats,
 };
 
 #[cfg(target_arch = "wasm32")]
+pub use makepad_wasm_bridge;
+#[cfg(all(not(target_arch = "wasm32"), feature = "web-protocol"))]
 pub use makepad_wasm_bridge;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
@@ -86,15 +227,25 @@ pub use makepad_objc_sys;
 #[cfg(target_os = "windows")]
 pub use ::windows;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use makepad_hal;
+
+/// The window-controls table of a desktop family: the HAL's, compiled in directly on the web
+/// (no HAL there), so widgets' caption code has one table on every target.
+#[cfg(not(target_arch = "wasm32"))]
+pub use makepad_hal::window_controls;
+#[cfg(target_arch = "wasm32")]
+#[path = "../hal/src/window_controls.rs"]
+pub mod window_controls;
+
 pub use makepad_futures;
 pub use makepad_script_std::makepad_network;
 pub use makepad_script_std::makepad_script;
+pub use makepad_script_census;
 pub use makepad_studio_protocol as studio;
 
 // Re-export trap module for Script derive macro error macros that use crate::trap::ScriptTrap
 pub use makepad_script_std::makepad_script::trap;
-
-pub use crate::gl_render_bridge::{GlApi, GlRenderBridge};
 
 pub use {
     crate::{
@@ -105,31 +256,69 @@ pub use {
         audio::*,
         component::{ComponentInfo, ComponentRegistries, ComponentRegistry},
         cursor::MouseCursor,
-        cx::{Cx, CxRef, LinuxWindowParams, OsType},
-        cx_api::{AccessibilityUpdatePayload, CxOsApi, CxOsOp, CxThreadPriority, OpenUrlInPlace},
-        draw_list::{CxDrawCall, CxDrawItem, CxDrawListPool, CxRectArea, DrawList, DrawListId},
+        cx::{Cx, CxMemoryReport, CxRef, GpuBackend, LinuxWindowParams, OsType},
+        cx_api::{ CxOsApi, CxOsOp, CxThreadPriority, HapticFeedback, OpenUrlInPlace, ScreenEdges},
+        display_context::{DisplayContext, NativeAppearance, ScreenOrientation, SystemBarAppearance},
+        font_policy::{
+            extend_font_asset_manifest, font_asset_manifest_len, FontAsset, FontChain, FontPolicy,
+            FontRole, FontSet, LazyFontAsset, LazyFontFamily, FONT_ASSET_MANIFEST_SECTION, LAZY_FONT_FACES, LAZY_FONT_FALLBACKS,
+            INTERNATIONAL_FONT_ASSET_MANIFEST, LATIN_FONT_ASSET_MANIFEST,
+            LATIN_FONT_ASSET_PACKAGE_MANIFEST, SYSTEM_FONT_ASSET_MANIFEST, MATH_VIEW_FONT_ASSET, INTER_FONT_ASSET,
+            ROBOTO_FLEX_FONT_ASSET, UI_SYMBOL_FALLBACK,
+        },
+        draw_list::{CxDrawCall, CxDrawKind, CxDrawItem, CxDrawListPool, CxRectArea, DrawList, DrawListId, DrawListRecordingStorage},
+        shared_instances::{
+            upload_pacing, FrameLease, FrameLeases, PublicationAccounting, PublicationIds, Publications,
+            PublishBackpressure, PublishError, PublishHints, PublishReceipt, ReceiptPhase, SharedInstances,
+            UploadObservation, WeakSharedInstances,
+        },
         draw_matrix::DrawMatrix,
         draw_pass::{
             CxDrawPassParent, CxDrawPassRect, DrawPass, DrawPassClearColor, DrawPassClearDepth,
-            DrawPassId, ScriptDrawPass,
+            DrawPassId, ScriptDrawPass, union_rects,
         },
-        draw_vars::DrawVars,
+        draw_vars::{DrawVars, DRAW_CALL_MAX_UNIFORM_FLOATS, DRAW_CALL_TEXTURE_SLOTS},
+        sploded::{SplodedParams, SplodedView},
         event::{
+            AppOpenEvent,
+            AppOpenItem,
+            AppOpenSource,
+            BackGestureEdge,
+            BackGestureEvent,
+            BackGestureState,
+            CancelScope,
+            CancelScopeKind,
             CharOffset,
             DigitDevice,
             DragEvent,
             DragHit,
             DragHitEvent,
+            DragImage,
             DragItem,
+            DragOut,
+            DragOutFile,
+            DragOutItem,
             DragResponse,
+            FilePromise,
             DragState,
             DrawEvent,
             DropEvent,
             DropHitEvent,
+            ChildWindowAction,
+            ChildWindowActionEvent,
+            ChildWindowClosedEvent,
+            ChildWindowEvent,
+            DomainEntry,
+            DomainListEvent,
+            DomainStateEvent,
+            DomainStatus,
             Event,
+            GpuPressureEvent,
+            LentId,
             FingerDownEvent,
             FingerHoverEvent,
             FingerMoveEvent,
+            FingerPinchEvent,
             FingerScrollEvent,
             FingerUpEvent,
             FullTextState,
@@ -145,12 +334,20 @@ pub use {
             KeyFocusEvent,
             KeyModifiers,
             MouseButton,
+            LocationErrorEvent,
+            LocationUpdateEvent,
             MouseDownEvent,
             MouseMoveEvent,
             MouseUpEvent,
             NetworkResponsesEvent,
+            StorageResponsesEvent,
             NextFrame,
             NextFrameEvent,
+            PinchEvent,
+            PinchPhase,
+            QuitReason,
+            QuitRequestedEvent,
+            SafeAreaInsets,
             SelectionHandleDragEvent,
             SelectionHandleKind,
             SelectionHandlePhase,
@@ -164,7 +361,6 @@ pub use {
             VirtualKeyboardEvent,
             WindowCloseRequestedEvent,
             WindowClosedEvent,
-            SafeAreaInsets,
             WindowDragQueryEvent,
             WindowDragQueryResponse,
             WindowGeom,
@@ -177,14 +373,25 @@ pub use {
             XrState,
             XrUpdateEvent,
         },
+        file_dialogs::{
+            FileDialog, FileDialogAction, VirtualFile, VirtualFileLimits,
+            DEFAULT_VIRTUAL_FILE_SIZE_LIMIT,
+        },
+        print::{PrintId, PrintJob, PrintResult, PrintResultEvent},
         game_input::*,
-        geometry::{Geometry, GeometryId},
+        geometry::{CxGeometry, Geometry, GeometryId, IndexData, VertexData},
+        draw_shader::{
+            CxDrawShaderCode, CxDrawShaderMapping, DrawShaderAttrFormat,
+            DrawShaderInputPacking, DrawShaderInputs,
+        },
         gpu_info::GpuPerformance,
+        gpu_info::{gpu_working_set_bytes, max_gpu_buffer_bytes, set_gpu_working_set_bytes, set_max_gpu_buffer_bytes},
         ime::{
             AutoCapitalize, AutoCorrect, InputMode, ReturnKeyType, SoftKeyboardConfig,
             TextInputConfig,
         },
         macos_menu::MacosMenu,
+        tray::{TrayClickEvent, TrayIcon, TrayImage, TrayMenuEvent, TrayMenuItem},
         media_api::CxMediaApi,
         media_host::{MediaControlBridge, MediaEventBridge, MediaTextureBridge, MediaTextureInfo},
         media_plugin::{
@@ -194,17 +401,27 @@ pub use {
             MseDecodedFrame, MseEngineOutput, MseInitMetadata, MsePlaybackEngine,
             MseVideoTrackInfo, PlaybackPrepared, VideoFrameDecoder,
         },
+        memory_watchdog::*,
         midi::*,
         os::*,
+        perf_monitor::*,
         playback_session::{
             mix_active_media_audio, register_active_media_audio, register_media_playback_session,
             take_registered_media_playback_session, unregister_active_media_audio,
             unregister_media_playback_session, MediaPlaybackSessionId,
         },
         script::vm::*,
-        shared_bytes::{MappedBytes, SharedBytes, SharedBytesStats},
-        texture::{
-            Texture, TextureAnimation, TextureFormat, TextureId, TextureSize, TextureUpdated,
+        script::reload::ScriptVmReload,
+        screen::{fit_window_rect_to_screens, linux_screen_names, screens, ScreenGeom, MIN_WINDOW_SIZE},
+        shared_bytes::{MappedBytes, HostBuf, HostBufStats, Scalar},
+        storage::{
+            StorageError, StorageHandle, StorageList, StorageOp, StorageRequestId,
+            StorageEstimate, StorageResponse, StorageResult, StorageStat, DEFAULT_STORAGE_VALUE_CAP,
+            MAX_STORAGE_KEY_BYTES, MAX_STORAGE_LIST_LIMIT, MAX_STORAGE_NAMESPACE_BYTES,
+        },
+        texture::{ReadbackTicket, ReadbackRequest, ReadbackError, TextureReadback, TEXTURE_READBACK_MAX_BYTES, STAGED_UPLOAD_BYTES,
+            image_cache_use_mipmaps, Texture, TextureAnimation, TextureFormat, TextureId,
+            TextureSize, TextureUpdated, TextureWrap, CompressedTextureFormat,
         },
         thread::*,
         ui_runner::*,
@@ -218,9 +435,10 @@ pub use {
         web_socket::{WebSocket, WebSocketMessage},
         window::{
             CxWindowPool, MacosWindowChrome, MacosWindowConfig, MacosWindowKind, MacosWindowLevel,
-            ScriptWindowHandle, WindowBackdrop, WindowHandle, WindowIcon, WindowIconBuffer,
-            WindowId, WindowVisuals,
+            ScriptWindowHandle, WaylandDecorationPreference, WindowBackdrop, WindowHandle,
+            WindowIcon, WindowIconBuffer, WindowId, WindowVisuals, badge_window_title, test_lane,
         },
+        window_snapshot::WindowSnapshotState,
         xr_tsdf::{
             ChunkKey, SparseTsdGridReadSnapshot, SparseTsdReadChunk, TsdfPublishedSnapshot,
             XrTsdfState, XrTsdfStats, XrTsdfStore,
@@ -229,7 +447,7 @@ pub use {
     app_main::*,
     arc_string_mut::ArcStringMut,
     component_list::ComponentList,
-    component_map::ComponentMap,
+    component_map::{ComponentMap, FastHashMap, FastHashSet},
     //makepad_image_formats::image,
     log::*,
     makepad_math::makepad_micro_serde,
@@ -241,10 +459,28 @@ pub use {
         apply::*, handle::*, heap::*, makepad_error_log, makepad_live_id, makepad_live_id::*,
         makepad_math, makepad_script_derive, makepad_script_derive::*, native::*, object::*,
         script_args, script_args_def, script_array_index, script_has_proto, script_is_fn,
-        script_value, script_value_bool, script_value_f64, set_script_value,
+        script_value, set_script_value,
         set_script_value_to_api, set_script_value_to_pod, string::*, traits::*, trap::*, value::*,
         vm::*,
     },
     smallvec,
     smallvec::SmallVec,
 };
+
+/// The compiled-shader handle the const-table API is keyed by
+/// (`Cx::shader_const_table`, `shader_const_patch`, `shader_const_reset`).
+pub use crate::draw_shader::DrawShaderId;
+pub use crate::draw_owners::DrawLabel;
+pub use crate::pick::{PickError, PickImage, PickTicket};
+/// Edit mode's literal-site map (`Cx::set_live_literals`,
+/// `set_literal_source`, `patch_literal`).
+pub use makepad_script_std::makepad_script::literal::{LiteralOrigin, LiteralReach, LiteralSite, LiteralValue};
+pub use crate::collect::{ScanEvent, Scanner};
+
+pub mod restart;
+pub mod engine_request;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod gpu_compute;
+#[cfg(not(target_arch = "wasm32"))]
+pub use gpu_compute::{GpuBuffer, GpuBufferFlags, ComputeKernel, ComputeParams, ComputePass};

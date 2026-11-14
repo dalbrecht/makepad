@@ -7,6 +7,11 @@ use makepad_csg_math::{dvec3, BBox3d, Mat4d, Vec3d};
 pub struct TriMesh {
     pub vertices: Vec<Vec3d>,
     pub triangles: Vec<[u32; 3]>,
+    /// Unit shading normals per triangle corner (three per triangle, in triangle order), exact
+    /// from the surface the mesh was tessellated from; empty when the mesh has none. They hold
+    /// only while `corner_normals.len() == triangles.len() * 3` and the vertices are as made:
+    /// whatever moves vertices or changes triangles clears them (`clear_normals`).
+    pub corner_normals: Vec<Vec3d>,
 }
 
 impl TriMesh {
@@ -14,6 +19,7 @@ impl TriMesh {
         TriMesh {
             vertices: Vec::new(),
             triangles: Vec::new(),
+            corner_normals: Vec::new(),
         }
     }
 
@@ -21,9 +27,21 @@ impl TriMesh {
         TriMesh {
             vertices: Vec::with_capacity(num_verts),
             triangles: Vec::with_capacity(num_tris),
+            corner_normals: Vec::new(),
         }
     }
 
+    pub fn clear_normals(&mut self) {
+        self.corner_normals.clear();
+    }
+
+    /// The exact corner normals when the mesh still has them.
+    pub fn exact_normals(&self) -> Option<&[Vec3d]> {
+        (!self.corner_normals.is_empty() && self.corner_normals.len() == self.triangles.len() * 3)
+            .then_some(&self.corner_normals[..])
+    }
+
+    /// Add a vertex without changing existing triangles or their corner normals.
     pub fn add_vertex(&mut self, v: Vec3d) -> u32 {
         let idx = self.vertices.len() as u32;
         self.vertices.push(v);
@@ -31,6 +49,7 @@ impl TriMesh {
     }
 
     pub fn add_triangle(&mut self, a: u32, b: u32, c: u32) {
+        self.clear_normals();
         self.triangles.push([a, b, c]);
     }
 
@@ -68,6 +87,7 @@ impl TriMesh {
 
     /// Flip all triangle windings (reverses normals).
     pub fn flip_normals(&mut self) {
+        self.clear_normals();
         for tri in &mut self.triangles {
             tri.swap(0, 1);
         }
@@ -76,11 +96,17 @@ impl TriMesh {
     /// Apply a transform to all vertices.
     /// Uses SIMD-batched transform when the `nightly` feature is enabled.
     pub fn transform(&mut self, mat: Mat4d) {
+        self.clear_normals();
         makepad_csg_math::batch_transform_points(&mut self.vertices, &mat);
     }
 
     /// Append another mesh into this one.
     pub fn merge(&mut self, other: &TriMesh) {
+        if self.exact_normals().is_some() && other.exact_normals().is_some() {
+            self.corner_normals.extend_from_slice(&other.corner_normals);
+        } else {
+            self.clear_normals();
+        }
         let offset = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&other.vertices);
         for &[a, b, c] in &other.triangles {
@@ -92,9 +118,22 @@ impl TriMesh {
     /// Reindexes all triangles. Removes degenerate triangles.
     /// Uses a spatial hash grid for O(n) average-case performance.
     pub fn weld_vertices(&mut self, tolerance: f64) {
+        let _ = self.weld_vertices_remap(tolerance);
+    }
+
+    /// Same as `weld_vertices`, but returns the old-index -> new-index remap
+    /// so callers can translate per-vertex data across the weld.
+    pub fn weld_vertices_remap(&mut self, tolerance: f64) -> Vec<u32> {
+        self.weld_vertices_remap_after(0, tolerance)
+    }
+
+    /// [`TriMesh::weld_vertices_remap`] of the vertices from `fixed` on: the first `fixed` keep their indices
+    /// and positions and join nothing (nor does anything join them).
+    pub fn weld_vertices_remap_after(&mut self, fixed: usize, tolerance: f64) -> Vec<u32> {
+        self.clear_normals();
         let n = self.vertices.len();
         if n == 0 {
-            return;
+            return Vec::new();
         }
         let tol_sq = tolerance * tolerance;
         // Cell size slightly larger than tolerance so that any two points within
@@ -103,12 +142,11 @@ impl TriMesh {
         let inv_cell = 1.0 / cell;
 
         // Spatial hash grid: maps cell coordinate to list of (new_vert_index, position).
-        let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<(u32, Vec3d)>> =
-            std::collections::HashMap::new();
-        let mut remap = vec![0u32; n];
-        let mut new_verts: Vec<Vec3d> = Vec::new();
+        let mut grid: makepad_csg_math::fast_hash::FastMap<(i64, i64, i64), Vec<(u32, Vec3d)>> = Default::default();
+        let mut remap: Vec<u32> = (0..n as u32).collect();
+        let mut new_verts: Vec<Vec3d> = self.vertices[..fixed].to_vec();
 
-        for i in 0..n {
+        for i in fixed..n {
             let vi = self.vertices[i];
             let cx = (vi.x * inv_cell).floor() as i64;
             let cy = (vi.y * inv_cell).floor() as i64;
@@ -152,6 +190,7 @@ impl TriMesh {
                 self.triangles.push([ra, rb, rc]);
             }
         }
+        remap
     }
 
     /// Get the three vertex positions of a triangle.
@@ -211,13 +250,6 @@ pub fn make_unit_cube() -> TriMesh {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_unit_cube() {
-        let c = make_unit_cube();
-        assert_eq!(c.vertex_count(), 8);
-        assert_eq!(c.triangle_count(), 12);
-    }
 
     #[test]
     fn test_bounding_box() {

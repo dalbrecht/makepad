@@ -1,0 +1,628 @@
+//! `/** ... */` doc-annotation metadata. ONE form; position determines
+//! meaning.
+//!
+//! The splash tokenizer records each `/** ... */` block keyed by the index
+//! of the NEXT token (`ScriptTokenizer::docs`); the parser never sees them.
+//! Every script object carries the ip of the BEGIN_PROTO / BEGIN_BARE
+//! opcode that constructed it (`ScriptObjectData::made_at`), so a doc
+//! resolves to an attachment point purely at query time, against (tokens,
+//! opcodes, source_map) — nothing is stored in the opcode stream and there
+//! is no on-disk artifact: metadata is rebuilt from source at every
+//! compile, so it can never drift. Hot reload compiles into new bodies;
+//! old ips stay resolvable against the retained old body.
+//!
+//! Position rules (resolve_docs / resolve_value_names):
+//! - before `key: value`, `name := Type{...}` or `key +: {...}`: a FIELD
+//!   doc on the enclosing object literal.
+//! - immediately before a value literal (`/**glow tint*/ #8f0`, numbers,
+//!   strings, true/false, a leading `-`): a VALUE NAME for that literal —
+//!   the tweaker's Constants rows.
+//! - anywhere else: an OBJECT doc on the next object literal that begins
+//!   within the following few source tokens (`DOC_ATTACH_WINDOW`).
+//! - consecutive blocks with the same attachment merge in order; block
+//!   content may span lines (a leading `*` gutter per line is stripped).
+//! - a doc that resolves to nothing (e.g. above an array element or at the
+//!   very end of a body) is dropped.
+//!
+//! - before `let NAME` / `var NAME`: a LET doc naming that binding
+//!   (resolve_let_docs), the label an editor shows for it.
+//! - immediately before a `color(…)` call: a VALUE NAME for that colour (the
+//!   name's token is the call's `color`), as before a `#hex`.
+//!
+//! `///text` lines are the same annotation as `/**text*/` (Rust's doc line;
+//! `script_mod!` hands both on as written); `//`, `////` and `/* */` stay plain
+//! comments.
+//!
+//! The cascade query (`ScriptVm::construction_chain`) walks an object's
+//! proto chain and returns one level per prototype: where it was
+//! constructed, its docs, and the keys it sets itself. Rust-built objects
+//! (made_at == ScriptIp::UNKNOWN) appear as levels with no location — the
+//! tweaker renders those as "native".
+use relax_api::relax_api;
+
+use crate::makepad_live_id::*;
+use crate::opcode::*;
+use crate::tokenizer::ScriptToken;
+use crate::tokenizer::ScriptTokenizer;
+use crate::value::*;
+use crate::vm::ScriptCode;
+use crate::vm::ScriptLoc;
+use crate::vm::ScriptVm;
+use crate::vm_query::*;
+
+/// How many source tokens after a non-field doc line an object literal may
+/// begin and still claim the doc. Generous enough for
+/// `mod.widgets.X = set_type_default() do mod.widgets.XBase{`.
+const DOC_ATTACH_WINDOW: u32 = 256;
+
+/// A caller-owned `Vec<(LiveId, String)>` of field docs the VM appends to (as ScriptTextOut).
+#[relax_api(plain, run)]
+#[repr(C)]
+pub struct ScriptFieldDocsOut<'a> {
+    ctx: *mut u8,
+    push: unsafe extern "C-unwind" fn(*mut u8, LiveId, *const u8, usize),
+    _out: std::marker::PhantomData<&'a mut Vec<(LiveId, String)>>,
+}
+
+impl<'a> ScriptFieldDocsOut<'a> {
+    #[inline(always)]
+    pub fn new(out: &'a mut Vec<(LiveId, String)>) -> Self {
+        unsafe extern "C-unwind" fn push(ctx: *mut u8, id: LiveId, ptr: *const u8, len: usize) {
+            let out = &mut *(ctx as *mut Vec<(LiveId, String)>);
+            out.push((id, std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)).to_string()));
+        }
+        Self { ctx: out as *mut Vec<(LiveId, String)> as *mut u8, push, _out: std::marker::PhantomData }
+    }
+
+    /// Appends one field's doc.
+    #[inline]
+    pub fn push(&mut self, id: LiveId, text: &str) {
+        unsafe { (self.push)(self.ctx, id, text.as_ptr(), text.len()) }
+    }
+}
+
+/// Longest proto chain construction_chain will walk.
+const MAX_CHAIN: usize = 24;
+
+/// One `/** ... */` doc (possibly several merged blocks) resolved to its
+/// attachment point inside one body.
+#[derive(Clone, Debug)]
+pub struct ScriptDocEntry {
+    /// Opcode index (within the body) of the BEGIN_PROTO / BEGIN_BARE
+    /// opcode of the object literal this doc belongs to. An object built
+    /// there carries the same value in `made_at.index`.
+    pub begin_index: u32,
+    /// None: the doc describes the object itself. Some(key): it describes
+    /// that field / named template of the object.
+    pub field: Option<LiveId>,
+    pub text: String,
+}
+
+/// One level of an object's construction chain (the object itself first,
+/// then its prototypes outward).
+pub struct ScriptChainLevel {
+    /// The object at this level.
+    pub object: ScriptObject,
+    /// Construction site; ScriptIp::UNKNOWN for Rust-built objects.
+    pub made_at: ScriptIp,
+    /// Source location of the construction site (None for native levels).
+    pub loc: Option<ScriptLoc>,
+    /// Doc annotation attached to the object literal itself.
+    pub doc: Option<String>,
+    /// Doc annotations attached to fields of this literal.
+    pub field_docs: Vec<(LiveId, String)>,
+    /// Keys this level sets itself: map keys plus named vec templates.
+    pub own_keys: Vec<LiveId>,
+}
+
+impl Clone for ScriptChainLevel {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        Self { object: self.object, made_at: self.made_at, loc: self.loc.clone(), doc: self.doc.clone(), field_docs: self.field_docs.clone(), own_keys: self.own_keys.clone() }
+    }
+}
+
+impl std::fmt::Debug for ScriptChainLevel {
+    #[inline(always)]
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("ScriptChainLevel")
+            .field("object", &self.object).field("made_at", &self.made_at)
+            .field("loc", &self.loc).field("doc", &self.doc)
+            .field("field_docs", &self.field_docs).field("own_keys", &self.own_keys).finish()
+    }
+}
+
+/// Built by the caller's side (construction_chain is an inline shell): every accessor is inline
+/// too, so a ScriptChainLevel never reaches the VM's own code (loader-core.md section 8).
+impl ScriptChainLevel {
+    #[inline(always)]
+    pub fn field_docs(&self) -> Vec<(LiveId, String)> {
+        let mut out = Vec::new();
+        self.field_docs_into(&mut ScriptFieldDocsOut::new(&mut out));
+        out
+    }
+    #[inline(always)]
+    pub fn field_docs_into(&self, out: &mut ScriptFieldDocsOut) {
+        for (id, text) in &self.field_docs { out.push(*id, text); }
+    }
+    #[inline(always)]
+    pub fn field_doc(&self, key: LiveId) -> Option<&str> { self.field_docs.iter().find_map(|(id, text)| (*id == key).then_some(text.as_str())) }
+    #[inline(always)]
+    pub fn object(&self) -> ScriptObject { self.object }
+    #[inline(always)]
+    pub fn made_at(&self) -> ScriptIp { self.made_at }
+    #[inline(always)]
+    pub fn loc(&self) -> Option<&ScriptLoc> { self.loc.as_ref() }
+    #[inline(always)]
+    pub fn doc(&self) -> Option<&str> { self.doc.as_deref() }
+    #[inline(always)]
+    pub fn own_keys(&self) -> &[LiveId] { &self.own_keys }
+}
+
+fn is_field_op(id: LiveId) -> bool {
+    id == id!(:) || id == id!(:=) || id == id!(+:)
+}
+
+/// Tokens a doc annotation can NAME (the `/**glow tint*/ #8f0` form).
+fn is_value_token(tok: &ScriptToken) -> bool {
+    match tok {
+        ScriptToken::F32(_)
+        | ScriptToken::F64(_)
+        | ScriptToken::F16(_)
+        | ScriptToken::U32(_)
+        | ScriptToken::I32(_)
+        | ScriptToken::U40(_)
+        | ScriptToken::Color(_)
+        | ScriptToken::String(_) => true,
+        ScriptToken::Identifier(id) => *id == id!(true) || *id == id!(false),
+        _ => false,
+    }
+}
+
+/// Strip per-line whitespace and a Rust-style leading `*` gutter from a
+/// block's content.
+fn clean_block_text(text: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        let line = line.strip_prefix('*').map(str::trim_start).unwrap_or(line);
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn as_begin(v: ScriptValue) -> Option<Opcode> {
+    match v.as_opcode() {
+        Some((op, _))
+            if op == Opcode::BEGIN_PROTO
+                || op == Opcode::BEGIN_BARE
+                || op == Opcode::BEGIN_ARRAY =>
+        {
+            Some(op)
+        }
+        _ => None,
+    }
+}
+
+fn is_end(v: ScriptValue) -> bool {
+    matches!(
+        v.as_opcode(),
+        Some((Opcode::END_PROTO, _)) | Some((Opcode::END_BARE, _)) | Some((Opcode::END_ARRAY, _))
+    )
+}
+
+/// Resolve a body's captured `///` lines to doc entries. Pure function of
+/// the compile artifacts; called at query time (doc lists are small).
+pub fn resolve_docs(
+    tokenizer: &ScriptTokenizer,
+    opcodes: &[ScriptValue],
+    source_map: &[Option<u32>],
+) -> Vec<ScriptDocEntry> {
+    // first opcode whose source token is at or after `t`. source_map is
+    // near-monotonic (operators emit late); a linear scan is exact.
+    let first_op_at = |t: u32| -> Option<usize> {
+        (0..opcodes.len()).find(|i| matches!(source_map.get(*i), Some(Some(tok)) if *tok >= t))
+    };
+
+    let mut out: Vec<ScriptDocEntry> = Vec::new();
+    for d in &tokenizer.docs {
+        let t = d.next_token;
+        let text = clean_block_text(&d.text);
+        let toks = &tokenizer.tokens;
+
+        // VALUE NAME position (`/**name*/ 0.35`, `/**ember*/ color(…)`) and
+        // LET docs: resolve_value_names, resolve_let_docs.
+        if toks
+            .get(t as usize)
+            .is_some_and(|tp| is_value_token(&tp.token))
+            || is_color_call(toks, t as usize)
+            || is_binding(toks, t as usize)
+        {
+            continue;
+        }
+        if toks
+            .get(t as usize)
+            .is_some_and(|tp| matches!(tp.token, ScriptToken::Operator(id) if id == id!(-)))
+            && toks
+                .get(t as usize + 1)
+                .is_some_and(|tp| is_value_token(&tp.token))
+        {
+            continue;
+        }
+
+        let resolved = 'resolve: {
+            // FIELD doc: `ident` followed by `:`, `:=` or `+:`.
+            if let (Some(a), Some(b)) = (toks.get(t as usize), toks.get(t as usize + 1)) {
+                if let ScriptToken::Identifier(name) = a.token {
+                    let op = match b.token {
+                        ScriptToken::Operator(id) | ScriptToken::Separator(id) => id,
+                        _ => LiveId(0),
+                    };
+                    if is_field_op(op) {
+                        // enclosing literal: walk back from the first opcode
+                        // of this statement, depth-matching END/BEGIN pairs.
+                        let Some(i) = first_op_at(t) else {
+                            break 'resolve None;
+                        };
+                        let mut depth = 0usize;
+                        for j in (0..i).rev() {
+                            if is_end(opcodes[j]) {
+                                depth += 1;
+                            } else if let Some(op) = as_begin(opcodes[j]) {
+                                if depth == 0 {
+                                    if op == Opcode::BEGIN_ARRAY {
+                                        break; // docs in arrays: unsupported
+                                    }
+                                    break 'resolve Some((j as u32, Some(name)));
+                                }
+                                depth -= 1;
+                            }
+                        }
+                        break 'resolve None;
+                    }
+                }
+            }
+            // OBJECT doc: next object literal within the window.
+            let Some(start) = first_op_at(t) else {
+                break 'resolve None;
+            };
+            for i in start..opcodes.len() {
+                let Some(Some(tok)) = source_map.get(i) else {
+                    continue;
+                };
+                if *tok < t {
+                    continue;
+                }
+                if tok.saturating_sub(t) > DOC_ATTACH_WINDOW {
+                    break;
+                }
+                match as_begin(opcodes[i]) {
+                    Some(Opcode::BEGIN_ARRAY) => break,
+                    Some(_) => break 'resolve Some((i as u32, None)),
+                    None => (),
+                }
+            }
+            None
+        };
+
+        if let Some((begin_index, field)) = resolved {
+            // merge with an existing entry for the same attachment
+            if let Some(prev) = out
+                .iter_mut()
+                .find(|e| e.begin_index == begin_index && e.field == field)
+            {
+                prev.text.push('\n');
+                prev.text.push_str(&text);
+            } else {
+                out.push(ScriptDocEntry {
+                    begin_index,
+                    field,
+                    text,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The lenient hint micro-grammar inside the one `/** */` form:
+/// `name [min..max] [step s]` — e.g. `/**pulse speed 0..2 step 0.05*/`.
+/// Range and step are HINTS for the editor's bounded scrubber, never
+/// clamps: the UI may scrub past a bound (expanding it) or type anything.
+/// Unrecognized words stay part of the name. Applies to value-position
+/// annotations and to field/definition docs alike.
+#[relax_api(handle, run)]
+#[derive(Clone, Debug)]
+pub struct ScriptDocHint {
+    pub name: String,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub step: Option<f64>,
+}
+
+/// Parse the hint micro-grammar out of a doc text, leniently.
+#[relax_api(run)]
+pub fn parse_doc_hint(text: &str) -> ScriptDocHint {
+    let mut name_parts: Vec<&str> = Vec::new();
+    let (mut min, mut max, mut step) = (None, None, None);
+    let mut words = text.split_whitespace().peekable();
+    while let Some(w) = words.next() {
+        if min.is_none() {
+            if let Some((a, b)) = w.split_once("..") {
+                if let (Ok(a), Ok(b)) = (a.parse::<f64>(), b.parse::<f64>()) {
+                    min = Some(a);
+                    max = Some(b);
+                    continue;
+                }
+            }
+        }
+        if step.is_none() && w == "step" {
+            if let Some(next) = words.peek() {
+                if let Ok(v) = next.parse::<f64>() {
+                    step = Some(v);
+                    words.next();
+                    continue;
+                }
+            }
+        }
+        name_parts.push(w);
+    }
+    ScriptDocHint {
+        name: name_parts.join(" "),
+        min,
+        max,
+        step,
+    }
+}
+
+/// A `/**name*/` annotation in value position: a human-authored friendly
+/// name for the literal that immediately follows it (an inline shader
+/// constant, usually). Feeds the tweaker's Constants rows; where no human
+/// wrote one, the AI annotation pass may add it.
+#[derive(Clone, Debug)]
+pub struct ScriptValueName {
+    /// Token index of the annotated literal (past a leading `-`).
+    pub token: u32,
+    pub name: String,
+}
+
+/// Whether token `t` begins a `color(…)` call (a named colour's value).
+fn is_color_call(toks: &[crate::tokenizer::ScriptTokenPos], t: usize) -> bool {
+    toks.get(t).is_some_and(|tp| matches!(tp.token, ScriptToken::Identifier(id) if id == id!(color)))
+        && toks.get(t + 1).is_some_and(|tp| matches!(tp.token, ScriptToken::OpenRound))
+}
+
+/// Whether token `t` is `let` or `var` (a binding a doc names).
+fn is_binding(toks: &[crate::tokenizer::ScriptTokenPos], t: usize) -> bool {
+    toks.get(t).is_some_and(|tp| matches!(tp.token, ScriptToken::Identifier(id) if id == id!(let) || id == id!(var)))
+}
+
+/// A doc naming a `let` / `var` binding: its name and the doc's text.
+#[derive(Clone, Debug)]
+pub struct ScriptLetDoc {
+    /// Token index of the binding's name.
+    pub token: u32,
+    pub name: LiveId,
+    pub text: String,
+}
+
+/// The binding annotations of a tokenizer, in token order: docs whose next
+/// token is `let` or `var` (consecutive lines merged).
+pub fn resolve_let_docs(tokenizer: &ScriptTokenizer) -> Vec<ScriptLetDoc> {
+    let toks = &tokenizer.tokens;
+    let mut out: Vec<ScriptLetDoc> = Vec::new();
+    for d in &tokenizer.docs {
+        let t = d.next_token as usize;
+        if !is_binding(toks, t) {
+            continue;
+        }
+        let Some(ScriptToken::Identifier(name)) = toks.get(t + 1).map(|tp| tp.token) else {
+            continue;
+        };
+        let text = clean_block_text(&d.text);
+        match out.iter_mut().find(|e| e.token == t as u32 + 1) {
+            Some(e) => {
+                e.text.push('\n');
+                e.text.push_str(&text);
+            }
+            None => out.push(ScriptLetDoc { token: t as u32 + 1, name, text }),
+        }
+    }
+    out
+}
+
+/// The value-position annotations of a tokenizer, in token order: docs
+/// whose next token is a value literal (or `-` then one), or a `color(…)`
+/// call (the name's token is `color`).
+pub fn resolve_value_names(tokenizer: &ScriptTokenizer) -> Vec<ScriptValueName> {
+    let toks = &tokenizer.tokens;
+    tokenizer
+        .docs
+        .iter()
+        .filter_map(|d| {
+            let t = d.next_token as usize;
+            if is_color_call(toks, t) {
+                return Some(ScriptValueName { token: d.next_token, name: clean_block_text(&d.text) });
+            }
+            if toks.get(t).is_some_and(|tp| is_value_token(&tp.token)) {
+                return Some(ScriptValueName {
+                    token: d.next_token,
+                    name: clean_block_text(&d.text),
+                });
+            }
+            if toks
+                .get(t)
+                .is_some_and(|tp| matches!(tp.token, ScriptToken::Operator(id) if id == id!(-)))
+                && toks.get(t + 1).is_some_and(|tp| is_value_token(&tp.token))
+            {
+                return Some(ScriptValueName {
+                    token: d.next_token + 1,
+                    name: clean_block_text(&d.text),
+                });
+            }
+            None
+        })
+        .collect()
+}
+
+/// The value-position annotation naming the literal at `token`, if any:
+/// a doc whose next token is that literal, or a `-` directly before it
+/// (`/**x*/ -0.5` names the `0.5`; the bool says so, and the shader
+/// compiler then folds the sign into the table value). The shader compiler
+/// asks this per literal when it lifts annotated literals into its
+/// constant table.
+pub fn value_name_at(tokenizer: &ScriptTokenizer, token: u32) -> Option<(String, bool)> {
+    let toks = &tokenizer.tokens;
+    if !toks.get(token as usize).is_some_and(|tp| is_value_token(&tp.token)) {
+        return None;
+    }
+    tokenizer.docs.iter().find_map(|d| {
+        if d.next_token == token {
+            return Some((clean_block_text(&d.text), false));
+        }
+        if d.next_token + 1 == token
+            && toks.get(d.next_token as usize).is_some_and(|tp| {
+                matches!(tp.token, ScriptToken::Operator(id) if id == id!(-))
+            })
+        {
+            return Some((clean_block_text(&d.text), true));
+        }
+        None
+    })
+}
+
+/// The float value of the literal token at `token` (`6.`, `10.0`, `0.25`),
+/// or None for anything that is not a float literal. Used to recover a
+/// whole-number float the parser packed into an opcode as an integer.
+pub fn float_literal_at(tokenizer: &ScriptTokenizer, token: u32) -> Option<f64> {
+    match tokenizer.tokens.get(token as usize)?.token {
+        ScriptToken::F64(v) => Some(v),
+        ScriptToken::F32(v) => Some(v as f64),
+        _ => None,
+    }
+}
+
+impl ScriptCode {
+    /// The `/**name*/` value-position annotations of one body.
+    pub fn resolve_body_value_names(&self, body_index: u16) -> Vec<ScriptValueName> {
+        let bodies = self.bodies.borrow();
+        let Some(body) = bodies.get(body_index as usize) else {
+            return Vec::new();
+        };
+        resolve_value_names(&body.tokenizer)
+    }
+
+    /// The `let` / `var` annotations of one body.
+    pub(crate) fn resolve_body_let_docs(&self, body_index: u16) -> Vec<ScriptLetDoc> {
+        let bodies = self.bodies.borrow();
+        let Some(body) = bodies.get(body_index as usize) else {
+            return Vec::new();
+        };
+        resolve_let_docs(&body.tokenizer)
+    }
+
+    /// Doc entries of one body, resolved fresh from its compile artifacts.
+    pub fn resolve_body_docs(&self, body_index: u16) -> Vec<ScriptDocEntry> {
+        let bodies = self.bodies.borrow();
+        let Some(body) = bodies.get(body_index as usize) else {
+            return Vec::new();
+        };
+        resolve_docs(
+            &body.tokenizer,
+            &body.parser.opcodes,
+            &body.parser.source_map,
+        )
+    }
+}
+
+impl<'a> ScriptVm<'a> {
+    /// The construction chain of a value: the object itself, then each
+    /// prototype outward. Each level resolves its `made_at` ip to a source
+    /// location and its `///` docs. This is the tweaker cascade view's
+    /// data source.
+    /// Built on the caller's side (an inline shell over the VM's bound accessors and
+    /// [`Self::site_docs_into`]): a ScriptChainLevel never passes through the VM's own code
+    /// (loader-core.md section 8).
+    #[inline(always)]
+    pub fn construction_chain(&self, value: ScriptValue) -> Vec<ScriptChainLevel> {
+        let mut out = Vec::new();
+        let mut cur = value;
+        while let Some(obj) = cur.as_object() {
+            if out.len() >= MAX_CHAIN {
+                break;
+            }
+            let heap = self.heap();
+            let made_at = heap.made_at(obj);
+            let mut own_keys: Vec<LiveId> = heap.map_entries(obj).iter().filter_map(|e| e.key.as_id()).collect();
+            for kv in heap.vec_ref(obj) {
+                if let Some(id) = kv.key.as_id() {
+                    own_keys.push(id);
+                }
+            }
+            let (loc, doc, field_docs) = if made_at.is_unknown() {
+                (None, None, Vec::new())
+            } else {
+                let mut doc = String::new();
+                let mut has_doc = false;
+                let mut field_docs = Vec::new();
+                self.site_docs_into(made_at, &mut crate::vm_api::ScriptTextOut::new(&mut doc), &mut has_doc, &mut ScriptFieldDocsOut::new(&mut field_docs));
+                (self.ip_to_loc(made_at), has_doc.then_some(doc), field_docs)
+            };
+            out.push(ScriptChainLevel { object: obj, made_at, loc, doc, field_docs, own_keys });
+            cur = heap.proto(obj);
+        }
+        out
+    }
+
+    /// The doc annotations of the object literal built at `made_at`: its own (into `doc`,
+    /// `has_doc` set) and its fields' (into `fields`).
+    #[inline(always)]
+    pub fn site_docs_into(&self, made_at: ScriptIp, doc: &mut crate::vm_api::ScriptTextOut, has_doc: &mut bool, fields: &mut ScriptFieldDocsOut) {
+        let mut sink = ScriptQuerySink::new();
+        sink.text0(doc);
+        sink.fields(fields);
+        let answer = self.bx.code_ref().query(QUERY_SITE_DOCS, &mut sink, |req| req.ip = made_at);
+        *has_doc = answer.flag;
+    }
+}
+
+/// What a [`ScriptDocHint`] holds, as plain data ([`ScriptDocHint::view`]); the min, max and
+/// step are valid where `has` has bit 0, 1 and 2 set.
+#[relax_api(plain, run)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ScriptDocHintView<'a> {
+    pub name: &'a str,
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+    pub has: u32,
+}
+
+#[relax_api(run)]
+impl ScriptDocHint {
+    #[relax_api(run)]
+    pub fn view(&self) -> ScriptDocHintView<'_> {
+        ScriptDocHintView {
+            name: &self.name,
+            min: self.min.unwrap_or(0.0),
+            max: self.max.unwrap_or(0.0),
+            step: self.step.unwrap_or(0.0),
+            has: self.min.is_some() as u32 | (self.max.is_some() as u32) << 1 | (self.step.is_some() as u32) << 2,
+        }
+    }
+}
+
+impl ScriptDocHint {
+    #[inline(always)]
+    pub fn name(&self) -> &str { self.view().name }
+    #[inline(always)]
+    pub fn min(&self) -> Option<f64> { let v = self.view(); (v.has & 1 != 0).then_some(v.min) }
+    #[inline(always)]
+    pub fn max(&self) -> Option<f64> { let v = self.view(); (v.has & 2 != 0).then_some(v.max) }
+    #[inline(always)]
+    pub fn step(&self) -> Option<f64> { let v = self.view(); (v.has & 4 != 0).then_some(v.step) }
+}

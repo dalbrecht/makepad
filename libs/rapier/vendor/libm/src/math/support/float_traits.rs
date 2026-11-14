@@ -268,7 +268,7 @@ macro_rules! float_impl {
             fn abs(self) -> Self {
                 cfg_if! {
                     // FIXME(msrv): `abs` is available in `core` starting with 1.85.
-                    if #[cfg(intrinsics_enabled)] {
+                    if #[cfg(all(feature = "unstable-intrinsics", not(feature = "force-soft-floats")))] {
                         self.abs()
                     } else {
                         super::super::generic::fabs(self)
@@ -278,7 +278,7 @@ macro_rules! float_impl {
             fn copysign(self, other: Self) -> Self {
                 cfg_if! {
                     // FIXME(msrv): `copysign` is available in `core` starting with 1.85.
-                    if #[cfg(intrinsics_enabled)] {
+                    if #[cfg(all(feature = "unstable-intrinsics", not(feature = "force-soft-floats")))] {
                         self.copysign(other)
                     } else {
                         super::super::generic::copysign(self, other)
@@ -288,7 +288,7 @@ macro_rules! float_impl {
             fn fma(self, y: Self, z: Self) -> Self {
                 cfg_if! {
                     // fma is not yet available in `core`
-                    if #[cfg(intrinsics_enabled)] {
+                    if #[cfg(all(feature = "unstable-intrinsics", not(feature = "force-soft-floats")))] {
                         // FIXME(msrv,bench): once our benchmark rustc version is above the
                         // 2022-09-23 nightly, this can be removed.
                         #[allow(unused_unsafe)]
@@ -451,33 +451,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(f16_enabled)]
-    fn check_f16() {
-        // Constants
-        assert_eq!(f16::EXP_SAT, 0b11111);
-        assert_eq!(f16::EXP_BIAS, 15);
-        assert_eq!(f16::EXP_MAX, 15);
-        assert_eq!(f16::EXP_MIN, -14);
-        assert_eq!(f16::EXP_MIN_SUBNORM, -24);
-
-        // `exp_unbiased`
-        assert_eq!(f16::FRAC_PI_2.exp_unbiased(), 0);
-        assert_eq!((1.0f16 / 2.0).exp_unbiased(), -1);
-        assert_eq!(f16::MAX.exp_unbiased(), 15);
-        assert_eq!(f16::MIN.exp_unbiased(), 15);
-        assert_eq!(f16::MIN_POSITIVE.exp_unbiased(), -14);
-        // This is a convenience method and not ldexp, `exp_unbiased` does not return correct
-        // results for zero and subnormals.
-        assert_eq!(f16::ZERO.exp_unbiased(), -15);
-        assert_eq!(f16::from_bits(0x1).exp_unbiased(), -15);
-        assert_eq!(f16::MIN_POSITIVE, f16::MIN_POSITIVE_NORMAL);
-
-        // `from_parts`
-        assert_biteq!(f16::from_parts(true, f16::EXP_BIAS, 0), -1.0f16);
-        assert_biteq!(f16::from_parts(false, 0, 1), f16::from_bits(0x1));
-    }
-
-    #[test]
     fn check_f32() {
         // Constants
         assert_eq!(f32::EXP_SAT, 0b11111111);
@@ -537,30 +510,4 @@ mod tests {
         assert_biteq!(f64::from_parts(false, 0, 1), f64::from_bits(0x1));
     }
 
-    #[test]
-    #[cfg(f128_enabled)]
-    fn check_f128() {
-        // Constants
-        assert_eq!(f128::EXP_SAT, 0b111111111111111);
-        assert_eq!(f128::EXP_BIAS, 16383);
-        assert_eq!(f128::EXP_MAX, 16383);
-        assert_eq!(f128::EXP_MIN, -16382);
-        assert_eq!(f128::EXP_MIN_SUBNORM, -16494);
-
-        // `exp_unbiased`
-        assert_eq!(f128::FRAC_PI_2.exp_unbiased(), 0);
-        assert_eq!((1.0f128 / 2.0).exp_unbiased(), -1);
-        assert_eq!(f128::MAX.exp_unbiased(), 16383);
-        assert_eq!(f128::MIN.exp_unbiased(), 16383);
-        assert_eq!(f128::MIN_POSITIVE.exp_unbiased(), -16382);
-        // This is a convenience method and not ldexp, `exp_unbiased` does not return correct
-        // results for zero and subnormals.
-        assert_eq!(f128::ZERO.exp_unbiased(), -16383);
-        assert_eq!(f128::from_bits(0x1).exp_unbiased(), -16383);
-        assert_eq!(f128::MIN_POSITIVE, f128::MIN_POSITIVE_NORMAL);
-
-        // `from_parts`
-        assert_biteq!(f128::from_parts(true, f128::EXP_BIAS, 0), -1.0f128);
-        assert_biteq!(f128::from_parts(false, 0, 1), f128::from_bits(0x1));
-    }
 }

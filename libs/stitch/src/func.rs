@@ -1,7 +1,7 @@
 use {
     crate::{
         code::{Code, UncompiledCode},
-        decode::{Decode, DecodeError, Decoder},
+        
         error::Error,
         exec,
         instance::Instance,
@@ -145,12 +145,13 @@ impl FuncType {
     /// [`FuncType`] [] -> [`ValType`?].
     pub(crate) fn from_val_type(type_: Option<ValType>) -> FuncType {
         thread_local! {
-            static TYPES: [FuncType; 7] = [
+            static TYPES: [FuncType; 8] = [
                 FuncType::new(vec![], vec![]),
                 FuncType::new(vec![], vec![ValType::I32]),
                 FuncType::new(vec![], vec![ValType::I64]),
                 FuncType::new(vec![], vec![ValType::F32]),
                 FuncType::new(vec![], vec![ValType::F64]),
+                FuncType::new(vec![], vec![ValType::V128]),
                 FuncType::new(vec![], vec![ValType::FuncRef]),
                 FuncType::new(vec![], vec![ValType::ExternRef]),
             ];
@@ -162,8 +163,9 @@ impl FuncType {
             Some(ValType::I64) => types[2].clone(),
             Some(ValType::F32) => types[3].clone(),
             Some(ValType::F64) => types[4].clone(),
-            Some(ValType::FuncRef) => types[5].clone(),
-            Some(ValType::ExternRef) => types[6].clone(),
+            Some(ValType::V128) => types[5].clone(),
+            Some(ValType::FuncRef) => types[6].clone(),
+            Some(ValType::ExternRef) => types[7].clone(),
         })
     }
 
@@ -171,25 +173,6 @@ impl FuncType {
     /// [`StackSlot`]s.
     pub(crate) fn call_frame_size(&self) -> usize {
         self.params().len().max(self.results().len()) + 4
-    }
-}
-
-impl Decode for FuncType {
-    fn decode(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        if decoder.read_byte()? != 0x60 {
-            return Err(DecodeError::new("malformed function type"))?;
-        }
-        let mut param_result_types: Vec<_> = decoder.decode_iter()?.collect::<Result<_, _>>()?;
-        let param_count = param_result_types.len();
-        let result_types = decoder.decode_iter()?;
-        param_result_types.reserve(result_types.size_hint().0);
-        for result_type in result_types {
-            param_result_types.push(result_type?);
-        }
-        Ok(Self {
-            params_results: param_result_types.into(),
-            param_count,
-        })
     }
 }
 

@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::error::GitError;
 use crate::oid::ObjectId;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefTarget {
     Direct(ObjectId),
     Symbolic(String),
@@ -17,10 +18,30 @@ pub struct Ref {
     pub target: RefTarget,
 }
 
+/// Refs that live in a worktree's private git dir rather than the shared
+/// common dir: `HEAD`, the pseudo-refs (`ORIG_HEAD`, `FETCH_HEAD`, …) and the
+/// per-worktree namespaces.
+pub fn is_private_ref(name: &str) -> bool {
+    if !name.starts_with("refs/") {
+        return true;
+    }
+    ["refs/bisect", "refs/worktree", "refs/rewritten"]
+        .iter()
+        .any(|ns| name == *ns || name.strip_prefix(ns).is_some_and(|rest| rest.starts_with('/')))
+}
+
+fn ref_dir<'a>(git_dir: &'a Path, common_dir: &'a Path, name: &str) -> &'a Path {
+    if is_private_ref(name) {
+        git_dir
+    } else {
+        common_dir
+    }
+}
+
 /// Read HEAD — returns Symbolic("refs/heads/main") or Direct(oid).
 pub fn read_head(git_dir: &Path) -> Result<RefTarget, GitError> {
     let head_path = git_dir.join("HEAD");
-    let content = fs::read_to_string(&head_path)?;
+    let content = fs::read_to_string(&head_path).map_err(|e| GitError::io_at("read HEAD", &head_path, e))?;
     let content = content.trim_end();
 
     if let Some(rest) = content.strip_prefix("ref: ") {
@@ -30,13 +51,24 @@ pub fn read_head(git_dir: &Path) -> Result<RefTarget, GitError> {
     }
 }
 
-/// Read a single ref by name (e.g. "refs/heads/main").
-/// Checks loose refs first, then packed-refs.
+/// Read a single ref by name (e.g. "refs/heads/main") in an ordinary
+/// repository (private and common dir are the same).
 pub fn read_ref(git_dir: &Path, name: &str) -> Result<Option<RefTarget>, GitError> {
+    read_ref_in(git_dir, git_dir, name)
+}
+
+/// Read a single ref by name, routing private refs to `git_dir` and shared
+/// refs and `packed-refs` to `common_dir`. Checks loose refs first, then
+/// packed-refs.
+pub fn read_ref_in(
+    git_dir: &Path,
+    common_dir: &Path,
+    name: &str,
+) -> Result<Option<RefTarget>, GitError> {
     // Try loose ref first
-    let loose_path = git_dir.join(name);
+    let loose_path = ref_dir(git_dir, common_dir, name).join(name);
     if loose_path.is_file() {
-        let content = fs::read_to_string(&loose_path)?;
+        let content = fs::read_to_string(&loose_path).map_err(|e| GitError::io_at("read loose ref", &loose_path, e))?;
         let content = content.trim_end();
         if let Some(rest) = content.strip_prefix("ref: ") {
             return Ok(Some(RefTarget::Symbolic(rest.to_string())));
@@ -44,8 +76,8 @@ pub fn read_ref(git_dir: &Path, name: &str) -> Result<Option<RefTarget>, GitErro
         return Ok(Some(RefTarget::Direct(ObjectId::from_hex(content)?)));
     }
 
-    // Try packed-refs
-    let packed = read_packed_refs(git_dir)?;
+    // Try packed-refs (always in the common dir)
+    let packed = read_packed_refs(common_dir)?;
     if let Some(oid) = packed.get(name) {
         return Ok(Some(RefTarget::Direct(*oid)));
     }
@@ -55,9 +87,15 @@ pub fn read_ref(git_dir: &Path, name: &str) -> Result<Option<RefTarget>, GitErro
 
 /// Resolve a ref to a concrete ObjectId, following symbolic refs.
 pub fn resolve_ref(git_dir: &Path, name: &str) -> Result<ObjectId, GitError> {
+    resolve_ref_in(git_dir, git_dir, name)
+}
+
+/// Resolve a ref to a concrete ObjectId, following symbolic refs hop by hop
+/// across the private/common routing.
+pub fn resolve_ref_in(git_dir: &Path, common_dir: &Path, name: &str) -> Result<ObjectId, GitError> {
     let mut current = name.to_string();
     for _ in 0..10 {
-        match read_ref(git_dir, &current)? {
+        match read_ref_in(git_dir, common_dir, &current)? {
             Some(RefTarget::Direct(oid)) => return Ok(oid),
             Some(RefTarget::Symbolic(target)) => current = target,
             None => return Err(GitError::RefNotFound(current)),
@@ -71,10 +109,105 @@ pub fn resolve_ref(git_dir: &Path, name: &str) -> Result<ObjectId, GitError> {
 
 /// Resolve HEAD to a concrete ObjectId.
 pub fn resolve_head(git_dir: &Path) -> Result<ObjectId, GitError> {
+    resolve_head_in(git_dir, git_dir)
+}
+
+/// Resolve the private HEAD through the shared refs.
+pub fn resolve_head_in(git_dir: &Path, common_dir: &Path) -> Result<ObjectId, GitError> {
     match read_head(git_dir)? {
         RefTarget::Direct(oid) => Ok(oid),
-        RefTarget::Symbolic(name) => resolve_ref(git_dir, &name),
+        RefTarget::Symbolic(name) => resolve_ref_in(git_dir, common_dir, &name),
     }
+}
+
+/// Write a ref into the directory its name routes to.
+pub fn write_ref_in(
+    git_dir: &Path,
+    common_dir: &Path,
+    name: &str,
+    oid: &ObjectId,
+) -> Result<(), GitError> {
+    write_ref(ref_dir(git_dir, common_dir, name), name, oid)
+}
+
+/// Delete a loose ref from the directory its name routes to.
+pub fn delete_ref_in(git_dir: &Path, common_dir: &Path, name: &str) -> Result<(), GitError> {
+    delete_ref(ref_dir(git_dir, common_dir, name), name)
+}
+
+/// List refs under a prefix. Both stores are enumerated and every full ref
+/// name is kept by ownership: shared names (`refs/heads`, `refs/tags`,
+/// `refs/remotes`, …) from the common dir, private names (`refs/bisect`,
+/// `refs/worktree`, `refs/rewritten`) from the worktree's own dir. In an
+/// ordinary repository the two are the same directory.
+pub fn list_refs_in(git_dir: &Path, common_dir: &Path, prefix: &str) -> Result<Vec<Ref>, GitError> {
+    let same_store = same_directory(git_dir, common_dir);
+    let mut result: HashMap<String, RefTarget> = HashMap::new();
+
+    // Shared store: packed refs first, loose refs override.
+    for (name, oid) in read_packed_refs(common_dir)?.iter() {
+        if name.starts_with(prefix) && (same_store || !is_private_ref(name)) {
+            result.insert(name.clone(), RefTarget::Direct(*oid));
+        }
+    }
+    let mut shared: HashMap<String, RefTarget> = HashMap::new();
+    collect_refs_under(common_dir, prefix, &mut shared)?;
+    for (name, target) in shared {
+        if same_store || !is_private_ref(&name) {
+            result.insert(name, target);
+        }
+    }
+
+    // Private store.
+    if !same_store {
+        let mut private: HashMap<String, RefTarget> = HashMap::new();
+        collect_refs_under(git_dir, prefix, &mut private)?;
+        for (name, target) in private {
+            if is_private_ref(&name) {
+                result.insert(name, target);
+            }
+        }
+    }
+
+    let mut refs: Vec<Ref> = result
+        .into_iter()
+        .map(|(name, target)| Ref { name, target })
+        .collect();
+    refs.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(refs)
+}
+
+fn same_directory(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Loose refs under `dir` whose full name starts with `prefix`: the prefix
+/// may name a directory (`refs/heads/`, `refs/bisect`) or a single ref.
+fn collect_refs_under(
+    dir: &Path,
+    prefix: &str,
+    result: &mut HashMap<String, RefTarget>,
+) -> Result<(), GitError> {
+    let prefix_path = dir.join(prefix);
+    if prefix_path.is_dir() {
+        collect_loose_refs(&prefix_path, prefix, result)?;
+    } else if prefix_path.is_file() && !prefix.is_empty() {
+        let content = fs::read_to_string(&prefix_path).map_err(|e| GitError::io_at("read loose ref", &prefix_path, e))?;
+        let content = content.trim_end();
+        let target = if let Some(rest) = content.strip_prefix("ref: ") {
+            RefTarget::Symbolic(rest.to_string())
+        } else {
+            RefTarget::Direct(ObjectId::from_hex(content)?)
+        };
+        result.insert(prefix.to_string(), target);
+    }
+    Ok(())
 }
 
 /// Parse .git/packed-refs file.
@@ -85,14 +218,31 @@ pub fn resolve_head(git_dir: &Path) -> Result<ObjectId, GitError> {
 /// <sha1> <refname>
 /// ^<sha1>           (peeled tag — we skip these)
 /// ```
-pub fn read_packed_refs(git_dir: &Path) -> Result<HashMap<String, ObjectId>, GitError> {
+///
+/// A file read before is not parsed again while it is the same file: git writes packed-refs
+/// whole and renames it into place, so every write changes its identity, size or mtime. A
+/// repository with thousands of packed refs costs a stat per ref read, not a parse.
+pub fn read_packed_refs(git_dir: &Path) -> Result<Arc<HashMap<String, ObjectId>>, GitError> {
+    type Parsed = (PackedKey, Arc<HashMap<String, ObjectId>>);
+    static PARSED: Mutex<Option<HashMap<PathBuf, Parsed>>> = Mutex::new(None);
     let packed_path = git_dir.join("packed-refs");
+    let key = match fs::metadata(&packed_path) {
+        Ok(meta) => PackedKey::of(&meta),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Arc::default()),
+        Err(e) => return Err(GitError::io_at("stat packed refs", &packed_path, e)),
+    };
+    if let Some((k, refs)) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&packed_path)) {
+        if *k == key {
+            return Ok(refs.clone());
+        }
+    }
     let mut refs = HashMap::new();
 
+    // replaced since the stat: the next read sees another key and parses again
     let content = match fs::read_to_string(&packed_path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(refs),
-        Err(e) => return Err(GitError::Io(e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Arc::default()),
+        Err(e) => return Err(GitError::io_at("read packed refs", &packed_path, e)),
     };
 
     for line in content.lines() {
@@ -112,7 +262,31 @@ pub fn read_packed_refs(git_dir: &Path) -> Result<HashMap<String, ObjectId>, Git
         refs.insert(name.to_string(), oid);
     }
 
+    let refs = Arc::new(refs);
+    PARSED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(packed_path, (key, refs.clone()));
     Ok(refs)
+}
+
+/// What tells one packed-refs file from the next.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PackedKey {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl PackedKey {
+    fn of(meta: &fs::Metadata) -> PackedKey {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        PackedKey {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            ino: meta.ino(),
+        }
+    }
 }
 
 /// Write a ref atomically using a lockfile.
@@ -146,66 +320,54 @@ pub fn update_head(git_dir: &Path, target: &RefTarget) -> Result<(), GitError> {
     Ok(())
 }
 
-/// List all refs under a given prefix (e.g. "refs/heads/").
-/// Returns refs from both loose and packed-refs, with loose taking precedence.
 pub fn list_refs(git_dir: &Path, prefix: &str) -> Result<Vec<Ref>, GitError> {
-    let mut result: HashMap<String, RefTarget> = HashMap::new();
-
-    // Read packed refs first (loose will override)
-    let packed = read_packed_refs(git_dir)?;
-    for (name, oid) in packed {
-        if name.starts_with(prefix) {
-            result.insert(name, RefTarget::Direct(oid));
-        }
-    }
-
-    // Walk loose refs directory
-    let prefix_dir = git_dir.join(prefix);
-    if prefix_dir.is_dir() {
-        collect_loose_refs(git_dir, &prefix_dir, prefix, &mut result)?;
-    }
-
-    let mut refs: Vec<Ref> = result
-        .into_iter()
-        .map(|(name, target)| Ref { name, target })
-        .collect();
-    refs.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(refs)
+    list_refs_in(git_dir, git_dir, prefix)
 }
 
 fn collect_loose_refs(
-    git_dir: &Path,
     dir: &Path,
-    prefix: &str,
+    dir_name: &str,
     result: &mut HashMap<String, RefTarget>,
 ) -> Result<(), GitError> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(GitError::Io(e)),
+        Err(e) => return Err(GitError::io_at("list refs", dir, e)),
     };
 
     for entry in entries {
-        let entry = entry?;
+        let entry = entry.map_err(|e| GitError::io_at("list refs", dir, e))?;
         let path = entry.path();
+        // Ref names are `/`-separated on every platform, so the name is
+        // built from the components walked, never from the OS path.
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        // `<ref>.lock` is a ref update in flight, never a ref (no ref name
+        // ends in `.lock`): read as one it was an empty or a phantom ref
+        if file_name.ends_with(".lock") {
+            continue;
+        }
+        let name = if dir_name.is_empty() || dir_name.ends_with('/') {
+            format!("{dir_name}{file_name}")
+        } else {
+            format!("{dir_name}/{file_name}")
+        };
         if path.is_dir() {
-            collect_loose_refs(git_dir, &path, prefix, result)?;
+            collect_loose_refs(&path, &name, result)?;
         } else if path.is_file() {
-            // Compute ref name relative to git_dir
-            let rel = path
-                .strip_prefix(git_dir)
-                .map_err(|_| GitError::InvalidRef("cannot strip git_dir prefix".into()))?;
-            let name = rel.to_string_lossy().to_string();
-            if name.starts_with(prefix) {
-                let content = fs::read_to_string(&path)?;
-                let content = content.trim_end();
-                let target = if let Some(rest) = content.strip_prefix("ref: ") {
-                    RefTarget::Symbolic(rest.to_string())
-                } else {
-                    RefTarget::Direct(ObjectId::from_hex(content)?)
-                };
-                result.insert(name, target);
-            }
+            // deleted or packed since the listing: not a loose ref any more
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(GitError::io_at("read loose ref", &path, e)),
+            };
+            let content = content.trim_end();
+            let target = if let Some(rest) = content.strip_prefix("ref: ") {
+                RefTarget::Symbolic(rest.to_string())
+            } else {
+                RefTarget::Direct(ObjectId::from_hex(content)?)
+            };
+            result.insert(name, target);
         }
     }
     Ok(())
@@ -226,6 +388,21 @@ pub fn delete_ref(git_dir: &Path, name: &str) -> Result<(), GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ref update in flight (git's `<ref>.lock`, empty while it is created, then holding the
+    /// new id until its rename) is no ref: the listing neither fails on it nor names it.
+    #[test]
+    fn a_ref_update_in_flight_is_not_listed() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let git_dir = dir.path();
+        let id = "552e2a0e14dd313f5f572118a18fba67ad99699c";
+        fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+        fs::write(git_dir.join("refs/heads/work"), format!("{id}\n")).unwrap();
+        fs::write(git_dir.join("refs/heads/rc-a.lock"), "").unwrap();
+        fs::write(git_dir.join("refs/heads/rc-b.lock"), format!("{id}\n")).unwrap();
+        let names: Vec<String> = list_refs_in(git_dir, git_dir, "refs/").unwrap().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["refs/heads/work"]);
+    }
 
     #[test]
     fn test_read_head_symbolic() {
@@ -269,6 +446,33 @@ mod tests {
             Some(RefTarget::Direct(read_oid)) => assert_eq!(read_oid, oid),
             other => panic!("expected Direct, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_list_refs_names_use_slashes() {
+        // Loose ref names are `/`-separated on every platform: a nested ref
+        // read back from the file system keeps that spelling (on Windows the
+        // OS path separator must not leak into the name).
+        let dir = crate::test_support::tempdir().unwrap();
+        let git_dir = dir.path();
+        let oid = ObjectId::from_hex("552e2a0e14dd313f5f572118a18fba67ad99699c").unwrap();
+        write_ref(git_dir, "refs/tags/v1", &oid).unwrap();
+        write_ref(git_dir, "refs/heads/main", &oid).unwrap();
+        write_ref(git_dir, "refs/heads/feature/deep/x", &oid).unwrap();
+
+        let names = |prefix: &str| -> Vec<String> {
+            list_refs(git_dir, prefix).unwrap().into_iter().map(|r| r.name).collect()
+        };
+        assert_eq!(names("refs/tags/"), vec!["refs/tags/v1"]);
+        assert_eq!(names("refs/tags"), vec!["refs/tags/v1"]);
+        assert_eq!(
+            names("refs/heads/"),
+            vec!["refs/heads/feature/deep/x", "refs/heads/main"]
+        );
+        assert_eq!(
+            names("refs/"),
+            vec!["refs/heads/feature/deep/x", "refs/heads/main", "refs/tags/v1"]
+        );
     }
 
     #[test]

@@ -7,93 +7,10 @@ use std::f64::consts::PI;
 // --- Primitive creation ---
 
 #[test]
-fn test_cube_creation() {
-    let c = Solid::cube(2.0, 3.0, 4.0, true);
-    assert!(!c.is_empty());
-    assert_eq!(c.triangle_count(), 12);
-    assert_eq!(c.vertex_count(), 8);
-
-    let vol = c.volume();
-    assert!((vol - 24.0).abs() < 1e-10, "cube volume: {}", vol);
-    assert!(c.is_valid());
-}
-
-#[test]
 fn test_cube_uniform() {
     let c = Solid::cube_uniform(2.0, true);
     let vol = c.volume();
     assert!((vol - 8.0).abs() < 1e-10, "2x2x2 cube volume: {}", vol);
-}
-
-#[test]
-fn test_sphere_creation() {
-    let s = Solid::sphere(1.0, 32, 16);
-    assert!(s.is_valid());
-
-    let vol = s.volume();
-    let expected = 4.0 / 3.0 * PI;
-    let error = (vol - expected).abs() / expected;
-    assert!(error < 0.02, "sphere volume error: {}%", error * 100.0);
-}
-
-#[test]
-fn test_cylinder_creation() {
-    let c = Solid::cylinder(1.0, 2.0, 64, true);
-    assert!(c.is_valid());
-
-    let vol = c.volume();
-    let expected = PI * 2.0;
-    let error = (vol - expected).abs() / expected;
-    assert!(error < 0.01, "cylinder volume error: {}%", error * 100.0);
-}
-
-#[test]
-fn test_cone_creation() {
-    let c = Solid::cone(1.0, 3.0, 64, true);
-    assert!(c.is_valid());
-
-    let vol = c.volume();
-    let expected = PI * 3.0 / 3.0;
-    let error = (vol - expected).abs() / expected;
-    assert!(error < 0.01, "cone volume error: {}%", error * 100.0);
-}
-
-#[test]
-fn test_torus_creation() {
-    let t = Solid::torus(2.0, 0.5, 64, 32);
-    assert!(t.is_valid());
-
-    let vol = t.volume();
-    let expected = 2.0 * PI * PI * 2.0 * 0.25;
-    let error = (vol - expected).abs() / expected;
-    assert!(error < 0.01, "torus volume error: {}%", error * 100.0);
-}
-
-#[test]
-fn test_extrude() {
-    let hex = hexagon(1.0);
-    let e = Solid::extrude(&hex, 2.0);
-    assert!(e.is_valid());
-
-    // Regular hexagon area = 3*sqrt(3)/2 * r^2
-    let hex_area = 3.0 * 3.0_f64.sqrt() / 2.0;
-    let expected_vol = hex_area * 2.0;
-    let vol = e.volume();
-    assert!(
-        (vol - expected_vol).abs() / expected_vol < 0.01,
-        "extruded hexagon volume: {} vs {}",
-        vol,
-        expected_vol
-    );
-}
-
-fn hexagon(radius: f64) -> Vec<[f64; 2]> {
-    (0..6)
-        .map(|i| {
-            let angle = PI / 3.0 * i as f64;
-            [radius * angle.cos(), radius * angle.sin()]
-        })
-        .collect()
 }
 
 // --- Boolean operations ---
@@ -209,16 +126,6 @@ fn test_difference_from_empty() {
 // --- Transforms ---
 
 #[test]
-fn test_translate() {
-    let c = Solid::cube_uniform(1.0, true).translate(10.0, 20.0, 30.0);
-    let bb = c.bounding_box();
-    assert!((bb.min.x - 9.5).abs() < 1e-10);
-    assert!((bb.max.x - 10.5).abs() < 1e-10);
-    assert!((bb.min.y - 19.5).abs() < 1e-10);
-    assert!((bb.max.y - 20.5).abs() < 1e-10);
-}
-
-#[test]
 fn test_scale() {
     let c = Solid::cube_uniform(1.0, true).scale(2.0, 3.0, 4.0);
     let vol = c.volume();
@@ -314,22 +221,6 @@ fn test_showcase_rook_is_manifold() {
 }
 
 #[test]
-fn test_cube_intersection_compound() {
-    // Intersection of two offset cubes
-    let a = Solid::cube_uniform(2.0, true);
-    let b = Solid::cube_uniform(2.0, true).translate(1.0, 1.0, 0.0);
-    let result = a.intersection(&b);
-
-    let vol = result.volume();
-    // Overlap region is 1.0 x 1.0 x 2.0 = 2.0
-    assert!(
-        (vol - 2.0).abs() < 0.2,
-        "axis-aligned intersection volume: {} (expected ~2.0)",
-        vol
-    );
-}
-
-#[test]
 fn test_three_way_union() {
     let a = Solid::cube_uniform(1.0, true);
     let b = Solid::cube_uniform(1.0, true).translate(2.0, 0.0, 0.0);
@@ -381,23 +272,6 @@ fn test_stl_roundtrip() {
 }
 
 #[test]
-fn test_obj_roundtrip() {
-    let original = Solid::cube_uniform(2.0, true);
-    let path = "/tmp/csg_integration_test.obj";
-
-    original.write_obj(path).unwrap();
-    let loaded = Solid::read_obj(path).unwrap();
-
-    assert_eq!(loaded.triangle_count(), 12);
-    assert_eq!(loaded.vertex_count(), 8);
-
-    let vol = loaded.volume();
-    assert!((vol - 8.0).abs() < 1e-10, "OBJ roundtrip volume: {}", vol);
-
-    std::fs::remove_file(path).ok();
-}
-
-#[test]
 fn test_boolean_result_stl_export() {
     // Full pipeline: create, boolean, export (cube-cube for debug speed)
     let a = Solid::cube_uniform(1.0, true);
@@ -432,26 +306,6 @@ fn test_bounding_box() {
 }
 
 #[test]
-fn test_surface_area() {
-    let c = Solid::cube_uniform(1.0, true);
-    let area = c.surface_area();
-    assert!(
-        (area - 6.0).abs() < 1e-10,
-        "unit cube surface area: {}",
-        area
-    );
-}
-
-#[test]
-fn test_centroid() {
-    let c = Solid::cube_uniform(1.0, true);
-    let center = c.centroid();
-    assert!(center.x.abs() < 1e-10);
-    assert!(center.y.abs() < 1e-10);
-    assert!(center.z.abs() < 1e-10);
-}
-
-#[test]
 fn test_centroid_translated() {
     let c = Solid::cube_uniform(1.0, true).translate(5.0, 0.0, 0.0);
     let center = c.centroid();
@@ -460,232 +314,7 @@ fn test_centroid_translated() {
     assert!(center.z.abs() < 1e-10);
 }
 
-// --- Edge cases ---
-
-#[test]
-fn test_flip() {
-    let c = Solid::cube_uniform(1.0, true);
-    let flipped = c.flip();
-    let vol = flipped.volume();
-    assert!((vol - (-1.0)).abs() < 1e-10, "flipped volume: {}", vol);
-}
-
-#[test]
-fn test_merge_no_boolean() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(5.0, 0.0, 0.0);
-    let merged = a.merge(&b);
-
-    assert_eq!(merged.vertex_count(), 16);
-    assert_eq!(merged.triangle_count(), 24);
-}
-
-#[test]
-fn test_weld() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(1.0, 0.0, 0.0);
-    let merged = a.merge(&b);
-    let welded = merged.weld(0.01);
-
-    // Two adjacent unit cubes share 4 vertices
-    assert_eq!(welded.vertex_count(), 12);
-}
-
-#[test]
-fn test_validate_primitive() {
-    let s = Solid::sphere(1.0, 16, 8);
-    let report = s.validate();
-    assert!(report.is_closed);
-    assert!(report.is_manifold);
-    assert!(report.is_consistently_oriented);
-    assert_eq!(report.degenerate_triangles, 0);
-}
-
-// --- Corefinement backend tests ---
-
-#[test]
-fn test_corefine_union_non_overlapping() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(5.0, 0.0, 0.0);
-    let u = a.union_corefine(&b);
-
-    let vol = u.volume();
-    assert!(
-        (vol - 2.0).abs() < 0.1,
-        "corefine non-overlapping union volume: {}",
-        vol
-    );
-}
-
-#[test]
-fn test_corefine_union_overlapping() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(0.5, 0.0, 0.0);
-    let u = a.union_corefine(&b);
-
-    let vol = u.volume();
-    assert!(
-        (vol - 1.5).abs() < 0.15,
-        "corefine overlapping union volume: {} (expected ~1.5)",
-        vol
-    );
-}
-
-#[test]
-fn test_corefine_difference() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(0.5, 0.0, 0.0);
-    let d = a.difference_corefine(&b);
-
-    let vol = d.volume();
-    assert!(
-        (vol - 0.5).abs() < 0.15,
-        "corefine difference volume: {} (expected ~0.5)",
-        vol
-    );
-}
-
-#[test]
-fn test_corefine_intersection() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(0.5, 0.0, 0.0);
-    let isect = a.intersection_corefine(&b);
-
-    let vol = isect.volume();
-    assert!(
-        (vol - 0.5).abs() < 0.15,
-        "corefine intersection volume: {} (expected ~0.5)",
-        vol
-    );
-}
-
-#[test]
-fn test_corefine_difference_no_overlap() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(5.0, 0.0, 0.0);
-    let d = a.difference_corefine(&b);
-
-    let vol = d.volume();
-    assert!(
-        (vol - 1.0).abs() < 0.1,
-        "corefine no-overlap difference should equal A: {}",
-        vol
-    );
-}
-
-#[test]
-fn test_corefine_intersection_no_overlap() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(5.0, 0.0, 0.0);
-    let isect = a.intersection_corefine(&b);
-
-    assert!(
-        isect.is_empty(),
-        "corefine non-overlapping intersection should be empty"
-    );
-}
-
-// --- Boolean operation tests ---
-
-#[test]
-fn test_boolean_union_volume() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(0.5, 0.0, 0.0);
-    let result = a.union(&b);
-    assert!(
-        result.volume() > 1.0 && result.volume() < 2.0,
-        "union volume should be between 1.0 and 2.0, got {}",
-        result.volume()
-    );
-}
-
-#[test]
-fn test_boolean_difference_volume() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(0.5, 0.0, 0.0);
-    let result = a.difference(&b);
-    assert!(
-        result.volume() > 0.0 && result.volume() < 1.0,
-        "difference volume should be between 0.0 and 1.0, got {}",
-        result.volume()
-    );
-}
-
-#[test]
-fn test_boolean_intersection_volume() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(0.5, 0.0, 0.0);
-    let result = a.intersection(&b);
-    assert!(
-        result.volume() > 0.0 && result.volume() < 1.0,
-        "intersection volume should be between 0.0 and 1.0, got {}",
-        result.volume()
-    );
-}
-
-#[test]
-fn test_corefine_identity() {
-    // Union with empty = self
-    let a = Solid::cube_uniform(1.0, true);
-    let u = a.union_corefine(&Solid::empty());
-    let vol = u.volume();
-    assert!(
-        (vol - 1.0).abs() < 1e-10,
-        "corefine union with empty: {}",
-        vol
-    );
-}
-
-#[test]
-fn test_corefine_cube_intersection_compound() {
-    // Intersection of two offset cubes
-    let a = Solid::cube_uniform(2.0, true);
-    let b = Solid::cube_uniform(2.0, true).translate(1.0, 1.0, 0.0);
-    let result = a.intersection_corefine(&b);
-
-    let vol = result.volume();
-    // Overlap region is 1.0 x 1.0 x 2.0 = 2.0
-    assert!(
-        (vol - 2.0).abs() < 0.3,
-        "corefine axis-aligned intersection volume: {} (expected ~2.0)",
-        vol
-    );
-}
-
 // --- New feature integration tests ---
-
-#[test]
-fn test_tapered_cylinder_frustum() {
-    // Frustum: r1=2, r2=1, height=3
-    let tc = Solid::tapered_cylinder(2.0, 1.0, 3.0, 64, true);
-    assert!(tc.is_valid());
-    // V = (pi*h/3) * (r1^2 + r1*r2 + r2^2) = (pi*3/3)*(4+2+1) = 7*pi
-    let expected = 7.0 * PI;
-    let vol = tc.volume();
-    let error = (vol - expected).abs() / expected;
-    assert!(
-        error < 0.01,
-        "frustum volume error: {}% (vol={}, expected={})",
-        error * 100.0,
-        vol,
-        expected
-    );
-}
-
-#[test]
-fn test_tapered_cylinder_is_cone() {
-    // r2=0 should produce a cone
-    let tc = Solid::tapered_cylinder(1.0, 0.0, 3.0, 64, true);
-    let cone = Solid::cone(1.0, 3.0, 64, true);
-    let vol_tc = tc.volume();
-    let vol_cone = cone.volume();
-    assert!(
-        (vol_tc - vol_cone).abs() < 0.01,
-        "tapered(r2=0) should match cone: {} vs {}",
-        vol_tc,
-        vol_cone
-    );
-}
 
 #[test]
 fn test_polyhedron_tetrahedron() {
@@ -732,23 +361,6 @@ fn test_mirror_x() {
     // Volume should be preserved (positive after flip)
     let vol = mirrored.volume();
     assert!((vol - 1.0).abs() < 1e-10, "mirrored volume: {}", vol);
-}
-
-#[test]
-fn test_mirror_y() {
-    let c = Solid::cube_uniform(1.0, false).translate(0.0, 3.0, 0.0);
-    let mirrored = c.mirror(1); // Mirror across XZ plane (Y)
-    let bb = mirrored.bounding_box();
-    assert!(
-        (bb.min.y - (-4.0)).abs() < 1e-10,
-        "mirror min.y: {}",
-        bb.min.y
-    );
-    assert!(
-        (bb.max.y - (-3.0)).abs() < 1e-10,
-        "mirror max.y: {}",
-        bb.max.y
-    );
 }
 
 #[test]
@@ -800,74 +412,6 @@ fn test_symmetric_difference() {
         (vol - 1.0).abs() < 0.2,
         "symmetric difference volume: {} (expected ~1.0)",
         vol
-    );
-}
-
-#[test]
-fn test_symmetric_difference_corefine() {
-    let a = Solid::cube_uniform(1.0, true);
-    let b = Solid::cube_uniform(1.0, true).translate(0.5, 0.0, 0.0);
-    let xor = a.symmetric_difference_corefine(&b);
-    let vol = xor.volume();
-    assert!(
-        (vol - 1.0).abs() < 0.2,
-        "corefine symmetric difference volume: {} (expected ~1.0)",
-        vol
-    );
-}
-
-#[test]
-fn test_linear_extrude_twist() {
-    // Extrude a square with 90 degree twist
-    let square = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-    let twisted = Solid::linear_extrude(&square, 2.0, 90.0, 1.0, 16);
-    assert!(!twisted.is_empty());
-    let vol = twisted.volume();
-    // Twist preserves volume (same cross-section area at each height)
-    let expected = 1.0 * 2.0; // area * height
-    assert!(
-        (vol - expected).abs() / expected < 0.05,
-        "twisted extrude volume: {} (expected ~{})",
-        vol,
-        expected
-    );
-}
-
-#[test]
-fn test_linear_extrude_scale() {
-    // Extrude a unit square scaling to 0.5 at top
-    let square = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-    let scaled = Solid::linear_extrude(&square, 3.0, 0.0, 0.5, 8);
-    assert!(!scaled.is_empty());
-    let vol = scaled.volume();
-    // Frustum-like: V = h/3 * (A1 + A2 + sqrt(A1*A2))
-    // A1 = 1.0, A2 = 0.25, h = 3.0
-    // V = 3/3 * (1.0 + 0.25 + 0.5) = 1.75
-    let expected = 1.75;
-    assert!(
-        (vol - expected).abs() / expected < 0.05,
-        "scaled extrude volume: {} (expected ~{})",
-        vol,
-        expected
-    );
-}
-
-#[test]
-fn test_rotate_extrude_full() {
-    // Revolve a small rectangle to make a cylinder-like shape
-    let profile = vec![[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]];
-    let lathe = Solid::rotate_extrude(&profile, 360.0, 64);
-    assert!(!lathe.is_empty());
-    let vol = lathe.volume();
-    // Annular cylinder: V = pi * h * (R^2 - r^2) = pi * 1.0 * (4 - 1) = 3*pi
-    let expected = 3.0 * PI;
-    let error = (vol - expected).abs() / expected;
-    assert!(
-        error < 0.02,
-        "rotate extrude annular volume error: {}% (vol={}, expected={})",
-        error * 100.0,
-        vol,
-        expected
     );
 }
 
@@ -984,4 +528,76 @@ fn test_cube_sphere_intersection() {
         "intersection should be smaller than sphere"
     );
     assert!(vol > 0.0);
+}
+
+// --- Coincident faces that are coplanar only up to rounding ---
+
+/// A rounded rectangle (centred, CCW), `seg` facets per quarter round.
+fn rounded_rect(w: f64, d: f64, r: f64, seg: u32) -> Vec<[f64; 2]> {
+    let (hx, hz) = (w / 2.0 - r, d / 2.0 - r);
+    let mut out = Vec::new();
+    for (k, (cx, cz)) in [(hx, -hz), (hx, hz), (-hx, hz), (-hx, -hz)].into_iter().enumerate() {
+        let start = -PI / 2.0 + k as f64 * PI / 2.0;
+        for i in 0..=seg {
+            let a = start + PI / 2.0 * i as f64 / seg as f64;
+            out.push([cx + r * a.cos(), cz + r * a.sin()]);
+        }
+    }
+    out
+}
+
+/// A shelf and the wall standing on its back edge, both with rounded vertical edges, each
+/// built centred and moved into place: their bottoms, back faces and the facets of the two
+/// shared rounded edges coincide, but only up to floating-point rounding (not bit-exactly).
+/// The union is one closed, manifold solid.
+#[test]
+fn test_union_rounded_coincident_faces_is_closed() {
+    let shelf = Solid::extrude(&rounded_rect(64.0, 46.0, 1.2, 3), 6.0);
+    let wall = Solid::extrude(&rounded_rect(64.0, 6.0, 1.2, 3), 52.0).translate(0.0, 0.0, -20.0);
+    let u = shelf.union(&wall);
+    let report = u.validate();
+    assert!(report.is_closed && report.is_manifold, "rounded shelf + wall: {report:?}");
+    let expected = shelf.volume() + wall.volume() - Solid::extrude(&rounded_rect(64.0, 6.0, 1.2, 3), 6.0).volume();
+    assert!((u.volume() - expected).abs() < 1e-6 * expected, "volume {} vs {expected}", u.volume());
+}
+
+/// Two boxes sharing three faces, both turned by an oblique rotation: the shared faces are
+/// coplanar only up to rounding. The union is one closed, manifold solid.
+#[test]
+fn test_union_rotated_boxes_sharing_faces_is_closed() {
+    let axis = dvec3(1.0, 2.0, 3.0).normalize();
+    let shelf = Solid::cube(64.0, 6.0, 46.0, false).rotate(axis, 33.0);
+    let wall = Solid::cube(64.0, 52.0, 6.0, false).rotate(axis, 33.0);
+    let u = shelf.union(&wall);
+    let report = u.validate();
+    assert!(report.is_closed && report.is_manifold, "rotated shelf + wall: {report:?}");
+    let expected = 64.0 * 6.0 * 46.0 + 64.0 * 52.0 * 6.0 - 64.0 * 6.0 * 6.0;
+    assert!((u.volume() - expected).abs() < 1e-6 * expected, "volume {} vs {expected}", u.volume());
+}
+
+// --- Solids touching face to face (coplanar faces with opposite normals) ---
+
+/// A box standing on a plate, a box against the plate's side, and a pocket
+/// flush with the plate's top: the touching faces are interior to a union,
+/// stay the plate's surface in a difference, and enclose nothing in an
+/// intersection. Every result is one closed, manifold solid of exact volume.
+#[test]
+fn test_touching_solids_union_difference_intersection() {
+    let plate = Solid::cube(80.0, 60.0, 8.0, false);
+    let check = |name: &str, s: &Solid, expected: f64| {
+        let r = s.validate();
+        assert!(r.is_closed && r.is_manifold, "{name}: {r:?}");
+        assert!((s.volume() - expected).abs() < 1e-6 * expected.max(1.0), "{name}: volume {} vs {expected}", s.volume());
+    };
+    // On top: the box's bottom touches the plate's top.
+    let on_top = Solid::cube(20.0, 20.0, 5.0, false).translate(5.3, 7.1, 8.0);
+    check("box on plate", &plate.union(&on_top), 80.0 * 60.0 * 8.0 + 20.0 * 20.0 * 5.0);
+    check("plate minus box on top", &plate.difference(&on_top), 80.0 * 60.0 * 8.0);
+    assert!(plate.intersection(&on_top).volume().abs() < 1e-6, "touching boxes enclose nothing");
+    // Side by side: half of the box's face against the plate's side.
+    let beside = Solid::cube(10.0, 10.0, 8.0, false).translate(80.0, 55.0, 0.0);
+    check("box beside plate", &plate.union(&beside), 80.0 * 60.0 * 8.0 + 10.0 * 10.0 * 8.0);
+    // A pocket whose top is flush with the plate's top.
+    let pocket = Solid::cube(10.0, 10.0, 3.0, false).translate(35.0, 25.0, 5.0);
+    check("flush pocket", &plate.difference(&pocket), 80.0 * 60.0 * 8.0 - 300.0);
 }

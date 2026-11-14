@@ -1,34 +1,131 @@
 use std::{
-    fmt,
-    io::{self, Read},
-    path::Path,
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    fmt, io,
+    ops::{Deref, Range},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-use std::fs::File;
+use std::{fs::File, io::Read};
 
-#[derive(Clone)]
-pub enum SharedBytes {
-    Owned(Rc<Vec<u8>>),
-    Mapped(Rc<MappedBytes>),
+mod sealed {
+    pub trait Sealed {}
 }
 
-impl SharedBytes {
-    pub fn from_owned(data: Rc<Vec<u8>>) -> Self {
+/// Plain numeric elements with no invalid bit patterns or drop glue.
+pub trait Scalar: sealed::Sealed + Copy + Send + Sync + 'static {}
+
+macro_rules! scalars {
+    ($($ty:ty),* $(,)?) => {$(
+        impl sealed::Sealed for $ty {}
+        impl Scalar for $ty {}
+    )*};
+}
+scalars!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64);
+
+/// Shared CPU storage. Cloning retains the allocation; mutation uses copy-on-write.
+#[derive(Clone)]
+pub struct HostBuf<T: Scalar = u8> {
+    store: Arc<Store<T>>,
+    // None tracks the whole allocation, including changes through the Vec API.
+    range: Option<Range<usize>>,
+}
+
+enum Store<T: Scalar> {
+    Heap(Vec<T>),
+    // Only HostBuf<u8>'s constructors create this variant.
+    File(Arc<MappedBytes>),
+    Lease {
+        ptr: *const T,
+        len: usize,
+        token: u64,
+        release: fn(u64),
+    },
+}
+
+// SAFETY: heap elements and mappings are Send + Sync. A lease's constructor
+// requires immutable storage and a release hook that can run on any thread.
+unsafe impl<T: Scalar> Send for Store<T> {}
+unsafe impl<T: Scalar> Sync for Store<T> {}
+
+impl<T: Scalar> Drop for Store<T> {
+    fn drop(&mut self) {
+        if let Self::Lease { token, release, .. } = self {
+            release(*token);
+        }
+    }
+}
+
+impl<T: Scalar> From<Vec<T>> for HostBuf<T> {
+    fn from(data: Vec<T>) -> Self {
         OWNED_LOADS.fetch_add(1, Ordering::Relaxed);
-        Self::Owned(data)
+        Self {
+            store: Arc::new(Store::Heap(data)),
+            range: None,
+        }
+    }
+}
+
+impl<T: Scalar> HostBuf<T> {
+    pub fn from_vec(data: Vec<T>) -> Self {
+        data.into()
     }
 
-    pub fn from_vec(data: Vec<u8>) -> Self {
-        Self::from_owned(Rc::new(data))
+    /// Takes ownership of a read-only lease without copying its elements.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null and aligned, even for an empty lease, and valid
+    /// for reads of `len` initialized elements in one allocation (at most
+    /// `isize::MAX` bytes). The storage must stay immutable and readable from
+    /// any thread until `release(token)` runs. Ownership of this release is
+    /// transferred here: the hook must safely release it exactly once, on any
+    /// thread, and must not unwind. The token must identify this lease uniquely
+    /// wherever the hook needs to distinguish outstanding leases.
+    pub unsafe fn from_lease(ptr: *const T, len: usize, token: u64, release: fn(u64)) -> Self {
+        Self {
+            store: Arc::new(Store::Lease {
+                ptr,
+                len,
+                token,
+                release,
+            }),
+            range: None,
+        }
     }
 
-    pub fn as_slice(&self) -> &[u8] {
-        match self {
-            SharedBytes::Owned(data) => data.as_slice(),
-            SharedBytes::Mapped(data) => data.as_slice(),
+    /// Shares a bounds-checked subrange without copying, retaining the whole store.
+    /// Mutable access through `make_mut` detaches only the visible elements.
+    pub fn slice(&self, range: Range<usize>) -> Self {
+        assert!(
+            range.start <= range.end && range.end <= self.len(),
+            "HostBuf slice out of bounds"
+        );
+        let start = self.range.as_ref().map_or(0, |range| range.start);
+        Self {
+            store: self.store.clone(),
+            range: Some(start + range.start..start + range.end),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        let data = match self.store.as_ref() {
+            Store::Heap(data) => data.as_slice(),
+            Store::File(data) => {
+                // SAFETY: File is constructed only for T = u8.
+                unsafe { std::slice::from_raw_parts(data.as_slice().as_ptr().cast(), data.len()) }
+            }
+            Store::Lease { ptr, len, .. } => {
+                // SAFETY: from_lease's contract keeps this immutable range alive
+                // until the last Arc drops, after every reference to this slice.
+                unsafe { std::slice::from_raw_parts(*ptr, *len) }
+            }
+        };
+        match &self.range {
+            Some(range) => &data[range.clone()],
+            None => data,
         }
     }
 
@@ -38,6 +135,64 @@ impl SharedBytes {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        match self.store.as_ref() {
+            Store::File(data) => Some(data.path()),
+            _ => None,
+        }
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.store, &other.store)
+    }
+
+    /// Mutable whole heap storage, only when unique and not a subrange view.
+    pub fn get_mut(&mut self) -> Option<&mut Vec<T>> {
+        if self.range.is_some() {
+            return None;
+        }
+        match Arc::get_mut(&mut self.store)? {
+            Store::Heap(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Mutable heap storage, copying shared, file or leased storage once.
+    pub fn make_mut(&mut self) -> &mut Vec<T> {
+        if self.get_mut().is_none() {
+            let data = self.as_slice().to_vec();
+            self.store = Arc::new(Store::Heap(data));
+            self.range = None;
+            COW.fetch_add(1, Ordering::Relaxed);
+        }
+        self.get_mut().expect("unique heap storage")
+    }
+}
+
+impl<T: Scalar> Deref for HostBuf<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl HostBuf<u8> {
+    /// Retains a read-only mapping another holder keeps.
+    pub fn from_mapped(mapped: Arc<MappedBytes>) -> Self {
+        Self {
+            store: Arc::new(Store::File(mapped)),
+            range: None,
+        }
+    }
+
+    pub fn mapped(&self) -> Option<&Arc<MappedBytes>> {
+        match self.store.as_ref() {
+            Store::File(data) => Some(data),
+            _ => None,
+        }
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -65,10 +220,10 @@ impl SharedBytes {
             let path = path.as_ref();
             let mut file = File::open(path)?;
             let len = file_len(&file, path)?;
-            match MappedBytes::map_file(&file, len) {
+            match MappedBytes::map_file(&file, len, path) {
                 Ok(mapped) => {
                     MMAP_HITS.fetch_add(1, Ordering::Relaxed);
-                    Ok(Self::Mapped(Rc::new(mapped)))
+                    Ok(Self::from_mapped(Arc::new(mapped)))
                 }
                 Err(_) => {
                     MMAP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -88,11 +243,36 @@ impl SharedBytes {
         }
     }
 
-    pub fn stats() -> SharedBytesStats {
-        SharedBytesStats {
+    /// Maps a nonempty file range read-only without taking ownership of the descriptor.
+    /// The descriptor may be closed afterwards; the backing file must remain unchanged.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    pub fn map_fd_range(fd: std::os::fd::RawFd, offset: u64, len: usize) -> io::Result<Self> {
+        Self::map_fd_range_named(fd, offset, len, "")
+    }
+
+    /// [`Self::map_fd_range`] for a range with a name another component can open again (an APK
+    /// asset, `apk:<asset path>`): `path()` reports it.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    pub fn map_fd_range_named(
+        fd: std::os::fd::RawFd,
+        offset: u64,
+        len: usize,
+        name: &str,
+    ) -> io::Result<Self> {
+        let mapped = MappedBytes {
+            inner: os::MappedBytesInner::map_fd_range(fd, offset, len)?,
+            path: PathBuf::from(name),
+        };
+        MMAP_HITS.fetch_add(1, Ordering::Relaxed);
+        Ok(Self::from_mapped(Arc::new(mapped)))
+    }
+
+    pub fn stats() -> HostBufStats {
+        HostBufStats {
             mmap_hits: MMAP_HITS.load(Ordering::Relaxed),
             mmap_fallbacks: MMAP_FALLBACKS.load(Ordering::Relaxed),
             owned_loads: OWNED_LOADS.load(Ordering::Relaxed),
+            cow: COW.load(Ordering::Relaxed),
         }
     }
 
@@ -100,41 +280,60 @@ impl SharedBytes {
         MMAP_HITS.store(0, Ordering::Relaxed);
         MMAP_FALLBACKS.store(0, Ordering::Relaxed);
         OWNED_LOADS.store(0, Ordering::Relaxed);
+        COW.store(0, Ordering::Relaxed);
     }
 }
 
-impl fmt::Debug for SharedBytes {
+impl<T: Scalar> fmt::Debug for HostBuf<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SharedBytes::Owned(data) => f
-                .debug_struct("SharedBytes::Owned")
-                .field("len", &data.len())
-                .finish(),
-            SharedBytes::Mapped(data) => f
-                .debug_struct("SharedBytes::Mapped")
-                .field("len", &data.len())
-                .finish(),
-        }
+        let kind = match self.store.as_ref() {
+            Store::Heap(_) => "HostBuf::Heap",
+            Store::File(_) => "HostBuf::File",
+            Store::Lease { .. } => "HostBuf::Lease",
+        };
+        f.debug_struct(kind).field("len", &self.len()).finish()
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct SharedBytesStats {
+pub struct HostBufStats {
     pub mmap_hits: u64,
     pub mmap_fallbacks: u64,
     pub owned_loads: u64,
+    /// Copies made by make_mut across all element types.
+    pub cow: u64,
 }
 
 pub struct MappedBytes {
     inner: os::MappedBytesInner,
+    path: PathBuf,
 }
+
+// SAFETY: the mapping is private and read-only; nothing writes through it, so any thread may read it.
+unsafe impl Send for MappedBytes {}
+unsafe impl Sync for MappedBytes {}
 
 impl MappedBytes {
     #[cfg(not(target_arch = "wasm32"))]
-    fn map_file(file: &File, len: usize) -> io::Result<Self> {
+    fn map_file(file: &File, len: usize, path: &Path) -> io::Result<Self> {
         Ok(Self {
             inner: os::MappedBytesInner::map_file(file, len)?,
+            path: path.to_path_buf(),
         })
+    }
+
+    /// Maps the file read-only (no fallback to reading it).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path)?;
+        let len = file_len(&file, path)?;
+        Self::map_file(&file, len, path)
+    }
+
+    /// The file this is mapped from.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -191,6 +390,7 @@ fn read_file_owned(file: &mut File, len: usize, path: &Path) -> io::Result<Vec<u
 static MMAP_HITS: AtomicU64 = AtomicU64::new(0);
 static MMAP_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static OWNED_LOADS: AtomicU64 = AtomicU64::new(0);
+static COW: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod os {
@@ -209,6 +409,12 @@ mod os {
     const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
 
     unsafe extern "C" {
+        // On 32-bit bionic and glibc, the plain `mmap` symbol takes a 32-bit
+        // `off_t`; `mmap64` takes 64 bits on every ABI (on 64-bit, it's an alias).
+        #[cfg_attr(
+            any(target_os = "android", all(target_os = "linux", target_env = "gnu")),
+            link_name = "mmap64"
+        )]
         fn mmap(
             addr: *mut c_void,
             length: usize,
@@ -218,11 +424,14 @@ mod os {
             offset: OffT,
         ) -> *mut c_void;
         fn munmap(addr: *mut c_void, length: usize) -> c_int;
+        fn getpagesize() -> c_int;
     }
 
     pub struct MappedBytesInner {
         ptr: *const u8,
         len: usize,
+        mapping: *mut c_void,
+        mapped_len: usize,
     }
 
     impl MappedBytesInner {
@@ -243,6 +452,53 @@ mod os {
             Ok(Self {
                 ptr: ptr.cast::<u8>(),
                 len,
+                mapping: ptr,
+                mapped_len: len,
+            })
+        }
+
+        pub fn map_fd_range(fd: c_int, offset: u64, len: usize) -> io::Result<Self> {
+            let offset = OffT::try_from(offset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "file offset exceeds off_t")
+            })?;
+            if len == 0 || len > isize::MAX as usize || offset.checked_add(len as OffT).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty or overflowing file range",
+                ));
+            }
+            let page_size = unsafe { getpagesize() };
+            if page_size <= 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let slice_offset = (offset % OffT::from(page_size)) as usize;
+            let mapped_len = len
+                .checked_add(slice_offset)
+                .filter(|len| *len <= isize::MAX as usize)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "mapped range exceeds address space",
+                    )
+                })?;
+            let ptr = unsafe {
+                mmap(
+                    ptr::null_mut(),
+                    mapped_len,
+                    PROT_READ,
+                    MAP_PRIVATE,
+                    fd,
+                    offset - slice_offset as OffT,
+                )
+            };
+            if ptr == MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                ptr: unsafe { ptr.cast::<u8>().add(slice_offset) },
+                len,
+                mapping: ptr,
+                mapped_len,
             })
         }
 
@@ -253,7 +509,7 @@ mod os {
 
     impl Drop for MappedBytesInner {
         fn drop(&mut self) {
-            let _ = unsafe { munmap(self.ptr.cast_mut().cast::<c_void>(), self.len) };
+            let _ = unsafe { munmap(self.mapping, self.mapped_len) };
         }
     }
 }
@@ -343,11 +599,13 @@ mod os {
 
 #[cfg(not(any(all(unix, not(target_arch = "wasm32")), windows)))]
 mod os {
+    #[cfg(not(target_arch = "wasm32"))]
     use std::{fs::File, io};
 
     pub struct MappedBytesInner;
 
     impl MappedBytesInner {
+        #[cfg(not(target_arch = "wasm32"))]
         pub fn map_file(_file: &File, _len: usize) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -363,8 +621,174 @@ mod os {
 
 #[cfg(test)]
 mod tests {
-    use super::SharedBytes;
-    use std::path::PathBuf;
+    use super::HostBuf;
+    use std::{
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+        thread,
+    };
+
+    #[test]
+    fn from_vec_keeps_allocation() {
+        let mut data = Vec::with_capacity(8);
+        data.extend([1u32, 2, 3]);
+        let ptr = data.as_ptr();
+        let mut buffer = HostBuf::from(data);
+        assert_eq!(buffer.as_ptr(), ptr, "moving a Vec must not copy its data");
+        assert_eq!(buffer.get_mut().unwrap().capacity(), 8);
+        assert_eq!(&*buffer, &[1, 2, 3]);
+        assert!(!buffer.is_empty());
+        assert!(buffer.path().is_none());
+        let empty = HostBuf::from(Vec::<f32>::new());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn copy_on_write_counts_only_copies() {
+        HostBuf::reset_stats();
+        let mut buffer = HostBuf::from(vec![1f32, 2.0]);
+        let ptr = buffer.as_ptr();
+        buffer.make_mut()[0] = 3.0;
+        assert_eq!(buffer.as_ptr(), ptr, "unique heap mutation must not copy");
+        assert_eq!(HostBuf::stats().cow, 0);
+        let mut shared = buffer.clone();
+        assert!(buffer.ptr_eq(&shared));
+        assert!(buffer.get_mut().is_none());
+        shared.make_mut()[0] = 4.0;
+        assert_eq!(HostBuf::stats().cow, 1);
+        assert!(!buffer.ptr_eq(&shared));
+        assert_eq!(buffer[0], 3.0, "the original must retain its contents");
+        assert_eq!(shared[0], 4.0);
+        shared.make_mut().push(5.0);
+        assert_eq!(
+            HostBuf::stats().cow,
+            1,
+            "subsequent unique mutation must not copy"
+        );
+        assert!(buffer.get_mut().is_some());
+
+        let mut file = HostBuf::from_file_mmap_or_read(bundled_font_path()).unwrap();
+        let mapping = file.mapped().unwrap().clone();
+        let first = file[0];
+        assert!(file.get_mut().is_none(), "a unique file is still read-only");
+        file.make_mut()[0] = first.wrapping_add(1);
+        assert_eq!(HostBuf::stats().cow, 2);
+        assert_eq!(mapping.as_slice()[0], first);
+        assert!(file.path().is_none());
+        assert!(file.get_mut().is_some());
+
+        static DATA: [u16; 2] = [7, 8];
+        static RELEASED: AtomicU64 = AtomicU64::new(0);
+        fn release(token: u64) {
+            RELEASED.fetch_add(token, Ordering::SeqCst);
+        }
+        RELEASED.store(0, Ordering::SeqCst);
+        // SAFETY: static immutable storage; the hook only records its release.
+        let mut lease = unsafe { HostBuf::from_lease(DATA.as_ptr(), DATA.len(), 1, release) };
+        assert!(lease.get_mut().is_none());
+        lease.make_mut()[0] = 9;
+        assert_eq!(HostBuf::stats().cow, 3);
+        assert_eq!(RELEASED.load(Ordering::SeqCst), 1);
+        assert_eq!(DATA, [7, 8]);
+        drop(lease);
+        assert_eq!(RELEASED.load(Ordering::SeqCst), 1);
+
+        let original = HostBuf::from(vec![10u32, 20, 30, 40]);
+        let mut view = original.slice(1..3);
+        assert!(view.get_mut().is_none());
+        drop(original);
+        assert!(
+            view.get_mut().is_none(),
+            "a view must not expose the whole Vec"
+        );
+        view.make_mut().push(50);
+        assert_eq!(&*view, &[20, 30, 50], "detaching copies only the view");
+        assert_eq!(HostBuf::stats().cow, 4);
+    }
+
+    #[test]
+    fn lease_releases_once_across_clones_and_threads() {
+        static RELEASED: AtomicU64 = AtomicU64::new(0);
+        fn release(token: u64) {
+            // SAFETY: the constructor transfers this Box to the lease's hook.
+            drop(unsafe { Box::from_raw(token as usize as *mut [u32; 3]) });
+            RELEASED.fetch_add(1, Ordering::SeqCst);
+        }
+        RELEASED.store(0, Ordering::SeqCst);
+        let ptr = Box::into_raw(Box::new([11u32, 12, 13]));
+        // SAFETY: this allocation is immutable until the hook frees it. Its
+        // sole ownership is transferred to the lease, including across threads.
+        let buffer: HostBuf<u32> =
+            unsafe { HostBuf::from_lease(ptr.cast(), 3, ptr as usize as u64, release) };
+        let view = buffer.slice(1..3);
+        let nested = view.slice(1..2);
+        assert!(buffer.ptr_eq(&nested), "nested views share the lease owner");
+        assert_eq!(&*nested, &[13]);
+        let shared = Arc::new(buffer.clone());
+        let reader = shared.clone();
+        thread::spawn(move || {
+            assert_eq!(&**reader, &[11, 12, 13]);
+            let clone = reader.as_ref().clone();
+            assert!(clone.ptr_eq(&reader));
+        })
+        .join()
+        .unwrap();
+        drop(buffer);
+        drop(view);
+        assert_eq!(
+            RELEASED.load(Ordering::SeqCst),
+            0,
+            "the last holder is still alive"
+        );
+        thread::spawn(move || drop(shared)).join().unwrap();
+        assert_eq!(
+            RELEASED.load(Ordering::SeqCst),
+            0,
+            "the UI view retains the lease"
+        );
+        drop(nested);
+        assert_eq!(
+            RELEASED.load(Ordering::SeqCst),
+            1,
+            "the last view releases once"
+        );
+        let ptr = Box::into_raw(Box::new([21u32, 22, 23]));
+        // SAFETY: the same owned immutable allocation and release hook as above.
+        let buffer: HostBuf<u32> =
+            unsafe { HostBuf::from_lease(ptr.cast(), 3, ptr as usize as u64, release) };
+        thread::spawn(move || drop(buffer)).join().unwrap();
+        assert_eq!(
+            RELEASED.load(Ordering::SeqCst),
+            2,
+            "a final worker-side drop also releases exactly once"
+        );
+    }
+
+    #[test]
+    fn views_share_heap_and_file_storage_and_check_bounds() {
+        let heap = HostBuf::from(vec![10u32, 20, 30, 40]);
+        let view = heap.slice(1..4);
+        let nested = view.slice(1..2);
+        assert!(heap.ptr_eq(&nested));
+        assert_eq!(nested.as_ptr(), heap.as_slice()[2..].as_ptr());
+        assert_eq!(&*nested, &[30]);
+        assert_eq!(nested.len(), 1);
+        assert!(view.slice(3..3).is_empty());
+        assert!(std::panic::catch_unwind(|| view.slice(0..4)).is_err());
+        let reversed = 2..1;
+        assert!(std::panic::catch_unwind(|| view.slice(reversed)).is_err());
+
+        let file = HostBuf::from_file_mmap_or_read(bundled_font_path()).unwrap();
+        let view = file.slice(1..8).slice(2..5);
+        assert!(file.ptr_eq(&view));
+        assert_eq!(view.as_ptr(), file.as_slice()[3..].as_ptr());
+        assert_eq!(view.as_slice(), &file[3..6]);
+        assert_eq!(view.path(), file.path());
+        assert!(Arc::ptr_eq(file.mapped().unwrap(), view.mapped().unwrap()));
+    }
 
     fn bundled_font_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -375,9 +799,9 @@ mod tests {
     fn from_file_matches_fs_read() {
         let path = bundled_font_path();
         let expected = std::fs::read(&path).expect("font file should be readable");
-        let bytes = SharedBytes::from_file(&path).expect("font bytes should load");
+        let bytes = HostBuf::from_file(&path).expect("font bytes should load");
         assert_eq!(bytes.as_slice(), expected.as_slice());
-        assert!(matches!(bytes, SharedBytes::Owned(_)));
+        assert!(bytes.path().is_none());
         assert!(!bytes.is_empty());
     }
 
@@ -386,16 +810,16 @@ mod tests {
     fn from_file_mmap_or_read_matches_fs_read() {
         let path = bundled_font_path();
         let expected = std::fs::read(&path).expect("font file should be readable");
-        let bytes = SharedBytes::from_file_mmap_or_read(&path).expect("font bytes should load");
+        let bytes = HostBuf::from_file_mmap_or_read(&path).expect("font bytes should load");
         assert_eq!(bytes.as_slice(), expected.as_slice());
-        assert!(matches!(bytes, SharedBytes::Mapped(_)));
+        assert_eq!(bytes.path(), Some(path.as_path()));
         assert!(!bytes.is_empty());
     }
 
     #[test]
     fn from_file_errors_for_missing_file() {
         let path = bundled_font_path().with_extension("missing");
-        let err = SharedBytes::from_file(&path).expect_err("missing file should fail");
+        let err = HostBuf::from_file(&path).expect_err("missing file should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

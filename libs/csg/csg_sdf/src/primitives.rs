@@ -118,10 +118,8 @@ impl SdfCapsule {
 
 impl Sdf3 for SdfCapsule {
     fn distance(&self, p: Vec3d) -> f64 {
-        let pa = p - self.a;
-        let ba = self.b - self.a;
-        let h = (pa.dot(ba) / ba.dot(ba)).clamp(0.0, 1.0);
-        (pa - ba * h).length() - self.radius
+        let v = |q: Vec3d| [q.x, q.y, q.z];
+        crate::strokes::capsule(v(p), v(self.a), v(self.b)) - self.radius
     }
 }
 
@@ -207,7 +205,6 @@ impl Sdf3 for SdfCappedCone {
     fn distance(&self, p: Vec3d) -> f64 {
         let d = p - self.center;
         let q = (d.x * d.x + d.z * d.z).sqrt();
-        let k1x = self.r2;
         let k1y = self.height;
         let k2x = self.r2 - self.r1;
         let k2y = 2.0 * self.height;

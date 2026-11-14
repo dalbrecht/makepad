@@ -1,0 +1,129 @@
+// CI smoke test for the window manager. Run by devhub ci, which finds every
+// `ci.splash` in the checkout and runs it with the `ci` module in scope.
+//
+// The rule: this script decides every input. The vision model never chooses
+// what to send; `ci.accept(image, text)` hands it one grab and numbered
+// questions, each ending in the answer that passes it (`expected YES` or
+// `expected NO`, which the model never sees); it answers each YES or NO. Keep it basic: does the
+// WM come up, switch to macOS, and launch a terminal (a hosted launch; the browser's own smoke
+// covers the browser).
+
+// Any Linux or Mac box. Windows: the terminal step fails (open: the judge sees no terminal on the desk).
+// ci os: any
+
+use mod.std.*
+use mod.ci;
+
+// Said in every acceptance: hidden test instances draw this on every grab.
+let FRAME = "This is a screenshot of one application window. A thin bright red frame runs around the very edge of the picture; it is the test harness's marker and is not part of the application. Ignore it. "
+
+ci.step("check other platforms", fn(){
+    ci.check_targets({packages: ["makepad-app-wm"] targets: ci.host.targets})
+})
+
+// The WM starts its apps through cargo. Building them first makes that
+// launch instant, so the waits below measure the app, not the compiler.
+ci.step("build the apps the desk will open", fn(){
+    ci.build({package: "makepad-app-terminal" binary: "makepad-app-terminal"})
+    // The terminal starts its shell through this helper, next to it.
+    ci.build({package: "makepad-agents" binary: "agents"})
+})
+
+let wm = ci.launch({package: "makepad-app-wm" binary: "makepad-app-wm" cwd: "."})
+
+ci.step("desktop is up", fn(){
+    ci.sleep(3.0)
+    wm.no_errors()
+    let start = wm.grab("start")
+    ci.accept(start, FRAME + "The application is a desktop window manager: it draws a whole desktop inside its own window. 1. Is the whole picture one flat colour from edge to edge? expected NO 2. Is there a bar or panel along the top edge or the bottom edge, running most of the width, with small icons or text in it? expected YES 3. Does a wallpaper or a flat desktop colour fill most of the remaining area? expected YES")
+    ci.accept(start, FRAME + "Some failures paint text over the whole window: a red or black panel with words such as panic, error, thread, unwrap, failed or backtrace, or a long block of monospace text filling the screen. 1. Does such an error panel or block of text cover the window? expected NO 2. Do any of the words panic, error, thread, unwrap, failed or backtrace appear in the picture? expected NO")
+})
+
+ci.step("switch to the macOS style", fn(){
+    wm.key("Space", {cmd: true})
+    wm.type_text("macos")
+    wm.key("ReturnKey")
+    wm.wait_log("desktop style macos applied", 15.0)
+    // The log line lands while the menu is still up and the desktop is
+    // still tweening: settle before looking.
+    ci.sleep(2.5)
+    let mac = wm.grab("macos")
+    ci.accept(mac, FRAME + "The application is a desktop window manager that can imitate several desktop styles; this is its macOS style. 1. Is there a thin menu bar across the very top of the picture, light or dark, with small text or a small mark at its left end and small status icons such as wifi, sound and battery at its right end, and maybe a clock in the middle or at the right? expected YES 2. Is there a dock along the bottom edge: a single row of many colourful square app icons with rounded corners, sitting on a translucent rounded shelf that is wider than it is tall? expected YES 3. Is there a Windows-style taskbar with a Start button at the bottom-left? expected NO")
+    ci.accept(mac, FRAME + "Look only at the top edge of this macOS-style desktop. 1. Does a thin bar run across the full top edge? expected YES 2. Is there something at its left end, such as a small mark or text? expected YES 3. Is there something at its right end, such as status icons or a clock? expected YES")
+    ci.accept(mac, FRAME + "Look only at the bottom quarter of this macOS-style desktop. The row of icons may be short and centred or long and nearly as wide as the picture; both are fine. 1. Is there a single row of at least four app icons? expected YES 2. Does that row sit on a rounded shelf or panel near the bottom edge? expected YES")
+
+})
+
+ci.step("launch the terminal", fn(){
+    wm.key("Space", {cmd: true})
+    wm.type_text("terminal")
+    wm.key("ReturnKey")
+    // The menu says what Return did; a launcher that lost the keys or
+    // picked nothing fails here, by name, not at the frame wait below.
+    wm.wait_log("shell menu activate apps.terminal", 20.0)
+    // "launched" fires at spawn; the window is a compile placeholder, then the
+    // JIT's load screen, until the app draws. The WM says when it has, and when
+    // a frame of it reached the desk (either may come first).
+    wm.wait_log("terminal client * app first frame", 180.0)
+    wm.wait_log("terminal client * first frame in", 180.0)
+    // A prompt alone is a blank window at this size: give the judge some lines.
+    ci.sleep(2.0)
+    wm.type_text("ls")
+    wm.key("ReturnKey")
+    ci.sleep(2.0)
+    let shot = wm.grab("terminal")
+    ci.accept(shot, FRAME + "It shows a desktop with app windows on it. A terminal window is a rectangular window whose content area is mostly one dark or one light flat colour with lines of monospace text starting at the left edge, usually with a prompt symbol such as $ or % or > on the last line, and a title bar above it. 1. Is at least one terminal window open, as described? expected YES")
+})
+
+// A hosted window keeps presenting and answering grabs through maximise, restore and resize,
+// also while a maximised window covers it (it is told it is covered and holds its own frames, but
+// a grab still gets one). The script asks the calculator the WM hosts, through its remote
+// endpoint, for the window's size and for a grab after each step; a grab that times out or a
+// resize that changes nothing fails the step.
+ci.step("a hosted window presents and grabs through maximise, restore and resize", fn(){
+    // a second window the calculator will cover
+    wm.key("Space", {cmd: true})
+    wm.type_text("clock")
+    wm.key("ReturnKey")
+    wm.wait_log("clock client * first frame in", 240.0)
+    wm.key("Space", {cmd: true})
+    wm.type_text("calculator")
+    wm.key("ReturnKey")
+    wm.wait_log("shell menu activate apps.calculator", 20.0)
+    wm.wait_log("calculator client * app first frame", 240.0)
+    wm.wait_log("calculator client * first frame in", 240.0)
+    ci.sleep(2.0)
+    let calc = wm.hosted("makepad-app-calculator")
+    let width = fn(){ calc.size()[0] }
+    let grabs = fn(step){ calc.grab("calculator-" + step) }
+    let normal = width()
+    grabs("normal")
+    calc.cmd("window k=maximize wait=1")
+    ci.sleep(1.5)
+    let big = width()
+    ci.check(big > normal + 50.0, "maximise did not enlarge the window: " + normal + " -> " + big)
+    grabs("maximised")
+    // the clock lies under it now: covered, it still grabs
+    ci.sleep(1.0)
+    wm.hosted("makepad-app-clock").grab("clock-covered")
+    let shot = wm.grab("desktop-calculator-maximised")
+    ci.accept(shot, FRAME + "It shows a desktop with app windows on it. 1. Does one calculator window fill most of the screen: a number display above a grid of round or square buttons with digits and operators? expected YES 2. Is the whole picture one flat colour? expected NO")
+    calc.cmd("window k=maximize wait=1")
+    ci.sleep(1.5)
+    ci.check(width() < big - 50.0, "restore did not shrink the window")
+    grabs("restored")
+    calc.cmd("resize w=520 h=640")
+    ci.sleep(1.5)
+    let resized = width()
+    ci.check(resized < normal - 20.0 || resized > normal + 20.0, "resize changed nothing: " + normal + " -> " + resized)
+    grabs("resized")
+    // maximised again after a resize
+    calc.cmd("window k=maximize wait=1")
+    ci.sleep(1.5)
+    grabs("maximised again")
+    wm.no_errors()
+})
+
+wm.no_errors()
+wm.quit()
+nil

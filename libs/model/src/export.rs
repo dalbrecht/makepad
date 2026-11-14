@@ -1,0 +1,694 @@
+use crate::build_detail::{CompilePhase, CompileTimer};
+use crate::{mesh, AnimationPath, Document, Error, Head, Result, Texture};
+use makepad_gltf::{
+    augment_glb_skin, replace_glb_node_animations, write_glb_mesh_textured_parts,
+    write_glb_mesh_textured_parts_linear, GlbAnimPath, GlbNodeAnimChannel, GlbNodeAnimClip,
+    GlbPrimitiveSkin, GlbSkinJoint, GlbTexturedPart,
+};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// Worker-owned export intermediates for a sequence of related compiles.
+/// Entries compare their source inputs; changing an object or a texture layer
+/// rebuilds that entry. Drop this with the build, rather than retaining model
+/// geometry and image layers in a process-wide cache.
+#[derive(Default)]
+pub struct CompileCache {
+    objects: BTreeMap<String, CachedObject>,
+    textures: BTreeMap<(u32, crate::SurfaceChannel), CachedTexture>,
+}
+
+struct CachedObject {
+    mesh: mesh::Mesh,
+    colors: Vec<(mesh::VertexId, [u64; 4])>,
+    rich_surface: bool,
+    parts: Vec<(u32, Arc<Part>)>,
+}
+
+struct CachedTexture {
+    msdf: bool,
+    layers: Vec<crate::SurfaceLayer>,
+    limits: (u32, usize),
+    texture: Option<makepad_gltf::GlbPbrTexture>,
+}
+
+// PartialEq alone identifies -0 and +0, but the exported f32 buffers retain
+// their bits. Check the floating-point mesh inputs as well as the topology.
+fn same_mesh(a: &mesh::Mesh, b: &mesh::Mesh) -> bool {
+    a == b
+        && a.vertices().iter().zip(b.vertices()).all(|(a, b)| {
+            a.position.map(f64::to_bits) == b.position.map(f64::to_bits)
+                && a.weights.iter().zip(&b.weights).all(|(a, b)| a.weight.to_bits() == b.weight.to_bits())
+        })
+        && a.corners().iter().zip(b.corners()).all(|(a, b)| {
+            a.uv.map(f64::to_bits) == b.uv.map(f64::to_bits)
+                && a.normal.map(|n| n.map(f64::to_bits)) == b.normal.map(|n| n.map(f64::to_bits))
+        })
+        && a.edge_attributes().values().zip(b.edge_attributes().values())
+            .all(|(a, b)| a.attributes.crease.to_bits() == b.attributes.crease.to_bits())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrimitiveSource {
+    pub object: String,
+    pub material: u32,
+    pub faces: Vec<mesh::FaceId>,
+    pub source_vertices: Vec<mesh::VertexId>,
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+}
+#[derive(Clone, Debug)]
+pub struct CompiledModel {
+    /// Per-part delivery diagnostics; the remaining geometry still compiles.
+    pub warnings: Vec<String>,
+    pub head: Head,
+    pub glb: Vec<u8>,
+    pub vertices: usize,
+    pub triangles: usize,
+    pub bounds: [[f32; 3]; 2],
+    pub primitives: Vec<PrimitiveSource>,
+}
+#[derive(Clone, Default)]
+struct Part {
+    source_vertices: Vec<mesh::VertexId>,
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    indices: Vec<u32>,
+    faces: Vec<mesh::FaceId>,
+    weights: Vec<f64>,
+    colors: Vec<[f32; 4]>,
+    tangents: Vec<[f32; 4]>,
+}
+fn f32_value(v: f64) -> Result<f32> {
+    let v = v as f32;
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(Error::Invalid("coordinate exceeds render precision"))
+    }
+}
+impl Document {
+    /// Compile opaque material primitives, preserving source corner UVs and normals.
+    /// Skinned output bakes a shared image and remaps derived UVs so consumers
+    /// using the first embedded image render every source material correctly.
+    /// A document skeleton adds skinning to every primitive; every rendered
+    /// vertex must then have known influences. Export keeps the four strongest
+    /// influences and renormalizes them, with a diagnostic per affected mesh. Editable rest TRS is
+    /// applied by the final authoring pass; cubic controls bake at 60 Hz.
+    /// Bounds are bind-pose bounds, not a conservative animated-motion envelope.
+    /// Existing GLB augmentation stages are bounded and cancellation is checked
+    /// between them; their inner serialization loops do not expose cancellation.
+    /// Object/face provenance accompanies the result. The source document, not
+    /// the render mesh, preserves editing identities and separate objects.
+    pub(crate) fn compile_evaluated(
+        &self,
+        cancelled: Option<&dyn Fn() -> bool>,
+        mut cache: Option<&mut CompileCache>,
+        delivery: Option<&crate::delivery::LodDelivery>,
+    ) -> Result<CompiledModel> {
+        let packing_timer = CompileTimer::new(CompilePhase::MeshPacking);
+        let mut ctx = mesh::Context::new(self.limits().mesh.clone(), cancelled);
+        let rich_surface =
+            !self.surface().materials.is_empty() || !self.surface().vertex_colors.is_empty();
+        let joint_count = self.skeleton().map_or(0, |s| s.joints.len());
+        if let Some(skeleton) = self.skeleton() {
+            skeleton.validate(self.limits(), &mut ctx)?;
+        }
+        // Admission includes dense weights required by the existing augmenter,
+        // compact skin buffers, writer copies and source material resources.
+        let predicted_triangles = self.objects().try_fold(0usize, |n, (_, m)| {
+            n.checked_add(
+                m.faces()
+                    .iter()
+                    .map(|f| f.corner_count as usize - 2)
+                    .sum::<usize>(),
+            )
+            .ok_or(Error::Budget("compiled triangles"))
+        })?;
+        let texture_bytes = self
+            .materials()
+            .values()
+            .map(|m| m.base_color_png.len())
+            .sum::<usize>();
+        let surface_bytes = self.surface().memory_bytes();
+        let working = predicted_triangles
+            .saturating_mul(512usize.saturating_add(joint_count.saturating_mul(32)))
+            .saturating_add(texture_bytes.saturating_mul(4))
+            .saturating_add(surface_bytes.saturating_mul(4));
+        if working > self.limits().mesh.max_bytes {
+            return Err(Error::Budget("skin/export working bytes"));
+        }
+        ctx.checkpoint(1)?;
+        let mut parts: BTreeMap<(String, u32), Arc<Part>> = BTreeMap::new();
+        let mut weld: std::collections::HashMap<(String, u32), std::collections::HashMap<(mesh::VertexId, [u32; 3], [u32; 2]), u32>> = std::collections::HashMap::new();
+        // Shape keys carry per-triangle normal deltas, so a document with
+        // morphs keeps one render vertex per triangle corner.
+        let weld_corners = self.rig().morphs.is_empty();
+        let mut triangles = 0usize;
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.objects.retain(|name, _| joint_count == 0 && weld_corners && self.state.objects.contains_key(name));
+            if !rich_surface { cache.textures.clear(); }
+        }
+        for (name, mesh) in self.objects() {
+            ctx.checkpoint(1)?;
+            // augment_glb_skin packs JOINTS_0/WEIGHTS_0 as four lanes, keeping
+            // the strongest influences and renormalizing them. Editable weights stay intact.
+            if joint_count > 0 && mesh.vertices().iter().any(|v| v.weights.len() > 4) {
+                eprintln!("model mesh {name}: exported four strongest joint influences per vertex, renormalized");
+            }
+            // Skinned export remaps UVs and weights, and morphs keep distinct
+            // corners. Cache only the static, welded representation.
+            let reusable = cache.is_some() && joint_count == 0 && weld_corners;
+            let colors = if reusable {
+                self.surface().vertex_colors.range((name.to_owned(), mesh::VertexId(0))..)
+                    .take_while(|((object, _), _)| object == name)
+                    .map(|((_, vertex), color)| (*vertex, color.map(f64::to_bits))).collect::<Vec<_>>()
+            } else { Vec::new() };
+            if let Some(hit) = cache.as_deref().and_then(|c| c.objects.get(name))
+                .filter(|hit| reusable && hit.rich_surface == rich_surface && hit.colors == colors && same_mesh(&hit.mesh, mesh)) {
+                for (material, part) in &hit.parts {
+                    triangles += part.indices.len() / 3;
+                    parts.insert((name.to_owned(), *material), part.clone());
+                }
+                continue;
+            }
+            if joint_count == 0 && mesh.vertices().iter().any(|v| !v.weights.is_empty()) {
+                return Err(Error::Invalid(
+                    "weighted mesh requires a skeleton; static compile cannot discard skin weights",
+                ));
+            }
+            // A closed shell wound inward would draw its inside under back-face
+            // culling; the product faces every closed shell out (drafts too).
+            let inward = mesh.inward_closed_faces(&mut ctx)?;
+            let oriented;
+            let mesh = if inward.is_empty() { mesh } else {
+                let mut copy = mesh.clone(); copy.flip_faces(&inward, &mut ctx)?; oriented = copy; &oriented
+            };
+            let triangulated = mesh.triangulate(&mut ctx)?;
+            triangles = triangles
+                .checked_add(triangulated.triangles.len())
+                .ok_or(Error::Budget("compiled triangles"))?;
+            // Conservative bound includes temporary writer copies and accessors.
+            if triangles.saturating_mul(384) > self.limits().mesh.max_bytes {
+                return Err(Error::Budget("compile working bytes"));
+            }
+            for tri in &triangulated.triangles {
+                ctx.checkpoint(1)?;
+                let part = Arc::make_mut(parts.entry((name.to_owned(), tri.material)).or_default());
+                let welded = weld.entry((name.to_owned(), tri.material)).or_default();
+                part.faces.push(tri.source_face);
+                for index in tri.indices {
+                    let v = &triangulated.vertices[index as usize];
+                    // Corners sharing source vertex, normal and UV share one
+                    // render vertex (weights and colour follow the source).
+                    let key = (v.source_vertex, v.normal.map(|x| (x as f32).to_bits()), v.uv.map(|x| (x as f32).to_bits()));
+                    if let Some(&existing) = welded.get(&key).filter(|_| weld_corners) {
+                        part.indices.push(existing);
+                        continue;
+                    }
+                    let next: u32 = part.positions.len().try_into().map_err(|_| Error::Budget("compiled vertices"))?;
+                    welded.insert(key, next);
+                    part.indices.push(next);
+                    part.source_vertices.push(v.source_vertex);
+                    part.positions.push([
+                        f32_value(v.position[0])?,
+                        f32_value(v.position[1])?,
+                        f32_value(v.position[2])?,
+                    ]);
+                    part.normals.push([
+                        f32_value(v.normal[0])?,
+                        f32_value(v.normal[1])?,
+                        f32_value(v.normal[2])?,
+                    ]);
+                    part.uvs.push([f32_value(v.uv[0])?, f32_value(v.uv[1])?]);
+                    if rich_surface {
+                        let color = self
+                            .surface()
+                            .vertex_colors
+                            .get(&(name.to_owned(), v.source_vertex))
+                            .copied()
+                            .unwrap_or([1.; 4]);
+                        part.colors.push([
+                            f32_value(color[0])?,
+                            f32_value(color[1])?,
+                            f32_value(color[2])?,
+                            f32_value(color[3])?,
+                        ]);
+                    }
+                    if joint_count > 0 {
+                        if v.weights.is_empty() {
+                            return Err(Error::Invalid(
+                                "skinned compile requires weights on every rendered vertex",
+                            ));
+                        }
+                        let start = part.weights.len();
+                        part.weights.resize(start + joint_count, 0.);
+                        for weight in &v.weights {
+                            if weight.joint as usize >= joint_count || weight.weight as f32 <= 0. {
+                                return Err(Error::Invalid(
+                                    "skin weight cannot be represented without loss",
+                                ));
+                            }
+                            part.weights[start + weight.joint as usize] = weight.weight;
+                        }
+                    }
+                }
+            }
+            if rich_surface {
+                let _tangent_timer = CompileTimer::new(CompilePhase::Tangents);
+                for (_, part) in parts.range_mut((name.to_owned(), 0)..).take_while(|((object, _), _)| object == name) {
+                    let part = Arc::make_mut(part);
+                    part.tangents = part_tangents(part, &mut ctx)?;
+                }
+            }
+            if reusable {
+                let object_parts = parts.range((name.to_owned(), 0)..).take_while(|((object, _), _)| object == name)
+                    .map(|((_, material), part)| (*material, part.clone())).collect();
+                cache.as_deref_mut().unwrap().objects.insert(name.to_owned(), CachedObject {
+                    mesh: self.object(name).unwrap().clone(), colors, rich_surface, parts: object_parts,
+                });
+            }
+        }
+        if triangles == 0 {
+            return Err(Error::Invalid("model has no surface to compile"));
+        }
+        if let Some(cache) = cache.as_deref_mut() {
+            let used = parts.keys().map(|(_, material)| *material).collect::<std::collections::BTreeSet<_>>();
+            cache.textures.retain(|(id, _), _| used.contains(id));
+        }
+        drop(packing_timer);
+        let atlas = if joint_count > 0 && !rich_surface {
+            let mut ranges = crate::atlas::UvBounds::new();
+            for ((_, material), part) in &parts {
+                let range = ranges
+                    .entry(*material)
+                    .or_insert([[f32::INFINITY; 2], [f32::NEG_INFINITY; 2]]);
+                for uv in &part.uvs {
+                    for axis in 0..2 {
+                        range[0][axis] = range[0][axis].min(uv[axis]);
+                        range[1][axis] = range[1][axis].max(uv[axis]);
+                    }
+                }
+            }
+            let mut atlas_limits = self.limits().clone();
+            atlas_limits.mesh.max_bytes = atlas_limits.mesh.max_bytes.saturating_sub(working);
+            let started = crate::program::ProgramInstant::now();
+            let texture_timer = CompileTimer::new(CompilePhase::Textures);
+            let png_before = crate::build_detail::png_time();
+            let atlas = crate::atlas::bake(self.materials(), &ranges, &atlas_limits, &mut ctx)?;
+            crate::program::record_texture_time(started.elapsed());
+            crate::build_detail::record_texture(None, crate::SurfaceChannel::BaseColor, "atlas", atlas.size[0], atlas.size[1],
+                started.elapsed().saturating_sub(crate::build_detail::png_time() - png_before));
+            drop(texture_timer);
+            for ((_, material), part) in &mut parts {
+                for uv in &mut Arc::make_mut(part).uvs {
+                    ctx.checkpoint(1)?;
+                    *uv = atlas.remap(*material, *uv);
+                }
+            }
+            Some(atlas)
+        } else {
+            None
+        };
+        let started = crate::program::ProgramInstant::now();
+        let png_before = crate::build_detail::png_time();
+        let white = Texture::solid(1, 1, [255; 3], self.limits())?.to_png(self.limits())?;
+        crate::program::record_texture_time(started.elapsed());
+        crate::build_detail::record_texture(None, crate::SurfaceChannel::BaseColor, "white", 1, 1,
+            started.elapsed().saturating_sub(crate::build_detail::png_time() - png_before));
+        let packing_timer = CompileTimer::new(CompilePhase::MeshPacking);
+        let mut bounds = [[f32::INFINITY; 3], [f32::NEG_INFINITY; 3]];
+        let mut vertices = 0;
+        let mut primitives = Vec::new();
+        let mut views = Vec::new();
+        for ((object, id), part) in &parts {
+            ctx.checkpoint(1)?;
+            let material = self
+                .materials()
+                .get(id)
+                .ok_or(Error::Invalid("unknown compiled material"))?;
+            for p in &part.positions {
+                for d in 0..3 {
+                    bounds[0][d] = bounds[0][d].min(p[d]);
+                    bounds[1][d] = bounds[1][d].max(p[d]);
+                }
+            }
+            vertices += part.positions.len();
+            primitives.push(PrimitiveSource {
+                object: object.clone(),
+                material: *id,
+                faces: part.faces.clone(),
+                // The GLB is welded; this record stays one entry per triangle corner.
+                source_vertices: part.indices.iter().map(|&i| part.source_vertices[i as usize]).collect(),
+                positions: part.indices.iter().map(|&i| part.positions[i as usize]).collect(),
+                normals: part.indices.iter().map(|&i| part.normals[i as usize]).collect(),
+            });
+            views.push(GlbTexturedPart {
+                positions: &part.positions,
+                normals: Some(&part.normals),
+                uvs: &part.uvs,
+                indices: &part.indices,
+                base_color_png: if let Some(atlas) = &atlas {
+                    &atlas.png
+                } else if material.base_color_png.is_empty() {
+                    &white
+                } else {
+                    &material.base_color_png
+                },
+                base_color_factor: if atlas.is_some() {
+                    Some([1.0; 4])
+                } else {
+                    Some([
+                        material.color[0] as f32,
+                        material.color[1] as f32,
+                        material.color[2] as f32,
+                        1.0,
+                    ])
+                },
+                colors: None,
+                lightmap_png: None,
+                lightmap_uvs: None,
+                detail_png: None,
+                detail_scale: [0.0; 2],
+            });
+        }
+        ctx.checkpoint(1)?;
+        drop(packing_timer);
+        let _assembly_timer = CompileTimer::new(CompilePhase::GlbAssembly);
+        let mut glb = if atlas.is_some() {
+            write_glb_mesh_textured_parts_linear(&views, false)
+        } else {
+            write_glb_mesh_textured_parts(&views, false)
+        };
+        drop(views);
+        if rich_surface {
+            glb = export_surface(self, &glb, &parts, &mut ctx, cache.as_deref_mut())?;
+        }
+        if let Some(skeleton) = self.skeleton() {
+            let parsed = makepad_gltf::parse_glb_bytes(&glb)
+                .map_err(|_| Error::Invalid("compiled GLB parse"))?;
+            let joint_node_start = parsed.document.nodes_slice().len();
+            let target_node = parsed
+                .document
+                .nodes_slice()
+                .iter()
+                .position(|n| n.mesh.is_some())
+                .ok_or(Error::Invalid("compiled GLB mesh node"))?;
+            let heads = skeleton.global_translations()?;
+            let joints = skeleton
+                .joints
+                .iter()
+                .zip(heads)
+                .map(|(joint, position)| {
+                    Ok(GlbSkinJoint {
+                        name: joint.name.clone(),
+                        parent: joint.parent.map(|p| p as usize),
+                        global_translation: [
+                            f32_value(position[0])?,
+                            f32_value(position[1])?,
+                            f32_value(position[2])?,
+                        ],
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let skins = parts
+                .into_iter()
+                .enumerate()
+                .map(|(primitive, (_, part))| GlbPrimitiveSkin {
+                    node: target_node,
+                    primitive,
+                    weights: Arc::unwrap_or_clone(part).weights,
+                })
+                .collect::<Vec<_>>();
+            ctx.checkpoint((vertices as u64).saturating_mul(joint_count as u64))?;
+            glb = augment_glb_skin(&glb, &joints, &skins)
+                .map_err(|_| Error::Invalid("GLB skin augmentation"))?;
+            ctx.checkpoint(1)?;
+            if !self.clips().is_empty() {
+                let mut clips = Vec::with_capacity(self.clips().len());
+                for clip in self.clips().values() {
+                    clip.validate(skeleton, self.limits(), &mut ctx)?;
+                    let mut channels = Vec::with_capacity(clip.channels.len());
+                    for channel in &clip.channels {
+                        let path = match channel.path {
+                            AnimationPath::Translation => GlbAnimPath::Translation,
+                            AnimationPath::Rotation => GlbAnimPath::Rotation,
+                            AnimationPath::Scale => GlbAnimPath::Scale,
+                        };
+                        let lanes = if channel.path == AnimationPath::Rotation {
+                            4
+                        } else {
+                            3
+                        };
+                        let mut times = Vec::with_capacity(channel.keys.len());
+                        let mut values = Vec::with_capacity(channel.keys.len() * lanes);
+                        if self.rig().clip_options.get(&clip.name).is_some_and(|o|o.interpolation==crate::Interpolation::Cubic) {
+                            let steps=(clip.duration()*60.).ceil()as usize;
+                            for i in 0..=steps {ctx.checkpoint(1)?;let time=(i as f64/60.).min(clip.duration());let pose=self.rig().sample_clip(skeleton,clip,time)?;
+                                let t=pose[channel.joint as usize];let value=match channel.path{AnimationPath::Translation=>[t.translation[0],t.translation[1],t.translation[2],0.],AnimationPath::Rotation=>t.rotation,AnimationPath::Scale=>[t.scale[0],t.scale[1],t.scale[2],0.]};
+                                times.push(f32_value(time)?);for &v in &value[..lanes]{values.push(f32_value(v)?);}
+                            }
+                        } else {
+                            for key in &channel.keys {ctx.checkpoint(1)?;times.push(f32_value(key.time)?);for &v in &key.value[..lanes]{values.push(f32_value(v)?);}}
+                        }
+                        channels.push(GlbNodeAnimChannel {
+                            node: joint_node_start + channel.joint as usize,
+                            path,
+                            times,
+                            values,
+                        });
+                    }
+                    clips.push(GlbNodeAnimClip {
+                        name: clip.name.clone(),
+                        channels,
+                    });
+                }
+                glb = replace_glb_node_animations(&glb, &clips)
+                    .map_err(|_| Error::Invalid("GLB animation augmentation"))?;
+            }
+        }
+        glb = crate::authoring_export::finish(self, glb, &primitives, delivery, &mut ctx)?;
+        ctx.checkpoint(glb.len() as u64)?;
+        Ok(CompiledModel {
+            warnings: delivery.map_or_else(Vec::new, |d| d.warnings.clone()),
+            head: self.head(),
+            glb,
+            vertices,
+            triangles,
+            bounds,
+            primitives,
+        })
+    }
+}
+
+/// Whether the material exports a UV-dependent texture. Surface materials
+/// override legacy slots; hidden or zero-opacity layers do not flatten to a
+/// texture. The exporter's neutral white image is not a UV constraint.
+pub(crate) fn material_samples_texture(doc: &Document, material: u32) -> bool {
+    if let Some(surface) = doc.surface().materials.get(&material) {
+        surface
+            .channels
+            .values()
+            .flatten()
+            .any(|layer| layer.visible && layer.opacity > 0.)
+    } else {
+        doc.materials()
+            .get(&material)
+            .is_some_and(|m| !m.base_color_png.is_empty())
+    }
+}
+
+fn export_surface(
+    doc: &Document,
+    glb: &[u8],
+    parts: &BTreeMap<(String, u32), Arc<Part>>,
+    ctx: &mut mesh::Context<'_>,
+    mut cache: Option<&mut CompileCache>,
+) -> Result<Vec<u8>> {
+    use crate::{SurfaceAlpha, SurfaceChannel, SurfaceMaterial};
+    use makepad_gltf::{augment_glb_pbr, GlbPbrMaterial, GlbPbrPrimitive, GlbPbrTexture};
+    let mut materials = Vec::new();
+    let mut ids = BTreeMap::new();
+    let mut assignments = Vec::new();
+    let mut derived_bytes = 0usize;
+    for (primitive, ((_, id), part)) in parts.iter().enumerate() {
+        ctx.checkpoint(1)?;
+        let material = if let Some(index) = ids.get(id) {
+            *index
+        } else {
+            let fallback;
+            let source = if let Some(source) = doc.surface().materials.get(id) {
+                source
+            } else {
+                let _texture_timer = CompileTimer::new(CompilePhase::Textures);
+                let started = crate::program::ProgramInstant::now();
+                fallback = SurfaceMaterial::from_legacy(
+                    doc.materials()
+                        .get(id)
+                        .ok_or(Error::Invalid("surface export material"))?,
+                    doc.limits(),
+                )?;
+                crate::program::record_texture_time(started.elapsed());
+                &fallback
+            };
+            source.validate(doc.limits(), ctx)?;
+            let samples_texture = material_samples_texture(doc, *id);
+            let mut map = |channel: SurfaceChannel| -> Result<Option<GlbPbrTexture>> {
+                if !samples_texture {
+                    return Ok(None);
+                }
+                let layers = source.channels.get(&channel).map(Vec::as_slice).unwrap_or(&[]);
+                let msdf = channel == SurfaceChannel::BaseColor && source.shading.is_some_and(|s| s.msdf > 0.0);
+                let limits = (doc.limits().max_texture_dimension, doc.limits().mesh.max_bytes);
+                let hit = cache.as_deref().and_then(|c| c.textures.get(&(*id, channel)))
+                    .filter(|c| c.msdf == msdf && c.limits == limits && c.layers == layers
+                        && c.layers.iter().zip(layers).all(|(a, b)| a.opacity.to_bits() == b.opacity.to_bits()));
+                let texture = if let Some(hit) = hit {
+                    hit.texture.clone()
+                } else {
+                    let started = crate::program::ProgramInstant::now();
+                    let _texture_timer = CompileTimer::new(CompilePhase::Textures);
+                    let texture = (|| -> Result<Option<GlbPbrTexture>> {
+                        let Some(image) = source.flatten(channel, doc.limits(), ctx)? else {
+                            return Ok(None);
+                        };
+                        let png_before = crate::build_detail::png_time();
+                        let mips = image.mip_chain(if msdf { crate::ImageEncoding::Linear } else { channel.encoding() }, doc.limits(), ctx)?;
+                        let png = image.to_png(doc.limits())?;
+                        let mut mip_pngs = Vec::new();
+                        for mip in mips {
+                            ctx.checkpoint(mip.pixels.len() as u64)?;
+                            let png = mip.to_png(doc.limits())?;
+                            mip_pngs.push(png);
+                        }
+                        let kind = layers.iter().find(|layer| layer.visible && layer.opacity > 0.)
+                            .map_or("image", |layer| crate::build_detail::texture_kind(channel, layer));
+                        crate::build_detail::record_texture(Some(*id), channel, kind, image.width, image.height,
+                            started.elapsed().saturating_sub(crate::build_detail::png_time() - png_before));
+                        Ok(Some(GlbPbrTexture { png, mip_pngs }))
+                    })();
+                    crate::program::record_texture_time(started.elapsed());
+                    let texture = texture?;
+                    if let Some(cache) = cache.as_deref_mut() {
+                        cache.textures.insert((*id, channel), CachedTexture { msdf, layers: layers.to_vec(), limits, texture: texture.clone() });
+                    }
+                    texture
+                };
+                if let Some(texture) = &texture {
+                    derived_bytes = derived_bytes.saturating_add(texture.png.len());
+                    for png in &texture.mip_pngs { derived_bytes = derived_bytes.saturating_add(png.len()); }
+                    if derived_bytes
+                        .saturating_mul(4)
+                        .saturating_add(doc.surface().memory_bytes())
+                        .saturating_add(glb.len() * 3)
+                        > doc.limits().mesh.max_bytes
+                    {
+                        return Err(Error::Budget("PBR export images"));
+                    }
+                }
+                Ok(texture)
+            };
+            let out = GlbPbrMaterial {
+                fur: source.fur,
+                shading: source.shading,
+                base_color: source.base_color,
+                metallic: source.metallic,
+                roughness: source.roughness,
+                normal_scale: source.normal_scale,
+                occlusion_strength: source.occlusion_strength,
+                emissive: source.emissive,
+                emissive_strength: source.emissive_strength,
+                alpha_mode: match source.alpha {
+                    SurfaceAlpha::Opaque => "OPAQUE",
+                    SurfaceAlpha::Mask => "MASK",
+                    SurfaceAlpha::Blend => "BLEND",
+                }
+                .into(),
+                alpha_cutoff: source.alpha_cutoff,
+                double_sided: source.double_sided,
+                base_color_texture: map(SurfaceChannel::BaseColor)?,
+                metallic_roughness_texture: map(SurfaceChannel::MetallicRoughness)?,
+                normal_texture: map(SurfaceChannel::Normal)?,
+                occlusion_texture: map(SurfaceChannel::Occlusion)?,
+                emissive_texture: map(SurfaceChannel::Emissive)?,
+            };
+            let index = materials.len();
+            materials.push(out);
+            ids.insert(*id, index);
+            index
+        };
+        assignments.push(GlbPbrPrimitive {
+            mesh: 0,
+            primitive,
+            material,
+            colors: part.colors.clone(),
+            tangents: part.tangents.clone(),
+        });
+    }
+    ctx.checkpoint((derived_bytes + glb.len()) as u64)?;
+    let output = augment_glb_pbr(glb, &materials, &assignments)
+        .map_err(|_| Error::Invalid("GLB PBR augmentation"))?;
+    ctx.checkpoint(output.len() as u64)?;
+    Ok(output)
+}
+fn part_tangents(part: &Part, ctx: &mut mesh::Context<'_>) -> Result<Vec<[f32; 4]>> {
+    fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        std::array::from_fn(|i| a[i] - b[i])
+    }
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a.iter().zip(b).map(|(a, b)| a * b).sum()
+    }
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+    fn norm(a: [f32; 3]) -> [f32; 3] {
+        let len = dot(a, a).sqrt();
+        if len > 1e-20 {
+            a.map(|v| v / len)
+        } else {
+            [1., 0., 0.]
+        }
+    }
+    let mut out = vec![[0.; 4]; part.positions.len()];
+    for ids in part.indices.chunks_exact(3) {
+        ctx.checkpoint(3)?;
+        let [a, b, c] = [ids[0] as usize, ids[1] as usize, ids[2] as usize];
+        let p1 = sub(part.positions[b], part.positions[a]);
+        let p2 = sub(part.positions[c], part.positions[a]);
+        let uv = |i: usize| {
+            [
+                part.uvs[i][0] - part.uvs[a][0],
+                part.uvs[i][1] - part.uvs[a][1],
+            ]
+        };
+        let u1 = uv(b);
+        let u2 = uv(c);
+        let det = u1[0] * u2[1] - u1[1] * u2[0];
+        for id in [a, b, c] {
+            let n = norm(part.normals[id]);
+            let (t, b) = if det.abs() > 1e-16 {
+                (
+                    std::array::from_fn(|i| (p1[i] * u2[1] - p2[i] * u1[1]) / det),
+                    std::array::from_fn(|i| (p2[i] * u1[0] - p1[i] * u2[0]) / det),
+                )
+            } else {
+                let axis = if n[2].abs() < 0.9 {
+                    [0., 0., 1.]
+                } else {
+                    [0., 1., 0.]
+                };
+                let t = norm(cross(axis, n));
+                (t, cross(n, t))
+            };
+            let t = norm(std::array::from_fn(|i| t[i] - n[i] * dot(n, t)));
+            let sign = if dot(cross(n, t), b) < 0. { -1. } else { 1. };
+            out[id] = [t[0], t[1], t[2], sign];
+        }
+    }
+    Ok(out)
+}

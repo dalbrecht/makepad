@@ -1,15 +1,21 @@
+pub(crate) mod raycast_vehicle;
 pub mod xr_body_spawn;
 pub mod xr_env;
 mod xr_gesture;
 pub mod xr_node;
 pub mod xr_permissions_flow;
 pub mod xr_root;
+pub mod xr_scene_view;
 pub mod xr_select;
 pub mod xr_shared_object_sync;
 pub mod xr_view;
 
 pub mod xr_peer_sync {
     pub use crate::sync::xr_peer_sync::*;
+}
+
+pub mod xr_scene_sync_controller {
+    pub use crate::sync::xr_scene_sync_controller::*;
 }
 
 pub(crate) use xr_gesture::{
@@ -19,11 +25,15 @@ pub(crate) use xr_gesture::{
 
 pub use crate::net::{XrActivityId, XrSpawnableObjectId};
 pub use crate::sync::xr_peer_sync::{XrPeerSync, XrPeerSyncAction};
+pub use crate::sync::xr_scene_sync_controller::XrSceneSyncController;
 pub use xr_body_spawn::{XrBodyDrive, XrBodyImpulse, XrBodySpawn, XrBodyWrench, XrCarControl};
-pub use xr_env::{DrawDepthMeshBasic, XrEnv};
+pub use xr_env::{
+    xr_grip_pose, xr_hand_colliders, xr_hold_frame, xr_two_hand_hold_pose, XrHandCollider, DrawDepthMeshBasic, XrEnv, XrBodySpawnCounts, XrPhysics, XrPhysicsBody, XrPhysicsCounters, XrPhysicsMetrics,
+    XrPhysicsState, XrPlayerHands, XR_WORKER_FIXED_DT,
+};
 pub use xr_node::{
     xr_draw_list_depth, xr_sort_child_draw_order, xr_widget_children, xr_widget_is_transparent,
-    xr_widget_local_sort_center, xr_widget_with_scene_node, xr_widget_world_transform, XrBodyKind,
+    xr_widget_local_sort_center, xr_widget_with_scene_node, xr_widget_world_transform, XrBodyKind, XrDepthQuerySupportRig,
     XrDrawContext, XrDrawScopeData, XrHandInfluencePoint, XrNode, XrNodeAction,
     XrPassthroughScopeData, XrPhysicsShape, XrRenderClass, XrRuntimeBodyState,
     XrSharedObjectPolicy, XR_HAND_INFLUENCE_POINTS_PER_HAND, XR_HAND_INFLUENCE_POINT_COUNT,
@@ -31,6 +41,7 @@ pub use xr_node::{
 };
 pub use xr_permissions_flow::XrPermissionsFlow;
 pub use xr_root::{XrCamera, XrRoot, XrRootAction};
+pub use xr_scene_view::{DrawXrSceneTexture, XrSceneView};
 pub use xr_select::{XrSelect, XrSelectAction};
 pub use xr_shared_object_sync::{
     collect_scene_spawnable_objects, XrLocalSharedObjectSnapshot, XrRemoteSharedObjectSnapshot,

@@ -1,10 +1,11 @@
 use {
     crate::{
         decoration::{Decoration, DecorationType},
+        diff::{DiffRowKind, GutterMode},
         draw_selection::DrawSelection,
         history::NewGroup,
         layout::{BlockElement, WrappedElement},
-        makepad_widgets::*,
+        makepad_widgets_core::*,
         selection::Affinity,
         session::{CodeSession, SelectionMode},
         settings::Settings,
@@ -14,6 +15,7 @@ use {
         Line, Selection, Token,
     },
     std::fmt::Write,
+    std::ops::Range,
     std::{mem, slice::Iter},
 };
 
@@ -24,23 +26,27 @@ script_mod! {
     mod.widgets.TokenColorsBase = #(TokenColors::script_component(vm))
     mod.widgets.TokenColors = set_type_default() do mod.widgets.TokenColorsBase {
         whitespace: #6E6E6E
-        delimiter: #a
-        delimiter_highlight: #f
+        delimiter: theme.color_syntax_punctuation
+        delimiter_highlight: theme.color_text
         error_decoration: #f00
         warning_decoration: #0f0
 
-        unknown: #C0C0C0
-        branch_keyword: #C485BE
-        constant: #CC917B
-        identifier: #D4D4D4
-        loop_keyword: #FF8C00
-        number: #B6CEAA
-        other_keyword: #5B9BD3
-        punctuator: #D4D4D4
-        string: #CC917B
-        function: #fffcc9
-        typename: #56C9B1
-        comment: #638D54
+        // The theme's syntax colours, set for its ground: a light theme's are dark enough to read
+        // on white, a dark theme's light enough on its editor.
+        unknown: theme.color_syntax_ident
+        branch_keyword: theme.color_syntax_keyword_branch
+        constant: theme.color_syntax_constant
+        identifier: theme.color_syntax_ident
+        macro_identifier: theme.color_syntax_macro
+        attribute: theme.color_syntax_attribute
+        loop_keyword: theme.color_syntax_keyword_loop
+        number: theme.color_syntax_literal
+        other_keyword: theme.color_syntax_keyword
+        punctuator: theme.color_syntax_punctuation
+        string: theme.color_syntax_string
+        function: theme.color_syntax_fn
+        typename: theme.color_syntax_type
+        comment: theme.color_syntax_comment
     }
 
     set_type_default() do #(DrawIndentGuide::script_shader(vm)) {
@@ -76,6 +82,7 @@ script_mod! {
         width: Fill
         margin: 0
         pad_left_top: vec2(10.0, 10.0)
+        pad_right: 0.0
         scroll_bars: mod.widgets.ScrollBars {}
         draw_bg +: { color: theme.color_bg_container }
         draw_gutter +: {
@@ -93,7 +100,7 @@ script_mod! {
                     return incol
                 }
                 if self.pos.y < 0.12 {
-                    return #f
+                    return vec4(1.0, 1.0, 1.0, incol.a)
                 }
                 return incol
             }
@@ -101,26 +108,71 @@ script_mod! {
         draw_indent_guide +: {
             color: theme.color_u_2
         }
+        draw_folded +: {
+            color: theme.color_u_2
+        }
+        draw_diff_added +: {color: theme.color_success}
+        draw_diff_removed +: {color: theme.color_error}
+        draw_diff_changed +: {color: theme.color_warning}
+        // Find: every match a soft wash, the current one a strong one.
+        draw_find_match +: {color: theme.color_focus}
+        draw_find_current +: {color: theme.color_focus}
+        // Lines a host lights for a moment (an outside edit), under the text.
+        draw_line_wash +: {color: theme.color_warning}
         draw_decoration +: {
         }
         draw_selection +: {
+            content_opacity: instance(1.0)
+        pixel: fn() {
+            let sdf = Sdf2d.viewport(self.rect_pos + self.pos * self.rect_size)
+            sdf.box(
+                self.rect_pos.x,
+                self.rect_pos.y,
+                self.rect_size.x,
+                self.rect_size.y,
+                self.border_radius
+            )
+            if self.prev_w > 0.0 {
+                sdf.box(
+                    self.prev_x,
+                    self.rect_pos.y - self.rect_size.y,
+                    self.prev_w,
+                    self.rect_size.y,
+                    self.border_radius
+                )
+                sdf.gloop(self.gloopiness)
+            }
+            if self.next_w > 0.0 {
+                sdf.box(
+                    self.next_x,
+                    self.rect_pos.y + self.rect_size.y,
+                    self.next_w,
+                    self.rect_size.y,
+                    self.border_radius
+                )
+                sdf.gloop(self.gloopiness)
+            }
+            return sdf.fill(self.color.mix(self.color_focus, self.focus)) * self.content_opacity
+        }
         }
 
         draw_cursor +: {
+            content_opacity: instance(1.0)
             focus: instance(0.0)
             blink: instance(1.0)
             pixel: fn() {
                 let color = theme.color_u_hidden.mix(self.color.mix(theme.color_u_hidden, self.blink), self.focus)
-                return vec4(color.rgb * color.a, color.a)
+                return vec4(color.rgb * color.a, color.a) * self.content_opacity
             }
             color: theme.color_white
         }
 
         draw_cursor_bg +: {
+            content_opacity: instance(1.0)
             focus: instance(0.0)
             pixel: fn() {
                 let color = theme.color_u_hidden.mix(theme.color_u_1, self.focus)
-                return vec4(color.rgb * color.a, color.a)
+                return vec4(color.rgb * color.a, color.a) * self.content_opacity
             }
         }
 
@@ -172,6 +224,11 @@ struct DrawCodeText {
     outline: f32,
 }
 
+/// A line drawn smaller than this (in logical pixels, a folded line) is
+/// too small to read: it draws as one bar the length of its text instead
+/// of glyph by glyph.
+const LEGIBLE_LINE_HEIGHT: f64 = 4.0;
+
 #[derive(Script, ScriptHook, Animator)]
 pub struct CodeEditor {
     #[source]
@@ -188,8 +245,42 @@ pub struct CodeEditor {
     token_colors: TokenColors,
     #[live]
     draw_indent_guide: DrawIndentGuide,
+    /// A folded line too small to read: one bar.
+    #[live]
+    draw_folded: DrawColor,
     #[live]
     draw_decoration: DrawDecoration,
+    #[live]
+    draw_diff_added: DrawColor,
+    #[live]
+    draw_diff_removed: DrawColor,
+    #[live]
+    draw_diff_changed: DrawColor,
+    #[live]
+    draw_find_match: DrawColor,
+    #[live]
+    draw_find_current: DrawColor,
+    #[live]
+    draw_line_wash: DrawColor,
+    /// Lines washed in `draw_line_wash`'s colour, each (0-based line range,
+    /// opacity 0..1); a host fades them by lowering the opacity and redrawing.
+    #[rust]
+    pub line_washes: Vec<(Range<usize>, f32)>,
+    /// A line to scroll to the middle of the view (caret untouched).
+    #[rust]
+    center_line: Option<usize>,
+    /// A line to scroll to a height in the view: its top that far below the
+    /// view's top (caret untouched).
+    #[rust]
+    place_line: Option<(usize, f64)>,
+    /// Find matches, sorted, each within one line; drawn behind the text.
+    #[rust]
+    pub find_matches: Vec<(Position, Position)>,
+    /// The match navigation is on, drawn stronger than the rest.
+    #[rust]
+    pub find_current: Option<usize>,
+    #[rust]
+    document_read_only: bool,
     #[live]
     draw_selection: DrawSelection,
     #[live]
@@ -204,10 +295,25 @@ pub struct CodeEditor {
     last_cursor_screen_pos: Option<Vec2d>,
     #[live]
     pad_left_top: Vec2d,
+    /// Space kept clear to the right of the text, e.g. for an overlaid scroll bar.
+    #[live]
+    pad_right: f64,
     #[rust]
     cell_size: Vec2d,
     #[rust]
     cell_offset_y: f64,
+    #[rust(1.0)]
+    base_font_scale: f32,
+    #[rust]
+    ascent: f64,
+    #[rust]
+    descent: f64,
+    #[rust(1.0)]
+    content_opacity: f32,
+    #[rust]
+    caret_policy: CaretPolicy,
+    #[rust]
+    retired_blink_timer: Timer,
     #[rust]
     gutter_rect: Rect,
     #[rust]
@@ -247,6 +353,40 @@ pub struct CodeEditor {
     /// want to show focused selection colors in child editors.
     #[rust(false)]
     external_selection_focus: bool,
+
+    /// A host drives the caret and selection itself and no input reaches the
+    /// editor: they are drawn as if it had the keys.
+    #[rust(false)]
+    driven: bool,
+}
+
+/// Editor-local logical pixels; ascent/descent are positive distances from baseline.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CodeMetrics {
+    pub line_advance: f64,
+    pub column_advance: f64,
+    pub gutter_width: f64,
+    pub ascent: f64,
+    pub descent: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CaretPolicy {
+    #[default]
+    Blink,
+    Steady,
+}
+
+/// The nearest insertion position and the grapheme actually under the pointer.
+/// The token range is document-global and clipped to the view's byte range.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextHit {
+    pub position: Position,
+    pub affinity: Affinity,
+    pub grapheme_range: Range<Position>,
+    pub token_range: Range<Position>,
+    pub token_kind: TokenKind,
+    pub rect: Rect,
 }
 
 pub enum KeepCursorInView {
@@ -257,6 +397,8 @@ pub enum KeepCursorInView {
     LockedCenter(Vec2d, Position, Affinity),
     FontResize(Vec2d),
     JumpToPosition,
+    /// Scroll so the cursor's line sits in the middle of the view.
+    CenterOnPosition,
     Off,
 }
 
@@ -276,6 +418,249 @@ impl KeepCursorInView {
 }
 
 impl CodeEditor {
+    /// Set the base glyph/layout scale. Non-finite or non-positive values are ignored.
+    /// Request a redraw after changing this; font metrics are exact after drawing.
+    pub fn set_font_scale(&mut self, scale: f32) {
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        let ratio = scale as f64 / self.base_font_scale as f64;
+        self.cell_size *= ratio;
+        self.cell_offset_y *= ratio;
+        self.ascent *= ratio;
+        self.descent *= ratio;
+        self.base_font_scale = scale;
+        self.reset_draw_font_scale();
+    }
+
+    fn reset_draw_font_scale(&mut self) {
+        self.draw_text.font_scale = self.base_font_scale;
+        self.draw_gutter.font_scale = self.base_font_scale;
+    }
+
+    pub fn metrics(&self, session: &CodeSession) -> CodeMetrics {
+        CodeMetrics {
+            line_advance: self.cell_size.y,
+            column_advance: self.cell_size.x,
+            gutter_width: if self.show_gutter {
+                (self.gutter_columns(session) + self.gutter_pad) as f64 * self.cell_size.x
+            } else {
+                0.0
+            },
+            ascent: self.ascent,
+            descent: self.descent,
+        }
+    }
+
+    /// Fade content while leaving the host/editor background unchanged.
+    pub fn set_content_opacity(&mut self, opacity: f32) {
+        if opacity.is_finite() {
+            self.content_opacity = opacity.clamp(0.0, 1.0);
+        }
+    }
+
+    fn is_read_only(&self) -> bool { self.read_only || self.document_read_only }
+
+    pub fn set_read_only(&mut self, cx: &mut Cx, read_only: bool) {
+        self.read_only = read_only;
+        if read_only {
+            self.stop_input_timers(cx);
+            cx.hide_text_ime();
+        } else if cx.has_key_focus(self.area()) {
+            self.reset_cursor_blinker(cx);
+        }
+        self.redraw(cx);
+    }
+
+    /// Steady never schedules blink work. An already queued timeout is cancelled
+    /// on the next draw/event (the first opportunity to access Cx).
+    pub fn set_caret_policy(&mut self, policy: CaretPolicy) {
+        self.caret_policy = policy;
+        if policy == CaretPolicy::Steady && self.blink_timer.0 != 0 {
+            self.retired_blink_timer = mem::take(&mut self.blink_timer);
+        }
+    }
+
+    fn stop_blink_timers(&mut self, cx: &mut Cx) {
+        cx.stop_timer(mem::take(&mut self.blink_timer));
+        cx.stop_timer(mem::take(&mut self.retired_blink_timer));
+    }
+
+    fn stop_input_timers(&mut self, cx: &mut Cx) {
+        self.stop_blink_timers(cx);
+        if matches!(self.keep_cursor_in_view, KeepCursorInView::Always(..)) {
+            self.keep_cursor_in_view = KeepCursorInView::Off;
+        }
+    }
+
+    /// Glyph advance cell in coordinates relative to the editor's outer rectangle.
+    /// Returns None outside the range, at invalid UTF-8/grapheme boundaries, or
+    /// before the first measured draw. EOL has a one-column insertion cell.
+    pub fn position_rect(&self, session: &CodeSession, position: Position) -> Option<Rect> {
+        if self.cell_size.x <= 0.0 || self.cell_size.y <= 0.0 {
+            return None;
+        }
+        let layout = session.layout();
+        let text = layout.as_text().as_lines().get(position.line_index)?;
+        if !text.is_char_boundary(position.byte_index) {
+            return None;
+        }
+        if !layout.view_line_range().contains(&position.line_index) {
+            return None;
+        }
+        let range = layout.line_byte_range(position.line_index);
+        if position.byte_index < range.start
+            || position.byte_index > range.end
+            || (position.byte_index == range.end && range.end < text.len())
+        {
+            return None;
+        }
+        let mut byte = 0;
+        let mut grapheme = None;
+        for g in text.graphemes() {
+            if byte == position.byte_index {
+                grapheme = Some(g);
+                break;
+            }
+            byte += g.len();
+        }
+        if byte != position.byte_index {
+            return None;
+        }
+        let line = layout.line(position.line_index);
+        let (row, column) = line.logical_to_grid_position(position.byte_index, Affinity::After);
+        let columns = grapheme.map_or(1, |g| g.column_count_at(column, line.tab_column_count));
+        Some(self.grid_rect(line, row, column, columns))
+    }
+
+    fn grid_rect(&self, line: Line<'_>, row: usize, column: usize, columns: usize) -> Rect {
+        let (x, y) = line.grid_to_normalized_position(row, column);
+        let (end_x, _) = line.grid_to_normalized_position(row, column + columns);
+        Rect {
+            pos: dvec2(x, line.y() + y) * self.cell_size + self.viewport_rect.pos
+                - self.unscrolled_rect.pos,
+            size: dvec2(
+                (end_x - x) * self.cell_size.x,
+                line.scale() * self.cell_size.y,
+            ),
+        }
+    }
+
+    /// Exact text-only picking in the same local coordinates as position_rect.
+    /// Gutter, padding, clipped text and empty cells have no source hit.
+    pub fn hit_test(&self, session: &CodeSession, local: DVec2) -> Option<TextHit> {
+        if !local.x.is_finite()
+            || !local.y.is_finite()
+            || self.cell_size.x <= 0.0
+            || self.cell_size.y <= 0.0
+        {
+            return None;
+        }
+        let absolute = local + self.unscrolled_rect.pos;
+        let visible = Rect {
+            pos: self.unscrolled_rect.pos
+                + self.pad_left_top
+                + dvec2(self.metrics(session).gutter_width, 0.0),
+            size: self.viewport_rect.size,
+        };
+        if !visible.contains(absolute) {
+            return None;
+        }
+        let normalized_y = (absolute.y - self.viewport_rect.pos.y) / self.cell_size.y;
+        let layout = session.layout();
+        if normalized_y < 0.0 || normalized_y >= layout.height() {
+            return None;
+        }
+        let index = layout.find_first_line_ending_after_y(normalized_y);
+        let bytes = layout.line_byte_range(index);
+        let line = layout.line(index);
+        let (mut byte, mut row, mut column) = (0, 0, 0);
+        for element in line.wrapped_elements() {
+            match element {
+                WrappedElement::Text {
+                    is_inlay: false,
+                    text,
+                } => {
+                    for grapheme in text.graphemes() {
+                        let start = byte;
+                        let columns = grapheme.column_count_at(column, line.tab_column_count);
+                        let rect = self.grid_rect(line, row, column, columns);
+                        byte += grapheme.len();
+                        column += columns;
+                        if start < bytes.start || byte > bytes.end {
+                            continue;
+                        }
+                        if local.x < rect.pos.x
+                            || local.x >= rect.pos.x + rect.size.x
+                            || local.y < rect.pos.y
+                            || local.y >= rect.pos.y + rect.size.y
+                        {
+                            continue;
+                        }
+                        let position = Position {
+                            line_index: index,
+                            byte_index: start,
+                        };
+                        let end = Position {
+                            line_index: index,
+                            byte_index: byte,
+                        };
+                        let (mut token_start, mut token_end, mut token_kind) =
+                            (start, byte, TokenKind::Unknown);
+                        let mut offset = 0;
+                        for token in &layout.document_layout.tokens[index] {
+                            if (offset..offset + token.len).contains(&start) {
+                                token_start = offset.max(bytes.start);
+                                token_end = (offset + token.len).min(bytes.end);
+                                token_kind = token.kind;
+                                break;
+                            }
+                            offset += token.len;
+                        }
+                        let after_midpoint = local.x >= rect.pos.x + rect.size.x * 0.5;
+                        return Some(TextHit {
+                            position: if after_midpoint { end } else { position },
+                            affinity: if after_midpoint {
+                                Affinity::Before
+                            } else {
+                                Affinity::After
+                            },
+                            grapheme_range: position..end,
+                            token_range: Position {
+                                line_index: index,
+                                byte_index: token_start,
+                            }..Position {
+                                line_index: index,
+                                byte_index: token_end,
+                            },
+                            token_kind,
+                            rect,
+                        });
+                    }
+                }
+                WrappedElement::Text {
+                    is_inlay: true,
+                    text,
+                } => column += text.column_count_at(column, line.tab_column_count),
+                WrappedElement::Widget(widget) => column += widget.column_count,
+                WrappedElement::Wrap => {
+                    row += 1;
+                    column = line.wrap_indent_column_count();
+                }
+            }
+        }
+        None
+    }
+
+    /// The current IME anchor in editor-local layout coordinates. A canvas
+    /// host can map this to its screen area after drawing the editor.
+    pub fn ime_anchor(&self, cx: &Cx) -> (Area, Vec2d) {
+        let area = self.scroll_bars.area();
+        let pos = self.viewport_rect.pos - area.clipped_rect(cx).pos
+            + self.last_cursor_screen_pos.unwrap_or_default() + dvec2(0.0, self.cell_size.y);
+        (area, pos)
+    }
+
     pub fn redraw(&mut self, cx: &mut Cx) {
         self.scroll_bars.redraw(cx);
     }
@@ -313,9 +698,20 @@ impl CodeEditor {
     }
 
     pub fn draw_walk_editor(&mut self, cx: &mut Cx2d, session: &mut CodeSession, walk: Walk) {
+        self.document_read_only = session.document().is_read_only();
         // This needs to be called first to ensure the session is up to date.
         session.handle_changes();
+        // A fold animation steps before this frame is laid out, so what is
+        // drawn and what `position_rect` reports after the draw agree (a
+        // host drawing over the text, block widgets, stays in place).
+        let folds_moving = session.update_folds();
 
+        self.reset_draw_font_scale();
+        if self.is_read_only() || self.caret_policy == CaretPolicy::Steady {
+            self.stop_blink_timers(cx);
+            if self.is_read_only() { self.stop_input_timers(cx); }
+            self.animator_cut(cx, ids!(blink.off));
+        }
         let text = self
             .draw_text
             .layout(cx, 0.0, 0.0, None, false, Align::default(), "!");
@@ -334,6 +730,13 @@ impl CodeEditor {
             let font_size = self.draw_text.text_style.font_size.max(1.0);
             (font_size * 0.6, font_size)
         };
+        let (ascent, descent) = text.rows.first().and_then(|row| row.glyphs.first())
+            .map(|glyph| (glyph.ascender_in_lpxs(), -glyph.descender_in_lpxs()))
+            .unwrap_or((height_in_lpxs * 0.8, height_in_lpxs * 0.2));
+        self.ascent = (ascent * self.base_font_scale) as f64;
+        self.descent = (descent * self.base_font_scale) as f64;
+        let width_in_lpxs = width_in_lpxs * self.base_font_scale;
+        let height_in_lpxs = height_in_lpxs * self.base_font_scale;
         let line_spacing_in_lpxs = height_in_lpxs * self.draw_text.text_style.line_spacing;
         self.cell_size = dvec2(width_in_lpxs as f64, line_spacing_in_lpxs as f64);
         self.cell_offset_y = ((line_spacing_in_lpxs - height_in_lpxs) / 2.0) as f64;
@@ -411,6 +814,22 @@ impl CodeEditor {
                 );
                 self.keep_cursor_in_view = KeepCursorInView::Off;
             }
+            // Before the first draw the view has no size: centre next frame.
+            KeepCursorInView::CenterOnPosition if self.viewport_rect.size.y <= 0.0 => {}
+            KeepCursorInView::CenterOnPosition => {
+                let view = self.viewport_rect.size;
+                let scroll = self.scroll_bars.get_scroll_pos();
+                let x = if cursor_pos.x < scroll.x || cursor_pos.x > scroll.x + view.x - self.cell_size.x * 4.0 {
+                    (cursor_pos.x - self.cell_size.x * 10.0).max(0.0)
+                } else {
+                    scroll.x
+                };
+                let y = (cursor_pos.y + self.cell_size.y * 0.5 - view.y * 0.5).max(0.0);
+                // Not clipped to the size laid out last: the lines just
+                // unfolded to show it make the text longer than it was.
+                self.scroll_bars.set_scroll_pos_no_clip(cx, dvec2(x, y));
+                self.keep_cursor_in_view = KeepCursorInView::Off;
+            }
             KeepCursorInView::FontResize(last_pos) => {
                 let new_pos = cursor_pos - self.scroll_bars.get_scroll_pos();
                 let delta = last_pos - new_pos;
@@ -420,37 +839,63 @@ impl CodeEditor {
             }
             KeepCursorInView::Off => {}
         }
+        if let Some((line, view_y)) = self.place_line {
+            if self.viewport_rect.size.y > 0.0 {
+                let line = line.min(session.document().as_text().as_lines().len().saturating_sub(1));
+                let (_, y) = session.layout().logical_to_normalized_position(
+                    Position { line_index: line, byte_index: 0 },
+                    Affinity::Before,
+                );
+                let y = (y * self.cell_size.y - view_y).max(0.0);
+                let x = self.scroll_bars.get_scroll_pos().x;
+                self.scroll_bars.set_scroll_pos_no_clip(cx, dvec2(x, y));
+                self.place_line = None;
+            }
+        }
+        if let Some(line) = self.center_line {
+            if self.viewport_rect.size.y > 0.0 {
+                let line = line.min(session.document().as_text().as_lines().len().saturating_sub(1));
+                let (_, y) = session.layout().logical_to_normalized_position(
+                    Position { line_index: line, byte_index: 0 },
+                    Affinity::Before,
+                );
+                let y = (y * self.cell_size.y + self.cell_size.y * 0.5 - self.viewport_rect.size.y * 0.5).max(0.0);
+                let x = self.scroll_bars.get_scroll_pos().x;
+                self.scroll_bars.set_scroll_pos_no_clip(cx, dvec2(x, y));
+                self.center_line = None;
+            }
+        }
+        let size_pending = self.viewport_rect.size.y <= 0.0
+            && (self.center_line.is_some() || matches!(self.keep_cursor_in_view, KeepCursorInView::CenterOnPosition));
 
-        // if height = Fit, we need to compute it based on layout
-        let height_is_fit = walk.height.is_fit();
-        //if height_is_fit{
-        //    walk.height = Size::Fixed(100000.0);
-        // }
-        const MAX_HEIGHT: f64 = 100_0000.0;
         self.scroll_bars.begin(cx, walk, Layout::default());
-
         let turtle_rect = cx.turtle().rect();
 
         let gutter_width = if self.show_gutter {
-            self.gutter_chars = session
-                .document()
-                .as_text()
-                .as_lines()
-                .len()
-                .to_string()
-                .column_count()
-                + 1;
+            self.gutter_chars = self.gutter_columns(session);
             self.gutter_chars as f64 * self.cell_size.x + self.gutter_pad as f64 * self.cell_size.x
         } else {
             self.gutter_chars = 0;
             0.0
+        };
+        let text_width = turtle_rect.size.x - gutter_width - self.pad_left_top.x - self.pad_right;
+        session.set_wrap_column(self.word_wrap.then(|| (text_width / self.cell_size.x) as usize));
+
+        // A Fit editor is bounded by its turtle's max (Size::Fit max or Walk::max_height),
+        // and with neither it's as tall as its text, so every line is in view.
+        let height_is_fit = walk.height.is_fit();
+        let fit_height = if height_is_fit {
+            cx.current_turtle_max_height()
+                .unwrap_or(session.layout().height() * self.cell_size.y + self.pad_left_top.y)
+        } else {
+            turtle_rect.size.y
         };
         self.gutter_rect = Rect {
             pos: turtle_rect.pos,
             size: Vec2d {
                 x: gutter_width,
                 y: if height_is_fit {
-                    MAX_HEIGHT
+                    fit_height
                 } else {
                     turtle_rect.size.y
                 },
@@ -464,7 +909,7 @@ impl CodeEditor {
             size: Vec2d {
                 x: turtle_rect.size.x - gutter_width,
                 y: if height_is_fit {
-                    MAX_HEIGHT
+                    fit_height
                 } else {
                     turtle_rect.size.y
                 },
@@ -476,12 +921,7 @@ impl CodeEditor {
         self.gutter_rect.size -= self.pad_left_top;
         self.viewport_rect.pos += self.pad_left_top;
         self.viewport_rect.size -= self.pad_left_top;
-
-        session.set_wrap_column(if self.word_wrap {
-            Some((self.viewport_rect.size.x / self.cell_size.x) as usize)
-        } else {
-            None
-        });
+        self.viewport_rect.size.x -= self.pad_right;
 
         let scroll_pos = self.scroll_bars.get_scroll_pos();
 
@@ -491,6 +931,16 @@ impl CodeEditor {
         self.line_end = session.layout().find_first_line_starting_after_y(
             (scroll_pos.y + self.viewport_rect.size.y) / self.cell_size.y,
         );
+        // A Fit editor can be far taller than what the scroll views around it show, so skip what they clip.
+        if height_is_fit {
+            let (visible_top, visible_bottom) = cx.turtle_visible_y_range();
+            let to_lines = |y: f64| (y - self.viewport_rect.pos.y) / self.cell_size.y;
+            self.line_start = self.line_start.max(session.layout().find_first_line_ending_after_y(to_lines(visible_top)));
+            self.line_end = self.line_end
+                .min(session.layout().find_first_line_starting_after_y(to_lines(visible_bottom)))
+                // Scrolled entirely out of view, we draw nothing.
+                .max(self.line_start);
+        }
         self.unscrolled_rect = cx.turtle().rect_unscrolled();
 
         let bg_rect = Rect {
@@ -498,33 +948,55 @@ impl CodeEditor {
             size: Vec2d {
                 x: self.unscrolled_rect.size.x,
                 y: if height_is_fit {
-                    MAX_HEIGHT
+                    fit_height
                 } else {
                     self.unscrolled_rect.size.y
                 },
             },
         };
         self.draw_bg.draw_abs(cx, bg_rect);
+        self.draw_diff_backgrounds(cx, session);
+        self.draw_line_washes(cx, session);
+        self.draw_find_layer(cx, session);
+        for vars in [&mut self.draw_cursor.draw_vars, &mut self.draw_cursor_bg.draw_vars, &mut self.draw_selection.draw_vars] {
+            vars.set_dyn_instance(cx, live_id!(content_opacity), &[self.content_opacity]);
+        }
+        if self.driven {
+            for vars in [&mut self.draw_cursor.draw_vars, &mut self.draw_cursor_bg.draw_vars] {
+                vars.set_dyn_instance(cx, live_id!(focus), &[1.0]);
+            }
+            self.draw_cursor.draw_vars.set_dyn_instance(cx, live_id!(blink), &[0.0]);
+        }
+        if self.document_read_only {
+            // Diff documents allow a steady navigation caret, including deletions.
+            self.draw_cursor.draw_vars.set_dyn_instance(cx, live_id!(blink), &[0.0]);
+        }
         self.draw_cursor.begin_many_instances(cx);
 
         if self.show_gutter {
+            let color = self.draw_gutter.color;
+            self.draw_gutter.color.w *= self.content_opacity;
             self.draw_gutter.begin_many_instances(cx);
             self.draw_gutter(cx, session);
             self.draw_gutter.end_many_instances(cx);
+            self.draw_gutter.color = color;
         }
         self.draw_selection_layer(cx, session);
         self.draw_text.begin_many_instances(cx);
         self.draw_text_layer(cx, session);
         self.draw_text.end_many_instances(cx);
+        self.reset_draw_font_scale();
+        let indent_color = self.draw_indent_guide.color;
+        self.draw_indent_guide.color.w *= self.content_opacity;
         self.draw_indent_guide_layer(cx, session);
+        self.draw_indent_guide.color = indent_color;
         self.draw_decoration_layer(cx, session);
-        self.draw_selection_layer(cx, session);
         // Get the last added selection.
         // Get the normalized cursor position. To go from normalized to screen position, multiply by
         // the cell size, then shift by the viewport origin.
 
         cx.turtle_mut().set_used(
-            session.layout().width() * self.cell_size.x + self.pad_left_top.x,
+            session.layout().width() * self.cell_size.x + self.pad_left_top.x + self.pad_right,
             self.height_scale * session.layout().height() * self.cell_size.y
                 + if height_is_fit || !self.empty_page_at_end {
                     0.0
@@ -538,7 +1010,7 @@ impl CodeEditor {
 
         self.scroll_bars.end(cx);
 
-        if !self.read_only && cx.has_key_focus(self.scroll_bars.area()) {
+        if !self.is_read_only() && cx.has_key_focus(self.scroll_bars.area()) {
             let area_rect = self.scroll_bars.area().clipped_rect(cx);
             let ime_pos = self
                 .last_cursor_screen_pos
@@ -551,7 +1023,7 @@ impl CodeEditor {
             cx.show_text_ime(self.scroll_bars.area(), ime_pos);
         }
 
-        if session.update_folds() {
+        if folds_moving || size_pending {
             cx.redraw_area_in_draw(self.scroll_bars.area());
         } else if self.keep_cursor_in_view.is_locked() {
             self.keep_cursor_in_view = KeepCursorInView::Off;
@@ -573,6 +1045,144 @@ impl CodeEditor {
         self.redraw(cx);
     }
 
+    /// Put the cursor at `pos` and scroll its line to the middle of the view.
+    pub fn set_cursor_and_center(&mut self, cx: &mut Cx, pos: Position, session: &mut CodeSession) {
+        session.set_selection(
+            session.clamp_position(pos),
+            Affinity::Before,
+            SelectionMode::Simple,
+            NewGroup::Yes,
+        );
+        self.keep_cursor_in_view = KeepCursorInView::CenterOnPosition;
+        self.redraw(cx);
+    }
+
+    /// Scroll `line` (0-based) to the middle of the view, leaving the caret.
+    pub fn center_line(&mut self, cx: &mut Cx, line: usize) {
+        self.center_line = Some(line);
+        self.redraw(cx);
+    }
+
+    /// Scroll `line` (0-based) so its top is `view_y` below the view's top,
+    /// leaving the caret: a host keeping a line where another view showed it.
+    pub fn place_line(&mut self, cx: &mut Cx, line: usize, view_y: f64) {
+        self.place_line = Some((line, view_y));
+        self.redraw(cx);
+    }
+
+    /// How far below the view's top `line`'s top is, as last scrolled
+    /// (negative above the view). None before the first draw.
+    pub fn line_view_y(&self, session: &CodeSession, line: usize) -> Option<f64> {
+        if self.viewport_rect.size.y <= 0.0 {
+            return None;
+        }
+        let line = line.min(session.document().as_text().as_lines().len().saturating_sub(1));
+        let (_, y) = session.layout().logical_to_normalized_position(
+            Position { line_index: line, byte_index: 0 },
+            Affinity::Before,
+        );
+        Some(y * self.cell_size.y - self.scroll_bars.get_scroll_pos().y)
+    }
+
+    /// The lines drawn last frame (0-based, half-open); empty before the
+    /// first draw.
+    pub fn semantics(&self, cx: &Cx, session: &CodeSession, node: &mut a11y_tree::Node) {
+        node.role = a11y_tree::Role::TextArea;
+        node.states = a11y_tree::States::FOCUSABLE | a11y_tree::States::MULTILINE;
+        node.states
+            .set(a11y_tree::States::READ_ONLY, self.is_read_only());
+        node.states
+            .set(a11y_tree::States::EDITABLE, !self.is_read_only());
+        node.actions = a11y_tree::Actions::FOCUS;
+        let text = node.text.get_or_insert_with(Default::default);
+        let doc = session.document();
+        let document_text = doc.as_text();
+        let lines = document_text.as_lines();
+        let content = document_text.to_string();
+        makepad_platform::a11y::set_string(&mut text.content, &content);
+        let offset = |pos: Position| {
+            lines
+                .iter()
+                .take(pos.line_index)
+                .map(|line| line.len() + 1)
+                .sum::<usize>()
+                + pos.byte_index
+        };
+        if let Some(selection) = session.selections().first() {
+            text.selection = (
+                offset(selection.anchor) as u32,
+                offset(selection.cursor.position) as u32,
+            );
+        }
+        text.lines.clear();
+        text.glyph_x.clear();
+        let glyphs = !self.is_read_only() || cx.has_key_focus(self.area());
+        let layout = session.layout();
+        let mut byte_offset = 0;
+        for (index, content) in lines.iter().enumerate() {
+            if self.visible_lines().contains(&index) && layout.view_line_range().contains(&index) {
+                let line = layout.line(index);
+                let bytes = layout.line_byte_range(index);
+                let mut last_row = None;
+                // One pass over the line gives every char's grid position.
+                for (byte, row, col) in line
+                    .grid_positions()
+                    .skip_while(|&(byte, _, _)| byte < bytes.start)
+                    .take_while(|&(byte, _, _)| byte <= bytes.end)
+                {
+                    let rect = self
+                        .grid_rect(line, row, col, 1)
+                        .translate(self.unscrolled_rect.pos);
+                    if last_row != Some(row) {
+                        if last_row.is_some() && glyphs {
+                            text.glyph_x.push(rect.pos.x as f32);
+                        }
+                        text.lines.push(a11y_tree::LineBox {
+                            start: (byte_offset + byte) as u32,
+                            rect: makepad_platform::a11y::semantic_rect(rect),
+                            baseline: (rect.pos.y + rect.size.y) as f32,
+                        });
+                        last_row = Some(row);
+                    }
+                    if let Some(last) = text.lines.last_mut() {
+                        last.rect.w = (rect.pos.x + rect.size.x) as f32 - last.rect.x;
+                    }
+                    if glyphs {
+                        text.glyph_x.push(rect.pos.x as f32);
+                    }
+                }
+                // The semantic line includes its terminating newline. It has no advance.
+                if glyphs && index + 1 < lines.len() {
+                    if let Some(x) = text.glyph_x.last().copied() {
+                        text.glyph_x.push(x);
+                    }
+                }
+            }
+            byte_offset += content.len() + 1;
+        }
+        // Bound the last visible line's byte range without claiming geometry for
+        // the rest of the document. The mirror falls back to empty bounds there.
+        if let Some(last) = text.lines.last() {
+            let end = text.content[last.start as usize..]
+                .find('\n')
+                .map(|i| last.start as usize + i + 1)
+                .unwrap_or(text.content.len());
+            if end < text.content.len() {
+                text.lines.push(a11y_tree::LineBox {
+                    start: end as u32,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    pub fn visible_lines(&self) -> Range<usize> {
+        if self.viewport_rect.size.y <= 0.0 {
+            return 0..0;
+        }
+        self.line_start..self.line_end
+    }
+
     pub fn set_selection_and_scroll(
         &mut self,
         cx: &mut Cx,
@@ -589,6 +1199,15 @@ impl CodeEditor {
         session.move_to(session.clamp_position(end), Affinity::Before, NewGroup::Yes);
         self.keep_cursor_in_view = KeepCursorInView::JumpToPosition;
         self.redraw(cx);
+    }
+
+    /// The text size of code and gutter, in the editor's own pixels (before
+    /// the base font scale). Request a redraw after changing it.
+    pub fn set_font_size(&mut self, size: f32) {
+        if size.is_finite() && size > 0.0 {
+            self.draw_text.text_style.font_size = size;
+            self.draw_gutter.text_style.font_size = size;
+        }
     }
 
     pub fn reset_font_size(&mut self) {
@@ -620,12 +1239,10 @@ impl CodeEditor {
     }
 
     pub fn reset_cursor_blinker(&mut self, cx: &mut Cx) {
-        if self.read_only {
-            self.animator_cut(cx, ids!(blink.off));
-        } else {
-            self.animator_cut(cx, ids!(blink.off));
-            cx.stop_timer(self.blink_timer);
-            self.blink_timer = cx.start_timeout(self.blink_speed)
+        self.stop_blink_timers(cx);
+        self.animator_cut(cx, ids!(blink.off));
+        if !self.is_read_only() && self.caret_policy == CaretPolicy::Blink {
+            self.blink_timer = cx.start_timeout(self.blink_speed);
         }
     }
 
@@ -640,6 +1257,29 @@ impl CodeEditor {
 
     /// Set external selection focus without triggering a redraw.
     /// Use this when you know a redraw will happen anyway (e.g., during draw cycle).
+    /// Scroll the viewport (a host resetting to the top-left after new text).
+    /// Where the view is scrolled to.
+    pub fn scroll_pos(&self) -> Vec2d {
+        self.scroll_bars.get_scroll_pos()
+    }
+
+    pub fn set_scroll_pos(&mut self, cx: &mut Cx, pos: Vec2d) {
+        self.scroll_bars.stop_motion();
+        self.scroll_bars.set_scroll_pos(cx, pos);
+        self.scroll_bars.redraw(cx);
+    }
+
+    /// Draw the caret (steady) and the selection as if the editor had the
+    /// keys, for a host that moves them itself (a presentation following an
+    /// edit being typed); nothing is editable by input.
+    pub fn set_driven(&mut self, cx: &mut Cx, driven: bool) {
+        self.driven = driven;
+        self.read_only = !driven;
+        self.set_caret_policy(if driven { CaretPolicy::Steady } else { CaretPolicy::Blink });
+        self.set_external_selection_focus_no_redraw(driven);
+        self.redraw(cx);
+    }
+
     pub fn set_external_selection_focus_no_redraw(&mut self, focus: bool) {
         self.external_selection_focus = focus;
         if focus {
@@ -653,6 +1293,16 @@ impl CodeEditor {
         self.external_selection_focus
     }
 
+    fn is_mutation_event(event: &Event) -> bool {
+        match event {
+            Event::TextInput(_) | Event::TextRangeReplace(_) | Event::TextCut(_) | Event::Drop(_) => true,
+            Event::KeyDown(key) => matches!(key.key_code, KeyCode::ReturnKey | KeyCode::Tab | KeyCode::Backspace | KeyCode::Delete)
+                || ((key.modifiers.control || key.modifiers.logo)
+                    && matches!(key.key_code, KeyCode::KeyZ | KeyCode::KeyY | KeyCode::KeyX | KeyCode::KeyV)),
+            _ => false,
+        }
+    }
+
     pub fn handle_event(
         &mut self,
         cx: &mut Cx,
@@ -661,16 +1311,22 @@ impl CodeEditor {
         session: &mut CodeSession,
     ) -> Vec<CodeEditorAction> {
         let mut actions = Vec::new();
+        self.document_read_only = session.document().is_read_only();
 
+        if self.is_read_only() || self.caret_policy == CaretPolicy::Steady {
+            self.stop_blink_timers(cx);
+            if self.is_read_only() { self.stop_input_timers(cx); }
+            self.animator_cut(cx, ids!(blink.off));
+        }
         self.animator_handle_event(cx, event);
 
         session.handle_changes();
+        if self.is_read_only() && Self::is_mutation_event(event) { return actions; }
 
-        if self.scroll_bars.handle_event(cx, event, scope).len() > 0 {
-            self.redraw(cx);
-        };
+        let mut scroll_actions = Vec::new();
+        self.scroll_bars.handle_main_event(cx, event, scope, &mut scroll_actions);
 
-        if self.blink_timer.is_event(event).is_some() {
+        if !self.is_read_only() && self.caret_policy == CaretPolicy::Blink && self.blink_timer.is_event(event).is_some() {
             if self.animator_in_state(cx, ids!(blink.off)) {
                 self.animator_play(cx, ids!(blink.on));
             } else {
@@ -679,8 +1335,18 @@ impl CodeEditor {
             self.blink_timer = cx.start_timeout(self.blink_speed)
         }
         let mut keyboard_moved_cursor = false;
-        match event.hits(cx, self.scroll_bars.area()) {
+        // With drag scrolling on, a touch drag scrolls instead of selecting text.
+        let can_touch_scroll = self.scroll_bars.has_drag_scrolling();
+        let hit = event.hits(cx, self.scroll_bars.area());
+        // A press that selects text claims its drag, so nothing scrolls under the selection.
+        if let Hit::FingerDown(fe) = &hit {
+            if !(can_touch_scroll && fe.device.is_touch()) {
+                cx.claim_finger_drag(fe.digit_id);
+            }
+        }
+        match hit {
             Hit::KeyFocusLost(_) => {
+                self.stop_input_timers(cx);
                 cx.hide_text_ime();
                 // Don't dim selection if external_selection_focus is active
                 // (cross-child selection where PortalList has focus)
@@ -778,7 +1444,7 @@ impl CodeEditor {
                 ..
             }) => {
                 if control || logo {
-                    //session.move_to_start_of_line(!shift);
+                    session.home(!shift);
                 } else {
                     session.move_left(!shift);
                 }
@@ -797,7 +1463,7 @@ impl CodeEditor {
                 ..
             }) => {
                 if control || logo {
-                    //session.move_to_end_of_line(!shift);
+                    session.end(!shift);
                 } else {
                     session.move_right(!shift);
                 }
@@ -846,7 +1512,7 @@ impl CodeEditor {
                 modifiers: KeyModifiers { shift, .. },
                 ..
             }) => {
-                for _ in 0..self.line_end - self.line_start - 3 {
+                for _ in 0..self.line_end.saturating_sub(self.line_start).saturating_sub(3) {
                     session.move_up(!shift);
                 }
                 keyboard_moved_cursor = true;
@@ -857,7 +1523,7 @@ impl CodeEditor {
                 modifiers: KeyModifiers { shift, .. },
                 ..
             }) => {
-                for _ in 0..self.line_end - self.line_start - 3 {
+                for _ in 0..self.line_end.saturating_sub(self.line_start).saturating_sub(3) {
                     session.move_down(!shift);
                 }
                 keyboard_moved_cursor = true;
@@ -867,7 +1533,7 @@ impl CodeEditor {
                 ref input,
                 was_paste: false,
                 ..
-            }) if input.len() > 0 && !self.read_only => {
+            }) if input.len() > 0 && !self.is_read_only() => {
                 session.insert(input.into());
                 self.redraw(cx);
                 keyboard_moved_cursor = true;
@@ -877,7 +1543,7 @@ impl CodeEditor {
                 ref input,
                 was_paste: true,
                 ..
-            }) if input.len() > 0 && !self.read_only => {
+            }) if input.len() > 0 && !self.is_read_only() => {
                 session.paste(input.into());
                 self.redraw(cx);
                 keyboard_moved_cursor = true;
@@ -886,7 +1552,7 @@ impl CodeEditor {
             Hit::KeyDown(KeyEvent {
                 key_code: KeyCode::ReturnKey,
                 ..
-            }) => {
+            }) if !self.is_read_only() => {
                 session.enter();
                 self.redraw(cx);
                 keyboard_moved_cursor = true;
@@ -896,7 +1562,7 @@ impl CodeEditor {
                 key_code: KeyCode::Tab,
                 modifiers: KeyModifiers { shift: false, .. },
                 ..
-            }) if !self.read_only => {
+            }) if !self.is_read_only() => {
                 session.indent();
                 self.redraw(cx);
                 keyboard_moved_cursor = true;
@@ -906,7 +1572,7 @@ impl CodeEditor {
                 key_code: KeyCode::Tab,
                 modifiers: KeyModifiers { shift: true, .. },
                 ..
-            }) if !self.read_only => {
+            }) if !self.is_read_only() => {
                 session.outdent();
                 self.redraw(cx);
                 keyboard_moved_cursor = true;
@@ -915,7 +1581,7 @@ impl CodeEditor {
             Hit::KeyDown(KeyEvent {
                 key_code: KeyCode::Delete,
                 ..
-            }) if !self.read_only => {
+            }) if !self.is_read_only() => {
                 session.delete();
                 self.redraw(cx);
                 keyboard_moved_cursor = true;
@@ -924,7 +1590,7 @@ impl CodeEditor {
             Hit::KeyDown(KeyEvent {
                 key_code: KeyCode::Backspace,
                 ..
-            }) if !self.read_only => {
+            }) if !self.is_read_only() => {
                 session.backspace();
                 self.redraw(cx);
                 keyboard_moved_cursor = true;
@@ -934,7 +1600,7 @@ impl CodeEditor {
                 *ce.response.borrow_mut() = Some(session.copy());
                 keyboard_moved_cursor = true;
             }
-            Hit::TextCut(ce) if !self.read_only => {
+            Hit::TextCut(ce) if !self.is_read_only() => {
                 *ce.response.borrow_mut() = Some(session.copy());
                 session.delete();
                 keyboard_moved_cursor = true;
@@ -951,7 +1617,7 @@ impl CodeEditor {
                         ..
                     },
                 ..
-            }) if (control || logo) && !shift && !self.read_only => {
+            }) if (control || logo) && !shift && !self.is_read_only() => {
                 if session.undo() {
                     cx.redraw_all();
                     actions.push(CodeEditorAction::TextDidChange);
@@ -968,7 +1634,18 @@ impl CodeEditor {
                         ..
                     },
                 ..
-            }) if (control || logo) && shift && !self.read_only => {
+            }) if (control || logo) && shift && !self.is_read_only() => {
+                if session.redo() {
+                    self.redraw(cx);
+                    actions.push(CodeEditorAction::TextDidChange);
+                    keyboard_moved_cursor = true;
+                }
+            }
+            Hit::KeyDown(KeyEvent {
+                key_code: KeyCode::KeyY,
+                modifiers: KeyModifiers { control: true, shift: false, alt: false, .. },
+                ..
+            }) if !self.is_read_only() => {
                 if session.redo() {
                     self.redraw(cx);
                     actions.push(CodeEditorAction::TextDidChange);
@@ -976,6 +1653,15 @@ impl CodeEditor {
                 }
             }
             Hit::KeyDown(ke) => actions.push(CodeEditorAction::UnhandledKeyDown(ke)),
+            // A touch that can scroll only acts on the text once it's a tap.
+            Hit::FingerDown(FingerDownEvent { device: DigitDevice::Touch { .. }, .. })
+            | Hit::FingerMove(FingerMoveEvent { device: DigitDevice::Touch { .. }, .. })
+                if can_touch_scroll => {}
+            Hit::FingerUp(fe) if can_touch_scroll && fe.device.is_touch() => {
+                if fe.was_tap() {
+                    self.select_at(cx, session, fe.abs, fe.tap_count);
+                }
+            }
             Hit::FingerDown(FingerDownEvent {
                 abs,
                 tap_count,
@@ -987,27 +1673,8 @@ impl CodeEditor {
                     },
                 ..
             }) => {
-                self.animator_play(cx, ids!(focus.on));
-                cx.set_key_focus(self.scroll_bars.area());
-                let ((cursor, affinity), is_in_gutter) = self.pick(session, abs);
-                session.set_selection(
-                    cursor,
-                    affinity,
-                    if is_in_gutter {
-                        SelectionMode::Line
-                    } else {
-                        match tap_count {
-                            1 => SelectionMode::Simple,
-                            2 => SelectionMode::Word,
-                            _ => SelectionMode::Line,
-                            //_ => SelectionMode::All,
-                        }
-                    },
-                    NewGroup::Yes,
-                );
-                self.reset_cursor_blinker(cx);
+                self.select_at(cx, session, abs, tap_count);
                 self.keep_cursor_in_view = KeepCursorInView::Always(abs, cx.new_next_frame());
-                self.redraw(cx);
             }
             Hit::FingerDown(FingerDownEvent {
                 abs,
@@ -1021,7 +1688,7 @@ impl CodeEditor {
                 ..
             }) => {
                 self.animator_play(cx, ids!(focus.on));
-                cx.set_key_focus(self.scroll_bars.area());
+                cx.set_key_focus_from_user(self.scroll_bars.area());
                 let ((cursor, affinity), is_in_gutter) = self.pick(session, abs);
                 session.add_selection(
                     cursor,
@@ -1066,12 +1733,18 @@ impl CodeEditor {
             }
             _ => {}
         }
+        // After our own hits, so a mouse press that selects has already claimed its drag.
+        self.scroll_bars.handle_scroll_event(cx, event, scope, &mut scroll_actions);
+        if !scroll_actions.is_empty() {
+            self.redraw(cx);
+        }
         if keyboard_moved_cursor {
             self.keep_cursor_in_view = KeepCursorInView::Once;
             self.reset_cursor_blinker(cx);
         }
         if let KeepCursorInView::Always(abs, next) = &mut self.keep_cursor_in_view {
             if next.is_event(event).is_some() {
+                if self.read_only || self.document_read_only { self.keep_cursor_in_view = KeepCursorInView::Off; return actions; }
                 *next = cx.new_next_frame();
                 let abs = *abs;
                 let ((cursor, affinity), _) = self.pick(session, abs);
@@ -1082,9 +1755,158 @@ impl CodeEditor {
         actions
     }
 
+    /// Puts the cursor at `abs`, or selects the word or line there on a double or triple press.
+    fn select_at(&mut self, cx: &mut Cx, session: &CodeSession, abs: Vec2d, tap_count: u32) {
+        self.animator_play(cx, ids!(focus.on));
+        cx.set_key_focus_from_user(self.scroll_bars.area());
+        let ((cursor, affinity), is_in_gutter) = self.pick(session, abs);
+        session.set_selection(
+            cursor,
+            affinity,
+            if is_in_gutter {
+                SelectionMode::Line
+            } else {
+                match tap_count {
+                    1 => SelectionMode::Simple,
+                    2 => SelectionMode::Word,
+                    _ => SelectionMode::Line,
+                    //_ => SelectionMode::All,
+                }
+            },
+            NewGroup::Yes,
+        );
+        self.reset_cursor_blinker(cx);
+        self.redraw(cx);
+    }
+
+    fn gutter_columns(&self, session: &CodeSession) -> usize {
+        if session.document().gutter_mode() == GutterMode::Diff {
+            if let Some(diff) = session.document().diff_metadata() {
+                return diff.gutter_digits() * 2 + 6;
+            }
+        }
+        session.document().as_text().as_lines().len().to_string().len() + 1
+    }
+
+    fn draw_diff_rect(&mut self, cx: &mut Cx2d, ty: DecorationType, rect: Rect, opacity: f32) {
+        let draw = match ty {
+            DecorationType::DiffAdded => &mut self.draw_diff_added,
+            DecorationType::DiffRemoved => &mut self.draw_diff_removed,
+            DecorationType::DiffChangedGutter => &mut self.draw_diff_changed,
+            _ => return,
+        };
+        let color = draw.color;
+        draw.color.w *= opacity * self.content_opacity;
+        draw.draw_abs(cx, rect);
+        draw.color = color;
+    }
+
+    /// Independent of glyph count: empty and wrapped rows have the same full-width tint.
+    fn diff_row_rect(&self, session: &CodeSession, line_index: usize) -> Option<Rect> {
+        let layout = session.layout();
+        let line = layout.line(line_index);
+        let left = self.unscrolled_rect.pos.x + self.metrics(session).gutter_width + self.pad_left_top.x;
+        let right = self.unscrolled_rect.pos.x + self.unscrolled_rect.size.x;
+        let top = (self.viewport_rect.pos.y + line.y() * self.cell_size.y).max(self.unscrolled_rect.pos.y);
+        let bottom = (self.viewport_rect.pos.y + (line.y() + line.height()) * self.cell_size.y)
+            .min(self.unscrolled_rect.pos.y + self.viewport_rect.size.y + self.pad_left_top.y);
+        (right > left && bottom > top).then_some(Rect {
+            pos: dvec2(left, top), size: dvec2(right - left, bottom - top),
+        })
+    }
+
+    fn draw_line_washes(&mut self, cx: &mut Cx2d, session: &CodeSession) {
+        if self.line_washes.is_empty() {
+            return;
+        }
+        let line_count = session.document().as_text().as_lines().len();
+        let washes = mem::take(&mut self.line_washes);
+        let color = self.draw_line_wash.color;
+        for (range, opacity) in &washes {
+            let start = range.start.max(self.line_start);
+            let end = range.end.min(self.line_end).min(line_count);
+            self.draw_line_wash.color.w = color.w * opacity.clamp(0.0, 1.0) * self.content_opacity;
+            for row in start..end {
+                if let Some(rect) = self.diff_row_rect(session, row) {
+                    self.draw_line_wash.draw_abs(cx, rect);
+                }
+            }
+        }
+        self.draw_line_wash.color = color;
+        self.line_washes = washes;
+    }
+
+    fn draw_diff_backgrounds(&mut self, cx: &mut Cx2d, session: &CodeSession) {
+        let decorations = session.document().decorations();
+        let start = decorations.partition_point(|decoration| decoration.end().line_index < self.line_start);
+        for decoration in &decorations[start..] {
+            if decoration.start().line_index >= self.line_end { break; }
+            if !matches!(decoration.ty, DecorationType::DiffAdded | DecorationType::DiffRemoved) { continue; }
+            let end = decoration.end().line_index + usize::from(decoration.end().byte_index != 0);
+            for row in decoration.start().line_index.max(self.line_start)..end.min(self.line_end) {
+                if let Some(rect) = self.diff_row_rect(session, row) {
+                    self.draw_diff_rect(cx, decoration.ty, rect, 0.14);
+                }
+            }
+        }
+    }
+
+    /// The find matches on the visible lines, as rects in draw space; a match
+    /// a wrap splits gets one rect per row.
+    fn find_rects(&self, session: &CodeSession) -> Vec<(Rect, bool)> {
+        let mut rects = Vec::new();
+        if self.find_matches.is_empty() || self.cell_size.x <= 0.0 {
+            return rects;
+        }
+        let layout = session.layout();
+        let view = layout.view_line_range();
+        let lines = layout.as_text().as_lines();
+        let first = self.find_matches.partition_point(|m| m.0.line_index < self.line_start);
+        for (index, &(start, end)) in self.find_matches.iter().enumerate().skip(first) {
+            if start.line_index >= self.line_end {
+                break;
+            }
+            if !view.contains(&start.line_index) || start.line_index >= lines.len() {
+                continue;
+            }
+            let range = layout.line_byte_range(start.line_index);
+            if start.byte_index < range.start || end.byte_index > range.end || end.byte_index <= start.byte_index {
+                continue;
+            }
+            let line = layout.line(start.line_index);
+            let (first_row, first_column) = line.logical_to_grid_position(start.byte_index, Affinity::After);
+            let (last_row, last_column) = line.logical_to_grid_position(end.byte_index, Affinity::Before);
+            for row in first_row..=last_row {
+                let from = if row == first_row { first_column } else { line.wrap_indent_column_count() };
+                let to = if row == last_row { last_column } else { line.column_count() };
+                if to <= from {
+                    continue;
+                }
+                let mut rect = self.grid_rect(line, row, from, to - from);
+                rect.pos += self.unscrolled_rect.pos;
+                rects.push((rect, Some(index) == self.find_current));
+            }
+        }
+        rects
+    }
+
+    fn draw_find_layer(&mut self, cx: &mut Cx2d, session: &CodeSession) {
+        for (rect, current) in self.find_rects(session) {
+            let (draw, opacity) = if current {
+                (&mut self.draw_find_current, 0.55)
+            } else {
+                (&mut self.draw_find_match, 0.22)
+            };
+            let color = draw.color;
+            draw.color.w *= opacity * self.content_opacity;
+            draw.draw_abs(cx, rect);
+            draw.color = color;
+        }
+    }
+
     fn draw_gutter(&mut self, cx: &mut Cx2d, session: &CodeSession) {
         let mut line_index = self.line_start;
-        let mut origin_y = session.layout().line(self.line_start).y();
+        let mut origin_y = session.layout().block_y(self.line_start);
         let mut buf = String::new();
         for element in session
             .layout()
@@ -1092,15 +1914,42 @@ impl CodeEditor {
         {
             match element {
                 BlockElement::Line { line, .. } => {
-                    self.draw_gutter.font_scale = line.scale() as f32;
+                    if line.scale() * self.cell_size.y < LEGIBLE_LINE_HEIGHT {
+                        line_index += 1;
+                        origin_y += line.height();
+                        continue;
+                    }
+                    self.draw_gutter.font_scale = self.base_font_scale * line.scale() as f32;
                     buf.clear();
-                    match self.gutter_chars {
-                        0 | 1 => write!(buf, "{: >0}", line_index + 1).unwrap(),
-                        2 => write!(buf, "{: >1}", line_index + 1).unwrap(),
-                        3 => write!(buf, "{: >2}", line_index + 1).unwrap(),
-                        4 => write!(buf, "{: >3}", line_index + 1).unwrap(),
-                        5 => write!(buf, "{: >4}", line_index + 1).unwrap(),
-                        _ => write!(buf, "{: >5}", line_index + 1).unwrap(),
+                    let diff = session.document().diff_metadata()
+                        .filter(|_| session.document().gutter_mode() == GutterMode::Diff);
+                    if let Some(diff) = diff {
+                        let row = &diff.rows[line_index];
+                        let digits = diff.gutter_digits();
+                        let old = row.old.as_ref().map(|line| (line.line + 1).to_string()).unwrap_or_default();
+                        let new = row.new.as_ref().map(|line| (line.line + 1).to_string()).unwrap_or_default();
+                        let mark = match row.kind {
+                            Some(DiffRowKind::Added) => "+",
+                            Some(DiffRowKind::Removed) => "-",
+                            _ => " ",
+                        };
+                        write!(buf, "{old:>digits$} | {new:>digits$} {mark}").unwrap();
+                        if let Some(ty) = row.gutter_mark {
+                            self.draw_diff_rect(cx, ty, Rect {
+                                pos: dvec2(self.gutter_rect.pos.x + self.gutter_rect.size.x - self.cell_size.x * 0.3,
+                                    self.viewport_rect.pos.y + origin_y * self.cell_size.y),
+                                size: dvec2(self.cell_size.x * 0.2, line.height() * self.cell_size.y),
+                            }, 1.0);
+                        }
+                    } else {
+                        match self.gutter_chars {
+                            0 | 1 => write!(buf, "{: >0}", line_index + 1).unwrap(),
+                            2 => write!(buf, "{: >1}", line_index + 1).unwrap(),
+                            3 => write!(buf, "{: >2}", line_index + 1).unwrap(),
+                            4 => write!(buf, "{: >3}", line_index + 1).unwrap(),
+                            5 => write!(buf, "{: >4}", line_index + 1).unwrap(),
+                            _ => write!(buf, "{: >5}", line_index + 1).unwrap(),
+                        }
                     }
                     self.draw_gutter.draw_abs(
                         cx,
@@ -1112,7 +1961,7 @@ impl CodeEditor {
                             + dvec2(
                                 (1.0 - line.scale()) * -self.cell_size.x + self.gutter_rect.size.x
                                     - line.scale() * self.gutter_rect.size.x,
-                                self.cell_offset_y,
+                                self.cell_offset_y * line.scale(),
                             ),
                         &buf,
                     );
@@ -1129,14 +1978,39 @@ impl CodeEditor {
     fn draw_text_layer(&mut self, cx: &mut Cx2d, session: &CodeSession) {
         let highlighted_delimiter_positions = session.highlighted_delimiter_positions();
         let mut line_index = self.line_start;
-        let mut origin_y = session.layout().line(self.line_start).y();
+        let mut origin_y = session.layout().block_y(self.line_start);
+        // Only the columns in view draw: a long line (a list of hundreds of
+        // numbers) costs what fits in the viewport, not its whole length.
+        let scroll_x = self.scroll_bars.get_scroll_pos().x;
+        let (seen_x0, seen_x1) = (scroll_x - self.cell_size.x * 2.0, scroll_x + self.viewport_rect.size.x + self.cell_size.x * 2.0);
         for element in session
             .layout()
             .block_elements(self.line_start, self.line_end)
         {
             match element {
+                BlockElement::Line { line, .. } if line.scale() * self.cell_size.y < LEGIBLE_LINE_HEIGHT => {
+                    // Too small to read (folded): one bar from its indent to
+                    // its end, within the view.
+                    let columns = line.text().chars().count();
+                    let indent = line.indent_column_count().min(columns);
+                    if columns > indent {
+                        let (x0, y) = line.grid_to_normalized_position(0, indent);
+                        let (x1, _) = line.grid_to_normalized_position(0, columns);
+                        let (x0, x1) = ((x0 * self.cell_size.x).max(seen_x0), (x1 * self.cell_size.x).min(seen_x1));
+                        if x1 > x0 {
+                            let h = (line.scale() * self.cell_size.y * 0.6).max(0.5);
+                            self.draw_folded.color.w = 0.5 * self.content_opacity;
+                            self.draw_folded.draw_abs(cx, Rect {
+                                pos: dvec2(x0 + self.viewport_rect.pos.x, (origin_y + y) * self.cell_size.y + self.viewport_rect.pos.y + (line.scale() * self.cell_size.y - h) * 0.5),
+                                size: dvec2(x1 - x0, h),
+                            });
+                        }
+                    }
+                    line_index += 1;
+                    origin_y += line.height();
+                }
                 BlockElement::Line { line, .. } => {
-                    self.draw_text.font_scale = line.scale() as f32;
+                    self.draw_text.font_scale = self.base_font_scale * line.scale() as f32;
                     let mut token_iter = line.tokens().iter().copied();
                     let mut token_slot = token_iter.next();
                     let mut row_index = 0;
@@ -1172,24 +2046,7 @@ impl CodeEditor {
                                     };
                                     let (text_0, text_1) = text.split_at(token.len);
                                     text = text_1;
-                                    self.draw_text.color = match token.kind {
-                                        TokenKind::Unknown => self.token_colors.unknown,
-                                        TokenKind::BranchKeyword => {
-                                            self.token_colors.branch_keyword
-                                        }
-                                        TokenKind::Comment => self.token_colors.comment,
-                                        TokenKind::Constant => self.token_colors.constant,
-                                        TokenKind::Delimiter => self.token_colors.delimiter,
-                                        TokenKind::Identifier => self.token_colors.identifier,
-                                        TokenKind::LoopKeyword => self.token_colors.loop_keyword,
-                                        TokenKind::Number => self.token_colors.number,
-                                        TokenKind::OtherKeyword => self.token_colors.other_keyword,
-                                        TokenKind::Punctuator => self.token_colors.punctuator,
-                                        TokenKind::String => self.token_colors.string,
-                                        TokenKind::Function => self.token_colors.function,
-                                        TokenKind::Typename => self.token_colors.typename,
-                                        TokenKind::Whitespace => self.token_colors.whitespace,
-                                    };
+                                    self.draw_text.color = self.token_colors.color(token.kind);
                                     self.draw_text.outline = 0.0;
                                     if let TokenKind::Delimiter = token.kind {
                                         if highlighted_delimiter_positions.contains(&Position {
@@ -1201,20 +2058,33 @@ impl CodeEditor {
                                                 self.token_colors.delimiter_highlight
                                         }
                                     }
+                                    self.draw_text.color.w *= self.content_opacity;
+                                    let visible_bytes = session.layout().line_byte_range(line_index);
                                     for grapheme in text_0.graphemes() {
+                                        if byte_index < visible_bytes.start || byte_index + grapheme.len() > visible_bytes.end {
+                                            byte_index += grapheme.len();
+                                            column_index += grapheme.column_count_at(column_index, line.tab_column_count);
+                                            continue;
+                                        }
                                         let (x, y) = line
                                             .grid_to_normalized_position(row_index, column_index);
+                                        let x_px = x * self.cell_size.x;
+                                        if x_px < seen_x0 || x_px > seen_x1 {
+                                            byte_index += grapheme.len();
+                                            column_index += grapheme.column_count_at(column_index, line.tab_column_count);
+                                            continue;
+                                        }
                                         self.draw_text.draw_abs(
                                             cx,
                                             Vec2d { x, y: origin_y + y } * self.cell_size
                                                 + dvec2(
                                                     self.viewport_rect.pos.x,
-                                                    self.viewport_rect.pos.y + self.cell_offset_y,
+                                                    self.viewport_rect.pos.y + self.cell_offset_y * line.scale(),
                                                 ),
                                             grapheme,
                                         );
                                         byte_index += grapheme.len();
-                                        column_index += grapheme.column_count();
+                                        column_index += grapheme.column_count_at(column_index, line.tab_column_count);
                                     }
                                 }
                             }
@@ -1224,13 +2094,16 @@ impl CodeEditor {
                             } => {
                                 let (x, y) =
                                     line.grid_to_normalized_position(row_index, column_index);
-                                self.draw_text.draw_abs(
-                                    cx,
-                                    Vec2d { x, y: origin_y + y } * self.cell_size
-                                        + self.viewport_rect.pos,
-                                    text,
-                                );
-                                column_index += text.column_count();
+                                // (An inlay at the line's end shows too: a
+                                // value written after the line.)
+                                let shown = session.layout().line_byte_range(line_index);
+                                let line_len = session.layout().as_text().as_lines()[line_index].len();
+                                if shown.contains(&byte_index) || (byte_index == shown.end && byte_index == line_len) {
+                                    self.draw_text.color = self.token_colors.identifier;
+                                    self.draw_text.color.w *= self.content_opacity;
+                                    self.draw_text.draw_abs(cx, Vec2d { x, y: origin_y + y } * self.cell_size + self.viewport_rect.pos, text);
+                                }
+                                column_index += text.column_count_at(column_index, line.tab_column_count);
                             }
                             WrappedElement::Widget(widget) => {
                                 column_index += widget.column_count;
@@ -1252,7 +2125,7 @@ impl CodeEditor {
     }
 
     fn draw_indent_guide_layer(&mut self, cx: &mut Cx2d, session: &CodeSession) {
-        let mut origin_y = session.layout().line(self.line_start).y();
+        let mut origin_y = session.layout().block_y(self.line_start);
         for element in session
             .layout()
             .block_elements(self.line_start, self.line_end)
@@ -1349,6 +2222,11 @@ impl CodeEditor {
         session: &CodeSession,
         position: Vec2d,
     ) -> ((Position, Affinity), bool) {
+        let ((position, affinity), gutter) = self.pick_unclamped(session, position);
+        ((session.clamp_position(position), affinity), gutter)
+    }
+
+    fn pick_unclamped(&self, session: &CodeSession, position: Vec2d) -> ((Position, Affinity), bool) {
         let position = (position - self.viewport_rect.pos) / self.cell_size;
 
         if position.y < 0.0 {
@@ -1378,7 +2256,7 @@ impl CodeEditor {
             );
         }
         let mut line_index = layout.find_first_line_ending_after_y(position.y);
-        let mut origin_y = layout.line(line_index).y();
+        let mut origin_y = layout.block_y(line_index);
         for block in layout.block_elements(line_index, line_index + 1) {
             match block {
                 BlockElement::Line {
@@ -1401,7 +2279,11 @@ impl CodeEditor {
                                     let start_y = origin_y + y;
                                     let (end_x, _) = line.grid_to_normalized_position(
                                         row_index,
-                                        column_index + grapheme.column_count(),
+                                        column_index
+                                            + grapheme.column_count_at(
+                                                column_index,
+                                                line.tab_column_count,
+                                            ),
                                     );
                                     let end_y = start_y + line.scale();
                                     if (start_y..=end_y).contains(&position.y) {
@@ -1432,7 +2314,7 @@ impl CodeEditor {
                                         }
                                     }
                                     byte_index += grapheme.len();
-                                    column_index += grapheme.column_count();
+                                    column_index += grapheme.column_count_at(column_index, line.tab_column_count);
                                 }
                             }
                             WrappedElement::Text {
@@ -1444,7 +2326,11 @@ impl CodeEditor {
                                 let start_y = origin_y + y;
                                 let (end_x, _) = line.grid_to_normalized_position(
                                     row_index,
-                                    column_index + text.column_count(),
+                                    column_index
+                                        + text.column_count_at(
+                                            column_index,
+                                            line.tab_column_count,
+                                        ),
                                 );
                                 let end_y = origin_y + line.scale();
                                 if (start_y..=end_y).contains(&position.y)
@@ -1461,7 +2347,7 @@ impl CodeEditor {
                                         false,
                                     );
                                 }
-                                column_index += text.column_count();
+                                column_index += text.column_count_at(column_index, line.tab_column_count);
                             }
                             WrappedElement::Widget(widget) => {
                                 column_index += widget.column_count;
@@ -1572,11 +2458,38 @@ impl CodeEditor {
                     origin_y += line.height();
                 }
                 BlockElement::Widget(widget) => {
+                    // A point on a block widget (a host's inline row, e.g.
+                    // a visualisation above a line) picks the start of the
+                    // line it sits above.
+                    if (origin_y..=origin_y + widget.height).contains(&position.y) {
+                        return (
+                            (
+                                Position {
+                                    line_index,
+                                    byte_index: 0,
+                                },
+                                Affinity::Before,
+                            ),
+                            false,
+                        );
+                    }
                     origin_y += widget.height;
                 }
             }
         }
-        panic!()
+        // Past every element (rounding at the bottom edge): the end.
+        let line_count = session.document().as_text().as_lines().len();
+        let last = line_count.saturating_sub(1);
+        (
+            (
+                Position {
+                    line_index: last,
+                    byte_index: usize::MAX,
+                },
+                Affinity::After,
+            ),
+            false,
+        )
     }
 }
 
@@ -1597,7 +2510,7 @@ struct DrawDecorationLayer<'a> {
 impl<'a> DrawDecorationLayer<'a> {
     fn draw_decoration_layer(&mut self, cx: &mut Cx2d, session: &CodeSession) {
         let mut line_index = self.code_editor.line_start;
-        let mut origin_y = session.layout().line(line_index).y();
+        let mut origin_y = session.layout().block_y(line_index);
         for block in session
             .layout()
             .block_elements(self.code_editor.line_start, self.code_editor.line_end)
@@ -1638,7 +2551,7 @@ impl<'a> DrawDecorationLayer<'a> {
                                         column_index,
                                     );
                                     byte_index += grapheme.len();
-                                    column_index += grapheme.column_count();
+                                    column_index += grapheme.column_count_at(column_index, line.tab_column_count);
                                     self.handle_event(
                                         cx,
                                         line_index,
@@ -1655,7 +2568,7 @@ impl<'a> DrawDecorationLayer<'a> {
                                 is_inlay: true,
                                 text,
                             } => {
-                                column_index += text.column_count();
+                                column_index += text.column_count_at(column_index, line.tab_column_count);
                             }
                             WrappedElement::Widget(widget) => {
                                 column_index += widget.column_count;
@@ -1758,8 +2671,10 @@ impl<'a> DrawDecorationLayer<'a> {
             match self.active_decoration.as_mut().unwrap().decoration.ty {
                 DecorationType::Warning => self.code_editor.token_colors.warning_decoration,
                 DecorationType::Error => self.code_editor.token_colors.error_decoration,
+                DecorationType::DiffAdded | DecorationType::DiffRemoved | DecorationType::DiffChangedGutter => return,
             };
 
+        self.code_editor.draw_decoration.color.w *= self.code_editor.content_opacity;
         self.code_editor.draw_decoration.draw_abs(
             cx,
             Rect {
@@ -1791,7 +2706,7 @@ struct DrawSelectionLayer<'a> {
 impl<'a> DrawSelectionLayer<'a> {
     fn draw_selection_layer(&mut self, cx: &mut Cx2d, session: &CodeSession) {
         let mut line_index = self.code_editor.line_start;
-        let mut origin_y = session.layout().line(line_index).y();
+        let mut origin_y = session.layout().block_y(line_index);
         for block in session
             .layout()
             .block_elements(self.code_editor.line_start, self.code_editor.line_end)
@@ -1832,7 +2747,7 @@ impl<'a> DrawSelectionLayer<'a> {
                                         column_index,
                                     );
                                     byte_index += grapheme.len();
-                                    column_index += grapheme.column_count();
+                                    column_index += grapheme.column_count_at(column_index, line.tab_column_count);
                                     self.draw_selection_event(
                                         cx,
                                         line_index,
@@ -1849,7 +2764,7 @@ impl<'a> DrawSelectionLayer<'a> {
                                 is_inlay: true,
                                 text,
                             } => {
-                                column_index += text.column_count();
+                                column_index += text.column_count_at(column_index, line.tab_column_count);
                             }
                             WrappedElement::Widget(widget) => {
                                 column_index += widget.column_count;
@@ -1985,6 +2900,7 @@ impl<'a> DrawSelectionLayer<'a> {
         row_index: usize,
         column_index: usize,
     ) {
+        if self.code_editor.read_only { return; }
         let (x, y) = line.grid_to_normalized_position(row_index, column_index);
 
         self.code_editor.draw_cursor.draw_abs(
@@ -1993,7 +2909,7 @@ impl<'a> DrawSelectionLayer<'a> {
                 pos: Vec2d { x, y: origin_y + y } * self.code_editor.cell_size
                     + self.code_editor.viewport_rect.pos,
                 size: Vec2d {
-                    x: 2.0,
+                    x: 2.0 * self.code_editor.base_font_scale as f64 * line.scale(),
                     y: line.scale() * self.code_editor.cell_size.y,
                 },
             },
@@ -2008,6 +2924,7 @@ impl<'a> DrawSelectionLayer<'a> {
         row_index: usize,
         column_index: usize,
     ) {
+        if self.code_editor.is_read_only() { return; }
         let (_x, y) = line.grid_to_normalized_position(row_index, column_index);
 
         self.code_editor.draw_cursor_bg.draw_abs(
@@ -2032,8 +2949,10 @@ struct ActiveSelection {
     start_x: f64,
 }
 
+/// The colour of each kind of token, as the editor draws them; a view that
+/// shows code outside an editor colours it the same way.
 #[derive(Script, ScriptHook)]
-struct TokenColors {
+pub struct TokenColors {
     #[live]
     unknown: Vec4f,
     #[live]
@@ -2048,6 +2967,10 @@ struct TokenColors {
     delimiter_highlight: Vec4f,
     #[live]
     identifier: Vec4f,
+    #[live]
+    macro_identifier: Vec4f,
+    #[live]
+    attribute: Vec4f,
     #[live]
     loop_keyword: Vec4f,
     #[live]
@@ -2070,6 +2993,30 @@ struct TokenColors {
     warning_decoration: Vec4f,
 }
 
+impl TokenColors {
+    /// The colour a token of `kind` draws in.
+    pub fn color(&self, kind: TokenKind) -> Vec4f {
+        match kind {
+            TokenKind::Unknown => self.unknown,
+            TokenKind::BranchKeyword => self.branch_keyword,
+            TokenKind::Comment => self.comment,
+            TokenKind::Constant => self.constant,
+            TokenKind::Delimiter => self.delimiter,
+            TokenKind::Identifier => self.identifier,
+            TokenKind::Macro => self.macro_identifier,
+            TokenKind::Attribute => self.attribute,
+            TokenKind::LoopKeyword => self.loop_keyword,
+            TokenKind::Number => self.number,
+            TokenKind::OtherKeyword => self.other_keyword,
+            TokenKind::Punctuator => self.punctuator,
+            TokenKind::String => self.string,
+            TokenKind::Function => self.function,
+            TokenKind::Typename => self.typename,
+            TokenKind::Whitespace => self.whitespace,
+        }
+    }
+}
+
 #[derive(Script, ScriptHook)]
 #[repr(C)]
 pub struct DrawIndentGuide {
@@ -2087,3 +3034,7 @@ struct DrawDecoration {
     #[live]
     color: Vec4f,
 }
+
+#[cfg(test)]
+#[path = "../tests/editor_apis/mod.rs"]
+mod editor_api_tests;

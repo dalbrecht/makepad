@@ -1,0 +1,200 @@
+//! Which theme the catalogue runs under, and switching it while it runs.
+//!
+//! The library binds `theme` into the widget prelude between `theme_mod` and
+//! `widgets_mod`, so the choice has to be made between those two calls. The
+//! app's `script_mod` does exactly that, reading a process-wide choice. A
+//! switch stores the choice and asks the platform for a live edit: the whole
+//! `script_mod` runs again and every widget is re-applied from its template
+//! under the new theme, in about ten milliseconds. Typed text and running
+//! animations do not survive that, which is the price of a real switch.
+use crate::makepad_widgets::desktop_style::{self, SheetEntry, StyleSheet};
+use crate::makepad_widgets::*;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// The three themes the library is written in. Everything after them in the
+/// list is a style sheet laid over one of these.
+const BASE: &[&str] = &["dark", "light", "skeleton"];
+
+static CHOICE: AtomicU8 = AtomicU8::new(0);
+
+/// One thing the picker offers: a base theme, or a sheet of the catalogue.
+#[derive(Clone, Copy, Debug)]
+pub enum Choice {
+    Base(usize),
+    Sheet(&'static SheetEntry),
+}
+
+impl PartialEq for Choice {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Choice::Base(a), Choice::Base(b)) => a == b,
+            (Choice::Sheet(a), Choice::Sheet(b)) => std::ptr::eq(*a, *b),
+            _ => false,
+        }
+    }
+}
+
+/// Everything the picker offers, in the order it offers it: the base themes,
+/// then every sheet of the catalogue, in its order (each dark variant after
+/// its light one).
+///
+/// Read off the library's own list rather than written out here, so a sheet
+/// added there turns up in the catalogue without anybody remembering to add
+/// it, and so the catalogue names none of them itself.
+/// The sheets whose design frames the catalogue's panes as windows: the
+/// segment display's windows set into its black plate, the handheld's
+/// screens in its shell, the frosted sheet's panes of glass over its ground,
+/// the liquid sheet's panes of light glass over its blobs. Under every other sheet the panes are clear and the window's own ground
+/// shows through them, as it always did; a sheet whose ground is its design
+/// (the futuristic metal hull, the cyberpunk board) would lose it under a
+/// pane of panel.
+const FRAMING_SHEETS: &[&str] = &["segment-display", "handheld", "frosted-glass", "liquid-glass"];
+
+/// Whether the catalogue's panes are drawn as the sheet's panels.
+pub fn frames_panes() -> bool {
+    match choices().get(choice()) {
+        Some(Choice::Sheet(entry)) => FRAMING_SHEETS.contains(&entry.id),
+        _ => false,
+    }
+}
+
+pub fn choices() -> Vec<Choice> {
+    let mut out: Vec<Choice> = (0..BASE.len()).map(Choice::Base).collect();
+    out.extend(desktop_style::catalogue().into_iter().map(Choice::Sheet));
+    out
+}
+
+impl Choice {
+    /// What a settings file and the remote surface call it.
+    pub fn name(self) -> String {
+        match self {
+            Choice::Base(i) => BASE[i].to_string(),
+            Choice::Sheet(entry) => entry.id.to_string(),
+        }
+    }
+
+    /// What the picker shows.
+    pub fn label(self) -> String {
+        match self {
+            Choice::Base(i) => {
+                let mut c = BASE[i].chars();
+                c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+            }
+            Choice::Sheet(entry) => entry.label.to_string(),
+        }
+    }
+}
+
+pub fn names() -> Vec<String> {
+    choices().into_iter().map(Choice::name).collect()
+}
+
+pub fn labels() -> Vec<String> {
+    choices().into_iter().map(Choice::label).collect()
+}
+
+pub fn choice() -> usize {
+    CHOICE.load(Ordering::Relaxed) as usize
+}
+
+pub fn index_of(name: &str) -> Option<usize> {
+    names().iter().position(|n| n == name)
+}
+
+/// Set the choice without applying it, for startup.
+pub fn set_choice(index: usize) {
+    CHOICE.store(index.min(choices().len() - 1) as u8, Ordering::Relaxed);
+}
+
+/// The library's `script_mod` split around the theme choice.
+/// Write a pick into the library, which is where it is read back from.
+///
+/// The base theme and the installed sheet both live in the library now, so
+/// this list and the developer panel's own picker write to one place and
+/// cannot disagree. This used to be done on every `script_mod` run, which
+/// made whichever list ran last the winner: the panel's pick was undone a
+/// tick after it was made.
+pub fn apply_choice(vm: &mut ScriptVm, picked: Choice) {
+    // A sheet is laid over the base its own token half starts from
+    // (`mod.theme = mod.themes.light`): what the sheet does not restyle --
+    // the catalogue's own panels, which keep the stock widgets on purpose --
+    // then reads on the sheet's ground. Every sheet went over the dark base,
+    // so under a light sheet those panels drew near-white text on a light
+    // ground.
+    let sheet = match picked {
+        Choice::Sheet(entry) => Some(StyleSheet::load(entry)),
+        Choice::Base(_) => None,
+    };
+    let base = match (picked, &sheet) {
+        (Choice::Base(1), _) => BaseTheme::Light,
+        (Choice::Base(2), _) => BaseTheme::Skeleton,
+        (_, Some(sheet)) if sheet_base_is_light(&sheet.theme) => BaseTheme::Light,
+        _ => BaseTheme::Dark,
+    };
+    set_base_theme(vm.cx_mut(), base);
+    // A sheet goes on BEFORE `widgets_mod`, which reads it for its token
+    // half as its first act; and comes off again for a base theme, or the
+    // last sheet tried would stay under every theme picked after it.
+    match sheet {
+        Some(sheet) => desktop_style::install(vm, sheet),
+        None => desktop_style::uninstall(vm),
+    }
+}
+
+/// Whether a sheet's token half starts from the light base: its first
+/// `mod.theme = mod.themes.<base>` assignment names `light`.
+fn sheet_base_is_light(theme: &str) -> bool {
+    theme
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("mod.theme = mod.themes."))
+        .is_some_and(|base| base.trim_end().starts_with("light"))
+}
+
+pub fn widgets_script_mod(vm: &mut ScriptVm) {
+    crate::makepad_widgets::theme_mod(vm);
+    crate::makepad_widgets::widgets_mod(vm);
+    // The widget half of a sheet. The library's own `script_mod` does this
+    // and this function stands in for it, so without the call a sheet's
+    // tokens arrived and its buttons, fields and panels stayed as they were:
+    // half a style, which is the trap `desktop_style` warns of by name.
+    desktop_style::apply_widgets(vm);
+}
+
+/// Switch the running app to another theme.
+pub fn select(cx: &mut Cx, index: usize) {
+    let names = names();
+    if index >= names.len() || index == choice() {
+        return;
+    }
+    set_choice(index);
+    crate::settings::set(crate::settings::THEME, &names[index]);
+    log!("storybook: theme {}", names[index]);
+    let picked = choices()[index];
+    cx.with_vm(|vm| apply_choice(vm, picked));
+    // A style reload re-runs `script_mod` and then applies with
+    // `ScriptReapply` rather than `Reload`, so typed text and running
+    // animations survive the switch. `request_script_reapply` alone would
+    // not do: it does not re-run `script_mod`, and both halves of a switch
+    // are emitted there.
+    cx.request_style_reload();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sheet_base_is_light;
+
+    #[test]
+    fn a_sheet_starts_from_the_base_its_token_half_names() {
+        assert!(sheet_base_is_light("// porcelain
+mod.theme = mod.themes.light
+mod.theme.color_bg_app = #fff
+"));
+        assert!(!sheet_base_is_light("mod.theme = mod.themes.dark
+"));
+        assert!(!sheet_base_is_light("  mod.theme = mod.themes.skeleton
+"));
+        assert!(!sheet_base_is_light("mod.theme.color_bg_app = #fff
+"));
+    }
+}

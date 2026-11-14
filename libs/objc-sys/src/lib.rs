@@ -1,10 +1,13 @@
+// Unit tests and documentation examples require the macOS runtime.
+#![cfg(any(target_os = "macos", not(any(test, doctest))))]
+
 mod malloc_buf;
 
 pub use encode::{Encode, EncodeArguments, Encoding};
 pub use message::{Message, MessageArguments, MessageError};
 
-pub use message::send_message as __send_message;
-pub use message::send_super_message as __send_super_message;
+pub use message::send_message_or_panic as __send_message_or_panic;
+pub use message::send_super_message_or_panic as __send_super_message_or_panic;
 
 #[macro_use]
 mod macros;
@@ -14,9 +17,6 @@ mod encode;
 mod message;
 pub mod rc;
 pub mod runtime;
-
-//#[cfg(test)]
-//mod test_utils;
 
 #[macro_export]
 macro_rules!objc_block {

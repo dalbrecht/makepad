@@ -1,9 +1,12 @@
+use relax_api::relax_api;
 use crate::gen_index::GenRef;
 use crate::makepad_live_id::*;
 use crate::opcode::*;
 use std::fmt;
 
+#[relax_api(plain, run)]
 #[derive(PartialEq, Eq, Clone, Copy, Hash, Ord, PartialOrd)]
+#[repr(transparent)]
 pub struct ScriptValue(u64);
 
 pub const NIL: ScriptValue = ScriptValue::NIL;
@@ -16,74 +19,100 @@ impl Default for ScriptValue {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[relax_api(plain, run)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(C)]
 pub struct ScriptIp {
     pub body: u16,
     pub index: u32,
 }
 
 impl ScriptIp {
+    /// Sentinel for "no source construction site" (Rust-built objects,
+    /// recycled-slot default). Never a valid ip: bodies are indexed far
+    /// below u16::MAX. Deliberately NOT u40-packable — this is a struct
+    /// field sentinel, not a tag value.
+    pub const UNKNOWN: Self = Self {
+        body: u16::MAX,
+        index: u32::MAX,
+    };
+
+    #[inline]
+    pub const fn is_unknown(&self) -> bool {
+        self.body == u16::MAX && self.index == u32::MAX
+    }
+
+    /// Bits of the 40-bit packing that name the script body: 16384 bodies.
+    /// A long-running host that compiles code at runtime (live shaders,
+    /// visualizer presets) creates a body per module, so this is the limit
+    /// that is reached first.
+    pub const BODY_BITS: u32 = 14;
+    /// Bits for the instruction index within a body: 67 million opcodes,
+    /// far above the largest module source.
+    pub const INDEX_BITS: u32 = 40 - Self::BODY_BITS;
+    /// Bodies that can be packed; body ids at or above this would collide.
+    pub const MAX_BODIES: usize = 1 << Self::BODY_BITS;
+    /// Instructions per body that can be packed.
+    pub const MAX_INDEX: usize = 1 << Self::INDEX_BITS;
+
+    #[inline]
     pub const fn from_u40(value: u64) -> Self {
         Self {
-            body: ((value >> 28) & 0xFFF) as u16,
-            index: ((value) & 0xFFF_FFFF) as u32,
+            body: ((value >> Self::INDEX_BITS) & (Self::MAX_BODIES as u64 - 1)) as u16,
+            index: (value & (Self::MAX_INDEX as u64 - 1)) as u32,
         }
     }
+    #[inline]
     pub const fn to_u40(&self) -> u64 {
-        ((self.body as u64) << 28) | self.index as u64
+        ((self.body as u64) << Self::INDEX_BITS) | self.index as u64
     }
 }
 
-/// Generation type for use-after-free detection.
-/// When check_gen feature is enabled: 8 bits gives us 256 generations per slot before wraparound.
-/// When disabled: zero-sized type that compiles away.
-#[cfg(feature = "check_gen")]
-pub type Generation = u8;
-#[cfg(not(feature = "check_gen"))]
-pub type Generation = ();
+/// A slot's generation: the high byte is the heap's tag (see `crate::heap_tag`), the low byte
+/// counts the slot's frees (256 before wraparound). One compare checks both: a stale handle
+/// (use after free) and a handle minted by another heap (a cross-heap use) never validate.
+/// Slot 0 of every table, the null value, has generation 0 in every heap.
+pub type Generation = u16;
+
+/// The bits a heap ref's index has in a `ScriptValue` (the generation takes the next 16).
+pub const HEAP_INDEX_BITS: u32 = 24;
 
 /// Default generation value for new allocations
-#[cfg(feature = "check_gen")]
 pub const GENERATION_ZERO: Generation = 0;
-#[cfg(not(feature = "check_gen"))]
-pub const GENERATION_ZERO: Generation = ();
 
+#[relax_api(plain, run)]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(C)]
 pub struct ScriptPod {
     pub(crate) index: u32,
-    #[cfg(feature = "check_gen")]
     pub(crate) generation: Generation,
 }
 
 impl ScriptPod {
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn new(index: u32, generation: Generation) -> Self {
         Self { index, generation }
     }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn new(index: u32, _generation: Generation) -> Self {
-        Self { index }
-    }
+    #[inline]
     pub fn index(&self) -> u32 {
         self.index
     }
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub fn generation(&self) -> Generation {
         self.generation
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub fn generation(&self) -> Generation {
-        ()
     }
 }
 
 impl From<ScriptPod> for ScriptValue {
+    #[inline]
     fn from(v: ScriptPod) -> Self {
         ScriptValue::from_pod(v)
     }
 }
 
+#[relax_api(plain, run)]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(C)]
 pub struct ScriptPodType {
     pub(crate) index: u32,
 }
@@ -92,68 +121,53 @@ impl ScriptPodType {
     pub const VOID: ScriptPodType = ScriptPodType { index: 0 };
 }
 
+#[relax_api(plain, run)]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(C)]
 pub struct ScriptObject {
     pub(crate) index: u32,
-    #[cfg(feature = "check_gen")]
     pub(crate) generation: Generation,
 }
 
+#[relax_api(plain, run)]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(C)]
 pub struct ScriptArray {
     pub(crate) index: u32,
-    #[cfg(feature = "check_gen")]
     pub(crate) generation: Generation,
 }
 
 impl ScriptObject {
-    #[cfg(feature = "check_gen")]
     pub const ZERO: ScriptObject = ScriptObject {
         index: 0,
         generation: 0,
     };
-    #[cfg(not(feature = "check_gen"))]
-    pub const ZERO: ScriptObject = ScriptObject { index: 0 };
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn new(index: u32, generation: Generation) -> Self {
         Self { index, generation }
     }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn new(index: u32, _generation: Generation) -> Self {
-        Self { index }
-    }
+    #[inline]
     pub fn index(&self) -> u32 {
         self.index
     }
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub fn generation(&self) -> Generation {
         self.generation
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub fn generation(&self) -> Generation {
-        ()
     }
 }
 
 impl ScriptArray {
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn new(index: u32, generation: Generation) -> Self {
         Self { index, generation }
     }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn new(index: u32, _generation: Generation) -> Self {
-        Self { index }
-    }
+    #[inline]
     pub fn index(&self) -> u32 {
         self.index
     }
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub fn generation(&self) -> Generation {
         self.generation
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub fn generation(&self) -> Generation {
-        ()
     }
 }
 
@@ -203,19 +217,25 @@ impl GenRef for ScriptPod {
     }
 }
 
+#[relax_api(plain, run)]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(transparent)]
 pub struct ScriptHandleType(pub(crate) u8);
 
 impl ScriptHandleType {
+    #[inline]
     pub fn to_redux(&self) -> ScriptTypeRedux {
         ScriptTypeRedux(ScriptValueType::REDUX_HANDLE_FIRST.0 + self.0)
     }
 }
 
+#[relax_api(plain, run)]
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(transparent)]
 pub struct ScriptTypeRedux(u8);
 
 impl ScriptTypeRedux {
+    #[inline]
     pub(crate) fn to_index(&self) -> usize {
         self.0 as usize
     }
@@ -259,27 +279,60 @@ impl fmt::Display for ScriptTypeRedux {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+/// repr(C) with `index` first (8 bytes, one register at the C boundary); ordering, hashing and
+/// Debug keep the logical order (ty, index, generation).
+#[relax_api(plain, run)]
+#[derive(Default, Copy, Clone, Eq, PartialEq)]
+#[repr(C)]
 pub struct ScriptHandle {
-    pub(crate) ty: ScriptHandleType,
     pub(crate) index: u32,
-    #[cfg(feature = "check_gen")]
+    pub(crate) ty: ScriptHandleType,
     pub(crate) generation: Generation,
 }
 
 impl ScriptHandle {
-    #[cfg(feature = "check_gen")]
+    #[inline]
+    fn key(&self) -> (ScriptHandleType, u32, Generation) {
+        return (self.ty, self.index, self.generation);
+    }
+}
+
+impl PartialOrd for ScriptHandle {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScriptHandle {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl std::hash::Hash for ScriptHandle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ty.hash(state);
+        self.index.hash(state);
+        self.generation.hash(state);
+    }
+}
+
+impl std::fmt::Debug for ScriptHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("ScriptHandle");
+        d.field("ty", &self.ty).field("index", &self.index);
+        d.field("generation", &self.generation);
+        d.finish()
+    }
+}
+
+impl ScriptHandle {
     pub const ZERO: ScriptHandle = ScriptHandle {
         ty: ScriptHandleType(0),
         index: 0,
         generation: 0,
     };
-    #[cfg(not(feature = "check_gen"))]
-    pub const ZERO: ScriptHandle = ScriptHandle {
-        ty: ScriptHandleType(0),
-        index: 0,
-    };
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn new(ty: ScriptHandleType, index: u32, generation: Generation) -> Self {
         Self {
             ty,
@@ -287,20 +340,13 @@ impl ScriptHandle {
             generation,
         }
     }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn new(ty: ScriptHandleType, index: u32, _generation: Generation) -> Self {
-        Self { ty, index }
-    }
+    #[inline]
     pub fn index(&self) -> u32 {
         self.index
     }
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub fn generation(&self) -> Generation {
         self.generation
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub fn generation(&self) -> Generation {
-        ()
     }
 }
 
@@ -315,7 +361,6 @@ impl GenRef for ScriptHandle {
     fn generation(&self) -> Generation {
         self.generation()
     }
-    #[cfg(feature = "check_gen")]
     #[inline]
     fn new(index: u32, generation: Generation) -> Self {
         Self {
@@ -324,29 +369,24 @@ impl GenRef for ScriptHandle {
             generation,
         }
     }
-    #[cfg(not(feature = "check_gen"))]
-    #[inline]
-    fn new(index: u32, _generation: Generation) -> Self {
-        Self {
-            ty: ScriptHandleType(0),
-            index,
-        }
-    }
 }
 
 impl From<ScriptObject> for ScriptValue {
+    #[inline]
     fn from(v: ScriptObject) -> Self {
         ScriptValue::from_object(v)
     }
 }
 
 impl From<ScriptArray> for ScriptValue {
+    #[inline]
     fn from(v: ScriptArray) -> Self {
         ScriptValue::from_array(v)
     }
 }
 
 impl From<ScriptValue> for ScriptObject {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         if let Some(obj) = v.as_object() {
             obj
@@ -357,18 +397,21 @@ impl From<ScriptValue> for ScriptObject {
 }
 
 impl From<ScriptHandle> for ScriptValue {
+    #[inline]
     fn from(v: ScriptHandle) -> Self {
         ScriptValue::from_handle(v)
     }
 }
 
 impl From<ScriptPodType> for ScriptValue {
+    #[inline]
     fn from(v: ScriptPodType) -> Self {
         ScriptValue::from_pod_type(v)
     }
 }
 
 impl From<ScriptValue> for ScriptHandle {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         if let Some(obj) = v.as_handle() {
             obj
@@ -378,32 +421,25 @@ impl From<ScriptValue> for ScriptHandle {
     }
 }
 
+#[relax_api(plain, run)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ScriptRegex {
     pub(crate) index: u32,
-    #[cfg(feature = "check_gen")]
     pub(crate) generation: Generation,
 }
 
 impl ScriptRegex {
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn new(index: u32, generation: Generation) -> Self {
         Self { index, generation }
     }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn new(index: u32, _generation: Generation) -> Self {
-        Self { index }
-    }
+    #[inline]
     pub fn index(&self) -> u32 {
         self.index
     }
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub fn generation(&self) -> Generation {
         self.generation
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub fn generation(&self) -> Generation {
-        ()
     }
 }
 
@@ -423,34 +459,28 @@ impl GenRef for ScriptRegex {
 }
 
 impl From<ScriptRegex> for ScriptValue {
+    #[inline]
     fn from(v: ScriptRegex) -> Self {
         ScriptValue::from_regex(v)
     }
 }
 
+#[relax_api(plain, run)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(C)]
 pub struct ScriptString {
     pub index: u32,
-    #[cfg(feature = "check_gen")]
     pub generation: Generation,
 }
 
 impl ScriptString {
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn new(index: u32, generation: Generation) -> Self {
         Self { index, generation }
     }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn new(index: u32, _generation: Generation) -> Self {
-        Self { index }
-    }
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub fn generation(&self) -> Generation {
         self.generation
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub fn generation(&self) -> Generation {
-        ()
     }
 }
 
@@ -470,130 +500,156 @@ impl GenRef for ScriptString {
 }
 
 impl From<ScriptString> for ScriptValue {
+    #[inline]
     fn from(v: ScriptString) -> Self {
         ScriptValue::from_string(v)
     }
 }
 
 impl From<f64> for ScriptValue {
+    #[inline]
     fn from(v: f64) -> Self {
         ScriptValue::from_f64(v)
     }
 }
 
 impl From<ScriptValue> for f64 {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         v.as_f64().unwrap_or(0.0) as _
     }
 }
 
 impl From<u32> for ScriptValue {
+    #[inline]
     fn from(v: u32) -> Self {
         ScriptValue::from_f64(v as f64)
     }
 }
 
 impl From<ScriptValue> for u32 {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         v.as_f64().unwrap_or(0.0) as _
     }
 }
 
 impl From<i32> for ScriptValue {
+    #[inline]
     fn from(v: i32) -> Self {
         ScriptValue::from_f64(v as f64)
     }
 }
 
 impl From<ScriptValue> for i32 {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         v.as_f64().unwrap_or(0.0) as _
     }
 }
 
 impl From<u16> for ScriptValue {
+    #[inline]
     fn from(v: u16) -> Self {
         ScriptValue::from_f64(v as f64)
     }
 }
 
 impl From<ScriptValue> for u16 {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         v.as_f64().unwrap_or(0.0) as _
     }
 }
 
 impl From<u8> for ScriptValue {
+    #[inline]
     fn from(v: u8) -> Self {
         ScriptValue::from_f64(v as f64)
     }
 }
 
 impl From<ScriptValue> for u8 {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         v.as_f64().unwrap_or(0.0) as _
     }
 }
 
 impl From<f32> for ScriptValue {
+    #[inline]
     fn from(v: f32) -> Self {
         ScriptValue::from_f64(v as f64)
     }
 }
 
 impl From<ScriptValue> for f32 {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         v.as_f64().unwrap_or(0.0) as _
     }
 }
 
 impl From<usize> for ScriptValue {
+    #[inline]
     fn from(v: usize) -> Self {
         ScriptValue::from_f64(v as f64)
     }
 }
 
 impl From<ScriptValue> for usize {
+    #[inline]
     fn from(v: ScriptValue) -> Self {
         v.as_f64().unwrap_or(0.0) as _
     }
 }
 
 impl From<bool> for ScriptValue {
+    #[inline]
     fn from(v: bool) -> Self {
         ScriptValue::from_bool(v)
     }
 }
 
 impl From<LiveId> for ScriptValue {
+    #[inline]
     fn from(v: LiveId) -> Self {
         ScriptValue::from_id(v)
     }
 }
 
 impl From<&LiveId> for ScriptValue {
+    #[inline]
     fn from(v: &LiveId) -> Self {
         ScriptValue::from_id(*v)
     }
 }
 
 impl From<Opcode> for ScriptValue {
+    #[inline]
     fn from(v: Opcode) -> Self {
         ScriptValue::from_opcode(v)
     }
 }
 // NaN box value
 
+#[relax_api(plain, run)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct ValueError {
     pub ty: ScriptValueType,
     pub ip: ScriptIp,
 }
 
+#[relax_api(plain, run)]
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[repr(transparent)]
 pub struct ScriptValueType(u8);
 
 impl ScriptValueType {
+    /// The type's number, as the constants below define it.
+    pub const fn index(self) -> u8 {
+        self.0
+    }
     pub const F64: Self = Self(0);
     pub const NAN: Self = Self(1);
     pub const F32: Self = Self(2);
@@ -667,9 +723,11 @@ impl ScriptValueType {
     pub const REDUX_ID: ScriptTypeRedux = ScriptTypeRedux(18);
     pub const REDUX_HANDLE_FIRST: ScriptTypeRedux = ScriptTypeRedux(19);
 
+    #[inline]
     pub const fn to_u64(&self) -> u64 {
         ((self.0 as u64) << 40) | 0xFFFF_0000_0000_0000
     }
+    #[inline]
     pub const fn from_u64(val: u64) -> Self {
         let val = ((val >> 40) & 0xff) as u8;
         if val > Self::ID.0 {
@@ -689,6 +747,13 @@ impl ScriptValueType {
             } else {
                 Self::REDUX_STRING
             }
+        } else if self.0 >= Self::F32.0 && self.0 <= Self::U40.0 {
+            // Every numeric storage subtype (f32/f16/u32/i32/u40) IS a number:
+            // collapsing them here gives ints the number bucket's methods and
+            // makes int-vs-float type checks agree — an integer literal used
+            // to fail against a float default with the absurd diagnostic
+            // "expected number, got number" (NaN keeps its own bucket).
+            Self::REDUX_NUMBER
         } else {
             ScriptTypeRedux(self.0)
         }
@@ -762,6 +827,7 @@ pub trait IdExt {
 }
 
 impl IdExt for LiveId {
+    #[inline]
     fn escape(&self) -> ScriptValue {
         ScriptValue::from_escaped_id(*self)
     }
@@ -819,6 +885,7 @@ impl ScriptValue {
 
     pub const ESCAPED_ID: u64 = 0x0000_4000_0000_0000;
 
+    #[inline]
     pub const fn value_type(&self) -> ScriptValueType {
         if self.is_non_nan_number() {
             return ScriptValueType::F64;
@@ -849,15 +916,22 @@ impl ScriptValue {
     err_fn!(script_err_io, ERR_IO); // file system, child process
     err_fn!(script_err_limit, ERR_LIMIT); // resource limits
 
+    /// What a derived apply's field slot holds when the field is set nowhere along the prototype
+    /// chain (ScriptHeap::resolve_fields): the not-found error without a source position.
+    pub const NOT_FOUND: ScriptValue = Self::script_err_not_found(ScriptIp::UNKNOWN);
+
+    #[inline]
     pub const fn raw(&self) -> u64 {
         self.0
     }
 
+    #[inline]
     pub const fn is_err(&self) -> bool {
         (self.0 & Self::TYPE_MASK) >= ScriptValueType::ERR_FIRST.to_u64()
             && (self.0 & Self::TYPE_MASK) <= ScriptValueType::ERR_LAST.to_u64()
     }
 
+    #[inline]
     pub const fn as_err(&self) -> Option<ValueError> {
         if self.is_err() {
             Some(ValueError {
@@ -873,6 +947,7 @@ impl ScriptValue {
 
     pub const TYPE_OPCODE: u64 = ScriptValueType::OPCODE.to_u64();
 
+    #[inline]
     pub const fn from_opcode(op: Opcode) -> Self {
         Self(Self::TYPE_OPCODE | (op.0 as u64) << 32)
     }
@@ -882,6 +957,7 @@ impl ScriptValue {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_OPCODE
     }
 
+    #[inline]
     pub const fn from_opcode_args(op: Opcode, args: OpcodeArgs) -> Self {
         Self(Self::TYPE_OPCODE | (op.0 as u64) << 32 | (args.0 as u64))
     }
@@ -896,24 +972,28 @@ impl ScriptValue {
         None
     }
 
+    #[inline]
     pub const fn set_opcode_args(&mut self, args: OpcodeArgs) {
         if self.is_opcode() {
             self.0 = (self.0 & 0xffff_ffff_0000_0000) | (args.0 as u64);
         }
     }
 
+    #[inline]
     pub const fn set_opcode_args_pop_to_me(&mut self) {
         if self.is_opcode() {
             self.0 |= OpcodeArgs::POP_TO_ME_FLAG as u64;
         }
     }
 
+    #[inline]
     pub const fn clear_opcode_args_pop_to_me(&mut self) {
         if self.is_opcode() {
             self.0 &= !(OpcodeArgs::POP_TO_ME_FLAG as u64);
         }
     }
 
+    #[inline]
     pub const fn has_opcode_args_pop_to_me(&self) -> bool {
         if self.is_opcode() {
             self.0 & (OpcodeArgs::POP_TO_ME_FLAG as u64) != 0
@@ -922,6 +1002,7 @@ impl ScriptValue {
         }
     }
 
+    #[inline]
     pub const fn is_assign_opcode(&self) -> bool {
         if self.is_opcode() {
             let code = Opcode(((self.0 >> 32) & 0xff) as u8);
@@ -930,6 +1011,7 @@ impl ScriptValue {
         false
     }
 
+    #[inline]
     pub const fn is_let_opcode(&self) -> bool {
         if self.is_opcode() {
             let code = Opcode(((self.0 >> 32) & 0xff) as u8);
@@ -943,20 +1025,29 @@ impl ScriptValue {
 
     // NIL
 
+    #[inline]
     pub const fn is_nil(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_NIL
     }
 
     // number
 
+    #[inline]
     pub const fn is_number(&self) -> bool {
         self.0 <= Self::TYPE_NUMBER_MAX
     }
 
+    /// Any numeric value as f64. The f64 case (nearly every number a
+    /// script computes) is inlined into the caller.
+    #[inline]
     pub const fn as_number(&self) -> Option<f64> {
         if let Some(v) = self.as_f64() {
             return Some(v);
         }
+        self.as_number_not_f64()
+    }
+
+    const fn as_number_not_f64(&self) -> Option<f64> {
         if let Some(v) = self.as_u40() {
             return Some(v as _);
         }
@@ -977,14 +1068,17 @@ impl ScriptValue {
 
     // f32
 
+    #[inline]
     pub const fn from_f32(v: f32) -> Self {
         Self(v.to_bits() as u64 | Self::TYPE_F32)
     }
 
+    #[inline]
     pub const fn is_f32(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_F32
     }
 
+    #[inline]
     pub const fn as_f32(&self) -> Option<f32> {
         if self.is_f32() {
             return Some(f32::from_bits(self.0 as u32));
@@ -994,14 +1088,17 @@ impl ScriptValue {
 
     // f16
 
+    #[inline]
     pub const fn from_f16(v: f32) -> Self {
         Self(v.to_bits() as u64 | Self::TYPE_F16)
     }
 
+    #[inline]
     pub const fn is_f16(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_F16
     }
 
+    #[inline]
     pub const fn as_f16(&self) -> Option<f32> {
         if self.is_f16() {
             return Some(f32::from_bits(self.0 as u32));
@@ -1013,14 +1110,17 @@ impl ScriptValue {
 
     // f32
 
+    #[inline]
     pub const fn from_u40(v: u64) -> Self {
         Self((v & 0xFF_FFFF_FFFF) as u64 | Self::TYPE_U40)
     }
 
+    #[inline]
     pub const fn is_u40(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_U40
     }
 
+    #[inline]
     pub const fn as_u40(&self) -> Option<u64> {
         if self.is_u40() {
             return Some(self.0 & 0xFF_FFFF_FFFF);
@@ -1028,14 +1128,17 @@ impl ScriptValue {
         None
     }
 
+    #[inline]
     pub const fn from_u32(v: u32) -> Self {
         Self(v as u64 | Self::TYPE_U32)
     }
 
+    #[inline]
     pub const fn is_u32(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_U32
     }
 
+    #[inline]
     pub const fn as_u32(&self) -> Option<u32> {
         if self.is_u32() {
             return Some(self.0 as u32);
@@ -1043,14 +1146,17 @@ impl ScriptValue {
         None
     }
 
+    #[inline]
     pub const fn from_i32(v: i32) -> Self {
         Self(v as u64 | Self::TYPE_I32)
     }
 
+    #[inline]
     pub const fn is_i32(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_I32
     }
 
+    #[inline]
     pub const fn as_i32(&self) -> Option<i32> {
         if self.is_i32() {
             return Some(self.0 as i32);
@@ -1077,6 +1183,7 @@ impl ScriptValue {
         None
     }
 
+    #[inline]
     pub const fn as_f64_traced_nan(&self) -> Option<ScriptIp> {
         if self.is_nan() {
             Some(ScriptIp::from_u40(self.0))
@@ -1104,8 +1211,20 @@ impl ScriptValue {
         self.0 <= Self::TYPE_TRACED_NAN_MAX
     }
 
+    #[inline]
     pub const fn is_non_nan_number(&self) -> bool {
         self.0 < Self::TYPE_NAN
+    }
+
+    /// Checked index for language reads and writes; unlike `as_index`, this
+    /// cannot truncate, saturate, or turn a non-number into item zero.
+    #[inline]
+    pub fn checked_index(&self) -> Option<usize> {
+        let value = self.as_number()?;
+        // The cast saturates and maps NaN to zero, so only a finite,
+        // non-negative, integral value in range survives the round trip.
+        let index = value as usize;
+        (index as f64 == value && index != usize::MAX).then_some(index)
     }
 
     pub const fn as_index(&self) -> usize {
@@ -1133,45 +1252,35 @@ impl ScriptValue {
         0
     }
 
+    #[inline]
     pub const fn is_index(&self) -> bool {
         self.0 <= Self::TYPE_NIL
     }
 
+    #[inline]
     pub const fn is_nan(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_NAN
     }
 
     // Object
-    // Layout: bits 0-31 = index, bits 32-39 = generation (when check_gen enabled)
+    // Layout: bits 0-23 = index, bits 24-39 = generation (heap tag in its high byte)
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn from_object(ptr: ScriptObject) -> Self {
-        Self(ptr.index as u64 | ((ptr.generation as u64) << 32) | Self::TYPE_OBJECT)
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn from_object(ptr: ScriptObject) -> Self {
-        Self(ptr.index as u64 | Self::TYPE_OBJECT)
+        Self(ptr.index as u64 | ((ptr.generation as u64) << 24) | Self::TYPE_OBJECT)
     }
 
+    #[inline]
     pub const fn is_object(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_OBJECT
     }
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn as_object(&self) -> Option<ScriptObject> {
         if self.is_object() {
             return Some(ScriptObject {
-                index: (self.0 & 0xffff_ffff) as u32,
-                generation: ((self.0 >> 32) & 0xff) as Generation,
-            });
-        }
-        None
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn as_object(&self) -> Option<ScriptObject> {
-        if self.is_object() {
-            return Some(ScriptObject {
-                index: (self.0 & 0xffff_ffff) as u32,
+                index: (self.0 & 0xff_ffff) as u32,
+                generation: ((self.0 >> 24) & 0xffff) as Generation,
             });
         }
         None
@@ -1179,14 +1288,17 @@ impl ScriptValue {
 
     // PodType
 
+    #[inline]
     pub const fn from_pod_type(ptr: ScriptPodType) -> Self {
         Self(ptr.index as u64 | Self::TYPE_POD_TYPE)
     }
 
+    #[inline]
     pub const fn is_pod_type(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_POD_TYPE
     }
 
+    #[inline]
     pub const fn as_pod_type(&self) -> Option<ScriptPodType> {
         if self.is_pod_type() {
             return Some(ScriptPodType {
@@ -1197,84 +1309,57 @@ impl ScriptValue {
     }
 
     // Pod
-    // Layout: bits 0-31 = index, bits 32-39 = generation (when check_gen enabled)
+    // Layout: bits 0-23 = index, bits 24-39 = generation (heap tag in its high byte)
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn from_pod(ptr: ScriptPod) -> Self {
-        Self(ptr.index as u64 | ((ptr.generation as u64) << 32) | Self::TYPE_POD)
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn from_pod(ptr: ScriptPod) -> Self {
-        Self(ptr.index as u64 | Self::TYPE_POD)
+        Self(ptr.index as u64 | ((ptr.generation as u64) << 24) | Self::TYPE_POD)
     }
 
+    #[inline]
     pub const fn is_pod(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_POD
     }
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn as_pod(&self) -> Option<ScriptPod> {
         if self.is_pod() {
             return Some(ScriptPod {
-                index: (self.0 & 0xffff_ffff) as u32,
-                generation: ((self.0 >> 32) & 0xff) as Generation,
-            });
-        }
-        None
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn as_pod(&self) -> Option<ScriptPod> {
-        if self.is_pod() {
-            return Some(ScriptPod {
-                index: (self.0 & 0xffff_ffff) as u32,
+                index: (self.0 & 0xff_ffff) as u32,
+                generation: ((self.0 >> 24) & 0xffff) as Generation,
             });
         }
         None
     }
 
     // Handle
-    // Layout: bits 0-31 = index, bits 32-39 = generation (when check_gen enabled)
+    // Layout: bits 0-23 = index, bits 24-39 = generation (heap tag in its high byte)
     // Handle type is encoded in the TYPE_MASK (different type tags per handle type)
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn from_handle(ptr: ScriptHandle) -> Self {
         Self(
             ptr.index as u64
-                | ((ptr.generation as u64) << 32)
+                | ((ptr.generation as u64) << 24)
                 | (Self::TYPE_HANDLE_FIRST + ((ptr.ty.0 as u64) << 40)),
         )
     }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn from_handle(ptr: ScriptHandle) -> Self {
-        Self(ptr.index as u64 | (Self::TYPE_HANDLE_FIRST + ((ptr.ty.0 as u64) << 40)))
-    }
 
+    #[inline]
     pub const fn is_handle(&self) -> bool {
         let ty = self.0 & Self::TYPE_MASK;
         ty >= Self::TYPE_HANDLE_FIRST && ty <= Self::TYPE_HANDLE_LAST
     }
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn as_handle(&self) -> Option<ScriptHandle> {
         if self.is_handle() {
             return Some(ScriptHandle {
                 ty: ScriptHandleType(
                     (((self.0 & Self::TYPE_MASK) - Self::TYPE_HANDLE_FIRST) >> 40) as u8,
                 ),
-                index: (self.0 & 0xffff_ffff) as u32,
-                generation: ((self.0 >> 32) & 0xff) as Generation,
-            });
-        }
-        None
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn as_handle(&self) -> Option<ScriptHandle> {
-        if self.is_handle() {
-            return Some(ScriptHandle {
-                ty: ScriptHandleType(
-                    (((self.0 & Self::TYPE_MASK) - Self::TYPE_HANDLE_FIRST) >> 40) as u8,
-                ),
-                index: (self.0 & 0xffff_ffff) as u32,
+                index: (self.0 & 0xff_ffff) as u32,
+                generation: ((self.0 >> 24) & 0xffff) as Generation,
             });
         }
         None
@@ -1282,6 +1367,7 @@ impl ScriptValue {
 
     // bool
 
+    #[inline]
     pub const fn from_bool(val: bool) -> Self {
         if val {
             Self::TRUE
@@ -1290,6 +1376,7 @@ impl ScriptValue {
         }
     }
 
+    #[inline]
     pub const fn as_bool(&self) -> Option<bool> {
         if self.is_bool() {
             return Some(self.0 == Self::TRUE.0);
@@ -1297,16 +1384,19 @@ impl ScriptValue {
         None
     }
 
+    #[inline]
     pub const fn is_bool(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_BOOL
     }
 
     // color
 
+    #[inline]
     pub const fn from_color(val: u32) -> Self {
         Self(val as u64 | Self::TYPE_COLOR)
     }
 
+    #[inline]
     pub const fn as_color(&self) -> Option<u32> {
         if self.is_color() {
             return Some((self.0 & 0xffff_ffff) as u32);
@@ -1314,42 +1404,30 @@ impl ScriptValue {
         None
     }
 
+    #[inline]
     pub const fn is_color(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_COLOR
     }
 
     // array
-    // Layout: bits 0-31 = index, bits 32-39 = generation (when check_gen enabled)
+    // Layout: bits 0-23 = index, bits 24-39 = generation (heap tag in its high byte)
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn from_array(val: ScriptArray) -> Self {
-        Self((val.index as u64) | ((val.generation as u64) << 32) | Self::TYPE_ARRAY)
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn from_array(val: ScriptArray) -> Self {
-        Self((val.index as u64) | Self::TYPE_ARRAY)
+        Self((val.index as u64) | ((val.generation as u64) << 24) | Self::TYPE_ARRAY)
     }
 
+    #[inline]
     pub const fn is_array(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_ARRAY
     }
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn as_array(&self) -> Option<ScriptArray> {
         if self.is_array() {
             Some(ScriptArray {
-                index: (self.0 & 0xFFFF_FFFF) as u32,
-                generation: ((self.0 >> 32) & 0xff) as Generation,
-            })
-        } else {
-            None
-        }
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn as_array(&self) -> Option<ScriptArray> {
-        if self.is_array() {
-            Some(ScriptArray {
-                index: (self.0 & 0xFFFF_FFFF) as u32,
+                index: (self.0 & 0xff_ffff) as u32,
+                generation: ((self.0 >> 24) & 0xffff) as Generation,
             })
         } else {
             None
@@ -1358,18 +1436,22 @@ impl ScriptValue {
 
     // id
 
+    #[inline]
     pub const fn from_id(val: LiveId) -> Self {
         Self(val.0 | Self::TYPE_ID)
     }
 
+    #[inline]
     pub const fn is_id(&self) -> bool {
         self.0 >= Self::TYPE_ID
     }
 
+    #[inline]
     pub const fn from_escaped_id(val: LiveId) -> Self {
         Self(val.0 | Self::TYPE_ID | Self::ESCAPED_ID)
     }
 
+    #[inline]
     pub const fn as_id(&self) -> Option<LiveId> {
         if self.is_id() {
             return Some(LiveId(self.0 & 0x0000_3fff_ffff_ffff));
@@ -1377,82 +1459,85 @@ impl ScriptValue {
         None
     }
 
+    #[inline]
     pub const fn is_escaped_id(&self) -> bool {
         self.0 >= Self::TYPE_ID | Self::ESCAPED_ID
     }
 
+    /// The plain id for an escaped id (`@name`), else the value unchanged.
+    /// Object maps store id keys plain, so a key that arrives from script
+    /// as `@name` (or as a `for k, v in obj` key) is unescaped before a
+    /// map lookup, insert or delete.
+    #[inline]
+    pub const fn unescape_id(self) -> Self {
+        if self.is_escaped_id() {
+            Self(self.0 & !Self::ESCAPED_ID)
+        } else {
+            self
+        }
+    }
+
+    /// The escaped id (`@name`) for a plain id, else the value unchanged.
+    /// A plain id on the operand stack is a variable reference, so an id
+    /// handed to script as data (an object key) is escaped.
+    #[inline]
+    pub const fn escape_id(self) -> Self {
+        if self.is_id() {
+            Self(self.0 | Self::ESCAPED_ID)
+        } else {
+            self
+        }
+    }
+
     // regex
-    // Layout: bits 0-31 = index, bits 32-39 = generation (when check_gen enabled)
+    // Layout: bits 0-23 = index, bits 24-39 = generation (heap tag in its high byte)
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn from_regex(ptr: ScriptRegex) -> Self {
-        Self(ptr.index as u64 | ((ptr.generation as u64) << 32) | Self::TYPE_REGEX)
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn from_regex(ptr: ScriptRegex) -> Self {
-        Self(ptr.index as u64 | Self::TYPE_REGEX)
+        Self(ptr.index as u64 | ((ptr.generation as u64) << 24) | Self::TYPE_REGEX)
     }
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn as_regex(&self) -> Option<ScriptRegex> {
         if self.is_regex() {
             return Some(ScriptRegex {
-                index: (self.0 & 0xffff_ffff) as u32,
-                generation: ((self.0 >> 32) & 0xff) as Generation,
-            });
-        }
-        None
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn as_regex(&self) -> Option<ScriptRegex> {
-        if self.is_regex() {
-            return Some(ScriptRegex {
-                index: (self.0 & 0xffff_ffff) as u32,
+                index: (self.0 & 0xff_ffff) as u32,
+                generation: ((self.0 >> 24) & 0xffff) as Generation,
             });
         }
         None
     }
 
+    #[inline]
     pub const fn is_regex(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_REGEX
     }
 
     // string
-    // Layout: bits 0-31 = index, bits 32-39 = generation (when check_gen enabled)
+    // Layout: bits 0-23 = index, bits 24-39 = generation (heap tag in its high byte)
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn from_string(ptr: ScriptString) -> Self {
-        Self(ptr.index as u64 | ((ptr.generation as u64) << 32) | Self::TYPE_STRING)
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn from_string(ptr: ScriptString) -> Self {
-        Self(ptr.index as u64 | Self::TYPE_STRING)
+        Self(ptr.index as u64 | ((ptr.generation as u64) << 24) | Self::TYPE_STRING)
     }
 
-    #[cfg(feature = "check_gen")]
+    #[inline]
     pub const fn as_string(&self) -> Option<ScriptString> {
         if self.is_string() {
             return Some(ScriptString {
-                index: (self.0 & 0xffff_ffff) as u32,
-                generation: ((self.0 >> 32) & 0xff) as Generation,
-            });
-        }
-        None
-    }
-    #[cfg(not(feature = "check_gen"))]
-    pub const fn as_string(&self) -> Option<ScriptString> {
-        if self.is_string() {
-            return Some(ScriptString {
-                index: (self.0 & 0xffff_ffff) as u32,
+                index: (self.0 & 0xff_ffff) as u32,
+                generation: ((self.0 >> 24) & 0xffff) as Generation,
             });
         }
         None
     }
 
+    #[inline]
     pub const fn is_string(&self) -> bool {
         (self.0 & Self::TYPE_MASK) == Self::TYPE_STRING
     }
 
+    #[inline]
     pub const fn is_string_like(&self) -> bool {
         let ty = self.0 & Self::TYPE_MASK;
         ty >= Self::TYPE_STRING && ty < Self::TYPE_INLINE_STRING_END
@@ -1545,10 +1630,12 @@ impl ScriptValue {
         }
     }
 
+    #[inline]
     pub const fn inline_string_not_empty(&self) -> bool {
         self.0 >= Self::TYPE_INLINE_STRING_1 && self.0 <= Self::TYPE_INLINE_STRING_END
     }
 
+    #[inline]
     pub const fn is_inline_string(&self) -> bool {
         self.0 >= Self::TYPE_INLINE_STRING_0 && self.0 < Self::TYPE_INLINE_STRING_END
     }
@@ -1623,5 +1710,25 @@ impl fmt::Display for ScriptValue {
             return write!(f, "{opcode}{args}");
         }
         write!(f, "?{:08x}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod script_ip_tests {
+    use super::*;
+
+    /// The largest body id and index round-trip through the 40-bit packing,
+    /// and neighbouring bodies stay distinct: more than 4096 bodies (the old
+    /// 12-bit limit, reached by hosts compiling shaders at runtime) no
+    /// longer alias.
+    #[test]
+    fn body_ids_past_4096_do_not_alias() {
+        let last = ScriptIp { body: (ScriptIp::MAX_BODIES - 1) as u16, index: (ScriptIp::MAX_INDEX - 1) as u32 };
+        assert_eq!(ScriptIp::from_u40(last.to_u40()), last);
+        assert!(last.to_u40() < 1 << 40);
+        let a = ScriptIp { body: 4096, index: 7 };
+        let b = ScriptIp { body: 0, index: 7 };
+        assert_ne!(a.to_u40(), b.to_u40());
+        assert_eq!(ScriptIp::from_u40(a.to_u40()), a);
     }
 }

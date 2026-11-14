@@ -2,6 +2,21 @@
 name = "makepad-example-map"
 version = "1.0.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["tweaker"]
+# The design overlay (Shift+F10 with the dev overlays on). On for development
+# builds; the Runner's releases build without it (--no-default-features).
+tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
 
 [dependencies]
-makepad-widgets = { path = "../../widgets", version = "2.0.0", features = ["maps"] }
+makepad-widgets = { path = "../../widgets", version = "2.0.0", default-features = false, features = ["maps"] }
+makepad-widgets-tweaker = { path = "../../widgets/families/tweaker", version = "2.0.0", optional = true }
+makepad-map-nav = { path = "../../libs/map_nav" }
+makepad-geodata = { path = "../../libs/geodata" }
+makepad-mbtile-reader = { path = "../../libs/mbtile_reader" }
+makepad-fast-inflate = { path = "../../libs/fast_inflate" }
+
+[dev-dependencies]
+makepad-test = { path = "../../libs/makepad_test", version = "0.1.0" }

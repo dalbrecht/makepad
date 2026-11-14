@@ -1,0 +1,72 @@
+//! devhub: one place to observe every JIT (`makepad run`) on the LAN.
+//!
+//! One app, two roles ([`node`] on each Linux WM, [`master`] on the user's Mac); the design is in
+//! the lane's DESIGN.md (local/agent_state/devhub). Everything rides on makepad-remote (frames,
+//! channels, the relay's `fwd` for full inspect, the hub's `route`); how hubs trust each other is
+//! behind [`trust::Trust`].
+
+// Output never panics: a CLI piped into `head` gets EPIPE (std's print macros would abort the
+// command). Test builds keep std's captured macros.
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! println {
+    () => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_all(b"\n"); }};
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+}
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! print {
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!($($t)+)); }};
+}
+// (and a master's own lines in the moment its log stamper ended before its output is back on the
+// log, [`logstamp`])
+#[cfg(not(test))]
+macro_rules! eprintln {
+    () => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all(b"\n"); }};
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+}
+
+pub mod proto;
+pub mod procinfo;
+pub mod heap;
+pub mod held;
+pub mod os;
+pub mod embed;
+pub mod inbox;
+pub mod notes;
+pub mod reports;
+pub mod hot;
+pub mod local;
+pub mod node;
+pub mod master;
+pub mod cli;
+pub mod sync;
+pub mod cluster;
+pub mod trust;
+pub mod glance;
+pub mod explorer;
+pub mod top;
+pub mod lease;
+pub mod land;
+pub mod private_check;
+pub mod ci_merge;
+pub mod gitlock;
+pub mod git_exec;
+pub mod gitread;
+pub mod nested;
+pub mod jitcache;
+pub mod logstamp;
+mod jit_misses;
+pub mod run_names;
+pub mod state;
+pub mod testlog;
+#[cfg(test)]
+mod testenv;
+#[cfg(feature = "checkout")]
+pub mod monitor;
+#[cfg(feature = "checkout")]
+pub mod orch;
+#[cfg(feature = "checkout")]
+pub mod gateproof;
+#[cfg(feature = "checkout")]
+pub mod bucket;

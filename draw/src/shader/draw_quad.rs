@@ -65,6 +65,57 @@ script_mod! {
         pixel: fn(){
             #0000
         }
+
+        // The window-space depth (0..1) the rasteriser gives a world point
+        // under this pass's camera, on every backend: what a shader that
+        // declares `fragment_depth(..)` writes so its surface and raster
+        // geometry occlude each other per pixel (per eye in XR).
+        depth_of: fn(world: vec4) -> f32 {
+            let clip = self.draw_pass.camera_projection * (self.draw_pass.camera_view * world)
+            return clip.z / clip.w
+        }
+    }
+
+    // A quad placed by a 2D affine map per instance: `affine_m` (a b c d) and
+    // `affine_t` (e f) take the quad's own box (0..affine_size) to pixels,
+    // x' = a x + c y + e, y' = b x + d y + f. `pos` is 0..1 over the box, as
+    // for DrawQuad; `place(p)` maps a point of the box for a vertex fn of its
+    // own (a box grown for an edge, say).
+    mod.draw.DrawAffineQuad = mod.std.set_type_default() do #(DrawAffineQuad::script_shader(vm)){
+        ..mod.draw.DrawQuad
+
+        place: fn(p: vec2) -> vec2 {
+            return vec2(
+                self.affine_m.x * p.x + self.affine_m.z * p.y + self.affine_t.x
+                self.affine_m.y * p.x + self.affine_m.w * p.y + self.affine_t.y
+            )
+        }
+
+        vertex: fn() {
+            let w = self.place(self.geom.pos * self.affine_size)
+            self.pos = self.geom.pos
+            self.world = self.draw_list.view_transform * vec4(w.x, w.y, self.draw_depth + self.draw_call.zbias, 1.0)
+            self.vertex_pos = self.draw_pass.camera_projection * (self.draw_pass.camera_view * self.world)
+        }
+    }
+
+    // A quad's cached picture drawn back (View `cache_bg`): `image` holds the
+    // pixels the quad's own shader rendered over the same rect, at the same
+    // density, its top-left at the texture's origin. A rect that is not a
+    // whole number of pixels was rendered into the next whole pixel, so the
+    // quad samples the part it covers. One texture read per pixel.
+    mod.draw.DrawCachedQuad = mod.std.set_type_default() do #(DrawCachedQuad::script_shader(vm)){
+        ..mod.draw.DrawQuad
+        image: texture_2d(float)
+        scale: varying(vec2f)
+        vertex: fn() {
+            let dpi = self.draw_pass.dpi_factor
+            self.scale = self.rect_size / (ceil(self.rect_size * dpi - vec2(0.01, 0.01)) / dpi)
+            self.vertex_pos = self.clip_and_transform_vertex(self.rect_pos, self.rect_size)
+        }
+        pixel: fn() {
+            return self.image.sample(self.pos * self.scale)
+        }
     }
 
     mod.draw.DrawColor = mod.std.set_type_default() do #(DrawColor::script_shader(vm)){
@@ -107,13 +158,78 @@ pub struct DrawColor {
     pub color: Vec4f,
 }
 
+/// Draws back the texture a View's `cache_bg` rendered its background into.
+#[derive(Script, ScriptHook, Debug)]
+#[repr(C)]
+pub struct DrawCachedQuad {
+    #[deref]
+    pub draw_super: DrawQuad,
+}
+
+/// A quad of `affine_size` placed by the affine `affine_m` / `affine_t` (see
+/// the shader): a turned, sheared or mirrored box in one instance.
+#[derive(Script, ScriptHook, Debug)]
+#[repr(C)]
+pub struct DrawAffineQuad {
+    #[deref]
+    pub draw_super: DrawQuad,
+    #[live]
+    pub affine_m: Vec4f,
+    #[live]
+    pub affine_t: Vec2f,
+    #[live]
+    pub affine_size: Vec2f,
+}
+
+impl DrawAffineQuad {
+    /// Place the box `size` (its own units) by `m` = [a, b, c, d, e, f]:
+    /// x' = a x + c y + e, y' = b x + d y + f.
+    pub fn set_affine(&mut self, m: [f64; 6], size: DVec2) {
+        self.affine_m = vec4(m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32);
+        self.affine_t = vec2(m[4] as f32, m[5] as f32);
+        self.affine_size = vec2(size.x as f32, size.y as f32);
+    }
+}
+
+/// The shader of a plain `mod.draw.DrawQuad` (its stock `pixel` is `#0000`),
+/// resolved on first use per Cx (`None` until then).
+#[derive(Default)]
+struct StockQuadShader(Option<Option<DrawShaderId>>);
+
 impl DrawQuad {
+    /// Whether drawing this quad changes no pixel: it draws through the plain
+    /// DrawQuad shader, whose `pixel` is transparent black, and blends
+    /// premultiplied-over, under which transparent black is the identity. A
+    /// custom shader (anything overriding `pixel` or `fragment`) is a different
+    /// shader and never counts. Its one other trace is the depth it writes in a
+    /// 2D pass: ink painted after it lies in front of it by paint order (each
+    /// draw raises zbias) unless that ink spends a lower `draw_depth`, and such
+    /// ink inside an invisible quad was being cut away by nothing visible.
+    /// Such a quad is only an area: a caller that needs the area takes the
+    /// turtle's rect instead of a GPU instance.
+    pub fn draws_nothing(&self, cx: &mut Cx2d) -> bool {
+        let Some(shader) = self.draw_vars.draw_shader_id else { return false };
+        if !self.draw_vars.options.alpha_blend {
+            return false;
+        }
+        let known = cx.cx.global::<StockQuadShader>().0;
+        let stock = match known {
+            Some(stock) => stock,
+            None => {
+                let Some(stock) = cx.cx.try_with_vm(|vm| DrawQuad::script_new_with_default(vm).draw_vars.draw_shader_id) else { return false };
+                cx.cx.global::<StockQuadShader>().0 = Some(stock);
+                stock
+            }
+        };
+        stock == Some(shader)
+    }
+
     pub fn begin(&mut self, cx: &mut Cx2d, walk: Walk, layout: Layout) {
         cx.push_draw_call_parent();
         self.draw_vars.append_group_id = cx.draw_call_group_background().0;
         cx.begin_turtle(walk, layout);
         if self.draw_vars.draw_shader_id.is_some() {
-            let new_area = cx.add_aligned_instance(&self.draw_vars);
+            let new_area = cx.add_aligned_instance(&mut self.draw_vars);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
         }
     }
@@ -137,7 +253,7 @@ impl DrawQuad {
         if let Some(mi) = &mut self.many_instances {
             mi.instances.extend_from_slice(self.draw_vars.as_slice());
         } else if self.draw_vars.can_instance() {
-            let new_area = cx.add_aligned_instance(&self.draw_vars);
+            let new_area = cx.add_aligned_instance(&mut self.draw_vars);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
         }
     }
@@ -163,16 +279,16 @@ impl DrawQuad {
 
     pub fn new_draw_call(&mut self, cx: &mut Cx2d) {
         self.draw_vars.append_group_id = cx.draw_call_group_background().0;
-        cx.new_draw_call(&self.draw_vars);
+        cx.new_draw_call(&mut self.draw_vars);
     }
 
     pub fn append_to_draw_call(&mut self, cx: &mut Cx2d) {
         self.draw_vars.append_group_id = cx.draw_call_group_background().0;
-        cx.append_to_draw_call(&self.draw_vars);
+        cx.append_to_draw_call(&mut self.draw_vars);
     }
 
     pub fn begin_many_instances(&mut self, cx: &mut Cx2d) {
-        let mi = cx.begin_many_aligned_instances(&self.draw_vars);
+        let mi = cx.begin_many_aligned_instances(&mut self.draw_vars);
         self.many_instances = mi;
     }
 
@@ -268,7 +384,7 @@ impl DrawQuad {
     pub fn begin(&mut self, cx: &mut Cx2d, walk: Walk, layout: Layout) {
         cx.begin_turtle(walk, layout);
         if self.draw_vars.draw_shader.is_some() {
-            let new_area = cx.add_aligned_instance(&self.draw_vars);
+            let new_area = cx.add_aligned_instance(&mut self.draw_vars);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
         }
     }
@@ -291,7 +407,7 @@ impl DrawQuad {
             mi.instances.extend_from_slice(self.draw_vars.as_slice());
         }
         else if self.draw_vars.can_instance() {
-            let new_area = cx.add_aligned_instance(&self.draw_vars);
+            let new_area = cx.add_aligned_instance(&mut self.draw_vars);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
         }
     }
@@ -316,15 +432,15 @@ impl DrawQuad {
     }
 
     pub fn new_draw_call(&self, cx: &mut Cx2d) {
-        cx.new_draw_call(&self.draw_vars);
+        cx.new_draw_call(&mut self.draw_vars);
     }
 
     pub fn append_to_draw_call(&self, cx: &mut Cx2d) {
-        cx.append_to_draw_call(&self.draw_vars);
+        cx.append_to_draw_call(&mut self.draw_vars);
     }
 
     pub fn begin_many_instances(&mut self, cx: &mut Cx2d) {
-        let mi = cx.begin_many_aligned_instances(&self.draw_vars);
+        let mi = cx.begin_many_aligned_instances(&mut self.draw_vars);
         self.many_instances = mi;
     }
 
@@ -336,3 +452,40 @@ impl DrawQuad {
     }
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::DrawQuad;
+    use crate::{geometry::geometry_gen::GeometryGen, makepad_platform::*};
+
+    /// Draw objects of the same functions share one compiled shader, and each draws its own
+    /// geometry: a quad over another geometry, made after the stock quad, keeps that geometry
+    /// (the shader caches bound it to the stock quad's).
+    #[test]
+    fn draws_of_one_shader_keep_their_own_geometry() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
+        cx.with_vm(|vm| {
+            crate::makepad_platform::script::script_mod(vm);
+            crate::script_mod(vm);
+            let stock = DrawQuad::script_new_with_default(vm);
+            let geometry = GeometryGen::from_quad_2d(0.0, 0.0, 2.0, 2.0).into_geometry(vm.cx_mut());
+            let own = geometry.geometry_id();
+            let handle = geometry.into_script_handle(vm);
+            let source = script! {
+                use mod.shader.*
+                use mod.draw.*
+                use mod.geom
+                DrawQuad{geom: vertex_buffer(geom.QuadVertex, #(handle))}
+            };
+            let other = vm.eval(source);
+            assert!(stock.draw_vars.draw_shader_id.is_some(), "the stock quad compiles");
+            assert_ne!(stock.draw_vars.geometry_id, Some(own));
+            for round in ["first", "second"] {
+                let quad = DrawQuad::script_from_value(vm, other);
+                assert_eq!(quad.draw_vars.draw_shader_id, stock.draw_vars.draw_shader_id, "{round} quad: one shader for the same functions");
+                assert_eq!(quad.draw_vars.geometry_id, Some(own), "{round} quad: draws its own geometry");
+            }
+        });
+    }
+}

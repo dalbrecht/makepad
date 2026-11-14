@@ -1,7 +1,8 @@
 use {
     crate::{
         char::CharExt,
-        decoration::{Decoration, DecorationSet},
+        decoration::{Decoration, DecorationSet, PreparedDecorationsError},
+        diff::{DiffMetadata, DiffRowSpec, GutterMode, PrepareDiffError, PreparedDiffDocument},
         history::{EditKind, History},
         inlays::{BlockInlay, InlineInlay},
         iter::IteratorExt,
@@ -14,13 +15,13 @@ use {
         tokenizer::Tokenizer,
     },
     std::{
-        cell::{Ref, RefCell},
+        cell::{Cell, Ref, RefCell},
         cmp::Ordering,
         collections::HashMap,
         iter,
         ops::Range,
         rc::Rc,
-        sync::mpsc::Sender,
+        sync::{atomic::{AtomicU64, Ordering as AtomicOrdering}, mpsc::Sender},
     },
 };
 
@@ -29,31 +30,193 @@ pub struct CodeDocument(Rc<DocumentInner>);
 
 impl CodeDocument {
     pub fn new(text: Text, decorations: DecorationSet) -> Self {
-        let line_count = text.as_lines().len();
-        let tokens: Vec<_> = (0..line_count)
-            .map(|line| tokenize(&text.as_lines()[line]).collect::<Vec<_>>())
-            .collect();
-        let inner = Self(Rc::new(DocumentInner {
-            history: RefCell::new(History::from(text)),
-            layout: RefCell::new(DocumentLayout {
-                indent_state: (0..line_count).map(|_| None).collect(),
-                tokens,
-                inline_inlays: (0..line_count).map(|_| Vec::new()).collect(),
-                block_inlays: Vec::new(),
-            }),
-            tokenizer: RefCell::new(Tokenizer::new(line_count)),
-            decorations: RefCell::new(decorations),
-            edit_senders: RefCell::new(HashMap::new()),
-        }));
-        inner.update_indent_state();
-        inner.0.tokenizer.borrow_mut().update(
-            &inner.0.history.borrow().as_text(),
-            &mut inner.0.layout.borrow_mut().tokens,
-        );
-        inner
+        let document = Self::from_prepared(Self::prepare(text));
+        *document.0.decorations.borrow_mut() = decorations;
+        document
     }
 
+    /// Tokenize and compute indentation without a Cx. The result can cross threads.
+    pub fn prepare(text: Text) -> PreparedDocument {
+        Self::prepare_cancellable(text, &|| false).expect("non-cancellable preparation")
+    }
+
+    pub fn prepare_cancellable(text: Text, cancel: &impl Fn() -> bool) -> Result<PreparedDocument, crate::tokenizer::TokenizeCancelled> {
+        Self::prepare_cancellable_for_language(makepad_code_language::LanguageId::Rust, text, cancel)
+    }
+
+    /// Path-aware preparation for file-backed callers. Text-only `prepare`
+    /// remains a Rust-default wrapper.
+    pub fn prepare_for_path(path: &str, text: Text) -> PreparedDocument {
+        Self::prepare_cancellable_for_path(path, text, &|| false)
+            .expect("non-cancellable preparation")
+    }
+
+    pub fn prepare_cancellable_for_path(
+        path: &str,
+        text: Text,
+        cancel: &impl Fn() -> bool,
+    ) -> Result<PreparedDocument, crate::tokenizer::TokenizeCancelled> {
+        Self::prepare_cancellable_for_detection(
+            makepad_code_language::detect_path(path, None),
+            text,
+            cancel,
+        )
+    }
+
+    pub fn prepare_cancellable_for_detection(
+        detection: makepad_code_language::Detection,
+        text: Text,
+        cancel: &impl Fn() -> bool,
+    ) -> Result<PreparedDocument, crate::tokenizer::TokenizeCancelled> {
+        Self::prepare_cancellable_with(text, cancel, |line_count| {
+            Tokenizer::for_detection(detection, line_count)
+        })
+    }
+
+    pub fn prepare_cancellable_for_language(
+        language: makepad_code_language::LanguageId,
+        text: Text,
+        cancel: &impl Fn() -> bool,
+    ) -> Result<PreparedDocument, crate::tokenizer::TokenizeCancelled> {
+        Self::prepare_cancellable_with(text, cancel, |line_count| {
+            Tokenizer::for_language(language, line_count)
+        })
+    }
+
+    fn prepare_cancellable_with(
+        text: Text,
+        cancel: &impl Fn() -> bool,
+        make_tokenizer: impl FnOnce(usize) -> Tokenizer,
+    ) -> Result<PreparedDocument, crate::tokenizer::TokenizeCancelled> {
+        if cancel() { return Err(crate::tokenizer::TokenizeCancelled); }
+        let text = if text.as_lines().is_empty() {
+            Text::new()
+        } else {
+            text
+        };
+        let line_count = text.as_lines().len();
+        let mut layout = DocumentLayout {
+            indent_state: vec![None; line_count],
+            tokens: vec![Vec::new(); line_count],
+            inline_inlays: vec![Vec::new(); line_count],
+            block_inlays: Vec::new(),
+        };
+        update_indent_state(&text, &mut layout.indent_state);
+        let mut tokenizer = make_tokenizer(line_count);
+        tokenizer.update_cancellable(&text, &mut layout.tokens, cancel)?;
+        Ok(PreparedDocument {
+            byte_len:text.as_lines().iter().map(|line|line.len()+1).sum(),
+            digest: crate::tokenizer::code_source_digest(&text, cancel)?,
+            version: 0,
+            text,
+            layout,
+            tokenizer,
+        })
+    }
+
+    /// Attach prepared allocations without rescanning or tokenizing the source.
+    pub fn from_prepared(prepared: PreparedDocument) -> Self {
+        static ID: AtomicU64 = AtomicU64::new(1);
+        Self(Rc::new(DocumentInner {
+            id: ID.fetch_add(1, AtomicOrdering::Relaxed),
+            next_anchor: Cell::new(0),
+            anchors: RefCell::new(HashMap::new()),
+            digest: Cell::new(Some(prepared.digest)),
+            version: Cell::new(prepared.version),
+            history: RefCell::new(History::from(prepared.text)),
+            layout: RefCell::new(prepared.layout),
+            tokenizer: RefCell::new(prepared.tokenizer),
+            decorations: RefCell::new(DecorationSet::default()),
+            edit_senders: RefCell::new(HashMap::new()),
+            diff: None,
+            gutter_mode: Cell::new(GutterMode::Plain),
+        }))
+    }
+
+    /// Validate complete display-order rows and prepare independent endpoint tokens.
+    /// Source line numbers are zero-based and exclude the final-newline sentinel.
+    pub fn prepare_diff(
+        rows: &[DiffRowSpec], old_text: &str, new_text: &str,
+    ) -> Result<PreparedDiffDocument, PrepareDiffError> {
+        crate::diff::prepare(rows, old_text, new_text)
+    }
+
+    pub fn prepare_diff_for_path(
+        path: &str,
+        rows: &[DiffRowSpec],
+        old_text: &str,
+        new_text: &str,
+    ) -> Result<PreparedDiffDocument, PrepareDiffError> {
+        let detection = makepad_code_language::detect_path(path, None);
+        crate::diff::prepare_for_detection(rows, old_text, new_text, detection)
+    }
+
+    /// Move all diff allocations into an immutable document in O(1).
+    pub fn from_prepared_diff(prepared: PreparedDiffDocument) -> Self {
+        let mut document = Self::from_prepared(prepared.document);
+        let inner = Rc::get_mut(&mut document.0).unwrap();
+        inner.diff = Some(prepared.metadata);
+        *inner.decorations.get_mut() = prepared.decorations;
+        inner.gutter_mode.set(GutterMode::Diff);
+        document
+    }
+
+    pub fn diff_metadata(&self) -> Option<&DiffMetadata> { self.0.diff.as_ref() }
+    pub fn is_read_only(&self) -> bool { self.0.diff.is_some() }
+    pub fn ensure_editable(&self) -> Result<(), DocumentMutationError> {
+        if self.is_read_only() { Err(DocumentMutationError::ReadOnlyDiff) } else { Ok(()) }
+    }
+    pub fn gutter_mode(&self) -> GutterMode { self.0.gutter_mode.get() }
+    /// Presentation only; switching back to Plain never enables text mutation.
+    pub fn set_gutter_mode(&self, mode: GutterMode) { self.0.gutter_mode.set(mode); }
+
+    pub fn version(&self) -> u64 {
+        self.0.version.get()
+    }
+
+    /// Content digest, recomputed lazily after edits. Prepared attachment is O(1).
+    pub fn digest(&self) -> u64 {
+        self.0.digest.get().unwrap_or_else(|| {
+            let digest = text_digest(&self.as_text());
+            self.0.digest.set(Some(digest));
+            digest
+        })
+    }
+
+    /// Anchor a valid UTF-8 boundary. Before stays before an insertion at the
+    /// boundary; After follows it. Deletion collapses covered anchors to its start.
+    /// Panics for a position outside the document or inside a UTF-8 character.
+    pub fn create_anchor(&self, position: Position, drift: Drift) -> TextAnchor {
+        assert!(
+            valid_position(&self.as_text(), position),
+            "invalid anchor position"
+        );
+        let id = self.0.next_anchor.get();
+        self.0.next_anchor.set(id + 1);
+        self.0.anchors.borrow_mut().insert(id, (position, drift));
+        TextAnchor {
+            document: self.0.id,
+            id,
+        }
+    }
+
+    pub fn resolve_anchor(&self, anchor: TextAnchor) -> Option<Position> {
+        if anchor.document != self.0.id {
+            return None;
+        }
+        self.0.anchors.borrow().get(&anchor.id).map(|entry| entry.0)
+    }
+
+    /// Release an anchor once no retained view or source link needs it.
+    pub fn remove_anchor(&self, anchor: TextAnchor) {
+        if anchor.document == self.0.id {
+            self.0.anchors.borrow_mut().remove(&anchor.id);
+        }
+    }
+
+    /// Legacy mutation methods are no-ops on a diff; use ensure_editable for a typed refusal.
     pub fn replace(&self, new_text: Text) {
+        if self.is_read_only() { return; }
         let mut history = self.0.history.borrow_mut();
 
         // Create an edit that deletes the entire existing text.
@@ -86,6 +249,115 @@ impl CodeDocument {
         self.update_after_edit(None, None, &edits);
     }
 
+    /// Replaces the text between `start` and `end` with `new_text` as it is:
+    /// one undo step, no autoindent, no delimiter injection. For a host
+    /// putting an outside change into the text, where typing's indent rules
+    /// would rewrite what it was given.
+    pub fn replace_range(&self, start: Position, end: Position, new_text: Text) {
+        self.apply_ranges_with(
+            true,
+            SessionId::default(),
+            EditKind::Other,
+            &SelectionSet::default(),
+            &[(start, end, new_text)],
+            None,
+        );
+    }
+
+    /// As `replace_range`, but joined to the undo step of the edit before
+    /// it: the steps of one gesture (a knob dragged, a number scrubbed)
+    /// undo as one.
+    pub fn replace_range_joined(&self, start: Position, end: Position, new_text: Text) {
+        if self.is_read_only() { return; }
+        let mut history = self.0.history.borrow_mut();
+        let delete_edit = Edit {
+            change: Change::Delete(start, end - start),
+            drift: Drift::Before,
+        };
+        let insert_edit = Edit {
+            change: Change::Insert(start, new_text),
+            drift: Drift::Before,
+        };
+        history.apply_edit(delete_edit.clone());
+        history.apply_edit(insert_edit.clone());
+        drop(history);
+        self.update_after_edit(None, None, &[delete_edit, insert_edit]);
+    }
+
+    /// Replaces several ranges as one undo step, as given (no autoindent).
+    /// `ranges` are disjoint, in ascending order of their starts; an empty
+    /// range at another's start comes before it. For a host writing one
+    /// gesture's several value changes.
+    pub fn replace_ranges(&self, ranges: &[(Position, Position, Text)]) {
+        self.apply_ranges_with(
+            true,
+            SessionId::default(),
+            EditKind::Other,
+            &SelectionSet::default(),
+            ranges,
+            None,
+        );
+    }
+
+    /// Applies `ranges` (disjoint, ascending by start; an empty range at another's start comes
+    /// first) as `session_id`'s edit of `kind`, recording `selections_before` with the group:
+    /// the group merges with the session's previous one of the same mergeable kind (typing
+    /// coalesces as it does in a code view), never with another session's. No autoindent, no
+    /// delimiter injection. The edits reach every session; `session_id` is their origin.
+    pub fn apply_ranges(
+        &self,
+        session_id: SessionId,
+        kind: EditKind,
+        selections_before: &SelectionSet,
+        ranges: &[(Position, Position, Text)],
+    ) {
+        self.apply_ranges_with(false, session_id, kind, selections_before, ranges, Some(session_id));
+    }
+
+    fn apply_ranges_with(
+        &self,
+        new_group: bool,
+        group_session: SessionId,
+        kind: EditKind,
+        selections_before: &SelectionSet,
+        ranges: &[(Position, Position, Text)],
+        origin: Option<SessionId>,
+    ) {
+        if self.is_read_only() || ranges.is_empty() { return; }
+        let mut history = self.0.history.borrow_mut();
+        if new_group {
+            history.force_new_group();
+        }
+        history.push_or_extend_group(group_session, kind, selections_before);
+        // Back to front: an edit never moves the ones still to apply.
+        let mut edits = Vec::with_capacity(ranges.len() * 2);
+        for (start, end, text) in ranges.iter().rev() {
+            let delete_edit = Edit { change: Change::Delete(*start, *end - *start), drift: Drift::Before };
+            let insert_edit = Edit { change: Change::Insert(*start, text.clone()), drift: Drift::Before };
+            history.apply_edit(delete_edit.clone());
+            history.apply_edit(insert_edit.clone());
+            edits.push(delete_edit);
+            edits.push(insert_edit);
+        }
+        drop(history);
+        self.update_after_edit(origin, None, &edits);
+    }
+
+    /// Highlight as the file at `path` (a rename that changed the
+    /// extension): retokenizes in place, keeping the text, history, anchors
+    /// and sessions.
+    pub fn set_language_for_path(&self, path: &str) {
+        let detection = makepad_code_language::detect_path(path, None);
+        let history = self.0.history.borrow();
+        let text = history.as_text();
+        let line_count = text.as_lines().len();
+        let mut tokenizer = Tokenizer::for_detection(detection, line_count);
+        let mut layout = self.0.layout.borrow_mut();
+        layout.tokens = vec![Vec::new(); line_count];
+        tokenizer.update(text, &mut layout.tokens);
+        *self.0.tokenizer.borrow_mut() = tokenizer;
+    }
+
     pub fn as_text(&self) -> Ref<'_, Text> {
         Ref::map(self.0.history.borrow(), |history| history.as_text())
     }
@@ -108,6 +380,7 @@ impl CodeDocument {
         settings: &Settings,
         mut f: impl FnMut(Editor<'_>, Position, Length),
     ) {
+        if self.is_read_only() { return; }
         let mut history = self.0.history.borrow_mut();
         history.push_or_extend_group(session_id, kind, selections);
         let mut edits = Vec::new();
@@ -178,6 +451,7 @@ impl CodeDocument {
         selections: &SelectionSet,
         mut f: impl FnMut(Editor, usize),
     ) {
+        if self.is_read_only() { return; }
         let mut history = self.0.history.borrow_mut();
         history.push_or_extend_group(origin_id, kind, selections);
         let mut edits = Vec::new();
@@ -211,8 +485,51 @@ impl CodeDocument {
         self.0.decorations.borrow_mut().add_decoration(decoration);
     }
 
+    /// Replace visual decorations without changing text or separate diff metadata.
+    pub fn replace_prepared_decorations(&mut self, decorations: Vec<Decoration>) -> Result<(), PreparedDecorationsError> {
+        self.0.decorations.borrow_mut().replace_prepared(decorations)
+    }
+
     pub fn clear_decorations(&mut self) {
         self.0.decorations.borrow_mut().clear()
+    }
+
+    /// Reserve rows above lines for content a host draws over the editor
+    /// itself (inline visualisations, block widgets): `(line, block)` pairs
+    /// in any order, replacing the previous set. The space is not moved by
+    /// edits; a host sets it again after the text changes, then calls
+    /// [`crate::CodeSession::relayout`] on each session of this document.
+    pub fn set_block_inlays(&self, mut inlays: Vec<(usize, crate::inlays::BlockInlay)>) {
+        inlays.sort_by_key(|(line, _)| *line);
+        self.0.layout.borrow_mut().block_inlays = inlays;
+    }
+
+    /// Whether `other` is this document (not a copy of its text).
+    pub fn is_same(&self, other: &CodeDocument) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Reserve columns inside lines for controls a host draws over the
+    /// editor (a colour swatch before a colour, a curve before an ease):
+    /// `(line, byte, inlay)` in any order, replacing the previous set. The
+    /// text after an inlay moves right by its columns; carets, selections
+    /// and hits skip it. Edits carry the inlays along with their text; a
+    /// host sets them again after the text changes, then calls
+    /// [`crate::CodeSession::relayout_inline`] on each session.
+    pub fn set_inline_inlays(&self, inlays: Vec<(usize, usize, crate::inlays::InlineInlay)>) {
+        let mut layout = self.0.layout.borrow_mut();
+        let lines = &mut layout.inline_inlays;
+        for line in lines.iter_mut() {
+            line.clear();
+        }
+        for (line, byte, inlay) in inlays {
+            if let Some(line) = lines.get_mut(line) {
+                line.push((byte, inlay));
+            }
+        }
+        for line in lines.iter_mut() {
+            line.sort_by_key(|(byte, _)| *byte);
+        }
     }
 
     pub fn add_session(
@@ -238,7 +555,7 @@ impl CodeDocument {
     ) {
         fn next_line_indent_column_count(line: &str, tab_column_count: usize) -> Option<usize> {
             if let Some(indent) = line.indent() {
-                let mut indent_column_count = indent.column_count();
+                let mut indent_column_count = indent.column_count_at(0, tab_column_count);
                 if line
                     .chars()
                     .rev()
@@ -292,7 +609,7 @@ impl CodeDocument {
                     })
                     .unwrap_or(false)
                 {
-                    desired_indentation_column_count -= 4;
+                    desired_indentation_column_count = desired_indentation_column_count.saturating_sub(4);
                 }
                 self.edit_lines_internal(line, edits, |line| {
                     crate::session::reindent(line, |_| desired_indentation_column_count)
@@ -349,10 +666,12 @@ impl CodeDocument {
     }
 
     pub fn force_new_group(&self) {
+        if self.is_read_only() { return; }
         self.0.history.borrow_mut().force_new_group()
     }
 
     pub fn undo(&self, origin_id: SessionId, selections: &SelectionSet) -> bool {
+        if self.is_read_only() { return false; }
         let mut changes = Vec::new();
         let selections = self.0.history.borrow_mut().undo(selections, &mut changes);
         if let Some(selections) = selections {
@@ -364,6 +683,7 @@ impl CodeDocument {
     }
 
     pub fn redo(&self, origin_id: SessionId, selections: &SelectionSet) -> bool {
+        if self.is_read_only() { return false; }
         let mut changes = Vec::new();
         let selections = self.0.history.borrow_mut().redo(selections, &mut changes);
         if let Some(selections) = selections {
@@ -380,6 +700,21 @@ impl CodeDocument {
         selections: Option<SelectionSet>,
         edits: &[Edit],
     ) {
+        if !edits.is_empty() {
+            self.0.version.set(self.version().checked_add(1).expect("document version overflow"));
+            self.0.digest.set(None);
+            for (position, drift) in self.0.anchors.borrow_mut().values_mut() {
+                for edit in edits {
+                    *position = match &edit.change {
+                        Change::Insert(at, text) if *at == *position => match drift {
+                            Drift::Before => *position,
+                            Drift::After => *position + text.length(),
+                        },
+                        _ => position.apply_edit(edit),
+                    };
+                }
+            }
+        }
         let mut layout = self.0.layout.borrow_mut();
         for edit in edits {
             match edit.change {
@@ -638,49 +973,12 @@ impl CodeDocument {
     }
 
     fn update_indent_state(&self) {
-        let mut layout = self.0.layout.borrow_mut();
-        let indent_state = &mut layout.indent_state;
-        let history = self.0.history.borrow();
-        let lines = history.as_text().as_lines();
-        let mut current_indent_column_count = 0;
-        for line_index in 0..lines.len() {
-            match indent_state[line_index] {
-                Some(IndentState::NonEmpty(_, next_indent_column_count)) => {
-                    current_indent_column_count = next_indent_column_count;
-                }
-                _ => {
-                    indent_state[line_index] = Some(match lines[line_index].indent() {
-                        Some(indent) => {
-                            let indent_column_count = indent.column_count();
-                            let mut next_indent_column_count = indent_column_count;
-                            if lines[line_index]
-                                .chars()
-                                .rev()
-                                .find_map(|char| {
-                                    if char.is_opening_delimiter() {
-                                        return Some(true);
-                                    }
-                                    if char.is_closing_delimiter() {
-                                        return Some(false);
-                                    }
-                                    None
-                                })
-                                .unwrap_or(false)
-                            {
-                                next_indent_column_count += 4;
-                            }
-                            current_indent_column_count = next_indent_column_count;
-                            IndentState::NonEmpty(indent_column_count, next_indent_column_count)
-                        }
-                        None => IndentState::Empty(current_indent_column_count),
-                    })
-                }
-            }
-        }
+        update_indent_state(&self.as_text(), &mut self.0.layout.borrow_mut().indent_state);
     }
+
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DocumentLayout {
     pub indent_state: Vec<Option<IndentState>>,
     pub tokens: Vec<Vec<Token>>,
@@ -713,6 +1011,13 @@ impl<'a> Editor<'a> {
 
 #[derive(Debug)]
 struct DocumentInner {
+    diff: Option<DiffMetadata>,
+    gutter_mode: Cell<GutterMode>,
+    id: u64,
+    next_anchor: Cell<u64>,
+    anchors: RefCell<HashMap<u64, (Position, Drift)>>,
+    digest: Cell<Option<u64>>,
+    version: Cell<u64>,
     history: RefCell<History>,
     layout: RefCell<DocumentLayout>,
     tokenizer: RefCell<Tokenizer>,
@@ -729,4 +1034,246 @@ fn tokenize(text: &str) -> impl Iterator<Item = Token> + '_ {
             TokenKind::Unknown
         },
     })
+}
+
+/// An opaque, document-scoped anchor; copies share the same lifetime until removal.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TextAnchor {
+    document: u64,
+    id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AnchorRange {
+    pub start: TextAnchor,
+    pub end: TextAnchor,
+}
+
+/// Immutable worker output. Fields are private so callers cannot forge a stamp.
+#[derive(Clone, Debug)]
+pub struct PreparedDocument {
+    byte_len:usize,
+    pub(crate) text: Text,
+    layout: DocumentLayout,
+    tokenizer: Tokenizer,
+    digest: u64,
+    version: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DocumentMutationError {
+    ReadOnlyDiff,
+}
+
+impl PreparedDocument {
+    pub(crate) fn from_diff_rows(text: Text, layout: DocumentLayout) -> Self {
+        Self { byte_len:text.as_lines().iter().map(|line|line.len()+1).sum(), digest: text_digest(&text), version: 0,
+            tokenizer: Tokenizer::new(text.as_lines().len()), text, layout }
+    }
+
+    /// Cached source-byte upper bound for O(1) worker admission on the UI.
+    pub fn byte_len(&self)->usize {self.byte_len}
+    pub fn layout(&self) -> &DocumentLayout { &self.layout }
+
+    pub fn as_text(&self) -> &Text {
+        &self.text
+    }
+    pub fn digest(&self) -> u64 {
+        self.digest
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+pub(crate) fn valid_position(text: &Text, position: Position) -> bool {
+    text.as_lines()
+        .get(position.line_index)
+        .is_some_and(|line| line.is_char_boundary(position.byte_index))
+}
+
+fn text_digest(text: &Text) -> u64 {
+    // FNV-1a over canonical UTF-8 including line separators, independent of Hash seeds.
+    let mut hash = 0xcbf29ce484222325u64;
+    for (index, line) in text.as_lines().iter().enumerate() {
+        if index != 0 {
+            hash = (hash ^ 10).wrapping_mul(0x100000001b3);
+        }
+        for byte in line.bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn update_indent_state(text: &Text, indent_state: &mut [Option<IndentState>]) {
+    let lines = text.as_lines();
+    let mut current_indent_column_count = 0;
+    for line_index in 0..lines.len() {
+        match indent_state[line_index] {
+            Some(IndentState::NonEmpty(_, next_indent_column_count)) => {
+                current_indent_column_count = next_indent_column_count;
+            }
+            _ => {
+                indent_state[line_index] = Some(match lines[line_index].indent() {
+                    Some(indent) => {
+                        let indent_column_count =
+                            indent.column_count_at(0, Settings::default().tab_column_count);
+                        let mut next_indent_column_count = indent_column_count;
+                        if lines[line_index]
+                            .chars()
+                            .rev()
+                            .find_map(|char| {
+                                if char.is_opening_delimiter() {
+                                    return Some(true);
+                                }
+                                if char.is_closing_delimiter() {
+                                    return Some(false);
+                                }
+                                None
+                            })
+                            .unwrap_or(false)
+                        {
+                            next_indent_column_count += 4;
+                        }
+                        current_indent_column_count = next_indent_column_count;
+                        IndentState::NonEmpty(indent_column_count, next_indent_column_count)
+                    }
+                    None => IndentState::Empty(current_indent_column_count),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::selection::{Cursor, Selection},
+        std::sync::mpsc,
+    };
+
+    #[test]
+    fn two_sessions_share_one_history() {
+        let position = |byte_index| Position { line_index: 0, byte_index };
+        let selection_at = |byte_index| {
+            let mut selections = SelectionSet::new();
+            selections.set_selection(Selection::from(Cursor {
+                position: position(byte_index),
+                ..Cursor::default()
+            }));
+            selections
+        };
+        let receive = |receiver: &mpsc::Receiver<(Option<SelectionSet>, Vec<Edit>)>,
+                       selections: Option<&SelectionSet>, property: &str| {
+            let messages: Vec<_> = iter::from_fn(|| receiver.try_recv().ok()).collect();
+            assert_eq!(messages.len(), 1, "{property}: exactly one broadcast");
+            let (received_selections, edits) = messages.into_iter().next().unwrap();
+            assert_eq!(received_selections.as_ref(), selections, "{property}: selections");
+            assert!(!edits.is_empty(), "{property}: edits are broadcast");
+            edits
+        };
+        let mut document = CodeDocument::new("hi".into(), DecorationSet::default());
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        assert_ne!(session_a, session_b, "sessions have fresh, distinct ids");
+        let (sender_a, receiver_a) = mpsc::channel();
+        let (sender_b, receiver_b) = mpsc::channel();
+        document.add_session(session_a, sender_a);
+        document.add_session(session_b, sender_b);
+
+        let before_typing = selection_at(2);
+        let before_second_char = selection_at(3);
+        let before_other_session = selection_at(0);
+        let before_delete = selection_at(5);
+        for (session, kind, selections, start, end, text, expected, property) in [
+            (session_a, EditKind::Insert, &before_typing, 2, 2, "a", "hia", "first typed character"),
+            (session_a, EditKind::Insert, &before_second_char, 3, 3, "b", "hiab", "second typed character"),
+            (session_b, EditKind::Insert, &before_other_session, 0, 0, "X", "Xhiab", "other session insert"),
+            (session_a, EditKind::Delete, &before_delete, 4, 5, "", "Xhia", "different edit kind"),
+        ] {
+            let start = position(start);
+            let end = position(end);
+            document.apply_ranges(session, kind, selections, &[(start, end, text.into())]);
+            assert_eq!(document.as_text().to_string(), expected, "{property}: text");
+            let expected_edits = vec![
+                Edit { change: Change::Delete(start, end - start), drift: Drift::Before },
+                Edit { change: Change::Insert(start, text.into()), drift: Drift::Before },
+            ];
+            for (name, receiver) in [("A", &receiver_a), ("B", &receiver_b)] {
+                let edits = receive(receiver, None, &format!("{property}: session {name}"));
+                assert_eq!(edits, expected_edits, "{property}: session {name} receives both edits in order");
+            }
+        }
+
+        let final_selection = selection_at(4);
+        let mut sel = final_selection.clone();
+        for (expected, restored, property) in [
+            ("Xhiab", &before_delete, "delete has its own group"),
+            ("hiab", &before_other_session, "another session never merges"),
+            ("hi", &before_typing, "typing coalesces with the first selection"),
+        ] {
+            assert!(document.undo(session_a, &sel), "{property}: undo succeeds");
+            assert_eq!(document.as_text().to_string(), expected, "{property}: undo text");
+            let edits_a = receive(&receiver_a, Some(restored), property);
+            let edits_b = receive(&receiver_b, None, "undo observer B receives no selections");
+            assert_eq!(edits_a, edits_b, "{property}: undo reaches both sessions");
+            sel = restored.clone();
+        }
+        assert!(!document.undo(session_a, &sel), "three groups exhaust undo history");
+        assert!(receiver_a.try_recv().is_err(), "empty undo does not broadcast to A");
+        assert!(receiver_b.try_recv().is_err(), "empty undo does not broadcast to B");
+        for (expected, restored) in [
+            ("hiab", &before_other_session),
+            ("Xhiab", &before_delete),
+            ("Xhia", &final_selection),
+        ] {
+            assert!(document.redo(session_b, &sel), "redo from session B succeeds: {expected}");
+            assert_eq!(document.as_text().to_string(), expected, "redo restores group text");
+            let edits_a = receive(&receiver_a, None, "redo observer A receives no selections");
+            let edits_b = receive(&receiver_b, Some(restored), "redo origin B restores selections");
+            assert_eq!(edits_a, edits_b, "redo reaches both sessions");
+            sel = restored.clone();
+        }
+
+        let before_c = selection_at(4);
+        let before_d = selection_at(5);
+        for (force_new, selections, at, text, expected) in [
+            (false, &before_c, 4, "c", "Xhiac"),
+            (true, &before_d, 5, "d", "Xhiacd"),
+        ] {
+            if force_new {
+                document.force_new_group();
+            }
+            document.apply_ranges(
+                session_a, EditKind::Insert, selections,
+                &[(position(at), position(at), text.into())],
+            );
+            assert_eq!(document.as_text().to_string(), expected, "forced group insert text");
+            let edits_a = receive(&receiver_a, None, "forced group origin A receives no selections");
+            let edits_b = receive(&receiver_b, None, "forced group observer B receives no selections");
+            assert_eq!(edits_a, edits_b, "forced group insert reaches both sessions");
+        }
+
+        document.replace_range(position(0), position(1), "Y".into());
+        assert_eq!(document.as_text().to_string(), "Yhiacd", "replace_range replaces only its range");
+        let edits_a = receive(&receiver_a, None, "replace_range sends no selections to A");
+        let edits_b = receive(&receiver_b, None, "replace_range sends no selections to B");
+        assert_eq!(edits_a, edits_b, "replace_range reaches both sessions");
+        let replacement_selection = SelectionSet::default();
+        sel = selection_at(6);
+        for (expected, restored, property) in [
+            ("Xhiacd", &replacement_selection, "replace_range opens its own group"),
+            ("Xhiac", &before_d, "force_new_group separates the second insert"),
+            ("Xhia", &before_c, "the first insert takes one more undo step"),
+        ] {
+            assert!(document.undo(session_a, &sel), "{property}: undo succeeds");
+            assert_eq!(document.as_text().to_string(), expected, "{property}: undo text");
+            let edits_a = receive(&receiver_a, Some(restored), property);
+            let edits_b = receive(&receiver_b, None, "undo observer B receives no selections");
+            assert_eq!(edits_a, edits_b, "{property}: undo reaches both sessions");
+            sel = restored.clone();
+        }
+    }
 }

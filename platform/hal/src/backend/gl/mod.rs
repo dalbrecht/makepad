@@ -1,0 +1,706 @@
+//! The GLES 3 HAL backend (Linux machines without a usable Vulkan device, Android devices
+//! without Vulkan 1.1, or MAKEPAD_HAL_BACKEND=gl). Same executor contract as Vulkan/Metal/D3D11:
+//! commands, generations, font jobs and lending use the shared executor; resources are keyed by
+//! (session, index) with generations; pipelines come as the GLSL dialect payload Cx's shader
+//! compiler emitted.
+//!
+//! One GL context, owned by one render thread (render.rs), does all GL work but Android's compiles
+//! after the first frame (worker.rs); the hooks here run inside `hal_submit` and only validate, lay
+//! out and queue owned jobs. Windows of the X11 and Wayland shells and of Android's Activity present
+//! through EGL window surfaces; offscreen windows (hidden runs, tests) use the surfaceless platform.
+//! Images keep their top row first as on the other backends: every vertex shader of the dialect
+//! flips clip-space Y and the present blit flips it back.
+//!
+//! Every window frame renders into the window's retained image, which the surface shows a copy
+//! of. Under a badge layer of session 0's (`Gpu::badge_layer`: badges, panels and window layers
+//! the executor composes) a frame stays there; the layer's frame copies it into the window's
+//! composed image, draws the layer over it and presents that. The copies, as all GL work, are
+//! jobs of the render thread, queued ahead of the frame that reads them.
+
+mod cache;
+pub(crate) mod egl;
+mod frame;
+mod program;
+mod render;
+pub mod surface;
+mod sys;
+mod timer;
+#[cfg(target_os = "android")]
+mod worker;
+
+use super::exec::{self, Gpu, PipeStatus};
+use super::{Backend, Pixels};
+use crate::buffers::{CmdView, PipelineBlob};
+use crate::glsl::GlslPipeline;
+use crate::ledger::{Charge, Kind, LedgerEntry, Pools};
+use crate::session::*;
+use crate::types::*;
+use render::{Caps, Event, Mailbox, Queue, ReadFormat, Token};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+
+/// A texture's storage on the render thread; dropping the last lease deletes it there (after
+/// every job queued before).
+pub(crate) struct TexObj {
+    key: u64,
+    desc: TextureObj,
+    /// a BGRA8 texture that is only uploaded keeps its bytes as RGBA storage, sampled swizzled
+    swizzled: bool,
+    queue: Queue,
+}
+
+impl Drop for TexObj {
+    fn drop(&mut self) {
+        let key = self.key;
+        self.queue.push(move |r| r.delete_texture(key));
+    }
+}
+
+pub(crate) struct BufObj {
+    key: u64,
+    size: u64,
+    queue: Queue,
+}
+
+impl Drop for BufObj {
+    fn drop(&mut self) {
+        let key = self.key;
+        self.queue.push(move |r| r.delete_buffer(key));
+    }
+}
+
+/// What a link tells the HAL side: the data size of each uniform block in `GlslPipeline::blocks`
+/// order (None: the program does not use it).
+pub(crate) struct Linked {
+    block_sizes: Vec<Option<u32>>,
+}
+
+/// A program shared by every pipeline with the same payload and layout.
+pub(crate) struct PipeState {
+    key: u64,
+    code: GlslPipeline,
+    desc: PipelineDesc,
+    linked: OnceLock<Result<Linked, String>>,
+    epoch: AtomicU64,
+    queue: Queue,
+}
+
+impl Drop for PipeState {
+    fn drop(&mut self) {
+        let key = self.key;
+        self.queue.push(move |r| r.delete_program(key));
+    }
+}
+
+pub(crate) struct Tex {
+    gen: u32,
+    obj: Arc<TexObj>,
+}
+struct Buf {
+    gen: u32,
+    obj: Arc<BufObj>,
+}
+struct Pipe {
+    gen: u32,
+    state: Arc<PipeState>,
+    epoch: u64,
+    announced: bool,
+}
+/// A host window's composed image under its badge layer (`Gpu::badge_layer`): the retained image
+/// with the layer drawn over, what the window presents.
+pub(crate) struct Composed {
+    gen: u32,
+    obj: Arc<TexObj>,
+    _charge: Charge,
+}
+
+/// The window system the windows live in: an X11/Wayland shell, or Android's Activity.
+#[cfg(target_os = "linux")]
+type ShellRef = &'static super::linux::Shared;
+#[cfg(target_os = "android")]
+type ShellRef = Box<dyn super::Shell>;
+
+pub struct GlBackend {
+    shell: Option<ShellRef>,
+    info: HalInfo,
+    caps: Arc<Caps>,
+    queue: Queue,
+    thread: Option<std::thread::JoinHandle<()>>,
+    next_key: u64,
+    /// what the render thread allocates for itself (arenas, word textures, readback buffers)
+    pools: Arc<Pools>,
+    tex: HashMap<(u32, u32), Tex>,
+    buf: HashMap<(u32, u32), Buf>,
+    pipe: HashMap<(u32, u32), Pipe>,
+    programs: HashMap<Vec<u8>, Weak<PipeState>>,
+    /// windows' images, by (owner, index)
+    win: HashMap<(u32, u32), Tex>,
+    /// the frame a window's kept image holds all of (and that image's key), so the window's next
+    /// pass can repaint just what changed since
+    damage_base: HashMap<(u32, u32), (u64, u64)>,
+    aliases: HashMap<(u32, Id), Id>,
+    /// Pick targets whose latest replay skipped a draw.
+    pick_pending: HashSet<(u32, Id)>,
+    /// session 0's windows with a badge layer (by index), and the image each last presented: its
+    /// retained image with the layer over it
+    badged: HashMap<u32, Option<Composed>>,
+    /// the composed image the badge frame being encoded draws into
+    compose: Option<Arc<TexObj>>,
+    mailbox: Mailbox,
+    /// video, audio, MIDI, camera, dialogs (`backend/linux/media`, `backend/android/media`)
+    #[cfg(target_os = "linux")]
+    media: super::linux::media::Media,
+    #[cfg(target_os = "android")]
+    media: super::android::media::AndroidMedia,
+}
+
+impl GlBackend {
+    #[cfg(target_os = "linux")]
+    pub fn new(flags: u32, wake: Arc<dyn Fn() + Send + Sync>, notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+        if flags & open_flags::OFFSCREEN_WINDOWS != 0 {
+            return Self::with_source(wake, Box::new(surface::Offscreen), None);
+        }
+        let shell = super::linux::Shared::global();
+        shell.start(flags, notify)?;
+        Self::on_shell(wake, shell)
+    }
+
+    /// On a started X11/Wayland shell (the DRM/KMS direct shell presents through Vulkan only).
+    #[cfg(target_os = "linux")]
+    pub fn on_shell(wake: Arc<dyn Fn() + Send + Sync>, shell: &'static super::linux::Shared) -> Result<Self, String> {
+        let mut backend = Self::with_source(wake, Box::new(super::linux::EglSurfaceSource(shell)), Some(shell))?;
+        backend.info.flags |= info_flags::DISPLAY_CLOCK;
+        if shell.client_chrome() { backend.info.flags |= info_flags::CLIENT_CHROME; }
+        if shell.window_manager() { backend.info.flags |= info_flags::WM_HOSTED; }
+        backend.info.dpi = shell.dpi();
+        Ok(backend)
+    }
+
+    /// Windows of `shell` present through `source`; without a shell they're offscreen.
+    pub(crate) fn with_source(wake: Arc<dyn Fn() + Send + Sync>, source: Box<dyn surface::EglSurfaceSource>, shell: Option<ShellRef>) -> Result<Self, String> {
+        let mailbox = Mailbox::new(wake);
+        let pools = Arc::new(Pools::default());
+        let (queue, caps, thread) = render::start(source, mailbox.clone(), pools.clone())?;
+        // offscreen too: a badge layer is composed into the retained image's copy either way
+        let mut info = HalInfo { backend: backend_id::GL, dialect: dialect::GLSL, formats: caps.formats, msaa: 1, dpi: 1.0,
+            flags: info_flags::WINDOW_BADGES | info_flags::WINDOW_LAYERS | info_flags::PARTIAL_REPAINT
+                | if caps.gpu_timer { info_flags::GPU_TIMESTAMPS } else { 0 } | if caps.program_cache_cold { info_flags::PIPELINE_CACHE_COLD } else { 0 },
+            max_texture: caps.max_texture, max_window: [caps.max_texture; 2],
+            device_kind: if caps.software { device_kind::SOFTWARE } else { device_kind::UNKNOWN }, ..Default::default() };
+        info.set_device_name(&caps.renderer);
+        if super::log_enabled() { eprintln!("[hal-gl] {} offscreen={} software={}", caps.renderer, shell.is_none(), caps.software); }
+        Ok(Self { shell, info, caps, queue, thread: Some(thread), next_key: 1, pools,
+            tex: HashMap::new(), buf: HashMap::new(), pipe: HashMap::new(), programs: HashMap::new(), win: HashMap::new(), damage_base: HashMap::new(),
+            aliases: HashMap::new(), pick_pending: HashSet::new(), badged: HashMap::new(), compose: None,
+            mailbox, media: Default::default() })
+    }
+
+    /// A software rasterizer (llvmpipe): the default selection prefers hardware Vulkan and GL.
+    pub fn software(&self) -> bool {
+        self.caps.software
+    }
+
+    /// What Android's `surfaceDestroyed` calls: the render thread lets go of every window
+    /// surface before it returns, as Android asks, or after a second at most.
+    #[cfg(target_os = "android")]
+    pub fn window_release(&self) -> Box<dyn Fn() + Send + Sync> {
+        let queue = self.queue.clone();
+        Box::new(move || {
+            let (done, released) = std::sync::mpsc::sync_channel(1);
+            queue.push_urgent(move |r| { r.ctx.close_all(); let _ = done.send(()); });
+            // before the first frame there's no surface to let go of, while the render thread may be compiling
+            if queue.surfaces.load(Ordering::SeqCst) == 0 { return; }
+            if released.recv_timeout(std::time::Duration::from_secs(1)).is_err() {
+                eprintln!("[hal-gl] the render thread didn't let go of the window within a second");
+            }
+        })
+    }
+
+    fn token(s: &Session) -> Token {
+        Token { sid: s.id, incarnation: s.font_frames.clone() }
+    }
+
+    fn window_key(&self, sid: u32, id: Id) -> (u32, Id) {
+        self.aliases.get(&(sid, id)).map_or((sid, id), |host| (HOST, *host))
+    }
+
+    fn key(&mut self) -> u64 {
+        self.next_key += 1;
+        self.next_key
+    }
+
+    fn new_texture(&mut self, mut desc: TextureObj) -> Result<Arc<TexObj>, String> {
+        let c = &self.caps;
+        if desc.w == 0 || desc.h == 0 || desc.depth == 0 || desc.mips == 0 || desc.mips > 32 - desc.w.max(desc.h).leading_zeros()
+            || desc.w > c.max_texture || desc.h > c.max_texture || desc.depth > c.max_layers {
+            return Err("invalid texture dimensions or mip count".into());
+        }
+        if c.formats & (1 << desc.format) == 0 {
+            return Err(format!("this GLES context cannot sample {}", format::name(desc.format)));
+        }
+        if desc.usage & usage::RENDER_TARGET != 0 && format::is_block(desc.format) {
+            return Err("compressed textures cannot be render targets".into());
+        }
+        desc.bytes = exec::texture_bytes(desc.format, desc.w, desc.h, desc.depth, desc.mips);
+        desc.imported = false;
+        let swizzled = desc.format == format::BGRA8 && desc.usage & usage::RENDER_TARGET == 0;
+        let key = self.key();
+        let made = desc.clone();
+        self.queue.push(move |r| r.create_texture(key, made, swizzled));
+        Ok(Arc::new(TexObj { key, desc, swizzled, queue: self.queue.clone() }))
+    }
+
+    fn new_buffer(&mut self, size: u64) -> Arc<BufObj> {
+        let key = self.key();
+        self.queue.push(move |r| r.create_buffer(key, size));
+        Arc::new(BufObj { key, size, queue: self.queue.clone() })
+    }
+
+    fn drain(&mut self, world: &mut World) {
+        for done in self.mailbox.take() {
+            let sid = done.token.sid;
+            if !world.session(sid).is_some_and(|s| Arc::ptr_eq(&s.font_frames, &done.token.incarnation)) { continue; }
+            match done.event {
+                Event::Frame { target, kind, frame, window, gpu_ns, ran } => {
+                    // a frame the GPU never ran isn't in the window's image, nor is any frame built on it
+                    if !ran && super::window_frame(kind) {
+                        let (key_sid, key) = self.window_key(sid, target);
+                        if self.damage_base.get(&(key_sid, key.index)).is_some_and(|(_, base)| *base >= frame) {
+                            self.damage_base.remove(&(key_sid, key.index));
+                        }
+                    }
+                    if let Some(s) = world.session_mut(sid) {
+                        s.stats.frames += 1;
+                        if gpu_ns > 0 { s.stats.gpu_frames += 1; s.stats.gpu_ns_total += gpu_ns; s.stats.gpu_ns_max = s.stats.gpu_ns_max.max(gpu_ns); }
+                    }
+                    if window {
+                        world.window_presented(sid, target, frame, gpu_ns, done.time);
+                        #[cfg(target_os = "linux")]
+                        if let Some(shell) = self.shell { shell.presented(self.window_key(sid, target)); }
+                        #[cfg(target_os = "android")]
+                        super::android::jni::surface_presented();
+                    }
+                    world.frame_done(sid, target, kind, frame, gpu_ns, done.time, [0.0; 2]);
+                }
+                Event::BufferLeases { req, status, leases } => world.to_session(sid, |q| q.buffer_leases(req, status, leases)),
+                Event::Readback { req, status, rect, lease } => world.to_session(sid, |q| q.readback(req, status, rect, lease)),
+            }
+        }
+        for ((sid, index), pipe) in &mut self.pipe {
+            let epoch = pipe.state.epoch.load(Ordering::Acquire);
+            if epoch == pipe.epoch { continue; }
+            pipe.epoch = epoch;
+            let id = Id::new(*index, pipe.gen);
+            let Some(s) = world.session_mut(*sid) else { continue };
+            if !pipe.announced {
+                pipe.announced = true;
+                s.pipelines_pending = s.pipelines_pending.saturating_sub(1);
+            }
+            match pipe.state.linked.get() {
+                Some(Err(e)) => {
+                    eprintln!("[hal-gl] pipeline {id:?} failed: {e}");
+                    let log = e.clone();
+                    world.to_session(*sid, |q| q.pipeline_failed(id, log.as_bytes()));
+                }
+                Some(Ok(_)) => world.to_session(*sid, |q| q.pipeline_ready(id)),
+                None => {}
+            }
+        }
+        // GL has no count of a process's video memory: `device_allocated` stays unknown
+        if let Some(host) = world.session_mut(HOST) {
+            let frame = host.frame;
+            host.ledger.set_pools(&self.pools, frame, crate::clock_ns());
+            for ((sid, index), t) in &self.win {
+                if *sid == HOST && host.ledger.get(Kind::Window, *index).is_none_or(|r| r.gen != t.gen || r.bytes != t.obj.desc.bytes
+                    || r.width != t.obj.desc.w || r.height != t.obj.desc.h) {
+                    host.ledger.add(window_row(Id::new(*index, t.gen), &t.obj.desc, crate::clock_ns(), host.frame));
+                }
+            }
+        }
+    }
+
+    /// Validates a readback of level 0 and queues it; answers the failure at once.
+    fn read(&mut self, s: &mut Session, tex: Option<Arc<TexObj>>, req: u32, rect: [u32; 4]) {
+        let result = (|| {
+            let t = tex.ok_or("readback texture has no storage")?;
+            if rect[0] >= t.desc.w || rect[1] >= t.desc.h { return Err("readback origin exceeds texture".to_string()); }
+            let rect = [rect[0], rect[1], rect[2].min(t.desc.w - rect[0]), rect[3].min(t.desc.h - rect[1])];
+            if rect[2] == 0 || rect[3] == 0 { return Err("empty readback region".into()); }
+            let read = ReadFormat::of(&t)?;
+            let (token, key) = (Self::token(s), t.key);
+            self.queue.push(move |r| r.read(token, key, read, req, rect));
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("[hal-gl] readback: {e}");
+            s.events.readback(req, readback::FAILED, rect, None);
+        }
+    }
+
+    /// The host's synchronous read of a window's newest frame (automation); never on a shell thread.
+    fn host_window_pixels(&mut self, world: &mut World, sid: u32, window: Option<Id>) -> Option<Pixels> {
+        let s = world.session_mut(sid)?;
+        let id = window.or_else(|| s.windows.keys_of(sid).into_iter().next())?;
+        let t = self.window_image(s, id)?;
+        if !matches!(t.desc.format, format::BGRA8 | format::RGBA8) { return None; }
+        let read = ReadFormat::of(&t).ok()?;
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        self.queue.push(move |r| { let _ = reply.send(r.read_now(t.key, read)); });
+        rx.recv().ok().flatten()
+    }
+}
+
+impl Backend for GlBackend {
+    fn info(&self) -> HalInfo {
+        self.info
+    }
+    fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) {
+        self.drain(world);
+        exec::submit(self, world, sid, view);
+    }
+    fn host_gpu(&mut self) -> Option<&mut dyn Gpu> {
+        Some(self)
+    }
+    fn step(&mut self, world: &mut World, sid: u32) {
+        self.drain(world);
+        #[cfg(target_os = "linux")]
+        if let Some(shell) = self.shell {
+            for (owner, id) in shell.drain_events(sid, world) {
+                // a parent close also closes native popups, and an X server can destroy a window
+                // on its own: retire their surfaces without a WindowClose command
+                let host = self.aliases.get(&(owner, id)).copied();
+                let key = self.window_key(owner, id);
+                self.window_closed(key.0, key.1);
+                let _ = world.release_window(owner, id);
+                if let Some(host) = host {
+                    self.aliases.retain(|_, parent| *parent != host);
+                    let _ = world.release_window(HOST, host);
+                    world.to_session(HOST, |q| q.closed(host));
+                }
+            }
+        }
+        if let Some(s) = world.session_mut(sid) {
+            let mut media = std::mem::take(&mut self.media);
+            #[cfg(target_os = "linux")]
+            media.step(self, s);
+            #[cfg(target_os = "android")]
+            media.drain(self, s);
+            self.media = media;
+        }
+        exec::step_timers(world, sid);
+    }
+    fn next_due(&self, world: &World, sid: u32) -> Option<u64> {
+        exec::next_timer(world, sid).into_iter().chain(self.media.next_due(sid, world.now())).min()
+    }
+    /// The app may make GL contexts of the HAL's share group (GL interop): it hears how.
+    #[cfg(target_os = "linux")]
+    fn session_opened(&mut self, world: &mut World, sid: u32) {
+        let [display, config, context] = self.caps.share;
+        world.to_session(sid, |q| q.gl_share(display, config, context));
+    }
+    fn session_closed(&mut self, world: &mut World, sid: u32) {
+        self.media.session_closed(sid);
+        self.queue.push(move |r| r.ctx.close_session(sid));
+        self.tex.retain(|k, _| k.0 != sid);
+        self.buf.retain(|k, _| k.0 != sid);
+        self.pipe.retain(|k, _| k.0 != sid);
+        self.win.retain(|k, _| k.0 != sid);
+        self.damage_base.retain(|k, _| k.0 != sid);
+        self.aliases.retain(|k, _| k.0 != sid);
+        self.pick_pending.retain(|k| k.0 != sid);
+        if sid == HOST { self.badged.clear(); }
+        self.programs.retain(|_, state| state.strong_count() > 0);
+        exec::free_session(world, sid);
+        #[cfg(target_os = "linux")]
+        if let Some(shell) = self.shell { shell.session_closed(sid); }
+    }
+    fn window_pixels(&mut self, world: &mut World, sid: u32, window: Option<Id>) -> Option<Pixels> {
+        self.host_window_pixels(world, sid, window)
+    }
+    /// The process ends next: the render thread (the one GL context) runs what was queued,
+    /// finishes the GPU's work (`Renderer::drop`) and is joined.
+    fn before_exit(&mut self) { self.stop(); }
+}
+
+impl GlBackend {
+    fn stop(&mut self) {
+        self.queue.push(|r| r.exit());
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() { eprintln!("[hal-gl] the render thread panicked"); }
+        }
+    }
+}
+
+impl Drop for GlBackend {
+    fn drop(&mut self) { self.stop(); }
+}
+
+impl Gpu for GlBackend {
+    #[cfg(target_os = "android")]
+    fn a11y_notify(&mut self, window: u64, notifications: &[makepad_a11y::Notification]) {
+        super::android::a11y::notify(window, notifications);
+    }
+    fn media(&mut self, s: &mut Session, c: &crate::cmds::HalCmd) -> bool {
+        let mut media = std::mem::take(&mut self.media);
+        let handled = media.command(self, s, c);
+        self.media = media;
+        handled
+    }
+    #[cfg(target_os = "android")]
+    fn auto_adopt(&self) -> bool { self.shell.as_ref().is_some_and(|s| s.auto_adopt()) }
+    fn os(&mut self, sid: u32, command: exec::OsCmd) -> bool {
+        if matches!(&command, exec::OsCmd::FileDialog { .. }) { return self.media.dialog(sid, command); }
+        #[cfg(target_os = "linux")]
+        { if let Some(shell) = self.shell { shell.command(sid, command); return true; } false }
+        #[cfg(target_os = "android")]
+        { self.shell.as_mut().is_some_and(|s| s.command(sid, command)) }
+    }
+    fn texture_create(&mut self, s: &mut Session, id: Id, t: &mut TextureObj) -> Result<(), String> {
+        let obj = self.new_texture(t.clone()).map_err(|e| { eprintln!("[hal-gl] texture create: {e}"); e })?;
+        t.bytes = obj.desc.bytes;
+        self.tex.insert((s.id, id.index), Tex { gen: id.gen, obj });
+        Ok(())
+    }
+    fn texture_update(&mut self, s: &mut Session, id: Id, _t: &TextureObj, mip: u16, rect: [u32; 4], layer: u32, data: &[u8]) {
+        let Some(t) = self.resolve(s, id) else { eprintln!("[hal-gl] texture upload: missing texture {id:?}"); s.bad(); return };
+        let mip = mip as u32;
+        let [x, y, w, h] = rect;
+        let (mw, mh) = ((t.desc.w >> mip).max(1), (t.desc.h >> mip).max(1));
+        let fits = mip < t.desc.mips && layer < t.desc.depth && w > 0 && h > 0 && x + w <= mw && y + h <= mh
+            && (!format::is_block(t.desc.format) || (x % 4 == 0 && y % 4 == 0 && (w % 4 == 0 || x + w == mw) && (h % 4 == 0 || y + h == mh)));
+        if !fits || data.len() as u64 != format::level_bytes(t.desc.format, w, h) {
+            eprintln!("[hal-gl] texture upload: invalid region");
+            s.bad();
+            return;
+        }
+        let (key, data, swap) = (t.key, data.to_vec(), !t.swizzled);
+        self.queue.push(move |r| r.upload(key, mip, rect, layer, data, swap));
+    }
+    fn texture_destroy(&mut self, sid: u32, id: Id) {
+        if self.tex.get(&(sid, id.index)).is_some_and(|t| t.gen <= id.gen) { self.tex.remove(&(sid, id.index)); }
+        self.pick_pending.remove(&(sid, id));
+    }
+    fn texture_readback(&mut self, s: &mut Session, id: Id, req: u32, rect: [u32; 4]) {
+        if self.pick_pending.contains(&(s.id, id)) {
+            s.events.readback(req, readback::INCOMPLETE, rect, None);
+            return;
+        }
+        let t = self.resolve(s, id);
+        self.read(s, t, req, rect);
+    }
+    /// GLES textures have no cross-process handle here: handle 0, as headless answers.
+    fn texture_share(&mut self, s: &mut Session, id: Id) {
+        s.events.texture_shared(id, 0);
+    }
+    fn texture_import(&mut self, _s: &mut Session, _id: Id, _handle: u64, _kind: u32) -> Option<TextureObj> {
+        None
+    }
+    fn texture_adopt_gl(&mut self, s: &mut Session, id: Id, name: u32, format: u32, w: u32, h: u32, owned: bool) -> Option<TextureObj> {
+        let bytes = if owned { exec::texture_bytes(format, w, h, 1, 1) } else { 0 };
+        let desc = TextureObj { format, w, h, depth: 1, mips: 1, usage: usage::SAMPLED, bytes, imported: true, uploaded: 0, lent: None };
+        let key = self.key();
+        let made = desc.clone();
+        self.queue.push(move |r| r.adopt_texture(key, name, made, owned));
+        let obj = Arc::new(TexObj { key, desc: desc.clone(), swizzled: false, queue: self.queue.clone() });
+        self.tex.insert((s.id, id.index), Tex { gen: id.gen, obj });
+        Some(desc)
+    }
+    fn gl_fence(&mut self, _s: &mut Session, sync: u64) {
+        self.queue.push(move |r| r.wait_fence(sync));
+    }
+    fn buffer_create(&mut self, s: &mut Session, id: Id, b: &mut BufferObj) -> Result<(), String> {
+        let obj = self.new_buffer(b.size);
+        b.bytes = b.size;
+        self.buf.insert((s.id, id.index), Buf { gen: id.gen, obj });
+        Ok(())
+    }
+    fn buffer_update(&mut self, s: &mut Session, id: Id, _b: &mut BufferObj, off: u64, data: &[u8]) {
+        match self.buf.get(&(s.id, id.index)).filter(|r| r.gen == id.gen) {
+            Some(r) => {
+                let (key, data) = (r.obj.key, data.to_vec());
+                self.queue.push(move |r| r.write_buffer(key, off, data));
+            }
+            None => {
+                eprintln!("[hal-gl] buffer update: missing buffer {id:?}");
+                s.bad();
+            }
+        }
+    }
+    fn buffer_destroy(&mut self, sid: u32, id: Id) {
+        if self.buf.get(&(sid, id.index)).is_some_and(|b| b.gen <= id.gen) { self.buf.remove(&(sid, id.index)); }
+    }
+    fn buffer_readbacks(&mut self, s: &mut Session, req: u32, ranges: &[BufferReadRange]) {
+        let reads: Option<Vec<_>> = ranges.iter().map(|range| {
+            let b = self.buf.get(&(s.id, range.id.index)).filter(|b| b.gen == range.id.gen)?;
+            Some((b.obj.clone(), range.offset, range.len))
+        }).collect();
+        let Some(reads) = reads else { s.events.buffer_leases(req, readback::STALE, Vec::new()); return; };
+        let token = Token { sid: s.id, incarnation: s.font_frames.clone() };
+        self.queue.push(move |r| {
+            let ranges: Vec<_> = reads.iter().map(|(b, off, len)| (b.key, *off, *len)).collect();
+            r.read_buffers(token, req, &ranges);
+        });
+    }
+    fn buffer_evictable(&mut self, _sid: u32, _id: Id) {}
+    fn pipeline_create(&mut self, s: &mut Session, id: Id, dialect: u32, blob: &PipelineBlob, _: Attr) -> PipeStatus {
+        if dialect != self::dialect::GLSL { return PipeStatus::Failed("GLES takes the GLSL dialect payload".into()); }
+        let code = match GlslPipeline::decode(blob.code) { Ok(c) => c, Err(e) => return PipeStatus::Failed(e) };
+        let custom = blob.bindings.len().saturating_sub(pipeline_binding::BUFFERS);
+        if blob.bindings.len() < pipeline_binding::BUFFERS || blob.bindings[pipeline_binding::TEXTURES] as usize != code.textures.len()
+            || code.blocks.len() != 5 + custom {
+            return PipeStatus::Failed("GLSL payload and pipeline bindings disagree".into());
+        }
+        let mut key = blob.code.to_vec();
+        for v in [blob.desc.blend, blob.desc.instance_stride, blob.desc.outputs] { key.extend_from_slice(&v.to_le_bytes()); }
+        let state = self.programs.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let state = Arc::new(PipeState { key: self.key(), code, desc: blob.desc, linked: OnceLock::new(), epoch: AtomicU64::new(0), queue: self.queue.clone() });
+            let job = state.clone();
+            self.queue.push(move |r| r.compile(&job));
+            self.programs.insert(key, Arc::downgrade(&state));
+            state
+        });
+        // a program linked for an earlier pipeline is announced at the next drain like a new one
+        self.pipe.insert((s.id, id.index), Pipe { gen: id.gen, state, epoch: 0, announced: false });
+        PipeStatus::Pending
+    }
+    fn pipeline_destroy(&mut self, sid: u32, id: Id) -> bool {
+        if self.pipe.get(&(sid, id.index)).is_some_and(|p| p.gen <= id.gen) {
+            return self.pipe.remove(&(sid, id.index)).is_some_and(|p| !p.announced);
+        }
+        false
+    }
+    fn frame(&mut self, s: &mut Session, sid: u32, target: Id, kind: u32, packet: u32, view: &CmdView, now: u64) -> Option<exec::SubmittedFrame> {
+        // a native camera preview follows where the window frame places it
+        #[cfg(target_os = "android")]
+        if kind & !target::FLAGS == target::WINDOW && kind & (target::PICK | target::BADGES | target::REPLAY) == 0 {
+            self.media.native_frame(s, target, packet, view);
+        }
+        self.encode_frame(s, sid, target, kind, packet, view, now)
+    }
+    fn snapshot(&mut self, s: &mut Session, window: Id, req: u32) {
+        let t = self.window_image(s, window);
+        let rect = t.as_ref().map_or([0; 4], |t| [0, 0, t.desc.w, t.desc.h]);
+        self.read(s, t, req, rect);
+    }
+    fn window_copy(&mut self, s: &mut Session, window: Id, texture: Id, req: u32) {
+        let result = (|| {
+            let source = self.window_image(s, window).ok_or("window has no retained frame")?;
+            let dest = self.resolve(s, texture).ok_or("copy destination has no storage")?;
+            if source.desc.w != dest.desc.w || source.desc.h != dest.desc.h || source.desc.format != dest.desc.format
+                || dest.desc.usage & usage::RENDER_TARGET == 0 || Arc::ptr_eq(&source, &dest) {
+                return Err("window copy dimensions/format differ".to_string());
+            }
+            let (token, from, to, rect) = (Self::token(s), source.key, dest.key, [0, 0, source.desc.w, source.desc.h]);
+            self.queue.push(move |r| r.copy(token, from, to, req, rect));
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("[hal-gl] window copy: {e}");
+            s.events.readback(req, readback::FAILED, [0; 4], None);
+        }
+    }
+    fn window_closed(&mut self, sid: u32, id: Id) {
+        self.win.remove(&(sid, id.index));
+        if sid == HOST { self.badged.remove(&id.index); }
+        self.damage_base.remove(&(sid, id.index));
+        self.queue.push(move |r| r.ctx.close((sid, id)));
+    }
+    fn badges(&self) -> bool { true }
+    fn badge_layer(&mut self, window: Id, on: bool) {
+        if on { self.badged.entry(window.index).or_insert(None); } else { self.badged.remove(&window.index); }
+        // The surface showed the composed image under a layer and the window's own image without
+        // one, so after a switch the window's next frame is repainted and presented whole: its
+        // damage is measured against its own image, not against what the surface holds.
+        self.damage_base.remove(&(HOST, window.index));
+    }
+    fn layer_copy(&mut self, s: &mut Session, window: Id, layer: Id, _now: u64) -> bool { self.copy_into_layer(s, window, layer) }
+    fn window_lent(&mut self, sid: u32, id: Id, host: Id, attach: bool) {
+        #[cfg(target_os = "linux")]
+        if let Some(shell) = self.shell { shell.lend(host, if attach { sid } else { HOST }, if attach { id } else { host }); }
+        #[cfg(target_os = "android")]
+        if let Some(shell) = &mut self.shell { shell.lent(sid, id, host, attach); }
+        if attach {
+            self.aliases.insert((sid, id), host);
+        } else {
+            self.aliases.remove(&(sid, id));
+        }
+    }
+}
+
+/// Decoded video planes reach GL as uploads into ordinary 2D textures; DMA-BUF planes are
+/// imported by the Vulkan backend only, so the media service falls back to system memory.
+#[cfg(target_os = "linux")]
+impl super::linux::media::Sink for GlBackend {
+    fn declare(&mut self, s: &mut Session, id: Id, fmt: u32) {
+        if s.textures.get(s.id, id).is_ok() { return; }
+        let desc = TextureObj { format: fmt, w: 1, h: 1, depth: 1, mips: 1, usage: usage::SAMPLED, bytes: 0, imported: true, uploaded: 0, lent: None };
+        if s.textures.insert(s.id, id, s.id, desc.clone()).is_ok() { video_row(s, id, &desc); } else { s.stale(); }
+    }
+    fn present(&mut self, s: &mut Session, ids: [Id; 4], frame: &super::linux::media::video::Frame) -> Result<bool, String> {
+        use super::linux::media::video::Storage;
+        let targets: Vec<_> = if frame.yuv & crate::media::yuv::ENABLED != 0 { ids[1..].to_vec() } else { vec![ids[0]] };
+        if targets.len() != frame.planes.len() { return Err("video frame plane count differs from texture targets".into()); }
+        for id in &targets {
+            if s.textures.get(s.id, *id).is_err() { return Ok(false); }
+        }
+        let mut uploads = Vec::new();
+        for (&id, plane) in targets.iter().zip(&frame.planes) {
+            let Storage::Bytes(bytes) = &plane.storage else { return Err("GLES does not import DMA-BUF video planes".into()) };
+            if bytes.len() as u64 != format::level_bytes(plane.format, plane.width, plane.height) {
+                return Err("video plane byte count differs from its extent".into());
+            }
+            let reuse = self.tex.get(&(s.id, id.index)).filter(|t| t.gen == id.gen && t.obj.desc.format == plane.format
+                && t.obj.desc.w == plane.width && t.obj.desc.h == plane.height).map(|t| t.obj.clone());
+            let obj = match reuse {
+                Some(obj) => obj,
+                None => self.new_texture(TextureObj { format: plane.format, w: plane.width, h: plane.height, depth: 1, mips: 1,
+                    usage: usage::SAMPLED, bytes: 0, imported: true, uploaded: 0, lent: None })?,
+            };
+            uploads.push((id, obj, bytes.clone()));
+        }
+        for (id, obj, bytes) in uploads {
+            let (key, w, h, swap) = (obj.key, obj.desc.w, obj.desc.h, !obj.swizzled);
+            self.queue.push(move |r| r.upload(key, 0, [0, 0, w, h], 0, bytes.to_vec(), swap));
+            let mut desc = obj.desc.clone();
+            desc.imported = true;
+            s.textures.get_mut(s.id, id).map_err(|_| "stale video texture")?.val = desc.clone();
+            self.tex.insert((s.id, id.index), Tex { gen: id.gen, obj });
+            video_row(s, id, &desc);
+        }
+        Ok(true)
+    }
+    fn release(&mut self, s: &mut Session, ids: [Id; 4]) {
+        for id in ids {
+            if self.tex.get(&(s.id, id.index)).is_some_and(|t| t.gen == id.gen) { self.tex.remove(&(s.id, id.index)); }
+            if let Ok(entry) = s.textures.get_mut(s.id, id) {
+                entry.val.bytes = 0;
+                entry.val.imported = true;
+            }
+            if let Some(row) = s.ledger.get_mut(Kind::Texture, id.index).filter(|r| r.gen == id.gen) { row.bytes = 0; }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn video_row(s: &mut Session, id: Id, desc: &TextureObj) {
+    if let Some(row) = s.ledger.get_mut(Kind::Texture, id.index).filter(|r| r.gen == id.gen) {
+        row.bytes = desc.bytes;
+        row.width = desc.w;
+        row.height = desc.h;
+        row.format = desc.format;
+    } else {
+        s.ledger.add(LedgerEntry { kind: Kind::Texture, detail: "video frame", index: id.index, gen: id.gen, bytes: desc.bytes,
+            format: desc.format, width: desc.w, height: desc.h, mips: 1, attr: Attr::default(),
+            created_ns: crate::clock_ns(), created_frame: s.frame, last_used_frame: 0, last_used_ns: 0, objects: 1, note: "" });
+    }
+}
+
+fn window_row(id: Id, desc: &TextureObj, now: u64, frame: u64) -> LedgerEntry {
+    LedgerEntry { kind: Kind::Window, detail: "window surface", index: id.index, gen: id.gen, bytes: desc.bytes,
+        format: desc.format, width: desc.w, height: desc.h, mips: 1, attr: Attr::default(),
+        created_ns: now, created_frame: frame, last_used_frame: frame, last_used_ns: now, objects: 1, note: WINDOW_NOTE }
+}
+
+/// The window image is counted; the EGL surface it is drawn to has buffers GL gives no size for.
+const WINDOW_NOTE: &str = "the EGL surface's buffers: the API reports no size";

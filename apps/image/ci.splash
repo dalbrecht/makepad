@@ -1,0 +1,24 @@
+// CI smoke test for apps/image. Run by devhub ci, which finds every `ci.splash`
+// in the checkout. The script decides every input; the vision model only
+// judges the grab against the acceptance text below. Basic on purpose: does
+// it check everywhere, build and come up here, and look like what it is.
+
+use mod.std.*
+use mod.ci;
+
+ci.step("check other platforms", fn(){
+    ci.check_targets({packages: ["makepad-app-image"] targets: ci.host.targets})
+})
+
+let app = ci.launch({package: "makepad-app-image" binary: "makepad-app-image" cwd: "."})
+
+ci.step("comes up", fn(){
+    ci.sleep(3.0)
+    app.no_errors()
+    let shot = app.grab("start")
+    ci.accept(shot, "This is a screenshot of one application window. A thin bright red frame runs around the very edge of the picture; it is the test harness's marker and is not part of the application. Ignore it. The application is an image viewer, which may show an empty state asking for an image. 1. Is the whole picture one flat colour from edge to edge, such as entirely black or entirely white? expected NO 2. Is any user interface visible, such as text labels, buttons, icons, panels, lists, input fields, a toolbar, a drawing or a picture? expected YES 3. Does an error panel cover the window: a large block of text with words such as panic, error, failed, backtrace or unwrap? expected NO")
+})
+
+app.no_errors()
+app.quit()
+nil

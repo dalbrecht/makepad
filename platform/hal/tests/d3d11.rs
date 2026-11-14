@@ -1,0 +1,430 @@
+//! Native D3D11 coverage (Windows, a hardware device). The same cases as tests/vulkan.rs: passes
+//! and draws into a texture and an offscreen window, exact readback, the ledger of a closing
+//! session, resize, and the pick variant's ids.
+#![cfg(windows)]
+
+use makepad_hal::hlsl::HlslPipeline;
+use makepad_hal::ledger::Kind;
+use makepad_hal::*;
+use std::time::{Duration, Instant};
+
+const TEX: Id = Id::new(1, 1);
+const PICK_TEX: Id = Id::new(2, 1);
+const VERTEX: Id = Id::new(1, 1);
+const INDEX: Id = Id::new(2, 1);
+const PIPE: Id = Id::new(1, 1);
+const PICK_PIPE: Id = Id::new(2, 1);
+const WINDOW: Id = Id::new(1, 1);
+
+/// One geometry input (`GEOMA0`, four floats) passed through; the pixel writes white.
+const HLSL: &str = "struct VertexIn { float4 g : GEOMA0; };
+float4 vertex_main(VertexIn i) : SV_POSITION { return i.g; }
+float4 pixel_main() : SV_TARGET0 { return float4(1.0, 1.0, 1.0, 1.0); }
+";
+
+/// The first vec4 of the pass's constant buffer (`pipeline_binding::PASS` at b1): a view of the
+/// pass shows its own block.
+const PASS_COLOR_HLSL: &str = "cbuffer passUniforms : register(b1) { float4 pass_color; };
+struct VertexIn { float4 g : GEOMA0; };
+float4 vertex_main(VertexIn i) : SV_POSITION { return i.g; }
+float4 pixel_main() : SV_TARGET0 { return pass_color; }
+";
+
+/// The pick variant's contract (shader_ir_hlsl): the draw id in `_pk.x` at b12, written as
+/// 24-bit colour.
+const PICK_HLSL: &str = "cbuffer _mp_pick : register(b12) { uint4 _pk; };
+struct VertexIn { float4 g : GEOMA0; };
+float4 vertex_main(VertexIn i) : SV_POSITION { return i.g; }
+float4 pixel_main() : SV_TARGET0 { uint p = _pk.x; return float4(float(p & 255u), float((p >> 8) & 255u), float((p >> 16) & 255u), 255.0) / 255.0; }
+";
+
+fn open() -> (std::sync::Arc<Hal>, HalInfo) {
+    let hal = Hal::new();
+    let info = hal.open(&OpenReq { backend: backend_id::D3D11, flags: open_flags::OFFSCREEN_WINDOWS, ..Default::default() });
+    assert_eq!(info.backend, backend_id::D3D11, "D3D11 HAL initialization failed");
+    assert_eq!(info.dialect, dialect::HLSL);
+    (hal, info)
+}
+
+fn until(hal: &Hal, sid: u32, mut accept: impl FnMut(HalEvent<'_>) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut store = EventStore::new(sid, 64, 65536);
+    loop {
+        assert!(Instant::now() < deadline, "D3D11 event deadline");
+        let mut buf = store.buf();
+        let n = hal.pump(10_000_000, &mut buf);
+        for (_, event) in store.reader(n, buf.arena_len) {
+            match event {
+                HalEvent::PipelineFailed { log, .. } => panic!("pipeline: {}", String::from_utf8_lossy(log)),
+                HalEvent::DeviceLost { .. } => panic!("D3D11 device lost"),
+                _ => {}
+            }
+            if accept(event) {
+                return;
+            }
+        }
+    }
+}
+
+fn frame_done(hal: &Hal, sid: u32, frame: u64) {
+    until(hal, sid, |e| matches!(e, HalEvent::FrameDone { frame: done, .. } if done == frame));
+}
+
+fn payload(source: &str) -> Vec<u8> {
+    HlslPipeline { source: source.into(), textures: Vec::new(), samplers: Vec::new() }.encode()
+}
+
+fn resources(hal: &Hal, sid: u32) {
+    let mut w = CmdWriter::new(sid);
+    w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 32, 32, [1, 1], Attr::default());
+    let vertices: Vec<u8> = [-1.0f32, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
+    w.buffer_create(VERTEX, buffer_kind::VERTEX, vertices.len() as u64, Attr::default());
+    w.buffer_update(VERTEX, 0, &vertices);
+    w.buffer_create(INDEX, buffer_kind::INDEX, 6, Attr::default());
+    w.buffer_update(INDEX, 0, &[0, 0, 1, 0, 2, 0]);
+    // one geometry input: stride 16, (offset 0, F32x4, 4 lanes)
+    let layout = [16, 0, 3, 4];
+    let none = u32::MAX;
+    let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &payload(HLSL), &[none, none, none, none, none, 0], &layout);
+    w.pipeline_create(PIPE, dialect::HLSL, Attr::default(), &blob);
+    let pick = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, blend: pipeline_blend::RAW, color_formats: [format::BGRA8, 0, 0, 0], ..Default::default() },
+        &payload(PICK_HLSL), &[none, none, none, none, none, 0], &layout);
+    w.pipeline_create(PICK_PIPE, dialect::HLSL, Attr::default(), &pick);
+    hal.submit(&w.buf());
+    let (mut normal, mut picked) = (false, false);
+    until(hal, sid, |e| {
+        match e {
+            HalEvent::PipelineReady { pipeline } if pipeline == PIPE => normal = true,
+            HalEvent::PipelineReady { pipeline } if pipeline == PICK_PIPE => picked = true,
+            _ => {}
+        }
+        normal && picked
+    });
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().stats.bad_args), 0);
+}
+
+fn pass(texture: Id, width: u32, height: u32, clear: [f32; 4]) -> Pass {
+    Pass { color: [texture, Id::NONE, Id::NONE, Id::NONE], load: [pass_load::CLEAR; 5], clear: [clear; 4],
+        viewport: [0.0, 0.0, width as f32, height as f32], dpi: 1.0, ..Default::default() }
+}
+
+fn draw() -> Draw {
+    Draw { pipeline: PIPE, vb: VERTEX, ib: INDEX, index: [0, 3], inst: Inst::inline(Slice::EMPTY, 1), scissor: [f32::NAN; 4], ..Default::default() }
+}
+
+fn rendered(hal: &Hal, sid: u32, target: Id, kind: u32, size: [u32; 2], frame: u64) {
+    let before = hal.with_world(|w| w.session(sid).unwrap().stats);
+    let mut w = CmdWriter::new(sid);
+    w.frame_begin(frame, FrameMeta::default());
+    w.pass(pass(if kind == target::WINDOW { Id::NONE } else { target }, size[0], size[1], [0.0, 0.0, 0.0, 1.0]));
+    let third = size[0] as f32 / 3.0;
+    let mut left = draw();
+    left.scissor = [0.0, 0.0, third, size[1] as f32];
+    let mut middle = draw();
+    middle.scissor = [third, 0.0, third, size[1] as f32];
+    w.draw(left);
+    w.draw(middle);
+    let mut second = pass(if kind == target::WINDOW { Id::NONE } else { target }, size[0], size[1], [0.0; 4]);
+    second.load[0] = pass_load::LOAD;
+    w.pass(second);
+    let mut right = draw();
+    right.scissor = [2.0 * third, 0.0, size[0] as f32 - 2.0 * third, size[1] as f32];
+    w.draw(right);
+    w.frame_end(target, kind);
+    hal.submit(&w.buf());
+    frame_done(hal, sid, frame);
+    let after = hal.with_world(|w| w.session(sid).unwrap().stats);
+    assert_eq!(after.bad_args, 0);
+    assert_eq!(after.passes - before.passes, 2);
+    assert_eq!(after.draws - before.draws, 3);
+    assert_eq!(after.skipped_draws, before.skipped_draws, "every draw encoded (pipelines were ready)");
+}
+
+fn pixels(hal: &Hal, sid: u32, req: u32) -> Vec<u8> {
+    let mut pixels = Vec::new();
+    until(hal, sid, |e| match e {
+        HalEvent::Readback { req: got, status, lease, .. } if got == req => {
+            // SAFETY: this process pumped the event and takes its lease once.
+            let p = unsafe { makepad_hal::lease::Held::from_payload(lease) }.unwrap();
+            assert_eq!(status, readback::OK);
+            pixels = p.to_vec();
+            true
+        }
+        _ => false,
+    });
+    pixels
+}
+
+#[test]
+fn offscreen_two_passes_three_draws() {
+    let (hal, info) = open();
+    resources(&hal, info.session);
+    rendered(&hal, info.session, TEX, target::TEXTURE, [32, 32], 1);
+    let mut w = CmdWriter::new(info.session);
+    w.texture_readback(TEX, 1, [0, 0, 32, 32]);
+    hal.submit(&w.buf());
+    let image = pixels(&hal, info.session, 1);
+    // the triangle's base (clip y = -1) is the bottom of the target: row 0 is the top
+    for x in [5, 16, 26] {
+        assert_eq!(&image[(27 * 32 + x) * 4..][..4], &[255; 4]);
+    }
+    for x in [5, 26] {
+        assert_eq!(&image[(2 * 32 + x) * 4..][..4], &[0, 0, 0, 255]);
+    }
+    assert!(hal.close(info.session));
+}
+
+#[test]
+fn cleared_target_readback_is_exact() {
+    let (hal, info) = open();
+    let mut w = CmdWriter::new(info.session);
+    w.texture_create(TEX, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 7, 5, [1, 1], Attr::default());
+    w.frame_begin(1, FrameMeta::default());
+    w.pass(pass(TEX, 7, 5, [17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0, 1.0]));
+    w.frame_end(TEX, target::TEXTURE);
+    hal.submit(&w.buf());
+    frame_done(&hal, info.session, 1);
+    w.clear();
+    w.texture_readback(TEX, 2, [0, 0, 7, 5]);
+    hal.submit(&w.buf());
+    assert_eq!(pixels(&hal, info.session, 2), [17, 34, 51, 255].repeat(35));
+    assert!(hal.close(info.session));
+}
+
+fn ledger(hal: &Hal, sid: u32) -> Vec<(Kind, u32, u32, u64)> {
+    hal.with_world(|w| {
+        let mut rows: Vec<_> = w.session(sid).unwrap().ledger.entries().filter(|r| r.kind != Kind::Window).map(|r| (r.kind, r.index, r.gen, r.bytes)).collect();
+        rows.sort();
+        rows
+    })
+}
+
+#[test]
+fn session_close_frees_exactly_its_ledger() {
+    let (hal, info) = open();
+    let other = hal.open(&OpenReq { backend: backend_id::D3D11, flags: open_flags::OFFSCREEN_WINDOWS, ..Default::default() }).session;
+    resources(&hal, info.session);
+    resources(&hal, other);
+    let own = ledger(&hal, info.session);
+    let survivor = ledger(&hal, other);
+    assert_eq!(own.len(), 5);
+    assert_eq!(survivor.len(), 5);
+    let total = hal.with_world(|w| Kind::ALL.into_iter().map(|k| w.count(k)).sum::<usize>());
+    assert!(hal.close(info.session));
+    assert!(hal.with_world(|w| w.session(info.session).is_none()));
+    assert_eq!(ledger(&hal, other), survivor);
+    assert_eq!(hal.with_world(|w| Kind::ALL.into_iter().map(|k| w.count(k)).sum::<usize>()), total - own.len());
+    assert_eq!(hal.backend_inits(), 1);
+    assert!(hal.close(other));
+}
+
+#[test]
+fn offscreen_window_resize_keeps_resources() {
+    let (hal, info) = open();
+    resources(&hal, info.session);
+    let mut w = CmdWriter::new(info.session);
+    w.window_create(WINDOW, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 32.0, 32.0], false);
+    hal.submit(&w.buf());
+    rendered(&hal, info.session, WINDOW, target::WINDOW, [32, 32], 1);
+    let retained = ledger(&hal, info.session);
+    w.clear();
+    w.window_geom(WINDOW, [0.0, 0.0, 80.0, 48.0]);
+    hal.submit(&w.buf());
+    rendered(&hal, info.session, WINDOW, target::WINDOW, [80, 48], 2);
+    assert_eq!(ledger(&hal, info.session), retained);
+    w.clear();
+    w.snapshot(WINDOW, 3);
+    hal.submit(&w.buf());
+    let image = pixels(&hal, info.session, 3);
+    assert_eq!(image.len(), 80 * 48 * 4);
+    assert_eq!(&image[(24 * 80 + 40) * 4..][..4], &[255; 4]);
+    assert!(hal.close(info.session));
+}
+
+#[test]
+fn pick_frame_answers_the_draw_id() {
+    let (hal, info) = open();
+    let sid = info.session;
+    resources(&hal, sid);
+    let mut w = CmdWriter::new(sid);
+    w.window_create(WINDOW, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 32.0, 32.0], false);
+    w.texture_create(PICK_TEX, usage::RENDER_TARGET | usage::SAMPLED, format::BGRA8, 32, 32, [1, 1], Attr::default());
+    w.frame_begin(1, FrameMeta::default());
+    w.pass(pass(PICK_TEX, 32, 32, [0.0; 4]));
+    let mut d = draw();
+    d.pipeline = PICK_PIPE;
+    d.pick = 0x12_3456;
+    w.draw(d);
+    w.frame_end(WINDOW, target::WINDOW | target::PICK);
+    hal.submit(&w.buf());
+    frame_done(&hal, sid, 1);
+    w.clear();
+    w.texture_readback(PICK_TEX, 7, [0, 0, 32, 32]);
+    hal.submit(&w.buf());
+    let pixels = pixels(&hal, sid, 7);
+    let id_at = |x: usize, y: usize| {
+        let p = &pixels[(y * 32 + x) * 4..];
+        p[0] as u32 | (p[1] as u32) << 8 | (p[2] as u32) << 16
+    };
+    assert_eq!(id_at(16, 28), 0x12_3456, "the triangle's draw id");
+    assert_eq!(id_at(1, 1), 0, "nothing drawn at the corner");
+    assert!(hal.close(sid));
+}
+
+/// A device loss (simulated: the device is dropped and a new one made, as on a removal) keeps
+/// every id: the session hears `DeviceLost { 1 }` then `DeviceReset { 2 }`, the pipelines answer
+/// ready again, the buffers take their contents again under the same ids and the same frame
+/// renders the same pixels; the ledger is unchanged and nothing counts as stale or bad.
+#[test]
+fn device_reset_keeps_ids_and_renders_again() {
+    let (hal, info) = open();
+    let sid = info.session;
+    resources(&hal, sid);
+    let mut w = CmdWriter::new(sid);
+    w.window_create(WINDOW, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 32.0, 32.0], false);
+    hal.submit(&w.buf());
+    rendered(&hal, sid, TEX, target::TEXTURE, [32, 32], 1);
+    rendered(&hal, sid, WINDOW, target::WINDOW, [32, 32], 2);
+    w.clear();
+    w.texture_readback(TEX, 1, [0, 0, 32, 32]);
+    hal.submit(&w.buf());
+    let before = pixels(&hal, sid, 1);
+    let rows = ledger(&hal, sid);
+
+    hal.simulate_device_loss();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut store = EventStore::new(sid, 64, 65536);
+    let (mut lost, mut reset, mut ready) = (None, None, Vec::new());
+    while !(reset.is_some() && ready.contains(&PIPE) && ready.contains(&PICK_PIPE)) {
+        assert!(Instant::now() < deadline, "no device reset");
+        let mut buf = store.buf();
+        let n = hal.pump(10_000_000, &mut buf);
+        for (_, event) in store.reader(n, buf.arena_len) {
+            match event {
+                HalEvent::DeviceLost { generation, .. } => {
+                    assert!(reset.is_none(), "DeviceLost after DeviceReset");
+                    lost = Some(generation);
+                }
+                HalEvent::DeviceReset { generation } => {
+                    assert!(lost.is_some(), "DeviceReset without DeviceLost");
+                    reset = Some(generation);
+                }
+                HalEvent::PipelineReady { pipeline } if reset.is_some() => ready.push(pipeline),
+                HalEvent::PipelineFailed { log, .. } => panic!("pipeline: {}", String::from_utf8_lossy(log)),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!((lost, reset), (Some(1), Some(2)));
+    assert_eq!(hal.with_world(|w| w.device_generation), 2);
+
+    // contents are the app's to send again: the same ids, no creates
+    let vertices: Vec<u8> = [-1.0f32, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
+    w.clear();
+    w.buffer_update(VERTEX, 0, &vertices);
+    w.buffer_update(INDEX, 0, &[0, 0, 1, 0, 2, 0]);
+    hal.submit(&w.buf());
+    rendered(&hal, sid, TEX, target::TEXTURE, [32, 32], 3);
+    rendered(&hal, sid, WINDOW, target::WINDOW, [32, 32], 4);
+    w.clear();
+    w.texture_readback(TEX, 2, [0, 0, 32, 32]);
+    w.snapshot(WINDOW, 3);
+    hal.submit(&w.buf());
+    assert_eq!(pixels(&hal, sid, 2), before);
+    let window = pixels(&hal, sid, 3);
+    assert_eq!(&window[(27 * 32 + 16) * 4..][..4], &[255; 4]);
+    assert_eq!(ledger(&hal, sid), rows);
+    let stats = hal.with_world(|w| w.session(sid).unwrap().stats);
+    assert_eq!((stats.bad_args, stats.stale_ids), (0, 0));
+    assert!(hal.close(sid));
+}
+
+/// An upload from a temporary (`&vec![..]`: freed at the end of its statement, its block handed
+/// out again before the submit) lands the bytes of the call: the writer copied them at the call.
+#[test]
+fn uploads_from_freed_temporaries_land_the_bytes_of_the_call() {
+    let (hal, info) = open();
+    let sid = info.session;
+    let (buffer, texture) = (Id::new(9, 1), Id::new(9, 1));
+    let want_buffer: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3) as u8).collect();
+    let want_texels: Vec<u8> = (0..16 * 16 * 4u32).map(|i| (i * 13 + 5) as u8).collect();
+    let mut w = CmdWriter::new(sid);
+    w.buffer_create(buffer, buffer_kind::INSTANCE, 4096, Attr::default());
+    w.texture_create(texture, usage::SAMPLED | usage::RENDER_TARGET, format::RGBA8, 16, 16, [1, 1], Attr::default());
+    w.buffer_update(buffer, 0, &want_buffer.clone());
+    w.texture_update(texture, 0, [0, 0, 16, 16], 0, &want_texels.clone());
+    let scribble = [vec![0xeeu8; 4096], vec![0xee; 1024]];
+    w.read_buffers(1, &[BufferReadRange { id: buffer, offset: 0, len: 4096 }]);
+    w.texture_readback(texture, 2, [0, 0, 16, 16]);
+    hal.submit(&w.buf());
+    drop(scribble);
+    let mut got: [Vec<u8>; 2] = Default::default();
+    until(&hal, sid, |e| {
+        if let HalEvent::BufferLeases { req: 1, status, records } = e {
+                use makepad_hal::buffers::Wire;
+                assert_eq!(status, readback::OK);
+                let record = makepad_hal::lease::Record::read(records);
+                got[0] = unsafe { std::slice::from_raw_parts(record.ptr as *const u8, record.len as usize) }.to_vec();
+                hal_lease_release(record.token);
+            }
+        if let HalEvent::Readback { req: req @ 1..=2, status, lease, .. } = e {
+            // SAFETY: this process pumped the event and takes its lease once.
+            let pixels = unsafe { makepad_hal::lease::Held::from_payload(lease) }.unwrap();
+            assert_eq!(status, readback::OK);
+            got[req as usize - 1] = pixels.to_vec();
+        }
+        got.iter().all(|g| !g.is_empty())
+    });
+    assert!(got[0] == want_buffer, "the buffer holds other bytes than its upload's");
+    assert!(got[1] == want_texels, "the texture holds other bytes than its upload's");
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().stats.bad_args), 0);
+    assert!(hal.close(sid));
+}
+
+/// One pass with two views side by side (`Pass::view_rects`), as the eyes of an XR frame: each
+/// draw runs once per view with that view's rect and its block of the pass uniforms (the left
+/// view's red, the right's green). The quad reaches two views past its view's left edge: every
+/// pixel of each half is its own view's colour, none the other's.
+#[test]
+fn two_views_draw_side_by_side_in_one_pass() {
+    const VIEWS: Id = Id::new(5, 1);
+    const WIDE: Id = Id::new(5, 1);
+    const WIDE_INDEX: Id = Id::new(6, 1);
+    const VIEW_PIPE: Id = Id::new(5, 1);
+    let (hal, info) = open();
+    let sid = info.session;
+    let mut w = CmdWriter::new(sid);
+    w.texture_create(VIEWS, usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 16, 8, [1, 1], Attr::default());
+    let quad: Vec<u8> = [-3.0f32, -1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, -3.0, 1.0, 0.0, 1.0].into_iter().flat_map(f32::to_le_bytes).collect();
+    w.buffer_create(WIDE, buffer_kind::VERTEX, quad.len() as u64, Attr::default());
+    w.buffer_update(WIDE, 0, &quad);
+    let index: Vec<u8> = [0u16, 1, 2, 0, 2, 3].into_iter().flat_map(u16::to_le_bytes).collect();
+    w.buffer_create(WIDE_INDEX, buffer_kind::INDEX, index.len() as u64, Attr::default());
+    w.buffer_update(WIDE_INDEX, 0, &index);
+    let none = u32::MAX;
+    let blob = CmdWriter::pipeline_blob(PipelineDesc { outputs: 1, ..Default::default() }, &payload(PASS_COLOR_HLSL), &[none, 1, none, none, none, 0], &[16, 0, 3, 4]);
+    w.pipeline_create(VIEW_PIPE, dialect::HLSL, Attr::default(), &blob);
+    hal.submit(&w.buf());
+    until(&hal, sid, |e| matches!(e, HalEvent::PipelineReady { pipeline } if pipeline == VIEW_PIPE));
+    w.clear();
+    w.frame_begin(1, FrameMeta::default());
+    let uniforms = w.keep(&[1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0][..]);
+    let view_rects = w.put_rects(&[[0.0, 0.0, 8.0, 8.0], [8.0, 0.0, 8.0, 8.0]]);
+    w.pass(Pass { color: [VIEWS, Id::NONE, Id::NONE, Id::NONE], load: [pass_load::CLEAR; 5], clear: [[0.0, 0.0, 0.0, 1.0]; 4],
+        viewport: [0.0, 0.0, 16.0, 8.0], dpi: 1.0, uniforms, view_rects, ..Default::default() });
+    w.draw(Draw { pipeline: VIEW_PIPE, vb: WIDE, ib: WIDE_INDEX, index: [0, 6], inst: Inst::inline(Slice::EMPTY, 1), scissor: [f32::NAN; 4], ..Default::default() });
+    w.frame_end(VIEWS, target::TEXTURE);
+    hal.submit(&w.buf());
+    frame_done(&hal, sid, 1);
+    w.clear();
+    w.texture_readback(VIEWS, 1, [0, 0, 16, 8]);
+    hal.submit(&w.buf());
+    let image = pixels(&hal, sid, 1);
+    for (k, p) in image.chunks(4).enumerate() {
+        let want: &[u8] = if k % 16 < 8 { &[255, 0, 0, 255] } else { &[0, 255, 0, 255] };
+        assert_eq!(p, want, "pixel ({}, {}) is not its own view's colour", k % 16, k / 16);
+    }
+    let stats = hal.with_world(|wd| wd.session(sid).unwrap().stats);
+    assert_eq!((stats.skipped_draws, stats.bad_args, stats.draws), (0, 0, 1), "the draw was drawn, once, and the views were taken");
+    assert!(hal.close(sid));
+}

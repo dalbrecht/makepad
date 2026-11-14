@@ -1,0 +1,24 @@
+[package]
+name = "makepad-platform-video"
+version = "1.0.0"
+edition = "2021"
+description = "Offline hardware video file encode/decode (Media Foundation / VideoToolbox), no Cx"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "makepad_video"
+path = "src/lib.rs"
+
+[dependencies]
+
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
+makepad-apple-sys = { path = "../../libs/apple_sys", version = "1.0.0" }
+makepad-objc-sys = { path = "../../libs/objc-sys", version = "1.0.0" }
+
+[target.'cfg(any(target_os = "linux", windows, target_os = "android"))'.dependencies]
+makepad-hal = { path = "../hal", version = "1.0.0" }
+
+[target.'cfg(windows)'.dependencies.windows]
+package = "makepad-windows-sys"
+path = "../../libs/windows/sys"
+version = "0.1.0"

@@ -4,6 +4,7 @@ use std::fmt;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::ptr;
 use std::str;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use encode;
 use {Encode, Encoding};
@@ -530,108 +531,58 @@ impl fmt::Debug for Object {
         write!(f, "<{:?}: {:p}>", self.class(), self)
     }
 }
-/*
-#[cfg(test)]
-mod tests {
-    use test_utils;
-    use Encode;
-    use super::{Class, Protocol, Sel};
 
-    #[test]
-    fn test_ivar() {
-        let cls = test_utils::custom_class();
-        let ivar = cls.instance_variable("_foo").unwrap();
-        assert!(ivar.name() == "_foo");
-        assert!(ivar.type_encoding() == <u32>::encode());
-        assert!(ivar.offset() > 0);
 
-        let ivars = cls.instance_variables();
-        assert!(ivars.len() > 0);
+/// The selector cached in `slot` (one static per `sel!` site), registered on first use.
+/// `name` ends in a NUL.
+#[doc(hidden)]
+#[inline]
+pub fn __cached_sel(slot: &'static AtomicUsize, name: &str) -> Sel {
+    // `Relaxed` is enough: `sel_registerName` is thread-safe and idempotent.
+    let ptr = slot.load(Ordering::Relaxed) as *const c_void;
+    if ptr.is_null() {
+        __register_sel(slot, name)
+    } else {
+        Sel { ptr }
     }
+}
 
-    #[test]
-    fn test_method() {
-        let cls = test_utils::custom_class();
-        let sel = Sel::register("foo");
-        let method = cls.instance_method(sel).unwrap();
-        assert!(method.name().name() == "foo");
-        assert!(method.arguments_count() == 2);
-        assert!(method.return_type() == <u32>::encode());
-        assert!(method.argument_type(1).unwrap() == Sel::encode());
+#[doc(hidden)]
+#[inline(never)]
+pub fn __register_sel(slot: &'static AtomicUsize, name: &str) -> Sel {
+    assert!(name.ends_with('\0'), "selector name must end in NUL");
+    let sel = unsafe { sel_registerName(name.as_ptr() as *const c_char) };
+    slot.store(sel.ptr as usize, Ordering::Relaxed);
+    sel
+}
 
-        let methods = cls.instance_methods();
-        assert!(methods.len() > 0);
+/// The class cached in `slot` (one static per `class!` site), looked up on first use;
+/// panics when the runtime has no class of that name. `name` ends in a NUL.
+#[doc(hidden)]
+#[inline]
+#[track_caller]
+pub fn __cached_class(slot: &'static AtomicUsize, name: &str) -> &'static Class {
+    let ptr = slot.load(Ordering::Relaxed) as *const Class;
+    if ptr.is_null() {
+        __lookup_class(slot, name)
+    } else {
+        unsafe { &*ptr }
     }
+}
 
-    #[test]
-    fn test_class() {
-        let cls = test_utils::custom_class();
-        assert!(cls.name() == "CustomObject");
-        assert!(cls.instance_size() > 0);
-        assert!(cls.superclass().is_none());
-
-        assert!(Class::get(cls.name()) == Some(cls));
-
-        let metaclass = cls.metaclass();
-        // The metaclass of a root class is a subclass of the root class
-        assert!(metaclass.superclass().unwrap() == cls);
-
-        let subclass = test_utils::custom_subclass();
-        assert!(subclass.superclass().unwrap() == cls);
+#[doc(hidden)]
+#[inline(never)]
+#[track_caller]
+pub fn __lookup_class(slot: &'static AtomicUsize, name: &str) -> &'static Class {
+    assert!(name.ends_with('\0'), "class name must end in NUL");
+    // `Relaxed` is enough: `objc_getClass` is thread-safe.
+    let cls = unsafe { objc_getClass(name.as_ptr() as *const c_char) };
+    slot.store(cls as usize, Ordering::Relaxed);
+    if cls.is_null() {
+        panic!(
+            "Class with name {} could not be found",
+            name.trim_end_matches('\0')
+        );
     }
-
-    #[test]
-    fn test_classes() {
-        assert!(Class::classes_count() > 0);
-        let classes = Class::classes();
-        assert!(classes.len() > 0);
-    }
-
-    #[test]
-    fn test_protocol() {
-        let proto = test_utils::custom_protocol();
-        assert!(proto.name() == "CustomProtocol");
-        let class = test_utils::custom_class();
-        assert!(class.conforms_to(proto));
-        let class_protocols = class.adopted_protocols();
-        assert!(class_protocols.len() > 0);
-    }
-
-    #[test]
-    fn test_protocol_method() {
-        let class = test_utils::custom_class();
-        let result: i32 = unsafe {
-            msg_send![class, addNumber:1 toNumber:2]
-        };
-        assert_eq!(result, 3);
-    }
-
-    #[test]
-    fn test_subprotocols() {
-        let sub_proto = test_utils::custom_subprotocol();
-        let super_proto = test_utils::custom_protocol();
-        assert!(sub_proto.conforms_to(super_proto));
-        let adopted_protocols = sub_proto.adopted_protocols();
-        assert_eq!(adopted_protocols[0], super_proto);
-    }
-
-    #[test]
-    fn test_protocols() {
-        // Ensure that a protocol has been registered on linux
-        let _ = test_utils::custom_protocol();
-
-        let protocols = Protocol::protocols();
-        assert!(protocols.len() > 0);
-    }
-
-    #[test]
-    fn test_object() {
-        let mut obj = test_utils::custom_object();
-        assert!(obj.class() == test_utils::custom_class());
-        let result: u32 = unsafe {
-            obj.set_ivar("_foo", 4u32);
-            *obj.get_ivar("_foo")
-        };
-        assert!(result == 4);
-    }
-}*/
+    unsafe { &*cls }
+}

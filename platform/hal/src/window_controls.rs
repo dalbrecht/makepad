@@ -1,0 +1,306 @@
+//! The window controls a makepad window manager gives the windows it hosts. Under the WM a makepad
+//! window draws its own caption, controls included, in the WM's desktop family: traffic lights at
+//! the left in a macOS-like family, minimise / maximise / close at the right in a Windows-like one,
+//! none in a tiling or mobile one. This is the one table of that: widgets' `resolve_chrome` reads
+//! it for an app's caption, and `makepad run`'s load screen (relax-boot, which draws with fonts and
+//! shaders only) reads [`host_window_controls`] for its caption, so the two look the same.
+use makepad_micro_serde::*;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
+
+/// The window controls of a desktop family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WindowControls {
+    /// No window controls (a tiling desktop, a phone).
+    None = 1,
+    /// Close / minimise / maximise as coloured lights at the caption's left.
+    Lights = 2,
+    /// Minimise / maximise / close at the caption's right.
+    Buttons = 3,
+}
+
+impl WindowControls {
+    /// The controls of the family `family`: its id (`macos`, `windows-2000`; widgets'
+    /// `DesktopStyle::id`) or its name as a style sheet carries it (`Macos`, `Windows2000`).
+    /// An unknown family has none.
+    pub fn of_family(family: &str) -> Self {
+        let mut key = [0u8; 16];
+        let mut n = 0;
+        for b in family.bytes().filter(|b| *b != b'-') {
+            if n == key.len() {
+                return Self::None;
+            }
+            key[n] = b.to_ascii_lowercase();
+            n += 1;
+        }
+        match &key[..n] {
+            b"macos" | b"nextstep" => Self::Lights,
+            b"windows" | b"windows2000" => Self::Buttons,
+            _ => Self::None,
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::None),
+            2 => Some(Self::Lights),
+            3 => Some(Self::Buttons),
+            _ => None,
+        }
+    }
+}
+
+/// The family a style sheet names (the `family` of a `{"makepad_style": {...}}` message or of a
+/// `MAKEPAD_WIDGET_STYLE_FILE`): `{"Macos":[]}` as the sheet serialises it, or a plain string.
+pub fn sheet_family(json: &str) -> Option<&str> {
+    let bytes = json.as_bytes();
+    let mut from = 0;
+    while let Some(at) = json[from..].find("\"family\"").map(|i| i + from) {
+        from = at + 1;
+        // a key, not text inside a string (a quote in a string is always escaped)
+        if at > 0 && bytes[at - 1] == b'\\' {
+            continue;
+        }
+        let rest = json[at + 8..].trim_start().strip_prefix(':')?.trim_start();
+        let rest = rest.strip_prefix('{').map(str::trim_start).unwrap_or(rest);
+        let name = rest.strip_prefix('"')?;
+        return Some(&name[..name.find('"')?]);
+    }
+    None
+}
+
+/// Set from the WM's style sheet: 0 not read yet, 0xff read and none, else a `WindowControls`.
+static HOST_CONTROLS: AtomicU8 = AtomicU8::new(0);
+
+/// The window controls of the window manager this process runs under, from its style sheet: the
+/// one it hands a child at spawn (the family of `MAKEPAD_WIDGET_STYLE_FILE`, else
+/// `MAKEPAD_WIDGET_STYLE_FAMILY` next to `MAKEPAD_WIDGET_STYLE`, as widgets' `system_style` reads
+/// the sheet), then its `makepad_style` messages (the WM-hosted shell, [`set_host_sheet`]).
+/// `None` without a WM's sheet. Meaningful only where a WM hosts the windows
+/// (`info_flags::WM_HOSTED`).
+pub fn host_window_controls() -> Option<WindowControls> {
+    match HOST_CONTROLS.load(Ordering::Acquire) {
+        0 => {
+            let controls = env_family().map(|family| WindowControls::of_family(&family));
+            // a message that came meanwhile wins
+            let _ = HOST_CONTROLS.compare_exchange(0, controls.map_or(0xff, |c| c as u8), Ordering::AcqRel, Ordering::Acquire);
+            WindowControls::from_u8(HOST_CONTROLS.load(Ordering::Acquire))
+        }
+        v => WindowControls::from_u8(v),
+    }
+}
+
+/// The WM sent its style sheet (`makepad_style`): its family's controls hold from now on.
+/// Returns whether they changed.
+pub fn set_host_sheet(json: &str) -> bool {
+    let Some(family) = sheet_family(json) else { return false };
+    let v = WindowControls::of_family(family) as u8;
+    HOST_CONTROLS.swap(v, Ordering::AcqRel) != v
+}
+
+/// The stock caption a window draws under the WM's style sheet, as widgets resolves it
+/// (`desktop_style::caption_look`, sent by the WM as `HostedCaption`): bar and title colours
+/// (0xRRGGBBAA) with focus and without, the title's font size, the buttons' glyph colour.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HostCaption {
+    pub bar: u32,
+    pub bar_unfocused: u32,
+    pub ink: u32,
+    pub ink_unfocused: u32,
+    /// points (widgets' font size)
+    pub size: f32,
+    /// the window buttons' glyph colour
+    pub button: u32,
+}
+
+static HOST_CAPTION: Mutex<Option<HostCaption>> = Mutex::new(None);
+
+/// The caption of the WM's style sheet (the WM-hosted shell sets it from the WM's message):
+/// `None` before one came, or without a WM.
+pub fn host_caption() -> Option<HostCaption> {
+    *HOST_CAPTION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The WM sent its sheet's caption. Returns whether it changed.
+pub fn set_host_caption(caption: HostCaption) -> bool {
+    let mut at = HOST_CAPTION.lock().unwrap_or_else(|e| e.into_inner());
+    let changed = *at != Some(caption);
+    *at = Some(caption);
+    changed
+}
+
+fn env_family() -> Option<String> {
+    if let Some(path) = std::env::var_os("MAKEPAD_WIDGET_STYLE_FILE") {
+        if let Some(family) = std::fs::read_to_string(path).ok().as_deref().and_then(sheet_family) {
+            return Some(family.to_string());
+        }
+    }
+    std::env::var("MAKEPAD_WIDGET_STYLE").ok()?;
+    std::env::var("MAKEPAD_WIDGET_STYLE_FAMILY").ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn families_by_id_and_by_sheet_name() {
+        assert_eq!(WindowControls::of_family("macos"), WindowControls::Lights);
+        assert_eq!(WindowControls::of_family("NextStep"), WindowControls::Lights);
+        assert_eq!(WindowControls::of_family("windows-2000"), WindowControls::Buttons);
+        assert_eq!(WindowControls::of_family("Windows2000"), WindowControls::Buttons);
+        assert_eq!(WindowControls::of_family("Windows"), WindowControls::Buttons);
+        assert_eq!(WindowControls::of_family("omarchy"), WindowControls::None);
+        assert_eq!(WindowControls::of_family("BlackOrange"), WindowControls::None);
+        assert_eq!(WindowControls::of_family("ios"), WindowControls::None);
+        assert_eq!(WindowControls::of_family("a-family-name-longer-than-any"), WindowControls::None);
+    }
+
+    #[test]
+    fn the_family_of_a_style_message() {
+        let json = r#"{"makepad_style":{"name":"macos-dark","family":{"Macos":[]},"resources":"","theme":"x \"family\": {\"Windows\":[]}","widgets":"","icons":[]}}"#;
+        assert_eq!(sheet_family(json), Some("Macos"));
+        let escaped_first = r#"{"makepad_style":{"name":"\"family\":\"Windows\"","family" : { "NextStep" : [] }}}"#;
+        assert_eq!(sheet_family(escaped_first), Some("NextStep"));
+        assert_eq!(sheet_family(r#"{"family":"windows"}"#), Some("windows"));
+        assert_eq!(sheet_family(r#"{"makepad_style":{"name":"windows"}}"#), None);
+    }
+
+    #[test]
+    fn hosted_resize_round_trips_and_rejects_invalid_messages() {
+        let resize = HostedResize { w: 640.5, h: 480.0 };
+        assert_eq!(HostedResize::parse(&resize.to_json()), Some(resize));
+        assert_eq!(HostedResize::parse(r#"{"w":640.5,"h":480.0}"#), None);
+        assert_eq!(HostedResize::parse(r#"{"makepad_resize":{"w":1}}"#), None);
+        assert_eq!(HostedAppFrame.to_json(), r#"{"makepad_app_frame":{}}"#);
+        assert_eq!(HostedAppFrame::parse(&HostedAppFrame.to_json()), Some(HostedAppFrame));
+        assert_eq!(HostedAppFrame::parse(r#"{"makepad_resize":{}}"#), None);
+        assert_eq!(HostedAppFrame::parse(r#"{"message":"makepad_app_frame"}"#), None);
+    }
+}
+
+/// A hosted app resizes its tile's window (`Window::resize`, the remote `resize`): the inner
+/// size `w` by `h` in the app's layout points, as JSON in a `Custom` message to the host. The
+/// host owns the tile, so it applies it (leaving maximised or snapped states) or declines; a
+/// request for the size it has. Lives here, not in the studio protocol, so that it does not
+/// change the hosted wire's fingerprint: a host that does not know it ignores it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostedResize { pub w: f64, pub h: f64 }
+impl HostedResize {
+    pub fn to_json(&self) -> String { format!("{{\"makepad_resize\":{{\"w\":{},\"h\":{}}}}}", self.w, self.h) }
+    pub fn parse(json: &str) -> Option<Self> {
+        let rest = json.split("\"makepad_resize\"").nth(1)?;
+        let number = |key: &str| -> Option<f64> {
+            let after = rest.split(key).nth(1)?.trim_start().strip_prefix(':')?.trim_start();
+            let end = after.find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))).unwrap_or(after.len());
+            after[..end].parse().ok().filter(|v: &f64| v.is_finite())
+        };
+        Some(Self { w: number("\"w\"")?, h: number("\"h\"")? })
+    }
+}
+
+/// A hosted process tells its host that the app's own first frame (not a loader's load screen)
+/// reached the host, once per process. A `Custom` message so it does not change the hosted
+/// wire's fingerprint: a host that does not know it ignores it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostedAppFrame;
+impl HostedAppFrame {
+    pub fn to_json(&self) -> String { "{\"makepad_app_frame\":{}}".into() }
+    pub fn parse(json: &str) -> Option<Self> {
+        json.split("\"makepad_app_frame\"").nth(1)?.trim_start().strip_prefix(':')?;
+        Some(Self)
+    }
+}
+
+/// `window_op` (the studio protocol's `HostedWindowOp::op`) for the app's own full-screen
+/// request (`Window::fullscreen`): the host fills the screen with the window in a space of
+/// its own, and `window_op::RESTORE` leaves it. Lives here, not in the studio protocol, so
+/// that it does not change the hosted wire's fingerprint: a host that does not know it
+/// ignores it.
+pub const WINDOW_OP_FULLSCREEN: u8 = 5;
+
+/// `HostedWindow::op` values.
+pub mod hosted_window_op {
+    /// Child to host: the window is gone (closed by the app, or after a `CLOSE_REQUEST`).
+    pub const CLOSED: u8 = 0;
+    /// Host to child: the person closed the window on the desk; the app closes it
+    /// unless its `WindowCloseRequested` says no.
+    pub const CLOSE_REQUEST: u8 = 1;
+    /// Child to host: what the app asked of the window (`Window::minimize` and the like).
+    pub const MINIMIZE: u8 = 2;
+    pub const MAXIMIZE: u8 = 3;
+    pub const RESTORE: u8 = 4;
+    pub const FULLSCREEN: u8 = 5;
+    /// Child to host: put the window at `x`, `y` (the app's screen coordinates, the
+    /// `WmEvent::Screens` it was given: relative to its first window).
+    pub const MOVE: u8 = 6;
+    /// Child to host: the window's title is `title` (on its creation and when it changes).
+    pub const TITLE: u8 = 7;
+    /// Child to host, for any of its windows (the first too): the inner size the app asked
+    /// for (`window.inner_size`), `x` by `y` points. The host honours it within its desk.
+    pub const SIZE: u8 = 8;
+    /// Child to host, for any of its windows (the first too): keep the window above the
+    /// host's other windows (`x` 1) or stop (`x` 0) (`WindowHandle::set_topmost`). Sent
+    /// after the window's creation, and again on it while the window is topmost.
+    pub const TOPMOST: u8 = 9;
+}
+
+/// A hosted app's windows after its first (an output window, a second view): the host
+/// shows each as a window of its own. Both ways, as JSON in `Custom`: a hosted Cx sends
+/// them, and so does the WM-hosted shell of `makepad run` for its later windows. Lives
+/// here, not in the studio protocol, so that it is no part of the hosted wire's
+/// fingerprint.
+#[derive(Clone, Debug, Default, PartialEq, SerJson, DeJson)]
+pub struct HostedWindow { pub window_id: usize, pub op: u8, pub x: f64, pub y: f64, pub title: String }
+#[derive(SerJson, DeJson)]
+struct HostedWindowEnvelope { makepad_hosted_window: HostedWindow }
+impl HostedWindow {
+    pub fn new(window_id: usize, op: u8) -> Self { Self { window_id, op, x: 0.0, y: 0.0, title: String::new() } }
+    pub fn topmost(window_id: usize, on: bool) -> Self { Self { x: on as u8 as f64, ..Self::new(window_id, hosted_window_op::TOPMOST) } }
+    pub fn title(window_id: usize, title: &str) -> Self { Self { title: title.to_string(), ..Self::new(window_id, hosted_window_op::TITLE) } }
+    pub fn to_json(&self) -> String { HostedWindowEnvelope { makepad_hosted_window: self.clone() }.serialize_json() }
+    pub fn parse(json: &str) -> Option<Self> {
+        if !json.contains("\"makepad_hosted_window\"") { return None; }
+        HostedWindowEnvelope::deserialize_json(json).ok().map(|e| e.makepad_hosted_window)
+    }
+}
+
+/// A clipboard's richer flavours (HTML, Markdown) across the hosted boundary, beside the text the
+/// studio protocol carries: up with a copy, just ahead of its `SetClipboard` (`request` 0), and
+/// down with a read's answer, just ahead of its `HostRelay::Clipboard` (`request` its id). `text`
+/// is the text they go with: a receiver takes them only with that same text. A `Custom` message,
+/// so it is no part of the hosted wire's fingerprint: a host or child that does not know it keeps
+/// the text alone.
+#[derive(Clone, Debug, Default, PartialEq, SerJson, DeJson)]
+pub struct HostedClipboard { pub request: u64, pub text: String, pub html: String, pub markdown: String }
+#[derive(SerJson, DeJson)]
+struct HostedClipboardEnvelope { makepad_clipboard: HostedClipboard }
+impl HostedClipboard {
+    pub fn to_json(&self) -> String { HostedClipboardEnvelope { makepad_clipboard: self.clone() }.serialize_json() }
+    pub fn parse(json: &str) -> Option<Self> {
+        if !json.contains("\"makepad_clipboard\"") { return None; }
+        HostedClipboardEnvelope::deserialize_json(json).ok().map(|e| e.makepad_clipboard)
+    }
+    /// Whether there is a flavour to send at all.
+    pub fn any(&self) -> bool { !self.html.is_empty() || !self.markdown.is_empty() }
+}
+
+#[cfg(test)]
+mod hosted_window_tests {
+    use super::*;
+
+    /// A later window's messages survive the trip, its title included (non-ASCII too).
+    #[test]
+    fn a_hosted_window_message_round_trips() {
+        let title = HostedWindow::title(3, "Viewer — Program Output");
+        assert_eq!(HostedWindow::parse(&title.to_json()), Some(title));
+        let mv = HostedWindow { x: 1610.5, y: -2.0, ..HostedWindow::new(3, hosted_window_op::MOVE) };
+        assert_eq!(HostedWindow::parse(&mv.to_json()), Some(mv));
+        assert_eq!(HostedWindow::parse(&HostedResize { w: 1.0, h: 2.0 }.to_json()), None);
+        // a clipboard's flavours, quotes, new lines and non-ASCII text included
+        let clip = HostedClipboard { request: 7, text: "a\tb \"c\"\n—".into(), html: "<p class=\"x\">a</p>\n".into(), markdown: "**a** `b`\n".into() };
+        assert_eq!(HostedClipboard::parse(&clip.to_json()), Some(clip));
+        assert_eq!(HostedClipboard::parse(&HostedWindow::new(1, 0).to_json()), None);
+    }
+}

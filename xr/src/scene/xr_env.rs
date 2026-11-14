@@ -4,26 +4,24 @@ use super::xr_node::{
     XR_HAND_INFLUENCE_POINTS_PER_HAND, XR_HAND_INFLUENCE_POINT_COUNT,
 };
 use crate::prelude::*;
-use crate::util::{
-    depth_debug_mesh::DebugDepthMeshChunk,
-    depth_debug_mesh_worker::{XrDepthDebugMeshSelection, XrDepthDebugMeshWorker},
+use makepad_widgets::makepad_platform::xr_tsdf::{
+    mesh::DebugDepthMeshChunk,
+    mesh_worker::{XrDepthDebugMeshSelection, XrDepthDebugMeshWorker},
 };
 use makepad_widgets::makepad_platform::{
     event::{CameraPreviewMode, VideoSource, VideoYuvMetadata},
     permission::{Permission, PermissionStatus},
     video::{VideoFormatId, VideoInputId, VideoInputsEvent, VideoPixelFormat},
 };
-use rapier3d::prelude::{
-    BroadPhaseBvh, CCDSolver, ColliderBuilder, ColliderHandle, ColliderSet, ImpulseJointSet,
-    IntegrationParameters, IslandManager, MultibodyJointSet, NarrowPhase, PhysicsPipeline,
-    Pose as RapierPose, Real as RapierReal, RigidBodyBuilder, RigidBodyHandle, RigidBodySet,
-    Rotation as RapierRotation, SharedShape, Vector as RapierVector,
-};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::Arc,
 };
+
+/// Physics handle aliases shared by the physics submodules (via `use super::*`).
+pub(crate) type RigidBodyHandle = makepad_box3d::id::BodyId;
+pub(crate) type ColliderHandle = makepad_box3d::id::ShapeId;
 
 const XR_DEPTH_MESH_FOCUS_CUBE_SIZE_METERS: f32 = 0.96;
 const XR_DEPTH_MESH_FOCUS_GRID_METERS: f32 = 0.32;
@@ -43,10 +41,13 @@ mod xr_hands;
 mod xr_passthrough;
 #[path = "xr_physics.rs"]
 mod xr_physics;
+pub use xr_hands::xr_hand_colliders;
+pub use xr_physics::{xr_grip_pose, xr_hold_frame, xr_two_hand_hold_pose, HandCollider as XrHandCollider};
+pub use xr_physics_worker::{XrBodySpawnCounts, XrPhysicsCounters, XrPhysicsState, XR_WORKER_FIXED_DT};
 #[path = "xr_physics_worker.rs"]
 mod xr_physics_worker;
 
-pub(crate) use self::xr_physics::RapierScene;
+pub(crate) use self::xr_physics::PhysicsScene;
 use self::{
     xr_depth::{DepthSurfaceMeshChunkHandle, RetainedDepthQueryHit},
     xr_passthrough::{
@@ -227,13 +228,13 @@ const XR_HAND_PLATE_HALF_DEPTH: f32 = 0.028;
 const XR_HAND_PLATE_FORWARD_OFFSET: f32 = 0.004;
 const XR_HAND_TIP_RADIUS_SCALE: f32 = 0.72;
 const XR_HAND_GRAB_MAX_DISTANCE: f32 = 0.24;
+/// How near (metres, grip point to surface) a grab must be to a body the other hand holds to
+/// join the hold: on it.
+const XR_HAND_SHARED_GRAB_MAX_DISTANCE: f32 = 0.04;
 const XR_HAND_DUAL_GRAB_MIN_SPAN: f32 = 0.035;
 const XR_HAND_GRAB_RELEASE_LINEAR_VELOCITY_SCALE: f32 = 1.0;
 const XR_BODY_LINEAR_DAMPING: f32 = 1.5;
 const XR_BODY_ANGULAR_DAMPING: f32 = 6.0;
-const XR_BODY_ADDITIONAL_SOLVER_ITERATIONS: usize = 4;
-const XR_BODY_SLEEP_ANGULAR_THRESHOLD: f32 = 2.0;
-const XR_BODY_SLEEP_TIME: f32 = 0.35;
 const XR_BODY_SNAP_SLEEP_LINEAR_SPEED: f32 = 0.03;
 const XR_BODY_SNAP_SLEEP_ANGULAR_SPEED: f32 = 1.0;
 const XR_BODY_SNAP_SLEEP_SETTLE_FRAMES: u8 = 4;
@@ -242,41 +243,68 @@ const XR_PBR_CORNER_SEGMENTS: usize = 3;
 const XR_PBR_HAND_CAPSULE_SUBDIVISIONS: usize = 8;
 const XR_PBR_HAND_SPHERE_SUBDIVISIONS: usize = 8;
 
+/// One player's hands and controllers for a physics step (in the scene's space). Player 0 is
+/// the local one; a host simulating for others passes theirs with their own ids.
+#[derive(Clone, Default)]
+pub struct XrPlayerHands {
+    pub player: u32,
+    pub left_hand: XrHand,
+    pub right_hand: XrHand,
+    pub left_controller: XrController,
+    pub right_controller: XrController,
+}
+
+/// One body of a physics scene as the worker builds it: a widget's cube, or any host's
+/// rigid body (the id is the host's own, carried as a `WidgetUid`).
 #[derive(Clone, Copy)]
-struct CollectedXrCube {
-    uid: WidgetUid,
-    body_kind: XrBodyKind,
-    spawn_pool: bool,
-    pose: Pose,
-    scale: Vec3f,
-    half_extents: Vec3f,
-    physics_shape: XrPhysicsShape,
-    depth_query_support: XrDepthQuerySupportRig,
-    density: f32,
-    friction: f32,
-    restitution: f32,
-    gravity_scale: f32,
+pub struct XrPhysicsBody {
+    pub uid: WidgetUid,
+    pub body_kind: XrBodyKind,
+    pub spawn_pool: bool,
+    pub pose: Pose,
+    pub scale: Vec3f,
+    pub half_extents: Vec3f,
+    pub physics_shape: XrPhysicsShape,
+    pub depth_query_support: XrDepthQuerySupportRig,
+    pub density: f32,
+    pub friction: f32,
+    pub restitution: f32,
+    pub gravity_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct XrPhysicsMetrics {
-    compute_ms: f64,
-    tsdf_query_ms: f64,
-    rapier_step_ms: f64,
-    depth_query_surface_count: usize,
-    scene_body_count: usize,
-    body_spawn_apply_count: usize,
-    body_spawn_miss_count: usize,
+pub struct XrPhysicsMetrics {
+    pub compute_ms: f64,
+    pub tsdf_query_ms: f64,
+    pub engine_step_ms: f64,
+    pub depth_query_surface_count: usize,
+    pub scene_body_count: usize,
+    /// where the spawns sent to the worker ended up (totals)
+    pub body_spawns: XrBodySpawnCounts,
 }
 
-struct XrPhysicsRuntime {
+/// The UI side of the XR physics: owns the physics worker thread ("makepad-xr-physics"),
+/// queues body commands until the scene is built, and holds the worker's newest result.
+/// It never waits on the worker: commands go into the worker's mailbox, results are taken
+/// from its latest-result slot when there is one.
+pub struct XrPhysics {
     worker: Option<XrPhysicsWorker>,
     runtime_bodies: Rc<HashMap<WidgetUid, XrRuntimeBodyState>>,
     runtime_contacts: Rc<Vec<(WidgetUid, WidgetUid)>>,
-    root_pose: Option<Pose>,
+    /// the newest physics states, oldest first (`pose_at` interpolates between them)
+    history: Vec<XrPhysicsState>,
+    counters: XrPhysicsCounters,
+    pub(crate) root_pose: Option<Pose>,
     scene_dirty: bool,
     revision: u64,
+    /// scenes built and physics resets so far (each makes a new revision)
+    rebuilds: usize,
+    resets: usize,
+    /// spawns a reset cleared before there was a worker (handed to it when it starts)
+    reset_spawns_before_worker: usize,
     metrics: XrPhysicsMetrics,
+    /// the depth-query hits of the newest applied result, for the env's debug view
+    retained_hits_update: Option<HashMap<u64, RetainedDepthQueryHit>>,
     pending_body_spawns: Vec<XrBodySpawn>,
     pending_body_despawns: Vec<WidgetUid>,
     pending_body_impulses: Vec<XrBodyImpulse>,
@@ -285,16 +313,22 @@ struct XrPhysicsRuntime {
     pending_car_controls: Vec<XrCarControl>,
 }
 
-impl Default for XrPhysicsRuntime {
+impl Default for XrPhysics {
     fn default() -> Self {
         Self {
             worker: None,
             runtime_bodies: Rc::new(HashMap::new()),
             runtime_contacts: Rc::new(Vec::new()),
+            history: Vec::new(),
+            counters: XrPhysicsCounters::default(),
             root_pose: None,
             scene_dirty: true,
             revision: 0,
+            rebuilds: 0,
+            resets: 0,
+            reset_spawns_before_worker: 0,
             metrics: XrPhysicsMetrics::default(),
+            retained_hits_update: None,
             pending_body_spawns: Vec::new(),
             pending_body_despawns: Vec::new(),
             pending_body_impulses: Vec::new(),
@@ -302,6 +336,233 @@ impl Default for XrPhysicsRuntime {
             pending_body_drives: Vec::new(),
             pending_car_controls: Vec::new(),
         }
+    }
+}
+
+impl XrPhysics {
+    fn worker(&mut self, cx: &mut Cx) -> &mut XrPhysicsWorker {
+        let reset_spawns = &mut self.reset_spawns_before_worker;
+        self.worker.get_or_insert_with(|| XrPhysicsWorker::new(cx.xr_tsdf(), std::mem::take(reset_spawns)))
+    }
+
+    fn apply_worker_result(&mut self, result: XrPhysicsWorkerResult) -> bool {
+        if result.revision != self.revision {
+            return false;
+        }
+        self.runtime_bodies = Rc::new(result.runtime_bodies);
+        self.runtime_contacts = Rc::new(result.runtime_contacts);
+        self.history = result.history;
+        self.counters = result.counters;
+        if let Some(retained_hits) = result.depth_query_retained_hits {
+            self.retained_hits_update = Some(retained_hits);
+        }
+        self.metrics = XrPhysicsMetrics {
+            compute_ms: result.physics_compute_ms,
+            tsdf_query_ms: result.physics_tsdf_query_ms,
+            engine_step_ms: result.physics_engine_step_ms,
+            depth_query_surface_count: result.physics_depth_query_surface_count,
+            scene_body_count: result.physics_scene_body_count,
+            body_spawns: result.body_spawns,
+        };
+        true
+    }
+
+    /// Takes the worker's newest result (results of an older revision are dropped);
+    /// true when the bodies changed.
+    pub fn poll(&mut self) -> bool {
+        let mut applied = false;
+        while let Some(result) = self.worker.as_mut().and_then(|worker| worker.take_latest_result()) {
+            applied |= self.apply_worker_result(result);
+        }
+        applied
+    }
+
+    /// The scene must be (re)built before bodies can be addressed.
+    pub fn needs_rebuild(&self) -> bool {
+        self.scene_dirty || self.worker.is_none()
+    }
+
+    pub fn mark_scene_dirty(&mut self) {
+        self.scene_dirty = true;
+    }
+
+    /// A new scene of `bodies` (a new revision: everything the worker still has of the old
+    /// one is dropped).
+    pub fn rebuild(&mut self, cx: &mut Cx, gravity: f32, bodies: Vec<XrPhysicsBody>, floor_y: Option<f32>) {
+        self.revision = self.revision.saturating_add(1);
+        self.rebuilds += 1;
+        let revision = self.revision;
+        self.worker(cx).request_rebuild(revision, gravity, bodies, floor_y);
+        self.scene_dirty = false;
+    }
+
+    pub fn spawn_body(&mut self, spawn: XrBodySpawn) {
+        self.pending_body_spawns.push(spawn);
+    }
+
+    pub fn despawn_body(&mut self, widget_uid: WidgetUid) {
+        self.pending_body_despawns.push(widget_uid);
+    }
+
+    pub fn apply_body_impulse(&mut self, impulse: XrBodyImpulse) {
+        self.pending_body_impulses.push(impulse);
+    }
+
+    pub fn apply_body_wrench(&mut self, wrench: XrBodyWrench) {
+        self.pending_body_wrenches.push(wrench);
+    }
+
+    pub fn apply_body_drive(&mut self, drive: XrBodyDrive) {
+        self.pending_body_drives.push(drive);
+    }
+
+    pub fn apply_car_control(&mut self, control: XrCarControl) {
+        self.pending_car_controls.push(control);
+    }
+
+    /// These hands and controllers (tracking space, metres) as of `time` (seconds of the
+    /// draw's clock: on a headset the picture's display time). The worker simulates fixed
+    /// `XR_WORKER_FIXED_DT` steps up to a little past `time`, each with the hands interpolated
+    /// between the samples around it, and publishes its newest states.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step(&mut self, cx: &mut Cx, time: f64, hands: Vec<XrPlayerHands>, floor_y: Option<f32>, time_scale: f32, include_retained_hits: bool) {
+        let revision = self.revision;
+        self.worker(cx).request_step(revision, time, hands, floor_y, time_scale, include_retained_hits);
+    }
+
+    /// A body's pose at `time` (the draw's clock): between the two physics states around it;
+    /// past the newest state carried on by the body's velocity. `None` when no state has it.
+    /// The flag says whether the pose had to be carried past the states (a late step).
+    pub fn pose_at(&self, uid: WidgetUid, time: f64) -> Option<(Pose, bool)> {
+        let find = |s: &XrPhysicsState| s.bodies.iter().find(|(u, _)| *u == uid).map(|(_, p)| *p);
+        let after = self.history.iter().position(|s| s.time >= time);
+        match after {
+            Some(0) => find(&self.history[0]).map(|p| (p, false)),
+            Some(i) => {
+                let (a, b) = (&self.history[i - 1], &self.history[i]);
+                let (pa, pb) = (find(a)?, find(b)?);
+                let f = ((time - a.time) / (b.time - a.time).max(1.0e-9)) as f32;
+                Some((Pose::from_lerp(pa, pb, f), false))
+            }
+            None => {
+                let newest = self.history.last()?;
+                let pose = find(newest)?;
+                let ahead = ((time - newest.time) as f32).min(0.05);
+                let state = self.runtime_bodies.get(&uid);
+                let pose = match state {
+                    Some(b) if b.dynamic_body && !b.sleeping => {
+                        let p = pose.position + b.linvel * ahead;
+                        let w = b.angvel.length();
+                        let o = if w > 1.0e-4 { Quat::multiply(&Quat::from_axis_angle(b.angvel * (1.0 / w), w * ahead), &pose.orientation) } else { pose.orientation };
+                        Pose::new(o, p)
+                    }
+                    _ => pose,
+                };
+                Some((pose, true))
+            }
+        }
+    }
+
+    /// The time of the newest physics state (`None` before the first step).
+    pub fn newest_state_time(&self) -> Option<f64> {
+        self.history.last().map(|s| s.time)
+    }
+
+    /// The worker's totals (steps, hand samples, new hands, skipped time).
+    pub fn counters(&self) -> &XrPhysicsCounters {
+        &self.counters
+    }
+
+    pub fn reset(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+        self.resets += 1;
+        // the spawns still queued here never reach the worker: the reset is their outcome
+        let unsent_spawns = self.pending_body_spawns.len();
+        if let Some(worker) = self.worker.as_mut() {
+            worker.request_reset(self.revision, unsent_spawns);
+        } else {
+            self.reset_spawns_before_worker += unsent_spawns;
+        }
+        // the spawn counts are the worker's totals: they carry over
+        self.metrics = XrPhysicsMetrics { body_spawns: self.metrics.body_spawns, ..Default::default() };
+        self.retained_hits_update = None;
+        Rc::make_mut(&mut self.runtime_bodies).clear();
+        Rc::make_mut(&mut self.runtime_contacts).clear();
+        self.history.clear();
+        self.pending_body_spawns.clear();
+        self.pending_body_despawns.clear();
+        self.pending_body_impulses.clear();
+        self.pending_body_wrenches.clear();
+        self.pending_body_drives.clear();
+        self.pending_car_controls.clear();
+        self.scene_dirty = true;
+    }
+
+    /// Sends the queued body commands once the scene exists.
+    pub fn flush_pending(&mut self, cx: &mut Cx) {
+        if self.needs_rebuild() {
+            return;
+        }
+        if self.pending_body_spawns.is_empty()
+            && self.pending_body_despawns.is_empty()
+            && self.pending_body_impulses.is_empty()
+            && self.pending_body_wrenches.is_empty()
+            && self.pending_body_drives.is_empty()
+            && self.pending_car_controls.is_empty()
+        {
+            return;
+        }
+        let revision = self.revision;
+        let pending_body_spawns = std::mem::take(&mut self.pending_body_spawns);
+        let pending_body_despawns = std::mem::take(&mut self.pending_body_despawns);
+        let pending_body_impulses = std::mem::take(&mut self.pending_body_impulses);
+        let pending_body_wrenches = std::mem::take(&mut self.pending_body_wrenches);
+        let pending_body_drives = std::mem::take(&mut self.pending_body_drives);
+        let pending_car_controls = std::mem::take(&mut self.pending_car_controls);
+        let worker = self.worker(cx);
+        for spawn in pending_body_spawns {
+            worker.request_body_spawn(revision, spawn);
+        }
+        for widget_uid in pending_body_despawns {
+            worker.request_body_despawn(revision, widget_uid);
+        }
+        for impulse in pending_body_impulses {
+            worker.request_body_impulse(revision, impulse);
+        }
+        for wrench in pending_body_wrenches {
+            worker.request_body_wrench(revision, wrench);
+        }
+        for drive in pending_body_drives {
+            worker.request_body_drive(revision, drive);
+        }
+        for control in pending_car_controls {
+            worker.request_car_control(revision, control);
+        }
+    }
+
+    fn take_retained_hits_update(&mut self) -> Option<HashMap<u64, RetainedDepthQueryHit>> {
+        self.retained_hits_update.take()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Scenes built and physics resets so far.
+    pub fn rebuilds_and_resets(&self) -> (usize, usize) {
+        (self.rebuilds, self.resets)
+    }
+
+    pub fn metrics(&self) -> &XrPhysicsMetrics {
+        &self.metrics
+    }
+
+    pub fn runtime_bodies(&self) -> &Rc<HashMap<WidgetUid, XrRuntimeBodyState>> {
+        &self.runtime_bodies
+    }
+
+    pub fn runtime_contacts(&self) -> &Rc<Vec<(WidgetUid, WidgetUid)>> {
+        &self.runtime_contacts
     }
 }
 
@@ -403,7 +664,7 @@ struct XrWorld {
     last_xr_state: Option<Rc<XrState>>,
     depth: XrDepthRuntime,
     passthrough: XrPassthroughRuntime,
-    physics: XrPhysicsRuntime,
+    physics: XrPhysics,
     hands: XrHandSystem,
     debug_floor_preview: XrDebugFloorPreview,
 }
@@ -512,15 +773,15 @@ impl XrEnv {
     }
 
     pub(crate) fn physics_compute_ms(&self) -> f64 {
-        self.world.physics.metrics.compute_ms
+        self.world.physics.metrics().compute_ms
     }
 
     pub(crate) fn physics_tsdf_query_ms(&self) -> f64 {
-        self.world.physics.metrics.tsdf_query_ms
+        self.world.physics.metrics().tsdf_query_ms
     }
 
-    pub(crate) fn physics_rapier_step_ms(&self) -> f64 {
-        self.world.physics.metrics.rapier_step_ms
+    pub(crate) fn physics_engine_step_ms(&self) -> f64 {
+        self.world.physics.metrics().engine_step_ms
     }
 
     pub(crate) fn physics_time_scale(&self) -> f32 {
@@ -538,19 +799,19 @@ impl XrEnv {
     }
 
     pub(crate) fn physics_depth_query_surface_count(&self) -> usize {
-        self.world.physics.metrics.depth_query_surface_count
+        self.world.physics.metrics().depth_query_surface_count
     }
 
     pub(crate) fn physics_scene_body_count(&self) -> usize {
-        self.world.physics.metrics.scene_body_count
+        self.world.physics.metrics().scene_body_count
     }
 
-    pub(crate) fn physics_body_spawn_apply_count(&self) -> usize {
-        self.world.physics.metrics.body_spawn_apply_count
+    pub(crate) fn physics_body_spawns(&self) -> XrBodySpawnCounts {
+        self.world.physics.metrics().body_spawns
     }
 
-    pub(crate) fn physics_body_spawn_miss_count(&self) -> usize {
-        self.world.physics.metrics.body_spawn_miss_count
+    pub(crate) fn physics_rebuilds_and_resets(&self) -> (usize, usize) {
+        self.world.physics.rebuilds_and_resets()
     }
 
     pub(crate) fn depth_mesh_chunk_count(&self) -> usize {
@@ -570,15 +831,15 @@ impl XrEnv {
     }
 
     pub(crate) fn physics_revision(&self) -> u64 {
-        self.world.physics.revision
+        self.world.physics.revision()
     }
 
     pub(crate) fn runtime_bodies(&self) -> Rc<HashMap<WidgetUid, XrRuntimeBodyState>> {
-        self.world.physics.runtime_bodies.clone()
+        self.world.physics.runtime_bodies().clone()
     }
 
     pub(crate) fn runtime_contacts(&self) -> Rc<Vec<(WidgetUid, WidgetUid)>> {
-        self.world.physics.runtime_contacts.clone()
+        self.world.physics.runtime_contacts().clone()
     }
 
     fn passthrough_video_id() -> LiveId {
@@ -897,7 +1158,7 @@ impl XrEnv {
         parent_pos: Vec3f,
         parent_ori: Quat,
         parent_scale: Vec3f,
-        cubes: &mut Vec<CollectedXrCube>,
+        cubes: &mut Vec<XrPhysicsBody>,
     ) {
         if !widget.visible() {
             return;
@@ -910,7 +1171,7 @@ impl XrEnv {
                 && (half.x > 0.0 || half.y > 0.0 || half.z > 0.0);
 
             if should_push {
-                cubes.push(CollectedXrCube {
+                cubes.push(XrPhysicsBody {
                     uid: widget.widget_uid(),
                     body_kind: node.body_kind(),
                     spawn_pool: node.spawn_pool(),
@@ -940,7 +1201,7 @@ impl XrEnv {
     fn collect_cubes_from_children(
         &self,
         children: &[(LiveId, WidgetRef)],
-    ) -> Vec<CollectedXrCube> {
+    ) -> Vec<XrPhysicsBody> {
         let mut cubes = Vec::new();
         let (root_pos, root_ori) = if let Some(root_pose) = self.world.physics.root_pose {
             (root_pose.position, root_pose.orientation)
@@ -954,46 +1215,11 @@ impl XrEnv {
         cubes
     }
 
-    fn ensure_physics_worker(&mut self, cx: &mut Cx) -> &mut XrPhysicsWorker {
-        self.world
-            .physics
-            .worker
-            .get_or_insert_with(|| XrPhysicsWorker::new(cx.xr_tsdf()))
-    }
-
-    fn apply_physics_worker_result(&mut self, result: XrPhysicsWorkerResult) -> bool {
-        if result.revision != self.world.physics.revision {
-            return false;
-        }
-        self.world.physics.runtime_bodies = Rc::new(result.runtime_bodies);
-        self.world.physics.runtime_contacts = Rc::new(result.runtime_contacts);
-        if let Some(retained_hits) = result.depth_query_retained_hits {
-            self.world.depth.query_retained_hits = retained_hits;
-        }
-        self.world.physics.metrics = XrPhysicsMetrics {
-            compute_ms: result.physics_compute_ms,
-            tsdf_query_ms: result.physics_tsdf_query_ms,
-            rapier_step_ms: result.physics_rapier_step_ms,
-            depth_query_surface_count: result.physics_depth_query_surface_count,
-            scene_body_count: result.physics_scene_body_count,
-            body_spawn_apply_count: result.physics_body_spawn_apply_count,
-            body_spawn_miss_count: result.physics_body_spawn_miss_count,
-        };
-        true
-    }
-
     fn poll_physics_worker(&mut self, cx: &mut Cx) {
-        let mut applied = false;
-        while let Some(result) = self
-            .world
-            .physics
-            .worker
-            .as_mut()
-            .and_then(|worker| worker.take_latest_result())
-        {
-            applied |= self.apply_physics_worker_result(result);
-        }
-        if applied {
+        if self.world.physics.poll() {
+            if let Some(retained_hits) = self.world.physics.take_retained_hits_update() {
+                self.world.depth.query_retained_hits = retained_hits;
+            }
             cx.redraw_all();
         }
     }
@@ -1001,22 +1227,18 @@ impl XrEnv {
     fn request_physics_rebuild(&mut self, cx: &mut Cx, children: &[(LiveId, WidgetRef)]) {
         let cubes = self.collect_cubes_from_children(children);
         self.world.depth.query_retained_hits.clear();
-        self.world.physics.revision = self.world.physics.revision.saturating_add(1);
-        let revision = self.world.physics.revision;
         let gravity = self.gravity;
         let floor_y = self
             .world
             .last_xr_state
             .as_deref()
             .and_then(|state| state.floor_y);
-        self.ensure_physics_worker(cx)
-            .request_rebuild(revision, gravity, cubes, floor_y);
-        self.world.physics.scene_dirty = false;
+        self.world.physics.rebuild(cx, gravity, cubes, floor_y);
     }
 
     pub fn ensure_physics(&mut self, cx: &mut Cx, children: &[(LiveId, WidgetRef)]) {
         self.poll_physics_worker(cx);
-        if self.world.physics.scene_dirty || self.world.physics.worker.is_none() {
+        if self.world.physics.needs_rebuild() {
             self.request_physics_rebuild(cx, children);
             cx.redraw_all();
         }
@@ -1024,31 +1246,31 @@ impl XrEnv {
     }
 
     pub fn spawn_body(&mut self, _cx: &mut Cx, spawn: XrBodySpawn) {
-        self.world.physics.pending_body_spawns.push(spawn);
+        self.world.physics.spawn_body(spawn);
     }
 
     pub fn despawn_body(&mut self, _cx: &mut Cx, widget_uid: WidgetUid) {
-        self.world.physics.pending_body_despawns.push(widget_uid);
+        self.world.physics.despawn_body(widget_uid);
     }
 
     pub fn apply_body_impulse(&mut self, _cx: &mut Cx, impulse: XrBodyImpulse) {
-        self.world.physics.pending_body_impulses.push(impulse);
+        self.world.physics.apply_body_impulse(impulse);
     }
 
     pub fn apply_body_wrench(&mut self, _cx: &mut Cx, wrench: XrBodyWrench) {
-        self.world.physics.pending_body_wrenches.push(wrench);
+        self.world.physics.apply_body_wrench(wrench);
     }
 
     pub fn apply_body_drive(&mut self, _cx: &mut Cx, drive: XrBodyDrive) {
-        self.world.physics.pending_body_drives.push(drive);
+        self.world.physics.apply_body_drive(drive);
     }
 
     pub fn apply_car_control(&mut self, _cx: &mut Cx, control: XrCarControl) {
-        self.world.physics.pending_car_controls.push(control);
+        self.world.physics.apply_car_control(control);
     }
 
     pub fn mark_scene_dirty(&mut self) {
-        self.world.physics.scene_dirty = true;
+        self.world.physics.mark_scene_dirty();
     }
 
     pub fn set_root_pose(&mut self, cx: &mut Cx, pose: Option<Pose>) {
@@ -1056,19 +1278,18 @@ impl XrEnv {
             return;
         }
         self.world.physics.root_pose = pose;
-        self.world.physics.scene_dirty = true;
+        self.world.physics.mark_scene_dirty();
         cx.redraw_all();
     }
 
     #[allow(dead_code)]
     fn has_dynamic_bodies(&self) -> bool {
-        !self.world.physics.runtime_bodies.is_empty()
+        !self.world.physics.runtime_bodies().is_empty()
     }
 
     pub fn step_physics(&mut self, cx: &mut Cx) {
         self.poll_physics_worker(cx);
         self.flush_pending_physics_commands(cx);
-        let revision = self.world.physics.revision;
         let physics_time_scale = self.physics_time_scale;
         let include_retained_hits = self.depth_query_hits_visible();
         let (left_hand, right_hand, left_controller, right_controller, floor_y) = self
@@ -1093,12 +1314,14 @@ impl XrEnv {
                     None,
                 )
             });
-        self.ensure_physics_worker(cx).request_step(
-            revision,
-            left_hand,
-            right_hand,
-            left_controller,
-            right_controller,
+        // the hands' time: the XR frame's display time, else now (the worker steps a fixed rate
+        // up to it). (Not XrState::time: for a remote headset's frames, whose display times
+        // are on its own clock, that reads 0.)
+        let time = cx.xr_frame_wire().map_or_else(|| cx.seconds_since_app_start(), |(ns, _)| ns as f64 / 1e9);
+        self.world.physics.step(
+            cx,
+            time,
+            vec![XrPlayerHands { player: 0, left_hand, right_hand, left_controller, right_controller }],
             floor_y,
             physics_time_scale,
             include_retained_hits,
@@ -1106,73 +1329,23 @@ impl XrEnv {
     }
 
     pub fn reset_physics(&mut self, cx: &mut Cx) {
-        self.world.physics.revision = self.world.physics.revision.saturating_add(1);
-        if let Some(worker) = self.world.physics.worker.as_mut() {
-            worker.request_reset(self.world.physics.revision);
-        }
-        self.world.physics.metrics = XrPhysicsMetrics::default();
+        self.world.physics.reset();
         self.world.depth.query_retained_hits.clear();
-        Rc::make_mut(&mut self.world.physics.runtime_bodies).clear();
-        Rc::make_mut(&mut self.world.physics.runtime_contacts).clear();
-        self.world.physics.pending_body_spawns.clear();
-        self.world.physics.pending_body_despawns.clear();
-        self.world.physics.pending_body_impulses.clear();
-        self.world.physics.pending_body_wrenches.clear();
-        self.world.physics.pending_body_drives.clear();
-        self.world.physics.pending_car_controls.clear();
-        self.world.physics.scene_dirty = true;
         cx.redraw_all();
     }
 
     pub fn flush_pending_physics_commands(&mut self, cx: &mut Cx) {
         self.poll_physics_worker(cx);
-        if self.world.physics.scene_dirty || self.world.physics.worker.is_none() {
-            return;
-        }
-        if self.world.physics.pending_body_spawns.is_empty()
-            && self.world.physics.pending_body_despawns.is_empty()
-            && self.world.physics.pending_body_impulses.is_empty()
-            && self.world.physics.pending_body_wrenches.is_empty()
-            && self.world.physics.pending_body_drives.is_empty()
-            && self.world.physics.pending_car_controls.is_empty()
-        {
-            return;
-        }
-        let revision = self.world.physics.revision;
-        let pending_body_spawns = std::mem::take(&mut self.world.physics.pending_body_spawns);
-        let pending_body_despawns = std::mem::take(&mut self.world.physics.pending_body_despawns);
-        let pending_body_impulses = std::mem::take(&mut self.world.physics.pending_body_impulses);
-        let pending_body_wrenches = std::mem::take(&mut self.world.physics.pending_body_wrenches);
-        let pending_body_drives = std::mem::take(&mut self.world.physics.pending_body_drives);
-        let pending_car_controls = std::mem::take(&mut self.world.physics.pending_car_controls);
-        let worker = self.ensure_physics_worker(cx);
-        for spawn in pending_body_spawns {
-            worker.request_body_spawn(revision, spawn);
-        }
-        for widget_uid in pending_body_despawns {
-            worker.request_body_despawn(revision, widget_uid);
-        }
-        for impulse in pending_body_impulses {
-            worker.request_body_impulse(revision, impulse);
-        }
-        for wrench in pending_body_wrenches {
-            worker.request_body_wrench(revision, wrench);
-        }
-        for drive in pending_body_drives {
-            worker.request_body_drive(revision, drive);
-        }
-        for control in pending_car_controls {
-            worker.request_car_control(revision, control);
-        }
+        self.world.physics.flush_pending(cx);
     }
 
     #[allow(dead_code)]
-    pub(crate) fn runtime_scene_ref(&self) -> Option<&RapierScene> {
+    pub(crate) fn runtime_scene_ref(&self) -> Option<&PhysicsScene> {
         None
     }
 
     #[allow(dead_code)]
-    pub(crate) fn runtime_scene_mut(&mut self) -> Option<&mut RapierScene> {
+    pub(crate) fn runtime_scene_mut(&mut self) -> Option<&mut PhysicsScene> {
         None
     }
 
@@ -1244,7 +1417,7 @@ impl XrEnv {
         };
 
         XrDrawScopeData {
-            runtime_bodies: self.world.physics.runtime_bodies.clone(),
+            runtime_bodies: self.world.physics.runtime_bodies().clone(),
             tracking_from_content: Mat4f::identity(),
             content_from_tracking: Mat4f::identity(),
             env_texture,
@@ -1316,8 +1489,8 @@ impl DrawDepthMeshBasic {
     fn draw_geometry(&mut self, cx: &mut Cx2d, geometry_id: GeometryId) {
         self.draw_vars.append_group_id = cx.draw_call_group_background().0;
         self.draw_vars.geometry_id = Some(geometry_id);
-        if cx.new_draw_call(&self.draw_vars).is_some() && self.draw_vars.can_instance() {
-            let new_area = cx.add_aligned_instance(&self.draw_vars);
+        if cx.new_draw_call(&mut self.draw_vars).is_some() && self.draw_vars.can_instance() {
+            let new_area = cx.add_aligned_instance(&mut self.draw_vars);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
         }
     }

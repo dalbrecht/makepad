@@ -5,9 +5,24 @@ authors = ["Makepad <info@makepad.nl>"]
 edition = "2021"
 description = "Makepad teamtalk"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/makepad/makepad/"
 repository = "https://github.com/makepad/makepad/"
 metadata.makepad-auto-version = "Ywx5y_Q1A52NaelyQCiYcZ6m0Po="
 
+[features]
+default = ["tweaker"]
+# The design overlay (Shift+F10 with the dev overlays on). On for development
+# builds; the Runner's releases build without it (--no-default-features).
+tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widgets/dock", "makepad-widgets/fab"]
+
 [dependencies]
-makepad-widgets = { path = "../../widgets", version = "2.0.0" }
+makepad-widgets = { path = "../../widgets", version = "2.0.0", default-features = false }
+makepad-widgets-tweaker = { path = "../../widgets/families/tweaker", version = "2.0.0", optional = true }
+makepad-teamtalk = { path = "../../libs/teamtalk" }
+
+[[bin]]
+name = "makepad-example-teamtalk"
+path = "src/main.rs"
+
+[[bin]]
+name = "teamtalk-bench"
+path = "src/bench.rs"

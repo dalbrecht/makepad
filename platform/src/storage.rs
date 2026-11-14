@@ -1,0 +1,1617 @@
+use {
+    crate::{
+        cx::Cx,
+        event::Event,
+        thread::ToUIReceiver,
+    },
+    std::collections::HashMap,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex};
+
+/// A request on its way to a worker, who holds the lock while running it: an app that ends runs
+/// what no worker took, and waits for what one did (`Cx::finish_native_storage_writes`).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type HeldStorageRequest = Arc<Mutex<Option<StorageRequest>>>;
+
+/// Default maximum size of one stored value. Writes are whole-value for now;
+/// streaming or append-style writes can be added without changing
+/// [`StorageHandle`].
+pub const DEFAULT_STORAGE_VALUE_CAP: usize = 64 * 1024 * 1024;
+pub const MAX_STORAGE_NAMESPACE_BYTES: usize = 64;
+pub const MAX_STORAGE_KEY_BYTES: usize = 1024;
+pub const MAX_STORAGE_LIST_LIMIT: u32 = 1024;
+
+/// Identifier returned immediately when an asynchronous storage operation is
+/// submitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StorageRequestId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Operation associated with a [`StorageResponse`].
+pub enum StorageOp {
+    Get,
+    Set,
+    Delete,
+    List,
+    GetRange,
+    Stat,
+    Estimate,
+}
+
+impl StorageOp {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn from_u32(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::Get,
+            1 => Self::Set,
+            2 => Self::Delete,
+            3 => Self::List,
+            4 => Self::GetRange,
+            5 => Self::Stat,
+            6 => Self::Estimate,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// One bounded, sorted page returned by [`StorageHandle::list`].
+pub struct StorageList {
+    /// Sorted keys in this page.
+    pub keys: Vec<String>,
+    /// Pass this value as `after` to request the next page.
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Metadata returned by [`StorageHandle::stat`].
+pub struct StorageStat {
+    pub len: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Best-effort storage usage and quota for the current origin or native
+/// storage volume.
+pub struct StorageEstimate {
+    pub usage: u64,
+    pub quota: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Successful payload of a storage response.
+pub enum StorageResult {
+    /// Result of `get` or `get_range`. `None` means the key was absent; an
+    /// existing empty value is `Some(Vec::new())`.
+    Value(Option<Vec<u8>>),
+    List(StorageList),
+    Stat(Option<StorageStat>),
+    Estimate(StorageEstimate),
+    /// Successful `set` or `delete`.
+    Unit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Error reported asynchronously for a storage request.
+pub enum StorageError {
+    InvalidNamespace(String),
+    InvalidKey(String),
+    InvalidListLimit { limit: u32, max: u32 },
+    ValueTooLarge { size: usize, max: usize },
+    QuotaExceeded(String),
+    Io(String),
+    Unsupported(String),
+    Backend(String),
+    Protocol(String),
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidNamespace(message)
+            | Self::InvalidKey(message)
+            | Self::Io(message)
+            | Self::Unsupported(message)
+            | Self::Backend(message)
+            | Self::Protocol(message) => f.write_str(message),
+            Self::QuotaExceeded(message) => f.write_str(message),
+            Self::InvalidListLimit { limit, max } => {
+                write!(f, "storage list limit {limit} is outside 1..={max}")
+            }
+            Self::ValueTooLarge { size, max } => {
+                write!(f, "storage value is {size} bytes; maximum is {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Completion record delivered in [`Event::Storage`].
+pub struct StorageResponse {
+    pub request_id: StorageRequestId,
+    pub namespace: String,
+    pub op: StorageOp,
+    pub result: Result<StorageResult, StorageError>,
+}
+
+pub type StorageResponsesEvent = Vec<StorageResponse>;
+
+/// A namespace-bound storage capability. Every operation performed through a
+/// handle is scoped to this namespace; no un-namespaced entry point exists.
+#[derive(Clone, Debug)]
+pub struct StorageHandle {
+    namespace: String,
+    namespace_error: Option<StorageError>,
+}
+
+impl StorageHandle {
+    /// Returns the validated namespace supplied to [`Cx::storage`].
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Reads a complete value. Missing and existing-empty values are distinct.
+    pub fn get(&self, cx: &mut Cx, key: &str) -> StorageRequestId {
+        self.submit(cx, StorageRequestKind::Get { key: key.into() })
+    }
+
+    /// Atomically replaces a complete value.
+    pub fn set(
+        &self,
+        cx: &mut Cx,
+        key: &str,
+        bytes: impl Into<Vec<u8>>,
+    ) -> StorageRequestId {
+        self.submit(
+            cx,
+            StorageRequestKind::Set {
+                key: key.into(),
+                value: bytes.into(),
+            },
+        )
+    }
+
+    /// Deletes a value. Deleting a missing key succeeds.
+    pub fn delete(&self, cx: &mut Cx, key: &str) -> StorageRequestId {
+        self.submit(cx, StorageRequestKind::Delete { key: key.into() })
+    }
+
+    /// Lists a sorted, bounded page of keys beginning with `prefix`.
+    /// Pass the preceding page's `next_cursor` as `after` to continue.
+    pub fn list(
+        &self,
+        cx: &mut Cx,
+        prefix: &str,
+        after: Option<String>,
+        limit: u32,
+    ) -> StorageRequestId {
+        self.submit(
+            cx,
+            StorageRequestKind::List {
+                prefix: prefix.into(),
+                after,
+                limit,
+            },
+        )
+    }
+
+    /// Reads at most `len` bytes starting at `offset`, without returning the
+    /// remainder of the value.
+    pub fn get_range(
+        &self,
+        cx: &mut Cx,
+        key: &str,
+        offset: u64,
+        len: u32,
+    ) -> StorageRequestId {
+        self.submit(
+            cx,
+            StorageRequestKind::GetRange {
+                key: key.into(),
+                offset,
+                len,
+            },
+        )
+    }
+
+    /// Returns a value's byte length without reading its contents.
+    pub fn stat(&self, cx: &mut Cx, key: &str) -> StorageRequestId {
+        self.submit(cx, StorageRequestKind::Stat { key: key.into() })
+    }
+
+    /// Estimates total storage usage and quota without escaping this
+    /// namespace-bound capability.
+    pub fn estimate(&self, cx: &mut Cx) -> StorageRequestId {
+        self.submit(cx, StorageRequestKind::Estimate)
+    }
+
+    fn submit(&self, cx: &mut Cx, kind: StorageRequestKind) -> StorageRequestId {
+        let op = kind.op();
+        let request_id = cx.storage_state.begin(self.namespace.clone(), op);
+        let request = StorageRequest {
+            request_id,
+            namespace: self.namespace.clone(),
+            kind,
+        };
+
+        let validation = self
+            .namespace_error
+            .clone()
+            .map_or_else(|| request.validate(cx.storage_state.value_cap), Err);
+        if let Err(error) = validation {
+            #[cfg(target_arch = "wasm32")]
+            cx.platform_ops
+                .push_back(crate::cx_api::CxOsOp::StorageRequestError {
+                    request_id,
+                    op,
+                    error,
+                });
+            #[cfg(not(target_arch = "wasm32"))]
+            cx.storage_state
+                .queue(StorageWorkerResponse::new(request_id, op, Err(error)));
+            return request_id;
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        cx.platform_ops
+            .push_back(crate::cx_api::CxOsOp::StorageRequest(request));
+
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            any(
+                target_os = "android",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "windows"
+            )
+        ))]
+        cx.start_native_storage_request(request);
+
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(any(
+                target_os = "android",
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "windows"
+            ))
+        ))]
+        cx.storage_state.queue(StorageWorkerResponse::new(
+            request_id,
+            op,
+            Err(StorageError::Unsupported(
+                "storage is unsupported on this platform".into(),
+            )),
+        ));
+
+        request_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StorageRequest {
+    pub(crate) request_id: StorageRequestId,
+    pub(crate) namespace: String,
+    pub(crate) kind: StorageRequestKind,
+}
+
+impl StorageRequest {
+    fn validate(&self, value_cap: usize) -> Result<(), StorageError> {
+        match &self.kind {
+            StorageRequestKind::Get { key }
+            | StorageRequestKind::Delete { key }
+            | StorageRequestKind::Stat { key } => validate_key(key),
+            StorageRequestKind::Set { key, value } => {
+                validate_key(key)?;
+                if value.len() > value_cap {
+                    return Err(StorageError::ValueTooLarge {
+                        size: value.len(),
+                        max: value_cap,
+                    });
+                }
+                Ok(())
+            }
+            StorageRequestKind::List {
+                prefix,
+                after,
+                limit,
+            } => {
+                validate_key(prefix)?;
+                if let Some(after) = after {
+                    validate_key(after)?;
+                }
+                if *limit == 0 || *limit > MAX_STORAGE_LIST_LIMIT {
+                    return Err(StorageError::InvalidListLimit {
+                        limit: *limit,
+                        max: MAX_STORAGE_LIST_LIMIT,
+                    });
+                }
+                Ok(())
+            }
+            StorageRequestKind::GetRange { key, len, .. } => {
+                validate_key(key)?;
+                if *len as usize > value_cap {
+                    return Err(StorageError::ValueTooLarge {
+                        size: *len as usize,
+                        max: value_cap,
+                    });
+                }
+                Ok(())
+            }
+            StorageRequestKind::Estimate => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StorageRequestKind {
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: Vec<u8>,
+    },
+    Delete {
+        key: String,
+    },
+    List {
+        prefix: String,
+        after: Option<String>,
+        limit: u32,
+    },
+    GetRange {
+        key: String,
+        offset: u64,
+        len: u32,
+    },
+    Stat {
+        key: String,
+    },
+    Estimate,
+}
+
+impl StorageRequestKind {
+    pub(crate) fn op(&self) -> StorageOp {
+        match self {
+            Self::Get { .. } => StorageOp::Get,
+            Self::Set { .. } => StorageOp::Set,
+            Self::Delete { .. } => StorageOp::Delete,
+            Self::List { .. } => StorageOp::List,
+            Self::GetRange { .. } => StorageOp::GetRange,
+            Self::Stat { .. } => StorageOp::Stat,
+            Self::Estimate => StorageOp::Estimate,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StorageWorkerResponse {
+    request_id: StorageRequestId,
+    op: StorageOp,
+    result: Result<StorageResult, StorageError>,
+}
+
+impl StorageWorkerResponse {
+    pub(crate) fn new(
+        request_id: StorageRequestId,
+        op: StorageOp,
+        result: Result<StorageResult, StorageError>,
+    ) -> Self {
+        Self {
+            request_id,
+            op,
+            result,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingStorageRequest {
+    namespace: String,
+    op: StorageOp,
+}
+
+pub(crate) struct StorageState {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) root: std::path::PathBuf,
+    next_request_id: u64,
+    pending: HashMap<StorageRequestId, PendingStorageRequest>,
+    responses: ToUIReceiver<StorageWorkerResponse>,
+    value_cap: usize,
+    /// The writes a worker may not have finished: what the app still owes the disk when it ends.
+    #[cfg(not(target_arch = "wasm32"))]
+    writes: Vec<HeldStorageRequest>,
+}
+
+impl Default for StorageState {
+    fn default() -> Self {
+        Self::new(
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::home::storage_dir(),
+        )
+    }
+}
+
+impl StorageState {
+    fn new(#[cfg(not(target_arch = "wasm32"))] root: std::path::PathBuf) -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            root,
+            next_request_id: 1,
+            pending: HashMap::new(),
+            responses: ToUIReceiver::default(),
+            value_cap: DEFAULT_STORAGE_VALUE_CAP,
+            #[cfg(not(target_arch = "wasm32"))]
+            writes: Vec::new(),
+        }
+    }
+}
+
+impl StorageState {
+    fn begin(&mut self, namespace: String, op: StorageOp) -> StorageRequestId {
+        let request_id = StorageRequestId(self.next_request_id);
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.pending
+            .insert(request_id, PendingStorageRequest { namespace, op });
+        request_id
+    }
+
+    fn finish(&mut self, response: StorageWorkerResponse) -> Option<StorageResponse> {
+        let pending = self.pending.remove(&response.request_id)?;
+        let result = if pending.op == response.op {
+            response.result
+        } else {
+            Err(StorageError::Protocol(format!(
+                "storage response operation mismatch: expected {:?}, received {:?}",
+                pending.op, response.op
+            )))
+        };
+        Some(StorageResponse {
+            request_id: response.request_id,
+            namespace: pending.namespace,
+            op: pending.op,
+            result,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn queue(&self, response: StorageWorkerResponse) {
+        let _ = self.responses.sender().send(response);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn sender(&self) -> crate::thread::ToUISender<StorageWorkerResponse> {
+        self.responses.sender()
+    }
+
+    /// `request` for a worker to take; a write stays known here until its worker lets it go.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn hold(&mut self, request: StorageRequest) -> HeldStorageRequest {
+        let writes = matches!(request.kind.op(), StorageOp::Set | StorageOp::Delete);
+        let held = Arc::new(Mutex::new(Some(request)));
+        if writes {
+            self.writes.retain(|write| Arc::strong_count(write) > 1);
+            self.writes.push(held.clone());
+        }
+        held
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn take_writes(&mut self) -> Vec<HeldStorageRequest> {
+        std::mem::take(&mut self.writes)
+    }
+}
+
+impl Cx {
+    /// Creates a namespace-bound storage handle. Invalid namespaces still
+    /// produce a handle so this infallible API remains convenient; every
+    /// operation on that handle completes asynchronously with
+    /// [`StorageError::InvalidNamespace`].
+    pub fn storage(&self, namespace: &str) -> StorageHandle {
+        StorageHandle {
+            namespace: namespace.into(),
+            namespace_error: validate_namespace(namespace).err(),
+        }
+    }
+
+    /// Changes the whole-value write and ranged-read response cap for future
+    /// requests. The default is [`DEFAULT_STORAGE_VALUE_CAP`].
+    pub fn set_storage_value_cap(&mut self, max_bytes: usize) {
+        self.storage_state.value_cap = max_bytes;
+    }
+
+    pub fn storage_value_cap(&self) -> usize {
+        self.storage_state.value_cap
+    }
+
+    pub(crate) fn dispatch_storage_responses(&mut self) {
+        let mut responses = Vec::new();
+        while let Ok(response) = self.storage_state.responses.try_recv() {
+            if let Some(response) = self.storage_state.finish(response) {
+                responses.push(response);
+            }
+        }
+        if !responses.is_empty() {
+            self.call_event_handler(&Event::Storage(responses));
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn finish_web_storage_request(
+        &mut self,
+        request_id: StorageRequestId,
+        op: StorageOp,
+        result: Result<StorageResult, StorageError>,
+    ) -> Option<StorageResponse> {
+        self.storage_state
+            .finish(StorageWorkerResponse::new(request_id, op, result))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn finish_web_storage_protocol_error(
+        &mut self,
+        request_id: StorageRequestId,
+        message: String,
+    ) -> Option<StorageResponse> {
+        let op = self.storage_state.pending.get(&request_id)?.op;
+        self.storage_state.finish(StorageWorkerResponse::new(
+            request_id,
+            op,
+            Err(StorageError::Protocol(message)),
+        ))
+    }
+}
+
+fn validate_namespace(namespace: &str) -> Result<(), StorageError> {
+    if namespace.is_empty() {
+        return Err(StorageError::InvalidNamespace(
+            "storage namespace must not be empty".into(),
+        ));
+    }
+    if namespace.len() > MAX_STORAGE_NAMESPACE_BYTES {
+        return Err(StorageError::InvalidNamespace(format!(
+            "storage namespace is {} bytes; maximum is {}",
+            namespace.len(),
+            MAX_STORAGE_NAMESPACE_BYTES
+        )));
+    }
+    if namespace == "."
+        || namespace == ".."
+        || !namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(StorageError::InvalidNamespace(
+            "storage namespace may contain only ASCII letters, digits, '.', '_' and '-'".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_key(key: &str) -> Result<(), StorageError> {
+    if key.len() > MAX_STORAGE_KEY_BYTES {
+        return Err(StorageError::InvalidKey(format!(
+            "storage key is {} bytes; maximum is {}",
+            key.len(),
+            MAX_STORAGE_KEY_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// Bytes the volume holding `path` has available to this process, as the
+/// operating system reports them; `path` must exist. What an application
+/// has to size a store by, instead of a figure of its own.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn volume_available_bytes(path: &std::path::Path) -> Result<u64, StorageError> {
+    native::volume_available_bytes(path)
+}
+
+/// The browser does not say how much its origin may store.
+#[cfg(target_arch = "wasm32")]
+pub fn volume_available_bytes(_path: &std::path::Path) -> Result<u64, StorageError> {
+    Err(StorageError::Unsupported(
+        "the volume's free space is not known in the browser".into(),
+    ))
+}
+
+/// A mounted volume: where its root is, its name, and its file system as the
+/// operating system names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Volume {
+    pub root: std::path::PathBuf,
+    pub name: String,
+    pub file_system: String,
+}
+
+impl Volume {
+    /// A FAT volume (FAT12, FAT16 or FAT32), as USB sticks and memory cards
+    /// for devices mostly are: macOS names them msdos, Linux vfat, Windows FAT
+    /// and FAT32.
+    pub fn is_fat(&self) -> bool {
+        matches!(self.file_system.as_str(), "msdos" | "vfat" | "FAT" | "FAT32")
+    }
+}
+
+/// The volumes mounted besides the system's own, as a desktop mounts
+/// removable media and disk images: on macOS those under /Volumes, on Linux
+/// those under /media and /run/media (never the system's own partitions,
+/// such as its boot partition), on Windows the removable drives with a volume
+/// in them (USB sticks and memory cards, never a fixed disk). On macOS and
+/// Linux it reads the system's mount table only, so a volume that doesn't
+/// answer never holds it up; on Windows each removable drive is asked for its
+/// volume's name and file system.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mounted_volumes() -> Result<Vec<Volume>, StorageError> {
+    native::mounted_volumes()
+}
+
+/// The browser shows no volumes.
+#[cfg(target_arch = "wasm32")]
+pub fn mounted_volumes() -> Result<Vec<Volume>, StorageError> {
+    Err(StorageError::Unsupported(
+        "the browser shows no mounted volumes".into(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod native {
+    use {
+        super::*,
+        std::{
+            fs::{self, File, OpenOptions},
+            io::{Read, Seek, SeekFrom, Write},
+            path::{Path, PathBuf},
+            sync::atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    const FILE_SUFFIX: &str = ".mpkv";
+    const PATH_CHUNK_BYTES: usize = 120;
+    static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+    pub(crate) fn execute(root: &Path, request: StorageRequest) -> StorageWorkerResponse {
+        let op = request.kind.op();
+        let result = execute_inner(root, &request.namespace, request.kind);
+        StorageWorkerResponse::new(request.request_id, op, result)
+    }
+
+    fn execute_inner(
+        root: &Path,
+        namespace: &str,
+        kind: StorageRequestKind,
+    ) -> Result<StorageResult, StorageError> {
+        let namespace_dir = root.join(namespace);
+        match kind {
+            StorageRequestKind::Get { key } => {
+                let path = key_path(&namespace_dir, &key);
+                match fs::read(path) {
+                    Ok(value) => Ok(StorageResult::Value(Some(value))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(StorageResult::Value(None))
+                    }
+                    Err(error) => Err(io_error("read", error)),
+                }
+            }
+            StorageRequestKind::Set { key, value } => {
+                atomic_write(&key_path(&namespace_dir, &key), &value)?;
+                Ok(StorageResult::Unit)
+            }
+            StorageRequestKind::Delete { key } => {
+                match fs::remove_file(key_path(&namespace_dir, &key)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(io_error("delete", error)),
+                }
+                Ok(StorageResult::Unit)
+            }
+            StorageRequestKind::List {
+                prefix,
+                after,
+                limit,
+            } => {
+                let mut keys = Vec::new();
+                collect_keys(&namespace_dir, &namespace_dir, &mut keys)?;
+                keys.sort_unstable();
+                keys.retain(|key| {
+                    key.starts_with(&prefix)
+                        && after.as_ref().map_or(true, |after| key.as_str() > after.as_str())
+                });
+                let has_more = keys.len() > limit as usize;
+                keys.truncate(limit as usize);
+                let next_cursor = has_more.then(|| keys.last().cloned()).flatten();
+                Ok(StorageResult::List(StorageList { keys, next_cursor }))
+            }
+            StorageRequestKind::GetRange {
+                key,
+                offset,
+                len,
+            } => {
+                let path = key_path(&namespace_dir, &key);
+                let mut file = match File::open(path) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(StorageResult::Value(None));
+                    }
+                    Err(error) => return Err(io_error("open range", error)),
+                };
+                let file_len = file.metadata().map_err(|error| io_error("stat", error))?.len();
+                if offset >= file_len || len == 0 {
+                    return Ok(StorageResult::Value(Some(Vec::new())));
+                }
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|error| io_error("seek", error))?;
+                let read_len = (file_len - offset).min(len as u64) as usize;
+                let mut value = vec![0; read_len];
+                file.read_exact(&mut value)
+                    .map_err(|error| io_error("read range", error))?;
+                Ok(StorageResult::Value(Some(value)))
+            }
+            StorageRequestKind::Stat { key } => {
+                match fs::metadata(key_path(&namespace_dir, &key)) {
+                    Ok(metadata) => Ok(StorageResult::Stat(Some(StorageStat {
+                        len: metadata.len(),
+                    }))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(StorageResult::Stat(None))
+                    }
+                    Err(error) => Err(io_error("stat", error)),
+                }
+            }
+            StorageRequestKind::Estimate => storage_estimate(root),
+        }
+    }
+
+    fn storage_estimate(root: &Path) -> Result<StorageResult, StorageError> {
+        let usage = tree_usage(root)?;
+        let probe = root
+            .ancestors()
+            .find(|path| path.exists())
+            .ok_or_else(|| StorageError::Io("storage estimate has no existing ancestor".into()))?;
+        let available = volume_available_bytes(probe)?;
+        Ok(StorageResult::Estimate(StorageEstimate {
+            usage,
+            quota: usage.saturating_add(available),
+        }))
+    }
+
+    fn tree_usage(path: &Path) -> Result<u64, StorageError> {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(io_error("estimate usage", error)),
+        };
+        let mut total = 0u64;
+        for entry in entries {
+            let entry = entry.map_err(|error| io_error("estimate usage entry", error))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|error| io_error("estimate usage metadata", error))?;
+            total = total.saturating_add(if metadata.is_dir() {
+                tree_usage(&entry.path())?
+            } else {
+                metadata.len()
+            });
+        }
+        Ok(total)
+    }
+
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "tvos"))))]
+    pub fn mounted_volumes() -> Result<Vec<Volume>, StorageError> {
+        let table = fs::read_to_string("/proc/self/mounts").map_err(|e| io_error("list volumes", e))?;
+        Ok(mount_table(&table))
+    }
+
+    /// The volumes of a mount table in /proc/self/mounts' form (per line the device, the
+    /// mount point and the file system, separated by spaces, a space in a field written as
+    /// `\040`) that are mounted where a desktop mounts removable media.
+    #[cfg(any(test, all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))))]
+    pub(crate) fn mount_table(table: &str) -> Vec<Volume> {
+        let unescape = |field: &str| -> String {
+            let b = field.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                let octal = b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|d| (b'0'..=b'7').contains(d));
+                if octal {
+                    out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
+                    i += 4;
+                } else {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        table
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split(' ');
+                let (_device, at, file_system) = (fields.next()?, fields.next()?, fields.next()?);
+                let root = PathBuf::from(unescape(at));
+                if !["/media", "/run/media"].iter().any(|under| root.starts_with(under) && root != Path::new(under)) {
+                    return None;
+                }
+                let name = root.file_name()?.to_string_lossy().into_owned();
+                Some(Volume { root, name, file_system: file_system.to_string() })
+            })
+            .collect()
+    }
+
+    #[cfg(windows)]
+    pub fn mounted_volumes() -> Result<Vec<Volume>, StorageError> {
+        unsafe extern "system" {
+            fn GetLogicalDriveStringsW(length: u32, buffer: *mut u16) -> u32;
+            fn GetDriveTypeW(root: *const u16) -> u32;
+            fn GetVolumeInformationW(root: *const u16, name: *mut u16, name_size: u32, serial: *mut u32, longest_name: *mut u32, flags: *mut u32, file_system: *mut u16, file_system_size: u32) -> i32;
+            fn SetThreadErrorMode(mode: u32, old: *mut u32) -> i32;
+        }
+        const DRIVE_REMOVABLE: u32 = 2;
+        // an empty card reader's slot answers "not ready" without the system's dialog
+        const SEM_FAILCRITICALERRORS: u32 = 0x1;
+        let mut buffer = vec![0u16; 128];
+        loop {
+            let length = unsafe { GetLogicalDriveStringsW(buffer.len() as u32, buffer.as_mut_ptr()) } as usize;
+            if length == 0 {
+                return Err(io_error("list volumes", std::io::Error::last_os_error()));
+            }
+            if length < buffer.len() {
+                buffer.truncate(length);
+                break;
+            }
+            buffer = vec![0u16; length + 1];
+        }
+        let mut old_mode = 0;
+        unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, &mut old_mode) };
+        let volumes = drive_roots(&buffer)
+            .filter_map(|root| {
+                let wide: Vec<u16> = root.encode_utf16().chain(Some(0)).collect();
+                if unsafe { GetDriveTypeW(wide.as_ptr()) } != DRIVE_REMOVABLE {
+                    return None;
+                }
+                let (mut label, mut file_system) = ([0u16; 261], [0u16; 261]);
+                let asked = unsafe { GetVolumeInformationW(wide.as_ptr(), label.as_mut_ptr(), label.len() as u32, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), file_system.as_mut_ptr(), file_system.len() as u32) };
+                let text = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|c| *c == 0).unwrap_or(w.len())]);
+                (asked != 0).then(|| drive_volume(&root, &text(&label), &text(&file_system)))
+            })
+            .collect();
+        unsafe { SetThreadErrorMode(old_mode, std::ptr::null_mut()) };
+        Ok(volumes)
+    }
+
+    /// The drives' roots (`E:\`) in the system's list of them: each one ended by a zero.
+    #[cfg(any(test, windows))]
+    pub(crate) fn drive_roots(list: &[u16]) -> impl Iterator<Item = String> + '_ {
+        list.split(|c| *c == 0).filter(|root| !root.is_empty()).map(String::from_utf16_lossy)
+    }
+
+    /// A drive's volume, named as Windows shows it: its label and drive letter, the letter
+    /// alone when it has no label.
+    #[cfg(any(test, windows))]
+    pub(crate) fn drive_volume(root: &str, label: &str, file_system: &str) -> Volume {
+        let letter = root.trim_end_matches('\\');
+        let name = if label.is_empty() { letter.to_string() } else { format!("{label} ({letter})") };
+        Volume { root: PathBuf::from(root), name, file_system: file_system.to_string() }
+    }
+
+    #[cfg(all(
+        unix,
+        target_pointer_width = "64",
+        not(any(target_os = "macos", target_os = "ios", target_os = "tvos"))
+    ))]
+    pub fn volume_available_bytes(path: &Path) -> Result<u64, StorageError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        #[repr(C)]
+        struct StatVfs {
+            block_size: usize,
+            fragment_size: usize,
+            blocks: u64,
+            blocks_free: u64,
+            blocks_available: u64,
+            files: u64,
+            files_free: u64,
+            files_available: u64,
+            filesystem_id: usize,
+            flags: usize,
+            name_max: usize,
+            spare: [u64; 32],
+        }
+        unsafe extern "C" {
+            fn statvfs(path: *const std::ffi::c_char, out: *mut StatVfs) -> std::ffi::c_int;
+        }
+
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| StorageError::Io("storage estimate path contains NUL".into()))?;
+        let mut stat: StatVfs = unsafe { std::mem::zeroed() };
+        if unsafe { statvfs(path.as_ptr(), &mut stat) } != 0 {
+            return Err(io_error("estimate free space", std::io::Error::last_os_error()));
+        }
+        Ok(stat
+            .fragment_size
+            .max(stat.block_size) as u64
+            * stat.blocks_available)
+    }
+
+    /// The system's `struct statfs` (the 64-bit inode layout).
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    #[repr(C)]
+    struct StatFs {
+        block_size: u32,
+        io_size: i32,
+        blocks: u64,
+        blocks_free: u64,
+        blocks_available: u64,
+        files: u64,
+        files_free: u64,
+        filesystem_id: [i32; 2],
+        owner: u32,
+        filesystem_type: u32,
+        flags: u32,
+        filesystem_subtype: u32,
+        filesystem_type_name: [u8; 16],
+        mount_on_name: [u8; 1024],
+        mount_from_name: [u8; 1024],
+        flags_ext: u32,
+        reserved: [u32; 7],
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    unsafe extern "C" {
+        // on x86_64 the plain names are the 32-bit inode layout's
+        #[cfg_attr(target_arch = "x86_64", link_name = "statfs$INODE64")]
+        fn statfs(path: *const std::ffi::c_char, out: *mut StatFs) -> std::ffi::c_int;
+        #[cfg_attr(target_arch = "x86_64", link_name = "getfsstat$INODE64")]
+        fn getfsstat(out: *mut StatFs, size: std::ffi::c_int, mode: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    /// The text of a NUL-terminated field.
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn field_text(field: &[u8]) -> String {
+        let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+        String::from_utf8_lossy(&field[..end]).into_owned()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    pub fn mounted_volumes() -> Result<Vec<Volume>, StorageError> {
+        // the mount table as the system has it cached: no volume is asked
+        const MNT_NOWAIT: std::ffi::c_int = 2;
+        let size = std::mem::size_of::<StatFs>();
+        let count = unsafe { getfsstat(std::ptr::null_mut(), 0, MNT_NOWAIT) };
+        if count < 0 {
+            return Err(io_error("list volumes", std::io::Error::last_os_error()));
+        }
+        // room for volumes mounted between the two calls
+        let mut table: Vec<StatFs> = (0..count as usize + 8).map(|_| unsafe { std::mem::zeroed() }).collect();
+        let bytes = std::ffi::c_int::try_from(table.len() * size).map_err(|_| StorageError::Io("the mount table is too large".into()))?;
+        let got = unsafe { getfsstat(table.as_mut_ptr(), bytes, MNT_NOWAIT) };
+        if got < 0 {
+            return Err(io_error("list volumes", std::io::Error::last_os_error()));
+        }
+        table.truncate(got as usize);
+        let mut volumes: Vec<Volume> = table
+            .iter()
+            .filter_map(|stat| {
+                let root = PathBuf::from(field_text(&stat.mount_on_name));
+                let name = root.strip_prefix("/Volumes").ok()?.to_str()?.to_string();
+                (!name.is_empty() && !name.contains('/')).then(|| Volume { name, file_system: field_text(&stat.filesystem_type_name), root })
+            })
+            .collect();
+        volumes.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(volumes)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    pub fn volume_available_bytes(path: &Path) -> Result<u64, StorageError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| StorageError::Io("storage estimate path contains NUL".into()))?;
+        let mut stat: StatFs = unsafe { std::mem::zeroed() };
+        if unsafe { statfs(path.as_ptr(), &mut stat) } != 0 {
+            return Err(io_error(
+                "estimate free space",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok((stat.block_size as u64).saturating_mul(stat.blocks_available))
+    }
+
+    #[cfg(windows)]
+    pub fn volume_available_bytes(path: &Path) -> Result<u64, StorageError> {
+        use std::os::windows::ffi::OsStrExt;
+        unsafe extern "system" {
+            fn GetDiskFreeSpaceExW(
+                directory: *const u16,
+                available: *mut u64,
+                total: *mut u64,
+                free: *mut u64,
+            ) -> i32;
+        }
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut available = 0;
+        let mut total = 0;
+        let mut free = 0;
+        if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, &mut total, &mut free) } == 0 {
+            return Err(io_error("estimate free space", std::io::Error::last_os_error()));
+        }
+        Ok(available)
+    }
+
+    #[cfg(not(any(windows, all(unix, target_pointer_width = "64"))))]
+    pub fn volume_available_bytes(_path: &Path) -> Result<u64, StorageError> {
+        Err(StorageError::Unsupported(
+            "native storage quota estimate is unsupported on this target".into(),
+        ))
+    }
+
+    fn atomic_write(path: &Path, value: &[u8]) -> Result<(), StorageError> {
+        let parent = path.parent().ok_or_else(|| {
+            StorageError::Io("storage key path has no parent directory".into())
+        })?;
+        fs::create_dir_all(parent).map_err(|error| io_error("create directory", error))?;
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("value.mpkv");
+        let temp_path = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let write_result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .map_err(|error| io_error("create temporary value", error))?;
+            file.write_all(value)
+                .map_err(|error| io_error("write temporary value", error))?;
+            file.sync_all()
+                .map_err(|error| io_error("sync temporary value", error))?;
+            replace_file(&temp_path, path).map_err(|error| io_error("commit value", error))?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_result
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+        }
+
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn collect_keys(
+        namespace_dir: &Path,
+        directory: &Path,
+        keys: &mut Vec<String>,
+    ) -> Result<(), StorageError> {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_error("list", error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| io_error("list entry", error))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| io_error("list entry type", error))?;
+            if file_type.is_dir() {
+                collect_keys(namespace_dir, &entry.path(), keys)?;
+            } else if file_type.is_file() {
+                if let Some(key) = decode_key_path(namespace_dir, &entry.path()) {
+                    keys.push(key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn key_path(namespace_dir: &Path, key: &str) -> PathBuf {
+        let encoded = if key.is_empty() {
+            "~".to_string()
+        } else {
+            hex_encode(key.as_bytes())
+        };
+        let mut path = namespace_dir.to_path_buf();
+        let chunks: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(PATH_CHUNK_BYTES)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect();
+        for chunk in &chunks[..chunks.len().saturating_sub(1)] {
+            path.push(chunk);
+        }
+        path.push(format!("{}{FILE_SUFFIX}", chunks.last().unwrap()));
+        path
+    }
+
+    fn decode_key_path(namespace_dir: &Path, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(namespace_dir).ok()?;
+        let mut encoded = String::new();
+        let component_count = relative.components().count();
+        for (index, component) in relative.components().enumerate() {
+            let component = component.as_os_str().to_str()?;
+            if index + 1 == component_count {
+                encoded.push_str(component.strip_suffix(FILE_SUFFIX)?);
+            } else {
+                encoded.push_str(component);
+            }
+        }
+        if encoded == "~" {
+            return Some(String::new());
+        }
+        String::from_utf8(hex_decode(&encoded)?).ok()
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0xf) as usize] as char);
+        }
+        encoded
+    }
+
+    fn hex_decode(encoded: &str) -> Option<Vec<u8>> {
+        if encoded.len() % 2 != 0 {
+            return None;
+        }
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| Some((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
+            .collect()
+    }
+
+    fn hex_digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+
+    fn io_error(action: &str, error: std::io::Error) -> StorageError {
+        StorageError::Io(format!("storage {action} failed: {error}"))
+    }
+
+    #[cfg(test)]
+    // Native filesystem tests use wall-clock values only to make temporary paths unique.
+    #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+    mod tests {
+        use super::*;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        /// A mount table's removable media are the mounts under /media and /run/media, each
+        /// with its root, name and file system, an escaped space in a mount point read back as
+        /// a space; the system's own mounts (its root, its FAT boot partition) aren't among them.
+        #[test]
+        fn a_mount_tables_volumes_are_its_removable_media() {
+            let table = "/dev/sda2 / ext4 rw,relatime 0 0\nproc /proc proc rw 0 0\n/dev/sda1 /boot/efi vfat rw 0 0\n/dev/sdb1 /media/PRINT\\040STICK vfat rw,uid=1000 0 0\n/dev/sdc1 /run/media/user/CARD exfat rw 0 0\n";
+            let v = mount_table(table);
+            assert_eq!(v.len(), 2, "{v:?}");
+            assert_eq!((v[0].root.as_path(), v[0].name.as_str(), v[0].file_system.as_str(), v[0].is_fat()), (Path::new("/media/PRINT STICK"), "PRINT STICK", "vfat", true));
+            assert_eq!((v[1].name.as_str(), v[1].is_fat()), ("CARD", false));
+            #[cfg(target_os = "linux")]
+            assert!(mounted_volumes().expect("the mount table").iter().all(|v| v.root.starts_with("/media") || v.root.starts_with("/run/media")), "removable media only");
+        }
+
+        /// Windows' list of drives is split into their roots, and a drive's volume is named by
+        /// its label and letter as Explorer shows it (the letter alone without a label); its FAT
+        /// file systems are FAT ones, exFAT and NTFS aren't. On Windows the drives listed are
+        /// removable ones with a volume in them: never the system's drive.
+        #[test]
+        fn a_drive_lists_removable_volumes_are_named_by_label_and_letter() {
+            let list: Vec<u16> = "C:\\\0E:\\\0F:\\\0\0".encode_utf16().collect();
+            assert_eq!(drive_roots(&list).collect::<Vec<_>>(), ["C:\\", "E:\\", "F:\\"]);
+            let stick = drive_volume("E:\\", "PRINTS", "FAT32");
+            assert_eq!((stick.root.as_path(), stick.name.as_str(), stick.is_fat()), (Path::new("E:\\"), "PRINTS (E:)", true));
+            assert_eq!(drive_volume("F:\\", "", "FAT").name, "F:");
+            assert!(drive_volume("F:\\", "", "FAT").is_fat() && !drive_volume("F:\\", "", "exFAT").is_fat() && !drive_volume("F:\\", "", "NTFS").is_fat());
+            #[cfg(windows)]
+            {
+                let system = std::env::var("SystemDrive").expect("the system drive");
+                assert!(mounted_volumes().expect("the drives").iter().all(|v| !v.root.to_string_lossy().starts_with(&system)), "never the system's drive");
+            }
+        }
+
+        struct TempDir(PathBuf);
+
+        impl TempDir {
+            fn new() -> Self {
+                let unique = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!(
+                    "makepad-platform-storage-test-{}-{unique}",
+                    std::process::id()
+                ));
+                fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn request(namespace: &str, id: u64, kind: StorageRequestKind) -> StorageRequest {
+            StorageRequest {
+                request_id: StorageRequestId(id),
+                namespace: namespace.into(),
+                kind,
+            }
+        }
+
+        fn run(root: &Path, namespace: &str, id: u64, kind: StorageRequestKind) -> StorageResult {
+            execute(root, request(namespace, id, kind)).result.unwrap()
+        }
+
+        #[test]
+        fn native_round_trip_ranges_pages_namespaces_and_encoding() {
+            let temp = TempDir::new();
+            let encoded_key = "folder/../snow-☃";
+            run(
+                &temp.0,
+                "app.one",
+                1,
+                StorageRequestKind::Set {
+                    key: encoded_key.into(),
+                    value: b"abcdef".to_vec(),
+                },
+            );
+            run(
+                &temp.0,
+                "app.one",
+                2,
+                StorageRequestKind::Set {
+                    key: "folder/z".into(),
+                    value: Vec::new(),
+                },
+            );
+            run(
+                &temp.0,
+                "app.two",
+                3,
+                StorageRequestKind::Set {
+                    key: encoded_key.into(),
+                    value: b"other".to_vec(),
+                },
+            );
+
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app.one",
+                    4,
+                    StorageRequestKind::Get {
+                        key: encoded_key.into()
+                    }
+                ),
+                StorageResult::Value(Some(b"abcdef".to_vec()))
+            );
+            run(
+                &temp.0,
+                "app.one",
+                12,
+                StorageRequestKind::Set {
+                    key: encoded_key.into(),
+                    value: b"updated".to_vec(),
+                },
+            );
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app.one",
+                    13,
+                    StorageRequestKind::Get {
+                        key: encoded_key.into()
+                    }
+                ),
+                StorageResult::Value(Some(b"updated".to_vec()))
+            );
+            run(
+                &temp.0,
+                "app.one",
+                14,
+                StorageRequestKind::Set {
+                    key: encoded_key.into(),
+                    value: b"abcdef".to_vec(),
+                },
+            );
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app.two",
+                    5,
+                    StorageRequestKind::Get {
+                        key: encoded_key.into()
+                    }
+                ),
+                StorageResult::Value(Some(b"other".to_vec()))
+            );
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app.one",
+                    6,
+                    StorageRequestKind::GetRange {
+                        key: encoded_key.into(),
+                        offset: 2,
+                        len: 3,
+                    }
+                ),
+                StorageResult::Value(Some(b"cde".to_vec()))
+            );
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app.one",
+                    7,
+                    StorageRequestKind::Stat {
+                        key: encoded_key.into()
+                    }
+                ),
+                StorageResult::Stat(Some(StorageStat { len: 6 }))
+            );
+
+            let first = run(
+                &temp.0,
+                "app.one",
+                8,
+                StorageRequestKind::List {
+                    prefix: "folder/".into(),
+                    after: None,
+                    limit: 1,
+                },
+            );
+            let StorageResult::List(first) = first else {
+                panic!()
+            };
+            assert_eq!(first.keys, vec![encoded_key]);
+            assert_eq!(first.next_cursor.as_deref(), Some(encoded_key));
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app.one",
+                    9,
+                    StorageRequestKind::List {
+                        prefix: "folder/".into(),
+                        after: first.next_cursor,
+                        limit: 1,
+                    }
+                ),
+                StorageResult::List(StorageList {
+                    keys: vec!["folder/z".into()],
+                    next_cursor: None,
+                })
+            );
+
+            let stored_path = key_path(&temp.0.join("app.one"), encoded_key);
+            assert!(stored_path.is_file());
+            assert!(!temp.0.join("app.one/folder").exists());
+
+            run(
+                &temp.0,
+                "app.one",
+                10,
+                StorageRequestKind::Delete {
+                    key: encoded_key.into(),
+                },
+            );
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app.one",
+                    11,
+                    StorageRequestKind::Get {
+                        key: encoded_key.into()
+                    }
+                ),
+                StorageResult::Value(None)
+            );
+        }
+
+        #[test]
+        fn value_cap_and_crash_temp_file() {
+            let request = request(
+                "app",
+                1,
+                StorageRequestKind::Set {
+                    key: "large".into(),
+                    value: vec![0; 5],
+                },
+            );
+            assert_eq!(
+                request.validate(4),
+                Err(StorageError::ValueTooLarge { size: 5, max: 4 })
+            );
+
+            let temp = TempDir::new();
+            let namespace_dir = temp.0.join("app");
+            run(
+                &temp.0,
+                "app",
+                2,
+                StorageRequestKind::Set {
+                    key: "stable".into(),
+                    value: b"committed".to_vec(),
+                },
+            );
+            let stable_path = key_path(&namespace_dir, "stable");
+            let stable_name = stable_path.file_name().unwrap().to_str().unwrap();
+            fs::write(
+                stable_path
+                    .parent()
+                    .unwrap()
+                    .join(format!(".{stable_name}.tmp.crash")),
+                b"partial",
+            )
+            .unwrap();
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app",
+                    3,
+                    StorageRequestKind::Get {
+                        key: "stable".into()
+                    }
+                ),
+                StorageResult::Value(Some(b"committed".to_vec()))
+            );
+            assert_eq!(
+                run(
+                    &temp.0,
+                    "app",
+                    4,
+                    StorageRequestKind::List {
+                        prefix: String::new(),
+                        after: None,
+                        limit: 10,
+                    }
+                ),
+                StorageResult::List(StorageList {
+                    keys: vec!["stable".into()],
+                    next_cursor: None,
+                })
+            );
+        }
+
+        #[test]
+        fn native_estimate_reports_usage_and_available_capacity() {
+            let temp = TempDir::new();
+            run(
+                &temp.0,
+                "app",
+                1,
+                StorageRequestKind::Set {
+                    key: "owned".into(),
+                    value: vec![7; 4096],
+                },
+            );
+            let estimate = run(
+                &temp.0,
+                "app",
+                2,
+                StorageRequestKind::Estimate,
+            );
+            let StorageResult::Estimate(estimate) = estimate else {
+                panic!("estimate returned the wrong result kind")
+            };
+            assert!(estimate.usage >= 4096);
+            assert!(estimate.quota >= estimate.usage);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_bookkeeping_restores_namespace_and_rejects_wrong_op() {
+        let mut state = StorageState::default();
+        let first = state.begin("one".into(), StorageOp::Get);
+        let second = state.begin("two".into(), StorageOp::Delete);
+        assert_ne!(first, second);
+
+        let response = state
+            .finish(StorageWorkerResponse::new(
+                first,
+                StorageOp::Get,
+                Ok(StorageResult::Value(None)),
+            ))
+            .unwrap();
+        assert_eq!(response.namespace, "one");
+        assert_eq!(response.op, StorageOp::Get);
+
+        let response = state
+            .finish(StorageWorkerResponse::new(
+                second,
+                StorageOp::Set,
+                Ok(StorageResult::Unit),
+            ))
+            .unwrap();
+        assert_eq!(response.namespace, "two");
+        assert_eq!(response.op, StorageOp::Delete);
+        assert!(matches!(response.result, Err(StorageError::Protocol(_))));
+        assert!(state
+            .finish(StorageWorkerResponse::new(
+                first,
+                StorageOp::Get,
+                Ok(StorageResult::Value(None))
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn namespace_validation_is_path_safe() {
+        assert!(validate_namespace("com.example_app-1").is_ok());
+        for invalid in ["", ".", "..", "../app", "app/name", "app name", "☃"] {
+            assert!(validate_namespace(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(validate_namespace(&"a".repeat(65)).is_err());
+    }
+
+    /// What an app asked to write before it ended is on disk after its `Event::Shutdown`, though
+    /// the pool cancels what no worker took: a close that saves and then ends keeps the save.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn what_an_app_asked_to_write_is_on_disk_after_its_shutdown() {
+        let root = std::env::temp_dir().join(format!("makepad-storage-shutdown-{}", std::process::id()));
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.storage_state = StorageState::new(root.clone());
+        let storage = cx.storage("ending");
+        for i in 0..256 {
+            storage.set(&mut cx, &format!("key-{i}"), vec![7u8; 64]);
+        }
+        cx.call_event_handler(&Event::Shutdown);
+        let stored = std::fs::read_dir(root.join("ending")).map_or(0, |dir| dir.count());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stored, 256);
+    }
+}

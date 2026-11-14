@@ -126,6 +126,10 @@ script_mod! {
         u_ambient: uniform(float(0.15))
         u_spec_strength: uniform(float(0.9))
         u_env_intensity: uniform(float(1.8))
+        // Inspection views: 0 lit, 1 albedo (unlit), 2 normals, 3 metallic,
+        // 4 roughness, 5 clay (white albedo, lit), 6 wire (clay + triangle
+        // edges; the mesh carries barycentrics in TEXCOORD_0).
+        u_view_mode: uniform(float(0.0))
 
         v_world_clip: varying(vec4f)
         v_world: varying(vec3f)
@@ -230,7 +234,7 @@ script_mod! {
             if self.u_has_base_color_texture <= 0.5 {
                 return base
             }
-            let tex_srgb = self.base_color_texture.sample_as_bgra(uv);
+            let tex_srgb = self.base_color_texture.sample(uv);
             let tex_linear = vec4(
                 pow(max(tex_srgb.x, 0.0), 2.2),
                 pow(max(tex_srgb.y, 0.0), 2.2),
@@ -247,7 +251,7 @@ script_mod! {
                     clamp(self.u_roughness_factor, 0.045, 1.0)
                 )
             }
-            let mr_tex = self.metallic_roughness_texture.sample_as_bgra(uv);
+            let mr_tex = self.metallic_roughness_texture.sample(uv);
             return vec2(
                 clamp(self.u_metallic_factor * mr_tex.z, 0.0, 1.0),
                 clamp(self.u_roughness_factor * mr_tex.y, 0.045, 1.0)
@@ -255,7 +259,7 @@ script_mod! {
         }
 
         get_normal_tangent: fn(uv: vec2) {
-            let n_tex_s = self.normal_texture.sample_as_bgra(uv);
+            let n_tex_s = self.normal_texture.sample(uv);
             return vec3(
                 n_tex_s.x * 2.0 - 1.0,
                 (n_tex_s.y * 2.0 - 1.0) * self.u_normal_scale,
@@ -267,7 +271,7 @@ script_mod! {
             if self.u_enable_occlusion <= 0.5 {
                 return 1.0
             }
-            let occlusion_tex = self.occlusion_texture.sample_as_bgra(uv);
+            let occlusion_tex = self.occlusion_texture.sample(uv);
             return mix(1.0, occlusion_tex.x, clamp(self.u_occlusion_strength, 0.0, 1.0))
         }
 
@@ -278,7 +282,7 @@ script_mod! {
             if self.u_has_emissive_texture <= 0.5 {
                 return self.u_emissive_factor
             }
-            let emissive_tex_srgb = self.emissive_texture.sample_as_bgra(uv);
+            let emissive_tex_srgb = self.emissive_texture.sample(uv);
             let emissive_tex = vec3(
                 pow(max(emissive_tex_srgb.x, 0.0), 2.2),
                 pow(max(emissive_tex_srgb.y, 0.0), 2.2),
@@ -311,7 +315,7 @@ script_mod! {
 
         sample_env_atlas: fn(dir: vec3f) -> vec3f {
             let uv = self.env_atlas_uv_from_dir(dir);
-            return self.env_atlas_texture.sample_as_bgra(uv).xyz
+            return self.env_atlas_texture.sample(uv).xyz
         }
 
         sample_env_faces: fn(dir: vec3f) -> vec3f {
@@ -322,24 +326,24 @@ script_mod! {
             if ad.x >= ad.y && ad.x >= ad.z {
                 if dir.x >= 0.0 {
                     let uv = vec2(-dir.z / safe_axis, -dir.y / safe_axis) * 0.5 + vec2(0.5, 0.5);
-                    return self.env_pos_x_texture.sample_as_bgra(uv).xyz
+                    return self.env_pos_x_texture.sample(uv).xyz
                 }
                 let uv = vec2(dir.z / safe_axis, -dir.y / safe_axis) * 0.5 + vec2(0.5, 0.5);
-                return self.env_neg_x_texture.sample_as_bgra(uv).xyz
+                return self.env_neg_x_texture.sample(uv).xyz
             } else if ad.y >= ad.z {
                 if dir.y >= 0.0 {
                     let uv = vec2(dir.x / safe_axis, dir.z / safe_axis) * 0.5 + vec2(0.5, 0.5);
-                    return self.env_pos_y_texture.sample_as_bgra(uv).xyz
+                    return self.env_pos_y_texture.sample(uv).xyz
                 }
                 let uv = vec2(dir.x / safe_axis, -dir.z / safe_axis) * 0.5 + vec2(0.5, 0.5);
-                return self.env_neg_y_texture.sample_as_bgra(uv).xyz
+                return self.env_neg_y_texture.sample(uv).xyz
             }
             if dir.z >= 0.0 {
                 let uv = vec2(dir.x / safe_axis, -dir.y / safe_axis) * 0.5 + vec2(0.5, 0.5);
-                return self.env_pos_z_texture.sample_as_bgra(uv).xyz
+                return self.env_pos_z_texture.sample(uv).xyz
             }
             let uv = vec2(-dir.x / safe_axis, -dir.y / safe_axis) * 0.5 + vec2(0.5, 0.5);
-            return self.env_neg_z_texture.sample_as_bgra(uv).xyz
+            return self.env_neg_z_texture.sample(uv).xyz
         }
 
         get_env_specular: fn(refl_dir: vec3) {
@@ -350,7 +354,7 @@ script_mod! {
                 return self.sample_env_faces(refl_dir)
             }
             if self.u_has_env_texture > 0.5 {
-                return self.env_texture.sample_as_bgra(refl_dir).xyz
+                return self.env_texture.sample(refl_dir).xyz
             }
             if self.u_has_env_atlas_texture > 0.5 {
                 return self.sample_env_atlas(refl_dir)
@@ -366,7 +370,7 @@ script_mod! {
                 return self.sample_env_faces(normal_dir)
             }
             if self.u_has_env_texture > 0.5 {
-                return self.env_texture.sample_as_bgra(normal_dir).xyz
+                return self.env_texture.sample(normal_dir).xyz
             }
             if self.u_has_env_atlas_texture > 0.5 {
                 return self.sample_env_atlas(normal_dir)
@@ -380,9 +384,20 @@ script_mod! {
 
         pixel: fn() {
             let uv = vec2(fract(self.v_uv.x), fract(self.v_uv.y));
-            let albedo = self.get_base_color(uv, self.v_color);
+            let albedo_in = self.get_base_color(uv, self.v_color);
+            let view_mode = self.u_view_mode;
+            if view_mode > 0.5 && view_mode < 1.5 {
+                return vec4(albedo_in.x, albedo_in.y, albedo_in.z, albedo_in.w)
+            }
+            // Clay / wire: neutral matte-ish surface so shading and topology
+            // read without the textures.
+            let albedo = if view_mode > 4.5 {
+                vec4(0.78, 0.78, 0.78, 1.0)
+            } else {
+                albedo_in
+            };
             let occlusion = self.get_occlusion(uv);
-            let emissive = self.get_emissive(uv);
+            let emissive = if view_mode > 4.5 { vec3(0.0, 0.0, 0.0) } else { self.get_emissive(uv) };
             let ambient = albedo.xyz * self.u_ambient;
             if self.u_enable_brdf <= 0.5 {
                 let color = self.tone_map_color(ambient * occlusion + emissive);
@@ -420,7 +435,18 @@ script_mod! {
             let ndotv = max(dot(n, v), 0.0001);
             let vdoth = max(dot(v, h), 0.0);
 
-            let mr = self.get_metal_roughness(uv);
+            let mr_in = self.get_metal_roughness(uv);
+            if view_mode > 1.5 && view_mode < 2.5 {
+                let nn = n * 0.5 + vec3(0.5, 0.5, 0.5);
+                return vec4(nn.x, nn.y, nn.z, 1.0)
+            }
+            if view_mode > 2.5 && view_mode < 3.5 {
+                return vec4(mr_in.x, mr_in.x, mr_in.x, 1.0)
+            }
+            if view_mode > 3.5 && view_mode < 4.5 {
+                return vec4(mr_in.y, mr_in.y, mr_in.y, 1.0)
+            }
+            let mr = if view_mode > 4.5 { vec2(0.0, 0.55) } else { mr_in };
             let metal = mr.x;
             let rough = mr.y;
             let f0 = mix(vec3(0.04, 0.04, 0.04), albedo.xyz, metal);
@@ -478,6 +504,20 @@ script_mod! {
 
             let indirect_diffuse = (ambient + ibl_diffuse) * occlusion;
             let color = self.tone_map_color(lit + indirect_diffuse + indirect_spec + emissive);
+            if view_mode > 5.5 {
+                // Triangle edges from the barycentrics smuggled in as UVs
+                // (u, v, 1-u-v), ~1.2 px wide in screen space.
+                let bary = vec3(self.v_uv.x, self.v_uv.y, 1.0 - self.v_uv.x - self.v_uv.y);
+                let fw = vec3(
+                    abs(dFdx(bary.x)) + abs(dFdy(bary.x)),
+                    abs(dFdx(bary.y)) + abs(dFdy(bary.y)),
+                    abs(dFdx(bary.z)) + abs(dFdy(bary.z))
+                );
+                let edge = min(min(bary.x / max(fw.x, 0.00001), bary.y / max(fw.y, 0.00001)), bary.z / max(fw.z, 0.00001));
+                let line = 1.0 - clamp(edge - 0.6, 0.0, 1.0);
+                let wire = mix(color, vec3(0.05, 0.85, 1.0), line * 0.9);
+                return vec4(wire.x, wire.y, wire.z, albedo.w)
+            }
             return vec4(color.x, color.y, color.z, albedo.w)
         }
     }
@@ -919,6 +959,9 @@ pub struct DrawPbr {
     pub spec_strength: f32,
     #[rust(1.8)]
     pub env_intensity: f32,
+    /// See `u_view_mode` in the shader (0 = lit).
+    #[rust(0.0)]
+    pub view_mode: f32,
     #[rust(0.0)]
     pub pad1: f32,
     #[deref]
@@ -1388,6 +1431,8 @@ impl DrawPbr {
             .set_uniform(cx.cx, live_id!(u_spec_strength), &[self.spec_strength]);
         self.draw_vars
             .set_uniform(cx.cx, live_id!(u_env_intensity), &[self.env_intensity]);
+        self.draw_vars
+            .set_uniform(cx.cx, live_id!(u_view_mode), &[self.view_mode]);
     }
 
     pub fn add_decoded_primitive(&mut self, primitive: &DecodedPrimitive) -> Result<(), String> {
@@ -1536,6 +1581,12 @@ impl DrawPbr {
                 }
             }
         }
+    }
+
+    /// Drop a host-installed equirect environment so the next
+    /// [`Self::default_env_texture`] rebuilds the procedural sky.
+    pub fn reset_default_env(&mut self) {
+        self.default_env_texture = None;
     }
 
     pub fn default_env_texture(&mut self, cx: &mut CxDraw) -> Texture {
@@ -2683,11 +2734,11 @@ impl DrawPbr {
             .ok_or_else(|| format!("invalid mesh handle {mesh}"))?;
         self.draw_vars.geometry_id = Some(geom.geometry_id());
         self.apply_draw_uniforms(cx);
-        if cx.new_draw_call(&self.draw_vars).is_none() {
+        if cx.new_draw_call(&mut self.draw_vars).is_none() {
             return Err("DrawPbr draw call failed (shader not initialized)".to_string());
         }
         if self.draw_vars.can_instance() {
-            let new_area = cx.add_instance(&self.draw_vars);
+            let new_area = cx.add_instance(&mut self.draw_vars);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
         }
         Ok(())
@@ -2714,7 +2765,7 @@ impl DrawPbr {
             .ok_or_else(|| format!("invalid mesh handle {mesh}"))?;
         self.draw_vars.geometry_id = Some(geom.geometry_id());
         self.apply_draw_uniforms(cx);
-        let Some(instances) = cx.begin_many_instances(&self.draw_vars) else {
+        let Some(instances) = cx.begin_many_instances(&mut self.draw_vars) else {
             return Err("DrawPbr begin_many_instances failed".to_string());
         };
         self.many_instances = Some(instances);
@@ -2760,9 +2811,9 @@ impl DrawPbr {
         geom.update_with_recycled_buffers(cx.cx, &mut self.acc_indices, &mut self.acc_verts);
         self.draw_vars.geometry_id = Some(geom.geometry_id());
         self.apply_draw_uniforms(cx);
-        cx.new_draw_call(&self.draw_vars);
+        cx.new_draw_call(&mut self.draw_vars);
         if self.draw_vars.can_instance() {
-            let new_area = cx.add_instance(&self.draw_vars);
+            let new_area = cx.add_instance(&mut self.draw_vars);
             self.draw_vars.area = cx.update_area_refs(self.draw_vars.area, new_area);
         }
     }

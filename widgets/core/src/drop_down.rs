@@ -1,0 +1,2358 @@
+use {
+    crate::{
+        animator::{Animate, Animator, AnimatorImpl},
+        makepad_derive_widget::*,
+        makepad_draw::*,
+        popup_menu::{PopupMenu, PopupMenuAction, PopupMenuPlace},
+        widget::*,
+        widget_async::CxSplashVmExt,
+    },
+    crate::makepad_draw::makepad_platform::makepad_script::{ScriptFnRef, ScriptRefOptionExt},
+    std::cell::RefCell,
+    std::rc::Rc,
+};
+use crate::makepad_draw::event::{DigitId, TouchState};
+
+script_mod! {
+    use mod.prelude.widgets_internal.*
+    use mod.widgets.*
+
+    mod.widgets.DrawLabelTextBase = #(DrawLabelText::script_component(vm))
+    mod.widgets.DropDownBase = #(DropDown::register_widget(vm))
+    set_type_default() do #(DrawLabelText::script_shader(vm)){
+        ..mod.draw.DrawText // splat in draw quad
+    }
+    /** The flat dropdown: a button face with a corner arrow, opening a popup menu. */
+    mod.widgets.DropDownFlat = set_type_default() do mod.widgets.DropDownBase{
+        width: Fit
+        height: Fit
+        // Centred, not TopLeft: a face carrying an icon beside its label
+        // gives the shorter of the two the slack, and top-aligning it put
+        // the icon three points above the words it belongs to. The popup's
+        // own rows already centre, so this is the two halves of one control
+        // agreeing. A label-only face has one walk and no slack, which is
+        // every call site that predates icons — the change cannot move them.
+        align: Align{x: 0.0, y: 0.5}
+
+        padding: theme.mspace_1{left: theme.space_2, right: 22.5}
+        margin: theme.mspace_v_1{}
+
+        /** The selected-item label ink, state-mixed with the face. */
+        draw_text +: {
+            /** disabled mix 0..1 step 0.01 */
+            disabled: instance(0.0)
+            /** pressed mix 0..1 step 0.01 */
+            down: instance(0.0)
+
+            ink_centered: true
+
+            color: theme.color_label_inner
+            color_hover: uniform(theme.color_label_inner_hover)
+            color_focus: uniform(theme.color_label_inner_focus)
+            color_down: uniform(theme.color_label_inner_down)
+            color_disabled: uniform(theme.color_label_inner_disabled)
+
+            text_style: theme.font_regular{
+                font_size: theme.font_size_p
+            }
+
+            get_color: fn() {
+                mix(
+                    mix(
+                        mix(
+                            self.color
+                            mix(
+                                self.color_focus
+                                self.color_hover
+                                self.hover
+                            )
+                            self.focus
+                        )
+                        mix(
+                            self.color_hover
+                            self.color_down
+                            self.down
+                        )
+                        self.hover
+                    )
+                    self.color_disabled
+                    self.disabled
+                )
+            }
+        }
+
+        /** The selected item's icon ink. Flat rather than state-mixed like
+        `draw_text`, because a chrome glyph has to stay readable over the
+        pressed face; the face itself already carries the state. */
+        draw_icon +: {
+            color: theme.color_label_inner
+        }
+
+        /** The icon sits in front of the label with a small gap, which
+        `icon_only` drops again since there is then nothing to separate from.
+        Only walked for a dropdown that was given `icons`, so a dropdown
+        without them keeps exactly its old metrics. */
+        icon_walk: Walk{
+            width: 10
+            height: Fit
+            margin: Inset{right: 5.0}
+        }
+
+        /** The dropdown face: an SDF box with a bevel stroke and a filled corner arrow. */
+        draw_bg +: {
+            /** pointer-hover mix 0..1 step 0.01 */
+            hover: instance(0.0)
+            /** keyboard-focus mix 0..1 step 0.01 */
+            focus: instance(0.0)
+            /** pressed mix 0..1 step 0.01 */
+            down: instance(0.0)
+            /** popup-open mix 0..1 step 0.01 */
+            active: instance(0.0)
+            /** disabled mix 0..1 step 0.01 */
+            disabled: instance(0.0)
+
+            /** bevel gradient axis: 0 vertical, 1 horizontal 0..1 step 1 */
+            gradient_border_horizontal: uniform(0.0)
+            /** fill gradient axis: 0 vertical, 1 horizontal 0..1 step 1 */
+            gradient_fill_horizontal: uniform(0.0)
+            /** bevel border thickness in pixels 0..4 step 0.5 */
+            border_size: uniform(theme.beveling)
+            /** corner rounding radius 0..24 step 0.5 */
+            border_radius: uniform(theme.corner_radius)
+
+            /** dither the gradient fill to hide banding 0..1 step 1 */
+            color_dither: uniform(1.0)
+
+            color: uniform(theme.color_outset)
+            color_hover: uniform(theme.color_outset_hover)
+            color_focus: uniform(theme.color_outset_focus)
+            color_down: uniform(theme.color_outset_down)
+            color_disabled: uniform(theme.color_outset_disabled)
+
+            /** fill gradient end stop; negative alpha means flat fill */
+            color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+            color_2_hover: uniform(theme.color_outset_2_hover)
+            color_2_focus: uniform(theme.color_outset_2_focus)
+            color_2_down: uniform(theme.color_outset_2_down)
+            color_2_disabled: uniform(theme.color_outset_2_disabled)
+
+            border_color: uniform(theme.color_bevel)
+            border_color_hover: uniform(theme.color_bevel_hover)
+            border_color_focus: uniform(theme.color_bevel_focus)
+            border_color_down: uniform(theme.color_bevel_down)
+            border_color_disabled: uniform(theme.color_bevel_disabled)
+
+            /** bevel gradient end stop; negative alpha means flat stroke */
+            border_color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+            border_color_2_hover: uniform(theme.color_bevel_outset_2_hover)
+            border_color_2_focus: uniform(theme.color_bevel_outset_2_focus)
+            border_color_2_down: uniform(theme.color_bevel_outset_2_down)
+            border_color_2_disabled: uniform(theme.color_bevel_outset_2_disabled)
+
+            /** the corner disclosure triangle ink */
+            arrow_color: uniform(theme.color_label_inner)
+            arrow_color_focus: uniform(theme.color_label_inner_focus)
+            arrow_color_hover: uniform(theme.color_label_inner_hover)
+            arrow_color_down: uniform(theme.color_label_inner_down)
+            arrow_color_disabled: uniform(theme.color_label_inner_disabled)
+
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let dither = Math.random_2d(self.pos.xy) * /** dither grain 0..0.5 step 0.01 */ 0.04 * self.color_dither
+
+                let mut color_fill = self.color
+                let mut color_fill_hover = self.color_hover
+                let mut color_fill_focus = self.color_focus
+                let mut color_fill_down = self.color_down
+                let mut color_fill_disabled = self.color_disabled
+
+                let mut color_stroke = self.border_color
+                let mut color_stroke_hover = self.border_color_hover
+                let mut color_stroke_focus = self.border_color_focus
+                let mut color_stroke_down = self.border_color_down
+                let mut color_stroke_disabled = self.border_color_disabled
+
+                // lets draw a little triangle in the corner
+                let c = vec2(self.rect_size.x - /** arrow inset from right 4..24 step 0.5 */ 10.0, self.rect_size.y * 0.5)
+                let sz = /** arrow half size 1..8 step 0.25 */ 2.5
+                let offset = /** arrow vertical nudge -4..4 step 0.5 */ 1.
+                let offset_x = /** arrow horizontal nudge -6..6 step 0.5 */ 2.
+
+                sdf.move_to(c.x - sz - offset_x, c.y - sz + offset)
+                sdf.line_to(c.x + sz - offset_x, c.y - sz + offset)
+                sdf.line_to(c.x - offset_x, c.y + sz * /** arrow apex depth 0..1 step 0.05 */ 0.25 + offset)
+                sdf.close_path()
+
+                sdf.fill_keep(
+                    mix(
+                        mix(
+                            mix(
+                                self.arrow_color
+                                self.arrow_color_focus
+                                self.focus
+                            )
+                            mix(
+                                self.arrow_color_hover
+                                self.arrow_color_down
+                                self.down
+                            )
+                            self.hover
+                        )
+                        self.arrow_color_disabled
+                        self.disabled
+                    )
+                )
+
+                let border_sz_uv = vec2(
+                    self.border_size / self.rect_size.x
+                    self.border_size / self.rect_size.y
+                )
+
+                let gradient_border = vec2(
+                    self.pos.x + dither
+                    self.pos.y + dither
+                )
+
+                let gradient_border_dir = if self.gradient_border_horizontal > 0.5 gradient_border.x else gradient_border.y
+
+                let sz_inner_px = vec2(
+                    self.rect_size.x - self.border_size * 2.
+                    self.rect_size.y - self.border_size * 2.
+                )
+
+                let scale_factor_fill = vec2(
+                    self.rect_size.x / sz_inner_px.x
+                    self.rect_size.y / sz_inner_px.y
+                )
+
+                let gradient_fill = vec2(
+                    self.pos.x * scale_factor_fill.x - border_sz_uv.x * 2. + dither
+                    self.pos.y * scale_factor_fill.y - border_sz_uv.y * 2. + dither
+                )
+
+                let gradient_fill_dir = if self.gradient_fill_horizontal > 0.5 gradient_fill.x else gradient_fill.y
+
+                sdf.box(
+                    self.border_size
+                    self.border_size
+                    self.rect_size.x - self.border_size * 2.
+                    self.rect_size.y - self.border_size * 2.
+                    self.border_radius
+                )
+
+                if self.color_2.x > -0.5 {
+                    color_fill = mix(self.color, self.color_2, gradient_fill_dir)
+                    color_fill_hover = mix(self.color_hover, self.color_2_hover, gradient_fill_dir)
+                    color_fill_focus = mix(self.color_focus, self.color_2_focus, gradient_fill_dir)
+                    color_fill_down = mix(self.color_down, self.color_2_down, gradient_fill_dir)
+                    color_fill_disabled = mix(self.color_disabled, self.color_2_disabled, gradient_fill_dir)
+                }
+
+                if self.border_color_2.x > -0.5 {
+                    color_stroke = mix(self.border_color, self.border_color_2, gradient_border_dir)
+                    color_stroke_hover = mix(self.border_color_hover, self.border_color_2_hover, gradient_border_dir)
+                    color_stroke_focus = mix(self.border_color_focus, self.border_color_2_focus, gradient_border_dir)
+                    color_stroke_down = mix(self.border_color_down, self.border_color_2_down, gradient_border_dir)
+                    color_stroke_disabled = mix(self.border_color_disabled, self.border_color_2_disabled, gradient_border_dir)
+                }
+
+                let fill = color_fill
+                    .mix(color_fill_focus, self.focus)
+                    .mix(color_fill_hover, self.hover)
+                    .mix(color_fill_down, self.down * self.hover)
+                    .mix(color_fill_disabled, self.disabled)
+
+                let stroke = color_stroke
+                    .mix(color_stroke_focus, self.focus)
+                    .mix(color_stroke_hover, self.hover)
+                    .mix(color_stroke_down, self.down * self.hover)
+                    .mix(color_stroke_disabled, self.disabled)
+
+                sdf.fill_keep(fill)
+                sdf.stroke(stroke, self.border_size)
+
+                sdf.result
+            }
+        }
+
+        popup_menu: mod.widgets.PopupMenu{}
+
+        selected_item: 0
+
+        animator : Animator{
+            disabled: {
+                default: @off
+                off: AnimatorState{
+                    from: {all: Forward{duration: 0.}}
+                    apply: {
+                        draw_bg: {disabled: 0.0}
+                        draw_text: {disabled: 0.0}
+                    }
+                }
+                on: AnimatorState{
+                    from: {all: Forward{duration: 0.2}}
+                    apply: {
+                        draw_bg: {disabled: 1.0}
+                        draw_text: {disabled: 1.0}
+                    }
+                }
+            }
+            hover: {
+                default: @off
+                off: AnimatorState{
+                    from: {all: Forward{duration: 0.1}}
+                    apply: {
+                        draw_bg: {down: 0.0, hover: 0.0}
+                        draw_text: {down: 0.0, hover: 0.0}
+                    }
+                }
+
+                on: AnimatorState{
+                    from: {
+                        all: Forward{duration: 0.1}
+                        down: Forward{duration: 0.01}
+                    }
+                    apply: {
+                        draw_bg: {down: 0.0, hover: [{time: 0.0, value: 1.0}]}
+                        draw_text: {down: 0.0, hover: [{time: 0.0, value: 1.0}]}
+                    }
+                }
+
+                down: AnimatorState{
+                    from: {all: Forward{duration: 0.2}}
+                    apply: {
+                        draw_bg: {down: [{time: 0.0, value: 1.0}], hover: 1.0}
+                        draw_text: {down: [{time: 0.0, value: 1.0}], hover: 1.0}
+                    }
+                }
+            }
+            focus: {
+                default: @off
+                off: AnimatorState{
+                    from: {all: Forward{duration: 0.2}}
+                    apply: {
+                        draw_bg: {focus: 0.0}
+                        draw_text: {focus: 0.0}
+                    }
+                }
+                on: AnimatorState{
+                    cursor: MouseCursor.Arrow
+                    from: {all: Forward{duration: 0.0}}
+                    apply: {
+                        draw_bg: {focus: 1.0}
+                        draw_text: {focus: 1.0}
+                    }
+                }
+            }
+        }
+    }
+
+    /** The standard dropdown: the flat face plus the theme's outset bevel. */
+    mod.widgets.DropDown = set_type_default() do mod.widgets.DropDownFlat{
+        draw_bg +: {
+            color: uniform(theme.color_outset)
+            color_hover: uniform(theme.color_outset_hover)
+            color_focus: uniform(theme.color_outset_focus)
+            color_down: uniform(theme.color_outset_down)
+            color_disabled: uniform(theme.color_u_hidden)
+
+            border_color: uniform(theme.color_bevel_outset_1)
+            border_color_hover: uniform(theme.color_bevel_outset_1_hover)
+            border_color_focus: uniform(theme.color_bevel_outset_1_focus)
+            border_color_down: uniform(theme.color_bevel_outset_1_down)
+            border_color_disabled: uniform(theme.color_bevel_outset_1_disabled)
+
+            border_color_2: uniform(theme.color_bevel_outset_2)
+            border_color_2_hover: uniform(theme.color_bevel_outset_2_hover)
+            border_color_2_focus: uniform(theme.color_bevel_outset_2_focus)
+            border_color_2_down: uniform(theme.color_bevel_outset_2_down)
+            border_color_2_disabled: uniform(theme.color_bevel_outset_2_disabled)
+        }
+
+        popup_menu: mod.widgets.PopupMenuFlat{}
+    }
+
+    mod.widgets.DropDownGradientY = mod.widgets.DropDown{
+        popup_menu: mod.widgets.PopupMenuGradientY{}
+        draw_bg +: {
+            color: uniform(theme.color_outset_1)
+            color_hover: uniform(theme.color_outset_1_hover)
+            color_focus: uniform(theme.color_outset_1_focus)
+            color_down: uniform(theme.color_outset_1_down)
+            color_disabled: uniform(theme.color_outset_1_disabled)
+
+            color_2: uniform(theme.color_outset_2)
+        }
+    }
+
+    mod.widgets.DropDownGradientX = mod.widgets.DropDownGradientY{
+        popup_menu: mod.widgets.PopupMenuGradientX{}
+
+        draw_bg +: {
+            gradient_border_horizontal: uniform(1.0)
+            gradient_fill_horizontal: uniform(1.0)
+        }
+    }
+
+}
+
+#[derive(Script, ScriptHook, Clone, Copy)]
+#[repr(C)]
+pub enum PopupMenuPosition {
+    #[pick]
+    OnSelected,
+    BelowInput,
+}
+
+/// Optional affine mapping for a dropdown drawn under a scaled/translated
+/// parent draw list. Popup menus themselves are window-space overlays.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PopupAnchorTransform {
+    pub scale: f64,
+    pub translation: DVec2,
+}
+
+impl PopupAnchorTransform {
+    pub fn rect(self, rect: Rect) -> Rect {
+        Rect {
+            pos: rect.pos * self.scale + self.translation,
+            size: rect.size * self.scale,
+        }
+    }
+
+    fn point(self, point: DVec2) -> DVec2 {
+        point * self.scale + self.translation
+    }
+}
+
+fn transform_popup_event(event: &Event, transform: PopupAnchorTransform) -> Option<Event> {
+    Some(match event {
+        Event::MouseDown(e) => {
+            let mut e = e.clone();
+            e.abs = transform.point(e.abs);
+            Event::MouseDown(e)
+        }
+        Event::MouseMove(e) => {
+            let mut e = e.clone();
+            e.abs = transform.point(e.abs);
+            e.lock_delta *= transform.scale;
+            Event::MouseMove(e)
+        }
+        Event::MouseUp(e) => {
+            let mut e = e.clone();
+            e.abs = transform.point(e.abs);
+            Event::MouseUp(e)
+        }
+        Event::MouseLeave(e) => {
+            let mut e = e.clone();
+            e.abs = transform.point(e.abs);
+            Event::MouseLeave(e)
+        }
+        Event::Scroll(e) => {
+            let mut e = e.clone();
+            e.abs = transform.point(e.abs);
+            e.scroll *= transform.scale;
+            Event::Scroll(e)
+        }
+        Event::LongPress(e) => {
+            let mut e = e.clone();
+            e.abs = transform.point(e.abs);
+            Event::LongPress(e)
+        }
+        Event::TouchUpdate(e) => {
+            let mut e = e.clone();
+            for touch in &mut e.touches {
+                touch.abs = transform.point(touch.abs);
+                touch.radius *= transform.scale;
+            }
+            Event::TouchUpdate(e)
+        }
+        _ => return None,
+    })
+}
+
+#[derive(Script, WidgetRegister, WidgetRef, WidgetSet, Animator)]
+pub struct DropDown {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+    #[apply_default]
+    animator: Animator,
+    /// Called (from script) with the chosen label when the choice changes.
+    #[live]
+    on_change: Option<ScriptFnRef>,
+
+    // `redraw`/`walk`/`uid`/`action_data` are the `Widget` derive's helper
+    // attributes; this widget hand-writes `WidgetNode` (for `children`), so
+    // they are wired by hand below instead.
+    #[live]
+    draw_bg: DrawQuad,
+    #[live]
+    draw_text: DrawLabelText,
+    /// Re-pointed at the selected item's icon on every draw, and left empty for
+    /// a dropdown that was given none — an empty `DrawSvg` is never walked, so
+    /// the face keeps its old metrics.
+    #[live]
+    draw_icon: DrawSvg,
+    #[live]
+    icon_walk: Walk,
+
+    #[walk]
+    walk: Walk,
+
+    // Read by the hand-written `visible`/`set_visible` below.
+    #[live(true)]
+    visible: bool,
+
+    #[live]
+    bind: String,
+    #[live]
+    bind_enum: String,
+
+    #[live]
+    popup_menu: ScriptValue,
+
+    #[live]
+    labels: Vec<String>,
+
+    /// Icons parallel to `labels`, one per item. Short is fine: an item past
+    /// the end of this list simply draws no icon, so a caller can give icons to
+    /// the few entries that have one and leave the rest as words.
+    #[live]
+    icons: Vec<DropDownIcon>,
+
+    /// Draw the closed face as the selected item's icon alone, for a console
+    /// too narrow for words. The popup still shows icon and label both — the
+    /// list is where the operator reads what an item means.
+    #[live]
+    icon_only: bool,
+
+    /// An override tint, interpreted by the face shader.
+    #[live]
+    marked: bool,
+    #[live]
+    mixed: bool,
+
+    #[rust]
+    pointer_focus: bool,
+    #[rust]
+    opening_digit: Option<DigitId>,
+
+    /// Popup rows drawn with the disabled palette while remaining selectable.
+    #[rust]
+    dimmed_items: Vec<bool>,
+
+    /// Popup rows that use the disabled palette and cannot be chosen by input.
+    #[rust]
+    disabled_items: Vec<bool>,
+
+    #[live]
+    popup_menu_position: PopupMenuPosition,
+
+    /// The tallest the open list may be, in points; 0 is no cap of its own.
+    /// Either way the list is no taller than the window has room for, and
+    /// past that its items scroll inside it, the chosen one brought into view
+    /// as it opens.
+    #[live]
+    popup_max_height: f64,
+
+    /// While the list is open, the row the arrow keys are on: shown, brought
+    /// into view, and chosen by Return. None is the chosen row.
+    #[rust]
+    keyed_item: Option<usize>,
+
+    #[rust]
+    is_active: bool,
+
+    /// The face's rect where the last frame settled it, read on the event
+    /// side while the list is open: the list is placed against it, since in
+    /// the draw the face stands where its parents have not aligned it yet.
+    #[rust]
+    settled_rect: Rect,
+
+    #[rust]
+    popup_anchor_transform: Option<PopupAnchorTransform>,
+
+    /// The menu store this dropdown draws from, kept so `children()` (which
+    /// gets no `Cx`) can surface the open menu's items to the widget tree.
+    #[rust]
+    popup_global: PopupMenuGlobal,
+
+    /// The key this dropdown last took up in the menu store, so a change of
+    /// template -- every rebuild is one -- lets the old key go.
+    #[rust]
+    popup_key: Option<PopupMenuKey>,
+
+    #[imperative]
+    #[live]
+    #[apply_state]
+    selected_item: usize,
+
+    #[layout]
+    layout: Layout,
+
+    #[rust]
+    action_data: WidgetActionData,
+}
+
+#[derive(Default, Clone)]
+struct PopupMenuGlobal {
+    map: Rc<RefCell<ComponentMap<PopupMenuKey, PopupMenu>>>,
+    /// How many dropdowns stand on each key. A module rebuild hands every
+    /// dropdown a fresh template object, and so a fresh key; the menu built
+    /// for the old key has nobody left to draw it, and it goes with the last
+    /// dropdown that lets the key go. Without this the cache kept one menu
+    /// per rebuild for the life of the process -- each holding its item
+    /// template's whole tree and a draw list -- and nothing ever asked for
+    /// them again.
+    users: Rc<RefCell<std::collections::HashMap<PopupMenuKey, usize>>>,
+}
+
+impl PopupMenuGlobal {
+    fn take_up(&self, key: PopupMenuKey) {
+        *self.users.borrow_mut().entry(key).or_insert(0) += 1;
+    }
+
+    /// One dropdown fewer on the key; the last one out takes the menu with
+    /// it. The map can be mid-borrow when this runs from a nested apply,
+    /// in which case the entry waits for the next release, or for the heap
+    /// to be retired.
+    fn let_go(&self, key: PopupMenuKey) {
+        let last = {
+            let mut users = self.users.borrow_mut();
+            match users.get_mut(&key) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                Some(_) => {
+                    users.remove(&key);
+                    true
+                }
+                None => false,
+            }
+        };
+        if last {
+            if let Ok(mut map) = self.map.try_borrow_mut() {
+                map.retain(|k, _| *k != key);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct PopupMenuKey {
+    // ScriptValue only identifies an object within one heap. Popup menus are
+    // Cx-global, so the heap is part of their identity too.
+    heap: usize,
+    template: ScriptValue,
+}
+
+/// One entry of `DropDown::icons`.
+///
+/// A `Vec` field only accepts elements the script layer marks as derivable, so
+/// the bare `Option<ScriptHandleRef>` that `DrawSvg::svg` uses cannot be the
+/// element type directly. Wrapping it in a derived struct earns that marker;
+/// `on_custom_apply` then takes the resource handle a `crate_resource(...)` in
+/// the DSL array evaluates to, so the call site stays a flat list of handles
+/// rather than a list of one-field objects.
+#[derive(Script)]
+pub struct DropDownIcon {
+    #[live]
+    svg: Option<ScriptHandleRef>,
+}
+
+impl ScriptHook for DropDownIcon {
+    fn on_type_check(_heap: &ScriptHeap, value: ScriptValue) -> bool {
+        value.is_nil() || value.as_handle().is_some()
+    }
+
+    fn on_custom_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        apply: &Apply,
+        scope: &mut Scope,
+        value: ScriptValue,
+    ) -> bool {
+        if value.as_handle().is_none() {
+            return false;
+        }
+        self.svg.script_apply(vm, apply, scope, value);
+        true
+    }
+}
+
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+struct DrawLabelText {
+    #[deref]
+    draw_super: DrawText,
+    #[live]
+    focus: f32,
+    #[live]
+    hover: f32,
+}
+
+impl ScriptHook for DropDown {
+    fn on_after_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        _apply: &Apply,
+        _scope: &mut Scope,
+        _obj: ScriptValue,
+    ) {
+        if self.popup_menu.is_nil() {
+            return;
+        }
+        vm.with_cx_mut(|cx| {
+            let global = cx.global::<PopupMenuGlobal>().clone();
+            self.popup_global = global.clone();
+            // Use try_borrow_mut to avoid panic if already borrowed (can happen during
+            // nested on_after_apply calls when PopupMenu creation triggers another DropDown apply)
+            let Ok(mut map) = global.map.try_borrow_mut() else {
+                return;
+            };
+
+            let popup_menu_val = self.popup_menu;
+            let key = self.popup_menu_key();
+            if self.popup_key != Some(key) {
+                drop(map);
+                if let Some(old) = self.popup_key.take() {
+                    global.let_go(old);
+                }
+                global.take_up(key);
+                self.popup_key = Some(key);
+                map = match global.map.try_borrow_mut() {
+                    Ok(map) => map,
+                    Err(_) => return,
+                };
+            }
+            let Some(vm_id) = cx.script_ref_vm_id(&self.source) else {
+                return;
+            };
+            map.get_or_insert(cx, key, |cx| {
+                cx.with_script_vm_id(vm_id, |vm| {
+                    PopupMenu::script_from_value(vm, popup_menu_val)
+                })
+            });
+        });
+    }
+}
+
+impl Drop for DropDown {
+    fn drop(&mut self) {
+        if let Some(key) = self.popup_key.take() {
+            self.popup_global.let_go(key);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum DropDownAction {
+    Select(usize),
+    #[default]
+    None,
+}
+
+impl DropDown {
+    /// The script's `on_change`, with the chosen label.
+    fn emit_change(&mut self, cx: &mut Cx) {
+        let Some(handler) = self.on_change.as_object() else { return };
+        let label = self.labels.get(self.selected_item).cloned().unwrap_or_default();
+        // Nothing to call into if the isolate that minted it is gone.
+        let Some(vm_id) = cx.script_ref_vm_id(&self.source) else { return };
+        cx.with_script_vm_id(vm_id, |vm| {
+            let label = vm.new_string(&label);
+            vm.with_instruction_limit(crate::widget_async::WIDGET_SCRIPT_INSTRUCTION_LIMIT as u64, |vm| {
+                vm.call(ScriptValue::from(handler), &[ScriptValue::from(label)]);
+            });
+        });
+    }
+
+    /// Remove every cached popup minted by one script heap before that heap's
+    /// isolate is freed. PopupMenu objects retain script refs (including their
+    /// item template), so allowing them to outlive the heap is both a leak and
+    /// an identity hazard when an allocator later reuses the heap address.
+    pub fn retire_popup_menus_for_heap(cx: &mut Cx, heap: usize) -> usize {
+        if heap == 0 {
+            return 0;
+        }
+        let global = cx.global::<PopupMenuGlobal>().clone();
+        let mut map = global.map.borrow_mut();
+        let before = map.len();
+        map.retain(|key, _| key.heap != heap);
+        before - map.len()
+    }
+
+    /// Test/diagnostic visibility for isolate lifecycle assertions.
+    #[doc(hidden)]
+    pub fn popup_menu_cache_len(cx: &mut Cx) -> usize {
+        cx.global::<PopupMenuGlobal>().map.borrow().len()
+    }
+
+    fn popup_menu_key(&self) -> PopupMenuKey {
+        PopupMenuKey {
+            heap: self.source.heap_key(),
+            template: self.popup_menu,
+        }
+    }
+
+    /// Whether the shared menu on screen is THIS dropdown's: whether this is
+    /// the dropdown that last drew it. Every dropdown on one template shares
+    /// one menu instance, so the items in it belong to one of them at a time
+    /// and the rest must not read them. See `handle_event`.
+    pub fn owns_the_menu(&self, cx: &mut Cx) -> bool {
+        let global = cx.global::<PopupMenuGlobal>().clone();
+        let Ok(map) = global.map.try_borrow() else {
+            return false;
+        };
+        map.get(&self.popup_menu_key()).is_some_and(|menu| menu.tree_parent == self.widget_uid())
+    }
+
+    pub fn selected_item_index(&self) -> usize {
+        self.selected_item
+    }
+
+    pub fn selected_item_label(&self) -> String {
+        if self.mixed { return "—".into(); }
+        self.labels
+            .get(self.selected_item)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_active(&mut self, cx: &mut Cx) {
+        self.is_active = true;
+        self.settled_rect = self.draw_bg.area().rect(cx);
+        self.keyed_item = None;
+        self.draw_bg.redraw(cx);
+        let global = cx.global::<PopupMenuGlobal>().clone();
+        let mut map = global.map.borrow_mut();
+        let lb = map.get_mut(&self.popup_menu_key()).unwrap();
+        let node_id = LiveId(self.selected_item as u64).into();
+        lb.init_select_item(node_id);
+        cx.sweep_lock(self.draw_bg.area());
+    }
+
+    /// A key while the list is open. The arrows, Home, End and the page keys
+    /// move the row the keys are on and bring it into view, without choosing
+    /// it; Return or Space chooses it and shuts the list; Escape shuts the
+    /// list and keeps the choice it had.
+    fn key_in_open_list(&mut self, cx: &mut Cx, key: KeyCode) {
+        let n = self.labels.len();
+        let at = self.keyed_item.unwrap_or(self.selected_item).min(n.saturating_sub(1));
+        let page = {
+            let global = cx.global::<PopupMenuGlobal>().clone();
+            let map = global.map.borrow();
+            map.get(&self.popup_menu_key()).map_or(1, |menu| menu.page_rows())
+        };
+        let open = |index: &usize| !self.item_is_disabled(*index);
+        let to = match key {
+            KeyCode::ArrowUp => (0..at).rev().find(open),
+            KeyCode::ArrowDown => (at + 1..n).find(open),
+            KeyCode::PageUp => (at.saturating_sub(page)..at).find(open),
+            KeyCode::PageDown => (at + 1..=(at + page).min(n.saturating_sub(1))).rev().find(open),
+            KeyCode::Home => (0..n).find(open),
+            KeyCode::End => (0..n).rev().find(open),
+            KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::Space => {
+                if let Some(index) = self.keyed_item.filter(|index| *index < n && open(index)) {
+                    self.selected_item = index;
+                    cx.widget_action_with_data(&self.action_data, self.widget_uid(), DropDownAction::Select(index));
+                    self.emit_change(cx);
+                }
+                self.set_closed(cx);
+                return;
+            }
+            KeyCode::Escape => {
+                self.set_closed(cx);
+                return;
+            }
+            _ => None,
+        };
+        if let Some(index) = to {
+            self.keyed_item = Some(index);
+            let global = cx.global::<PopupMenuGlobal>().clone();
+            let mut map = global.map.borrow_mut();
+            if let Some(menu) = map.get_mut(&self.popup_menu_key()) {
+                menu.key_to_item(cx, LiveId(index as u64).into());
+            }
+        }
+    }
+
+    pub fn set_closed(&mut self, cx: &mut Cx) {
+        self.is_active = false;
+        self.opening_digit = None;
+        self.draw_bg.redraw(cx);
+        cx.sweep_unlock(self.draw_bg.area());
+    }
+
+    pub fn draw_text(&mut self, cx: &mut Cx2d, label: &str) {
+        self.draw_bg.begin(cx, self.walk, self.layout);
+        self.draw_text
+            .draw_walk(cx, Walk::fit(), Align::default(), label);
+        self.draw_bg.end(cx);
+    }
+
+    /// The icon for item `index`, or `None` where the caller gave fewer icons
+    /// than labels (or none at all).
+    fn icon_at(&self, index: usize) -> Option<&ScriptHandleRef> {
+        self.icons.get(index).and_then(|icon| icon.svg.as_ref())
+    }
+
+    fn item_is_disabled(&self, index: usize) -> bool {
+        self.disabled_items.get(index).copied().unwrap_or(false)
+    }
+
+    /// Point `draw_icon` at item `index`'s icon and report whether there is one.
+    /// Only writes on an actual change: a `ScriptHandleRef` is a GC root, and
+    /// re-seating one every frame churns the root table for nothing.
+    fn seat_icon(&mut self, index: usize) -> bool {
+        let want = self.icons.get(index).and_then(|icon| icon.svg.as_ref());
+        if self.draw_icon.svg.as_ref().map(|s| s.as_handle()) != want.map(|s| s.as_handle()) {
+            self.draw_icon.svg = want.cloned();
+        }
+        self.draw_icon.svg.is_some()
+    }
+
+    pub fn draw_walk(&mut self, cx: &mut Cx2d, walk: Walk) {
+        self.draw_bg.set_dyn_instance(cx, id!(marked), &[self.marked as u8 as f32]);
+        self.draw_text.set_dyn_instance(cx, id!(mixed), &[self.mixed as u8 as f32]);
+        let keyboard_focus = cx.has_key_focus(self.draw_bg.area()) && !self.pointer_focus;
+        self.draw_bg.set_dyn_instance(cx, id!(keyboard_focus), &[keyboard_focus as u8 as f32]);
+        self.draw_bg.begin(cx, walk, self.layout);
+
+        let has_icon = self.seat_icon(self.selected_item);
+        if has_icon {
+            // The gap in `icon_walk` exists to hold the label off the glyph;
+            // with the label gone there is nothing to hold off, and a collapsed
+            // face should be as narrow as the icon.
+            let icon_walk = if self.icon_only {
+                Walk {
+                    margin: Inset::default(),
+                    ..self.icon_walk
+                }
+            } else {
+                self.icon_walk
+            };
+            self.draw_icon.draw_walk(cx, icon_walk);
+        }
+
+        // `icon_only` lets the icon stand in for the words. An item that was
+        // given no icon has nothing to stand in for them, so it keeps them
+        // rather than leaving the operator a blank face.
+        if !(self.icon_only && has_icon) {
+            if self.mixed {
+                self.draw_text.draw_walk(cx, Walk::fit(), Align::default(), "—");
+            } else if let Some(val) = self.labels.get(self.selected_item) {
+                // A label set to ellipsize takes the room the face leaves it
+                // (its padding keeps the chevron clear) and ends in "…".
+                let walk = if self.draw_text.text_overflow == crate::makepad_draw::shader::draw_text::TextOverflow::Ellipsis {
+                    Walk { width: Size::fill(), height: Size::fit(), ..Walk::fit() }
+                } else {
+                    Walk::fit()
+                };
+                self.draw_text.draw_walk(cx, walk, Align::default(), val);
+            } else {
+                self.draw_text
+                    .draw_walk(cx, Walk::fit(), Align::default(), " ");
+            }
+        }
+        self.draw_bg.end(cx);
+
+        cx.add_nav_stop(self.draw_bg.area(), NavRole::DropDown, Inset::default());
+
+        if self.is_active && !self.popup_menu.is_nil() {
+            let global = cx.global::<PopupMenuGlobal>().clone();
+            let mut map = global.map.borrow_mut();
+            let popup_menu = map.get_mut(&self.popup_menu_key()).unwrap();
+
+            // One menu instance serves every dropdown with the same template,
+            // so claim its items for this dropdown while they draw.
+            popup_menu.tree_parent = self.uid;
+            popup_menu.icon_column = !self.icons.is_empty();
+            popup_menu.max_height = self.popup_max_height;
+            let area = self.settled_rect;
+            let anchor = self
+                .popup_anchor_transform
+                .map(|transform| transform.rect(area))
+                .unwrap_or(area);
+            popup_menu.begin(
+                cx,
+                match self.popup_menu_position {
+                    PopupMenuPosition::OnSelected => PopupMenuPlace::OnItem,
+                    PopupMenuPosition::BelowInput => PopupMenuPlace::Below { anchor },
+                },
+                area,
+            );
+            popup_menu.fit_width_to_items(
+                cx,
+                self.labels.iter().enumerate().map(|(i, label)| {
+                    (LiveId(i as u64).into(), label.as_str(), self.icon_at(i))
+                }),
+            );
+
+            match self.popup_menu_position {
+                PopupMenuPosition::OnSelected => {
+                    let mut item_pos = None;
+                    for (i, item) in self.labels.iter().enumerate() {
+                        let node_id = LiveId(i as u64).into();
+                        if i == self.selected_item {
+                            item_pos = Some(cx.turtle().pos());
+                        }
+                        popup_menu.draw_item_full(
+                            cx,
+                            node_id,
+                            &item,
+                            self.icon_at(i),
+                            self.dimmed_items.get(i).copied().unwrap_or(false),
+                            self.item_is_disabled(i),
+                        );
+                    }
+
+                    let shift = anchor.pos - area.pos;
+                    match item_pos {
+                        Some(item_pos) => popup_menu.end_at_item(cx, self.draw_bg.area(), shift, item_pos),
+                        None => popup_menu.end(cx, self.draw_bg.area(), shift),
+                    }
+                }
+                PopupMenuPosition::BelowInput => {
+                    for (i, item) in self.labels.iter().enumerate() {
+                        let node_id = LiveId(i as u64).into();
+                        popup_menu.draw_item_full(
+                            cx,
+                            node_id,
+                            &item,
+                            self.icon_at(i),
+                            self.dimmed_items.get(i).copied().unwrap_or(false),
+                            self.item_is_disabled(i),
+                        );
+                    }
+
+                    let shift = anchor.pos - area.pos + dvec2(0.0, anchor.size.y);
+
+                    popup_menu.end(cx, self.draw_bg.area(), shift);
+                }
+            }
+        }
+    }
+}
+
+impl WidgetNode for DropDown {
+    fn widget_uid(&self) -> WidgetUid {
+        self.uid
+    }
+
+    fn set_action_data(&mut self, action_data: std::sync::Arc<dyn ActionTrait>) {
+        self.action_data.set_box(action_data)
+    }
+
+    fn action_data(&self) -> Option<std::sync::Arc<dyn ActionTrait>> {
+        self.action_data.clone_data()
+    }
+
+    fn area(&self) -> Area {
+        self.draw_bg.area()
+    }
+
+    fn walk(&mut self, _cx: &mut Cx) -> Walk {
+        self.walk
+    }
+
+    fn redraw(&mut self, cx: &mut Cx) {
+        self.draw_bg.redraw(cx);
+    }
+
+    fn visible(&self) -> bool {
+        self.visible
+    }
+
+    fn set_visible(&mut self, cx: &mut Cx, visible: bool) {
+        if self.visible != visible {
+            self.visible = visible;
+            // The open menu would stay up with nothing under it.
+            if !visible && self.is_active {
+                self.set_closed(cx);
+            }
+            self.redraw(cx);
+        }
+    }
+
+    fn children(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) {
+        // The open menu's items are widgets too (the design tweaker picks and
+        // styles them); the menu that owns them is not a tree node, so they
+        // surface here — only while this dropdown is the one showing them.
+        if !self.is_active || self.popup_menu.is_nil() {
+            return;
+        }
+        let Ok(map) = self.popup_global.map.try_borrow() else {
+            return;
+        };
+        let Some(menu) = map.get(&self.popup_menu_key()) else {
+            return;
+        };
+        for (id, item) in menu.item_refs() {
+            visit(id, item);
+        }
+    }
+}
+
+impl Widget for DropDown {
+    fn semantics_parts(&self, _cx: &Cx, out: &mut Vec<(u64, Option<u64>, a11y_tree::Node)>) {
+        if self.is_active {
+            return;
+        }
+        let Ok(map) = self.popup_global.map.try_borrow() else {
+            return;
+        };
+        let Some(menu) = map.get(&self.popup_menu_key()) else {
+            return;
+        };
+        // Templates share a popup; only its current owner may hide it.
+        if menu.tree_parent != self.widget_uid() {
+            return;
+        }
+        out.push((
+            0,
+            None,
+            a11y_tree::Node {
+                id: a11y_tree::NodeId::widget(menu.widget_uid().0),
+                role: a11y_tree::Role::Menu,
+                states: a11y_tree::States::HIDDEN,
+                ..Default::default()
+            },
+        ));
+    }
+
+    fn handle_action(
+        &mut self,
+        cx: &mut Cx,
+        action: &a11y_tree::ActionRequest,
+        _scope: &mut Scope,
+    ) -> a11y_tree::ActionResult {
+        use a11y_tree::{ActionArg, ActionResult, Actions as A};
+        if self.disabled(cx) {
+            return ActionResult::Disabled;
+        }
+        if action.action == A::EXPAND {
+            self.set_active(cx);
+        } else if action.action == A::COLLAPSE {
+            self.set_closed(cx);
+        } else if action.action == A::SELECT {
+            let ActionArg::Text(label) = &action.arg else {
+                return ActionResult::Unsupported;
+            };
+            let Some(index) = self.labels.iter().position(|item| item == label) else {
+                return ActionResult::Unsupported;
+            };
+            if self.item_is_disabled(index) {
+                return ActionResult::Disabled;
+            }
+            self.selected_item = index;
+            cx.widget_action_with_data(
+                &self.action_data,
+                self.widget_uid(),
+                DropDownAction::Select(index),
+            );
+            self.emit_change(cx);
+            self.set_closed(cx);
+        } else {
+            return ActionResult::Unhandled;
+        }
+        self.redraw(cx);
+        ActionResult::Handled
+    }
+
+    fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
+        let _ = cx;
+        node.role = a11y_tree::Role::ComboBox;
+        makepad_platform::a11y::set_string(&mut node.name, &self.text());
+        node.states = a11y_tree::States::FOCUSABLE;
+        node.states
+            .set(a11y_tree::States::DISABLED, self.disabled(cx));
+        node.actions = a11y_tree::Actions::FOCUS | a11y_tree::Actions::EXPAND;
+        node.states.insert(a11y_tree::States::HAS_POPUP);
+        node.name =
+            (|| -> Option<String> { Some(self.selected_item_label()) })().unwrap_or_default();
+        node.value = self.selected_item_label();
+        node.states.set(a11y_tree::States::EXPANDED, self.is_active);
+        node.states
+            .set(a11y_tree::States::COLLAPSED, !self.is_active);
+        node.actions = a11y_tree::Actions::FOCUS
+            | a11y_tree::Actions::EXPAND
+            | a11y_tree::Actions::COLLAPSE
+            | a11y_tree::Actions::SELECT;
+    }
+
+    /// Every item's label, and the list opened so the run draws it.
+    fn scan(&mut self, cx: &mut Cx, _scan: &ScanEvent, _scope: &mut Scope) {
+        for label in &self.labels {
+            self.draw_text.scan_text(cx, label);
+        }
+        let global = cx.global::<PopupMenuGlobal>().clone();
+        let has_menu = global.map.borrow().contains_key(&self.popup_menu_key());
+        if has_menu {
+            self.set_active(cx);
+        }
+    }
+
+    fn set_disabled(&mut self, cx: &mut Cx, disabled: bool) {
+        self.animator_toggle(
+            cx,
+            disabled,
+            Animate::Yes,
+            ids!(disabled.on),
+            ids!(disabled.off),
+        );
+    }
+
+    fn disabled(&self, cx: &Cx) -> bool {
+        self.animator_in_state(cx, ids!(disabled.on))
+    }
+
+
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        self.animator_handle_event(cx, event);
+        if !self.visible && event.requires_visibility() {
+            return;
+        }
+        if self.is_active {
+            // Between frames every rect is final: a face that moved while its
+            // list is open (a window resized) has the list follow it.
+            self.settled_rect = self.draw_bg.area().rect(cx);
+        }
+        let uid = self.widget_uid();
+        let opening_release = self.opening_digit.and_then(|digit| match event {
+            Event::MouseUp(e) if digit == live_id!(mouse).into() && e.button == MouseButton::PRIMARY => {
+                Some((e.abs, false))
+            }
+            Event::TouchUpdate(e) => e.touches.iter().find_map(|touch| {
+                (digit == live_id_num!(touch, touch.uid).into()
+                    && matches!(touch.state, TouchState::Stop | TouchState::Cancel))
+                    .then_some((touch.abs, touch.state == TouchState::Cancel))
+            }),
+            Event::FingerCancel(e) if digit == e.digit_id => Some((e.abs, true)),
+            _ => None,
+        });
+
+        // ONE menu instance serves every dropdown on the same template, and
+        // it holds the items of whichever dropdown last DREW it
+        // (`tree_parent`, claimed in `draw_walk`). Between this dropdown
+        // being pressed and its own first draw, the items standing in that
+        // menu are somebody else's: they are somewhere else on the screen,
+        // they say something else, and they answer to another list. Reading
+        // them here turns a press anywhere over that other menu's rows into a
+        // choice made HERE -- a `Select` carrying the other list's row
+        // number, sent under this dropdown's uid, which is a value nobody
+        // chose arriving at a control nobody touched.
+        //
+        // So the menu is this dropdown's to read only once it has drawn it.
+        // Until then there is nothing of ours on the screen to be pressed,
+        // and the press belongs to whoever drew last. Closing still works by
+        // the plain routes -- key focus lost, and the dropdown's own hits --
+        // and the next draw makes the menu ours again.
+        if self.is_active && !self.popup_menu.is_nil() && self.owns_the_menu(cx) {
+            let global = cx.global::<PopupMenuGlobal>().clone();
+            let mut map = global.map.borrow_mut();
+            let menu = map.get_mut(&self.popup_menu_key()).unwrap();
+            let mut close = false;
+            let popup_event = self
+                .popup_anchor_transform
+                .and_then(|transform| transform_popup_event(event, transform));
+            let popup_event = popup_event.as_ref().unwrap_or(event);
+            // The opening release belongs to its final position, even when
+            // no move event reached the popup. Releasing on the face keeps it open.
+            let opening_choice = opening_release.and_then(|(pos, cancelled)| {
+                if cancelled
+                    || self.opening_digit.is_some_and(|digit| cx.fingers.press_taken_away(digit))
+                    || self.draw_bg.area().rect(cx).contains(pos)
+                {
+                    return None;
+                }
+                let pos = self.popup_anchor_transform.map(|t| t.point(pos)).unwrap_or(pos);
+                menu.item_refs().find_map(|(id, item)| {
+                    let index = id.0 as usize;
+                    (index < self.labels.len()
+                        && !self.item_is_disabled(index)
+                        && item.area().clipped_rect(cx).contains(pos))
+                        .then_some(index)
+                })
+            });
+            menu.handle_event_with(
+                cx,
+                popup_event,
+                self.draw_bg.area(),
+                &mut |cx, action| match action {
+                    PopupMenuAction::WasSweeped(_node_id) => {}
+                    PopupMenuAction::WasSelected(node_id) => {
+                        if opening_release.is_some() {
+                            return;
+                        }
+                        let index = node_id.0 .0 as usize;
+                        if index >= self.labels.len() || self.item_is_disabled(index) {
+                            return;
+                        }
+                        self.selected_item = index;
+                        cx.widget_action_with_data(
+                            &self.action_data,
+                            uid,
+                            DropDownAction::Select(self.selected_item),
+                        );
+                        self.emit_change(cx);
+                        self.draw_bg.redraw(cx);
+                        close = true;
+                    }
+                    _ => (),
+                },
+            );
+            if let Some(index) = opening_choice {
+                self.selected_item = index;
+                cx.widget_action_with_data(&self.action_data, uid, DropDownAction::Select(index));
+                self.emit_change(cx);
+                close = true;
+            }
+            if close {
+                self.set_closed(cx);
+            }
+
+            // The open menu sits on top, so a scroll over it leaves what's under it alone.
+            if let Event::Scroll(e) = popup_event {
+                let is_over = menu.menu_contains_pos(cx, e.abs);
+                let area = self.draw_bg.area();
+                cx.is_scroll_owner(e, area, Vec2Index::X, is_over);
+                cx.is_scroll_owner(e, area, Vec2Index::Y, is_over);
+            }
+
+            // check if we clicked outside of the popup menu
+            if let Event::MouseDown(e) = popup_event {
+                if !menu.menu_contains_pos(cx, e.abs) {
+                    self.set_closed(cx);
+                    self.animator_play(cx, ids!(hover.off));
+                    // The press that closes the list is the list's. What was
+                    // walked before this saw the lock and nothing else; what
+                    // is walked after would see no lock, now it is released,
+                    // and take the press as its own: a tab beside the page
+                    // switched as the list closed. Marked on the event as it
+                    // came in, which `transform_popup_event` copied.
+                    if let Event::MouseDown(e) = event {
+                        if e.handled.get().is_empty() {
+                            e.handled.set(self.draw_bg.area());
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        if opening_release.is_some() {
+            self.opening_digit = None;
+        }
+
+        match event.hits_with_sweep_area(cx, self.draw_bg.area(), self.draw_bg.area()) {
+            Hit::KeyFocusLost(_) => {
+                self.pointer_focus = false;
+                self.animator_play(cx, ids!(focus.off));
+                self.set_closed(cx);
+                self.animator_play(cx, ids!(hover.off));
+                self.draw_bg.redraw(cx);
+            }
+            Hit::KeyFocus(_) => {
+                self.animator_play(cx, ids!(focus.on));
+            }
+            Hit::KeyDown(ke) if !self.disabled(cx) && self.is_active => {
+                self.pointer_focus = false;
+                self.key_in_open_list(cx, ke.key_code);
+            }
+            Hit::KeyDown(ke) if !self.disabled(cx) => {
+                self.pointer_focus = false;
+                self.draw_bg.redraw(cx);
+                match ke.key_code {
+                    KeyCode::ArrowUp => {
+                        if let Some(index) = (0..self.selected_item.min(self.labels.len()))
+                            .rev()
+                            .find(|&index| !self.item_is_disabled(index))
+                        {
+                            self.selected_item = index;
+                            cx.widget_action_with_data(
+                                &self.action_data,
+                                uid,
+                                DropDownAction::Select(self.selected_item),
+                            );
+                            self.emit_change(cx);
+                            self.set_closed(cx);
+                            self.draw_bg.redraw(cx);
+                        }
+                    }
+                    KeyCode::ArrowDown => {
+                        if let Some(index) = (self.selected_item.saturating_add(1)..self.labels.len())
+                            .find(|&index| !self.item_is_disabled(index))
+                        {
+                            self.selected_item = index;
+                            cx.widget_action_with_data(
+                                &self.action_data,
+                                uid,
+                                DropDownAction::Select(self.selected_item),
+                            );
+                            self.emit_change(cx);
+                            self.set_closed(cx);
+                            self.draw_bg.redraw(cx);
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            Hit::FingerDown(fe) if fe.is_primary_hit() => {
+                if self.animator_in_state(cx, ids!(disabled.off)) {
+                    self.pointer_focus = true;
+                    self.draw_bg.redraw(cx);
+                    cx.set_key_focus_from_user(self.draw_bg.area());
+                    self.animator_play(cx, ids!(hover.down));
+                    if !self.is_active {
+                        self.opening_digit = Some(fe.digit_id);
+                        self.set_active(cx);
+                    }
+                }
+            }
+            Hit::FingerHoverIn(_) => {
+                cx.set_cursor(MouseCursor::Hand);
+                self.animator_play(cx, ids!(hover.on));
+            }
+            Hit::FingerHoverOut(_) => {
+                self.animator_play(cx, ids!(hover.off));
+            }
+            Hit::FingerUp(fe) if fe.is_primary_hit() => {
+                if fe.is_over {
+                    if fe.device.has_hovers() {
+                        self.animator_play(cx, ids!(hover.on));
+                    }
+                } else {
+                    self.animator_play(cx, ids!(hover.off));
+                }
+            }
+            _ => (),
+        };
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        if !self.visible {
+            return DrawStep::done();
+        }
+        self.draw_walk(cx, walk);
+        DrawStep::done()
+    }
+}
+
+impl DropDownRef {
+    pub fn set_popup_anchor_transform(
+        &self,
+        cx: &mut Cx,
+        transform: Option<PopupAnchorTransform>,
+    ) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.popup_anchor_transform != transform {
+                inner.popup_anchor_transform = transform;
+                inner.draw_bg.redraw(cx);
+            }
+        }
+    }
+
+    pub fn set_labels_with<F: FnMut(&mut String)>(&self, cx: &mut Cx, mut f: F) {
+        if let Some(mut inner) = self.borrow_mut() {
+            let mut i = 0;
+            loop {
+                if i >= inner.labels.len() {
+                    inner.labels.push(String::new());
+                }
+                let s = &mut inner.labels[i];
+                s.clear();
+                f(s);
+                if s.len() == 0 {
+                    break;
+                }
+                i += 1;
+            }
+            inner.labels.truncate(i);
+            inner.draw_bg.redraw(cx);
+        }
+    }
+
+    pub fn set_labels(&self, cx: &mut Cx, labels: Vec<String>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.labels = labels;
+            inner.draw_bg.redraw(cx);
+        }
+    }
+
+    /// Set which popup rows use the disabled palette. These rows deliberately
+    /// stay selectable (for example a hub model that will be acquired).
+    pub fn set_dimmed_items(&self, cx: &mut Cx, dimmed_items: Vec<bool>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.dimmed_items = dimmed_items;
+            inner.draw_bg.redraw(cx);
+        }
+    }
+
+    /// Disable input for these rows and draw them with the disabled palette.
+    /// Missing entries remain enabled. Programmatic selection may still show
+    /// a saved choice that has become unavailable.
+    pub fn set_disabled_items(&self, cx: &mut Cx, disabled_items: Vec<bool>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.disabled_items != disabled_items {
+                inner.disabled_items = disabled_items;
+                inner.draw_bg.redraw(cx);
+            }
+        }
+    }
+
+    pub fn selected(&self, actions: &Actions) -> Option<usize> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let DropDownAction::Select(id) = item.cast() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    pub fn changed(&self, actions: &Actions) -> Option<usize> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let DropDownAction::Select(id) = item.cast() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    pub fn changed_label(&self, actions: &Actions) -> Option<String> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let DropDownAction::Select(id) = item.cast() {
+                if let Some(inner) = self.borrow() {
+                    return Some(inner.labels[id].clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn set_selected_item(&self, cx: &mut Cx, item: usize) {
+        if let Some(mut inner) = self.borrow_mut() {
+            let new_selected = item.min(inner.labels.len().max(1) - 1);
+            if new_selected != inner.selected_item {
+                inner.selected_item = new_selected;
+                inner.draw_bg.redraw(cx);
+            }
+        }
+    }
+
+    pub fn selected_item(&self) -> usize {
+        if let Some(inner) = self.borrow() {
+            return inner.selected_item;
+        }
+        0
+    }
+
+    /// Collapse the closed face to the selected item's icon, or spell it out
+    /// again. The host drives this off its own width, so it fires on every
+    /// resize step — hence the guard against redrawing for an unchanged value.
+    pub fn set_icon_only(&self, cx: &mut Cx, icon_only: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.icon_only != icon_only {
+                inner.icon_only = icon_only;
+                inner.draw_bg.redraw(cx);
+            }
+        }
+    }
+
+    pub fn icon_only(&self) -> bool {
+        if let Some(inner) = self.borrow() {
+            return inner.icon_only;
+        }
+        false
+    }
+
+    pub fn selected_label(&self) -> String {
+        if let Some(inner) = self.borrow() {
+            return inner.labels[inner.selected_item].clone();
+        }
+        "".to_string()
+    }
+
+    pub fn set_selected_by_label(&self, label: &str, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if let Some(index) = inner.labels.iter().position(|v| v == label) {
+                if inner.selected_item != index {
+                    inner.selected_item = index;
+                    inner.draw_bg.redraw(cx);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod outside_press_tests {
+    use super::*;
+    use crate::button::ButtonAction;
+    use crate::makepad_draw::cx_draw::CxDraw;
+    use std::cell::Cell;
+
+    const SIZE: DVec2 = DVec2 { x: 800.0, y: 600.0 };
+
+    struct Target {
+        pass: DrawPass,
+        draw_list: DrawList2d,
+        overlay: Overlay,
+    }
+
+    impl Target {
+        fn new(cx: &mut Cx) -> Self {
+            let overlay = cx.with_vm(|vm| Overlay::script_new(vm));
+            Target { pass: DrawPass::new(cx), draw_list: DrawList2d::new(cx), overlay }
+        }
+
+        fn draw(&mut self, cx: &mut Cx, root: &WidgetRef) {
+            self.pass.set_size(cx, SIZE);
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(cx, &event);
+            let mut cx2d = Cx2d::new(&mut draw);
+            cx2d.begin_pass(&self.pass, None);
+            self.draw_list.begin_always(&mut cx2d);
+            self.overlay.begin(&mut cx2d);
+            cx2d.begin_root_turtle(SIZE, Layout::flow_down());
+            root.draw_all(&mut cx2d, &mut Scope::empty());
+            cx2d.end_pass_sized_turtle();
+            self.overlay.end(&mut cx2d);
+            self.draw_list.end(&mut cx2d);
+            cx2d.end_pass(&self.pass);
+        }
+    }
+
+    fn press(abs: DVec2) -> Event {
+        Event::MouseDown(MouseDownEvent {
+            abs,
+            button: MouseButton::PRIMARY,
+            window_id: WindowId(1, 1),
+            modifiers: KeyModifiers::default(),
+            handled: Cell::new(Area::Empty),
+            time: 0.0,
+        })
+    }
+
+    fn release(abs: DVec2) -> Event {
+        Event::MouseUp(MouseUpEvent {
+            abs,
+            button: MouseButton::PRIMARY,
+            window_id: WindowId(1, 1),
+            modifiers: KeyModifiers::default(),
+            time: 0.0,
+        })
+    }
+
+    /// A press and its release through the whole page, in tree order, and
+    /// whether the button heard the press.
+    fn click(cx: &mut Cx, root: &WidgetRef, at: DVec2, button: &WidgetRef) -> bool {
+        let mut heard = false;
+        for event in [press(at), release(at)] {
+            let actions = cx.capture_actions(|cx| root.handle_event(cx, &event, &mut Scope::empty()));
+            heard |= actions
+                .iter()
+                .filter_map(|action| action.as_widget_action())
+                .any(|action| {
+                    action.widget_uid == button.widget_uid()
+                        && matches!(action.cast::<ButtonAction>(), ButtonAction::Pressed(_))
+                });
+        }
+        heard
+    }
+
+    fn middle(cx: &Cx, widget: &WidgetRef) -> DVec2 {
+        let rect = widget.area().rect(cx);
+        assert!(rect.size.x > 0.0, "not drawn");
+        rect.pos + rect.size * 0.5
+    }
+
+    /// An open list closes on a press
+    /// outside it, and the press goes no further: a button walked after the
+    /// list does not hear it, though the list's lock is gone by the time
+    /// the button is walked. The next press reaches the button.
+    ///
+    /// The list has a button of its own, and opens from Rust: with no
+    /// event loop here to end a capture on release, a widget that once took
+    /// a press would take every later one.
+    #[test]
+    fn a_press_outside_an_open_list_closes_it_and_reaches_nothing_after_it() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_cx_os();
+        cx.with_vm(crate::script_mod);
+        let root = cx.with_vm(|vm| {
+            let value = crate::script_eval!(vm, {
+                use mod.prelude.widgets.*
+                use mod.widgets.*
+                View{
+                    width: Fill
+                    height: Fill
+                    flow: Down
+                    spacing: 20.
+                    // The lists before the buttons, as a page is walked
+                    // before the side panel beside it.
+                    event_order: EventOrder.Down
+                    pick := DropDown{width: 150.}
+                    after_pick := Button{width: 150. height: 40. margin: Inset{top: 200.} text: "after"}
+                }
+            });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let labels = || vec!["One".to_string(), "Two".to_string(), "Three".to_string()];
+        root.drop_down(&cx, ids!(pick)).set_labels(&mut cx, labels());
+        let mut target = Target::new(&mut cx);
+        target.draw(&mut cx, &root);
+        let pick = root.widget(&cx, ids!(pick));
+        let is_active = |pick: &WidgetRef| pick.borrow::<DropDown>().unwrap().is_active;
+
+        let after = root.widget(&cx, ids!(after_pick));
+        let on_after = middle(&cx, &after);
+        pick.borrow_mut::<DropDown>().unwrap().set_active(&mut cx);
+        target.draw(&mut cx, &root);
+        assert!(is_active(&pick));
+        assert!(!click(&mut cx, &root, on_after, &after), "the button heard the press that closed the drop-down's list");
+        assert!(!is_active(&pick), "the press outside closed the drop-down's list");
+        assert_eq!(cx.sweep_lock_area(), None);
+        target.draw(&mut cx, &root);
+        assert!(click(&mut cx, &root, on_after, &after), "with the list closed the button hears its press");
+    }
+}
+
+#[cfg(test)]
+mod popup_cache_tests {
+    use super::*;
+    use crate::makepad_script::script;
+    use crate::makepad_platform::ScriptApply;
+
+    /// A module rebuild hands every dropdown a fresh popup template, and so
+    /// a fresh cache key. The menu built for the old key went on living in
+    /// the cache with its item template's tree and its draw list -- one more
+    /// per rebuild, for the life of the process. Now the last dropdown off a
+    /// key takes the menu with it, and a dropped dropdown does the same.
+    #[test]
+    fn a_dropdown_lets_go_of_the_menu_its_old_template_earned() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| crate::script_mod(vm));
+        let build = |cx: &mut Cx| {
+            cx.with_vm(|vm| {
+                vm.eval(script! {
+                    use mod.prelude.widgets.*
+                    DropDown{ popup_menu: PopupMenuFlat{} }
+                })
+            })
+        };
+        let first = build(&mut cx);
+        let mut widget = cx.with_vm(|vm| WidgetRef::script_from_value(vm, first));
+        assert_eq!(DropDown::popup_menu_cache_len(&mut cx), 1, "the first template earned no menu");
+        // The same widget applied from a second template object, which is
+        // what a rebuild does to every dropdown in the tree.
+        let second = build(&mut cx);
+        assert_ne!(first.as_object(), second.as_object(), "the second build is the same object; the test proves nothing");
+        cx.with_vm(|vm| widget.script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), second));
+        assert_eq!(DropDown::popup_menu_cache_len(&mut cx), 1, "the old template's menu stayed in the cache");
+        drop(widget);
+        assert_eq!(DropDown::popup_menu_cache_len(&mut cx), 0, "a dropped dropdown left its menu behind");
+    }
+
+    /// Two dropdowns on one template share one menu, and it stays as long as
+    /// either of them stands on it.
+    #[test]
+    fn a_shared_menu_stays_until_the_last_dropdown_lets_go() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| crate::script_mod(vm));
+        let (a, b) = cx.with_vm(|vm| {
+            let value = vm.eval(script! {
+                use mod.prelude.widgets.*
+                View{ one := DropDown{} two := DropDown{} }
+            });
+            let root = WidgetRef::script_from_value(vm, value);
+            (root.clone(), root)
+        });
+        assert_eq!(DropDown::popup_menu_cache_len(&mut cx), 1, "two dropdowns on one template should share one menu");
+        drop(a);
+        assert_eq!(DropDown::popup_menu_cache_len(&mut cx), 1, "the menu went while a dropdown still stood on it");
+        drop(b);
+        assert_eq!(DropDown::popup_menu_cache_len(&mut cx), 0);
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use crate::makepad_script::script;
+    use crate::makepad_platform::event::{ScrollEvent, ScrollPhase};
+    use std::cell::Cell;
+
+    fn popup(cx: &mut Cx) -> PopupMenu {
+        cx.with_vm(|vm| {
+            let value = vm.eval(script! {
+                use mod.prelude.widgets.*
+                PopupMenu{}
+            });
+            PopupMenu::script_from_value(vm, value)
+        })
+    }
+
+    #[test]
+    fn popup_anchor_rect_applies_camera_scale_and_translation() {
+        let rect = Rect {
+            pos: dvec2(110.0, 70.0),
+            size: dvec2(80.0, 24.0),
+        };
+        let half = PopupAnchorTransform {
+            scale: 0.5,
+            translation: dvec2(20.0, -5.0),
+        }
+        .rect(rect);
+        assert_eq!(half.pos, dvec2(75.0, 30.0));
+        assert_eq!(half.size, dvec2(40.0, 12.0));
+
+        let double = PopupAnchorTransform {
+            scale: 2.0,
+            translation: dvec2(-30.0, 15.0),
+        }
+        .rect(rect);
+        assert_eq!(double.pos, dvec2(190.0, 155.0));
+        assert_eq!(double.size, dvec2(160.0, 48.0));
+
+        for transform in [
+            PopupAnchorTransform {
+                scale: 0.5,
+                translation: dvec2(20.0, -5.0),
+            },
+            PopupAnchorTransform {
+                scale: 2.0,
+                translation: dvec2(-30.0, 15.0),
+            },
+        ] {
+            let event = Event::Scroll(ScrollEvent {
+                window_id: WindowId(1, 1),
+                scroll: dvec2(8.0, -4.0),
+                abs: dvec2(110.0, 70.0),
+                modifiers: KeyModifiers::default(),
+                handled_x: Cell::new(false),
+                handled_y: Cell::new(false),
+                is_mouse: true,
+                time: 0.0,
+                phase: ScrollPhase::None,
+            });
+            assert!(matches!(
+                transform_popup_event(&event, transform),
+                Some(Event::Scroll(event))
+                    if event.abs == transform.point(dvec2(110.0, 70.0))
+                        && event.scroll == dvec2(8.0, -4.0) * transform.scale
+            ));
+        }
+    }
+
+    #[test]
+    fn popup_cache_can_retire_one_isolate_heap() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let global = cx.global::<PopupMenuGlobal>().clone();
+        let first = popup(&mut cx);
+        let second = popup(&mut cx);
+        {
+            let mut map = global.map.borrow_mut();
+            map.insert(
+                PopupMenuKey {
+                    heap: 11,
+                    template: ScriptValue::NIL,
+                },
+                first,
+            );
+            map.insert(
+                PopupMenuKey {
+                    heap: 22,
+                    template: ScriptValue::NIL,
+                },
+                second,
+            );
+        }
+        assert_eq!(DropDown::retire_popup_menus_for_heap(&mut cx, 11), 1);
+        let map = global.map.borrow();
+        assert!(!map.keys().any(|key| key.heap == 11));
+        assert!(map.keys().any(|key| key.heap == 22));
+    }
+}
+
+#[cfg(test)]
+mod popup_scroll_tests {
+    use super::*;
+    use crate::makepad_draw::cx_draw::CxDraw;
+    use crate::makepad_platform::event::{ScrollEvent, ScrollPhase};
+    use crate::scroll_bars::ScrollExtent;
+    use std::cell::Cell;
+
+    const SIZE: DVec2 = DVec2 { x: 800.0, y: 600.0 };
+    const WINDOW: WindowId = WindowId(1, 1);
+
+    /// A window-less pass with the overlay a window keeps, which is where
+    /// the list draws.
+    struct Target {
+        pass: DrawPass,
+        draw_list: DrawList2d,
+        overlay: Overlay,
+    }
+
+    impl Target {
+        fn new(cx: &mut Cx) -> Self {
+            let overlay = cx.with_vm(|vm| Overlay::script_new(vm));
+            Target { pass: DrawPass::new(cx), draw_list: DrawList2d::new(cx), overlay }
+        }
+
+        fn draw(&mut self, cx: &mut Cx, root: &WidgetRef) {
+            self.pass.set_size(cx, SIZE);
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(cx, &event);
+            let mut cx2d = Cx2d::new(&mut draw);
+            cx2d.begin_pass(&self.pass, None);
+            self.draw_list.begin_always(&mut cx2d);
+            self.overlay.begin(&mut cx2d);
+            cx2d.begin_root_turtle(SIZE, Layout::flow_down());
+            root.draw_all(&mut cx2d, &mut Scope::empty());
+            cx2d.end_pass_sized_turtle();
+            self.overlay.end(&mut cx2d);
+            self.draw_list.end(&mut cx2d);
+            cx2d.end_pass(&self.pass);
+        }
+    }
+
+    /// A page holding one dropdown of a hundred items, its list capped at
+    /// 200 points.
+    fn page(cx: &mut Cx) -> (WidgetRef, WidgetRef, Target) {
+        let root = cx.with_vm(|vm| {
+            let value = crate::script_eval!(vm, {
+                use mod.prelude.widgets.*
+                use mod.widgets.*
+                View{
+                    width: Fill
+                    height: Fill
+                    flow: Down
+                    pick := DropDown{width: 150. popup_max_height: 200.}
+                }
+            });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let labels = (0..100).map(|i| format!("Item {i}")).collect();
+        root.drop_down(cx, ids!(pick)).set_labels(cx, labels);
+        let mut target = Target::new(cx);
+        target.draw(cx, &root);
+        let pick = root.widget(cx, ids!(pick));
+        (root, pick, target)
+    }
+
+    fn open(cx: &mut Cx, root: &WidgetRef, pick: &WidgetRef, target: &mut Target) {
+        pick.borrow_mut::<DropDown>().unwrap().set_active(cx);
+        target.draw(cx, root);
+    }
+
+    fn is_open(pick: &WidgetRef) -> bool {
+        pick.borrow::<DropDown>().unwrap().is_active
+    }
+
+    /// The open list, read through the store every dropdown on the template
+    /// shares.
+    fn menu<R>(cx: &mut Cx, pick: &WidgetRef, f: impl FnOnce(&mut Cx, &PopupMenu) -> R) -> R {
+        let key = pick.borrow::<DropDown>().unwrap().popup_menu_key();
+        let global = cx.global::<PopupMenuGlobal>().clone();
+        let map = global.map.borrow();
+        f(cx, map.get(&key).expect("the dropdown has no list"))
+    }
+
+    fn menu_rect(cx: &mut Cx, pick: &WidgetRef) -> Rect {
+        menu(cx, pick, |cx, menu| menu.area().rect(cx))
+    }
+
+    fn extent(cx: &mut Cx, pick: &WidgetRef) -> ScrollExtent {
+        menu(cx, pick, |_, menu| menu.scroll_bars().extent())
+    }
+
+    fn row(cx: &mut Cx, pick: &WidgetRef, index: u64) -> Rect {
+        menu(cx, pick, |cx, menu| {
+            menu.item_refs()
+                .find(|(id, _)| *id == LiveId(index))
+                .map(|(_, item)| item.area().rect(cx))
+                .expect("the row was not drawn")
+        })
+    }
+
+    fn inside(inner: Rect, outer: Rect) -> bool {
+        inner.pos.y >= outer.pos.y - 0.01
+            && inner.pos.y + inner.size.y <= outer.pos.y + outer.size.y + 0.01
+            && inner.pos.x >= outer.pos.x - 0.01
+            && inner.pos.x + inner.size.x <= outer.pos.x + outer.size.x + 0.01
+    }
+
+    fn wheel(at: DVec2, dy: f64) -> Event {
+        Event::Scroll(ScrollEvent {
+            window_id: WINDOW,
+            scroll: dvec2(0.0, dy),
+            abs: at,
+            modifiers: KeyModifiers::default(),
+            handled_x: Cell::new(false),
+            handled_y: Cell::new(false),
+            is_mouse: true,
+            time: 0.0,
+            phase: ScrollPhase::None,
+        })
+    }
+
+    fn press(abs: DVec2) -> Event {
+        Event::MouseDown(MouseDownEvent {
+            abs,
+            button: MouseButton::PRIMARY,
+            window_id: WINDOW,
+            modifiers: KeyModifiers::default(),
+            handled: Cell::new(Area::Empty),
+            time: 1.0,
+        })
+    }
+
+    fn drag(abs: DVec2) -> Event {
+        Event::MouseMove(MouseMoveEvent {
+            abs,
+            lock_delta: DVec2::default(),
+            window_id: WINDOW,
+            modifiers: KeyModifiers::default(),
+            time: 1.1,
+            handled: Cell::new(Area::Empty),
+        })
+    }
+
+    fn release(abs: DVec2) -> Event {
+        Event::MouseUp(MouseUpEvent {
+            abs,
+            button: MouseButton::PRIMARY,
+            window_id: WINDOW,
+            modifiers: KeyModifiers::default(),
+            time: 1.2,
+        })
+    }
+
+    fn key(key_code: KeyCode) -> Event {
+        Event::KeyDown(KeyEvent { key_code, ..Default::default() })
+    }
+
+    /// Every choice the dropdown reported out of these events.
+    fn send(cx: &mut Cx, root: &WidgetRef, pick: &WidgetRef, events: &[Event]) -> Vec<usize> {
+        let mut chosen = Vec::new();
+        for event in events {
+            let actions = cx.capture_actions(|cx| root.handle_event(cx, event, &mut Scope::empty()));
+            chosen.extend(
+                actions
+                    .iter()
+                    .filter_map(|action| action.as_widget_action())
+                    .filter(|action| action.widget_uid == pick.widget_uid())
+                    .filter_map(|action| match action.cast::<DropDownAction>() {
+                        DropDownAction::Select(index) => Some(index),
+                        DropDownAction::None => None,
+                    }),
+            );
+        }
+        chosen
+    }
+
+    /// A hundred items capped at 200 points show in a scroll area: the list
+    /// is no taller than its cap and holds more than it shows, the wheel
+    /// moves the rows by the wheel's delta, and the last row can be reached.
+    #[test]
+    fn a_capped_list_scrolls_its_items_by_the_wheel() {
+        crate::on_test_cx(|| {
+            let mut cx = crate::checkout_test_cx();
+            let (root, pick, mut target) = page(&mut cx);
+            open(&mut cx, &root, &pick, &mut target);
+
+            let list = menu_rect(&mut cx, &pick);
+            assert!(
+                list.size.y > 0.0 && list.size.y <= 200.0 + 0.01,
+                "the list is {} points tall, past its cap of 200",
+                list.size.y
+            );
+            let shown = extent(&mut cx, &pick);
+            assert!(
+                shown.visible.y > 0.0 && shown.total.y > shown.visible.y,
+                "the list holds no more than it shows: {shown:?}"
+            );
+            assert_eq!(shown.pos.y, 0.0, "the first row is chosen, so the list starts at the top");
+            let first = row(&mut cx, &pick, 0);
+
+            let over_list = list.pos + list.size * 0.5;
+            let chosen = send(&mut cx, &root, &pick, &[wheel(over_list, 50.0)]);
+            assert!(chosen.is_empty(), "the wheel chose {chosen:?}");
+            assert_eq!(extent(&mut cx, &pick).pos.y, 50.0, "the wheel moved the list by its delta");
+            target.draw(&mut cx, &root);
+            assert_eq!(menu_rect(&mut cx, &pick), list, "the list moved instead of its rows");
+            let moved = row(&mut cx, &pick, 0);
+            assert!(
+                (moved.pos.y - (first.pos.y - 50.0)).abs() < 0.01,
+                "the rows did not move with the list: the first row went from {} to {}",
+                first.pos.y,
+                moved.pos.y
+            );
+
+            // All the way down: the last row comes into the list.
+            send(&mut cx, &root, &pick, &[wheel(over_list, 100_000.0)]);
+            let shown = extent(&mut cx, &pick);
+            assert_eq!(shown.pos.y, shown.total.y - shown.visible.y, "the wheel stops at the end");
+            target.draw(&mut cx, &root);
+            let list = menu_rect(&mut cx, &pick);
+            let last = row(&mut cx, &pick, 99);
+            assert!(inside(last, list), "the last row {last:?} is not inside the list {list:?}");
+            assert!(is_open(&pick), "scrolling closed the list");
+        });
+    }
+
+    /// A page holding one dropdown of `n` items near the bottom edge of the
+    /// window, its list left uncapped.
+    fn low_page(cx: &mut Cx, n: usize) -> (WidgetRef, WidgetRef, Target) {
+        let root = cx.with_vm(|vm| {
+            let value = crate::script_eval!(vm, {
+                use mod.prelude.widgets.*
+                use mod.widgets.*
+                View{
+                    width: Fill
+                    height: Fill
+                    flow: Down
+                    View{width: Fill height: 560.}
+                    pick := DropDown{width: 150.}
+                }
+            });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let labels = (0..n).map(|i| format!("Item {i}")).collect();
+        root.drop_down(cx, ids!(pick)).set_labels(cx, labels);
+        let mut target = Target::new(cx);
+        target.draw(cx, &root);
+        let pick = root.widget(cx, ids!(pick));
+        (root, pick, target)
+    }
+
+    /// A page holding one dropdown of `n` items at the foot of a panel that
+    /// its parent aligns to the bottom of the window, the way an app hangs a
+    /// panel in a corner: the face is drawn a panel too high and only comes
+    /// down when its parents end, after the list was laid out.
+    fn aligned_low_page(cx: &mut Cx, n: usize) -> (WidgetRef, WidgetRef, Target) {
+        let root = cx.with_vm(|vm| {
+            let value = crate::script_eval!(vm, {
+                use mod.prelude.widgets.*
+                use mod.widgets.*
+                View{
+                    width: Fill
+                    height: Fill
+                    align: Align{x: 0.0, y: 1.0}
+                    View{
+                        width: Fit
+                        height: Fit
+                        flow: Down
+                        padding: Inset{left: 18, right: 0, top: 0, bottom: 26}
+                        View{width: 150. height: 40.}
+                        pick := DropDown{width: 150.}
+                    }
+                }
+            });
+            WidgetRef::script_from_value(vm, value)
+        });
+        let labels = (0..n).map(|i| format!("Item {i}")).collect();
+        root.drop_down(cx, ids!(pick)).set_labels(cx, labels);
+        let mut target = Target::new(cx);
+        target.draw(cx, &root);
+        let pick = root.widget(cx, ids!(pick));
+        (root, pick, target)
+    }
+
+    fn window() -> Rect {
+        Rect { pos: DVec2::default(), size: SIZE }
+    }
+
+    type Page = fn(&mut Cx, usize) -> (WidgetRef, WidgetRef, Target);
+
+    /// A list whose rows fit the window draws every row as it always did:
+    /// the list is as tall as its rows, nothing scrolls and no bar shows.
+    #[test]
+    fn a_list_that_fits_draws_every_row_as_before() {
+        crate::on_test_cx(|| {
+            let mut cx = crate::checkout_test_cx();
+            let (root, pick, mut target) = low_page(&mut cx, 5);
+            open(&mut cx, &root, &pick, &mut target);
+
+            let list = menu_rect(&mut cx, &pick);
+            let first = row(&mut cx, &pick, 0);
+            let last = row(&mut cx, &pick, 4);
+            assert!(inside(first, list) && inside(last, list), "the list {list:?} does not hold all its rows");
+            assert!(inside(list, window()), "the list {list:?} left the window");
+            let shown = extent(&mut cx, &pick);
+            assert!(shown.total.y <= shown.visible.y + 0.5, "a list that fits scrolls: {shown:?}");
+            let bar = menu(&mut cx, &pick, |cx, menu| menu.scroll_bars().bar_areas()[1].rect(cx));
+            assert!(bar.size.y == 0.0, "a list that fits shows a bar {bar:?}");
+        });
+    }
+
+    /// Sixty rows in a dropdown near the bottom edge, with no cap of its
+    /// own: the list stays inside the window, taller rows than the window
+    /// holds scroll inside it, and the wheel and the keys both reach the last
+    /// row, which Return then chooses. A list hung below its control goes
+    /// over it instead, since there is no room under it.
+    fn a_long_list_near_the_bottom_edge(below: bool, page: Page) {
+        crate::on_test_cx(move || {
+            let mut cx = crate::checkout_test_cx();
+            let (root, pick, mut target) = page(&mut cx, 60);
+            let face = pick.area().rect(&cx);
+            assert!(
+                face.pos.y + face.size.y > SIZE.y - 60.0,
+                "the control {face:?} is not near the bottom edge"
+            );
+            if below {
+                pick.borrow_mut::<DropDown>().unwrap().popup_menu_position = PopupMenuPosition::BelowInput;
+            }
+            open(&mut cx, &root, &pick, &mut target);
+
+            let list = menu_rect(&mut cx, &pick);
+            assert!(list.size.y > 0.0 && inside(list, window()), "the list {list:?} left the window");
+            let shown = extent(&mut cx, &pick);
+            assert!(shown.total.y > shown.visible.y, "sixty rows do not scroll: {shown:?}");
+            if below {
+                let face = pick.area().rect(&cx);
+                assert!(
+                    list.pos.y + list.size.y <= face.pos.y + 0.01,
+                    "the list {list:?} hangs below a control {face:?} with no room under it"
+                );
+            }
+            assert!(!inside(row(&mut cx, &pick, 59), list), "the last row shows before any scroll");
+
+            // The wheel, all the way down.
+            let over_list = list.pos + list.size * 0.5;
+            let chosen = send(&mut cx, &root, &pick, &[wheel(over_list, 100_000.0)]);
+            assert!(chosen.is_empty(), "the wheel chose {chosen:?}");
+            target.draw(&mut cx, &root);
+            assert_eq!(menu_rect(&mut cx, &pick), list, "the list moved instead of its rows");
+            let last = row(&mut cx, &pick, 59);
+            assert!(inside(last, list), "the wheel did not bring the last row {last:?} into the list {list:?}");
+
+            // The keys: Home back to the first row, End down to the last.
+            cx.set_key_focus(pick.area());
+            cx.action(());
+            cx.handle_actions();
+            let chosen = send(&mut cx, &root, &pick, &[key(KeyCode::Home)]);
+            assert!(chosen.is_empty() && is_open(&pick), "Home chose {chosen:?} or shut the list");
+            target.draw(&mut cx, &root);
+            assert!(inside(row(&mut cx, &pick, 0), list), "Home did not bring the first row into view");
+            assert!(!inside(row(&mut cx, &pick, 59), list), "Home left the last row in view");
+            let chosen = send(&mut cx, &root, &pick, &[key(KeyCode::End)]);
+            assert!(chosen.is_empty() && is_open(&pick), "End chose {chosen:?} or shut the list");
+            target.draw(&mut cx, &root);
+            assert_eq!(menu_rect(&mut cx, &pick), list, "the keys moved the list");
+            assert!(inside(row(&mut cx, &pick, 59), list), "End did not bring the last row into view");
+            let chosen = send(&mut cx, &root, &pick, &[key(KeyCode::ReturnKey)]);
+            assert_eq!(chosen, vec![59], "Return chose another row than the one the keys were on");
+            assert!(!is_open(&pick), "Return left the list open");
+        });
+    }
+
+    #[test]
+    fn a_long_list_on_its_chosen_row_near_the_bottom_edge_stays_in_the_window() {
+        a_long_list_near_the_bottom_edge(false, low_page);
+    }
+
+    #[test]
+    fn a_long_list_below_a_control_near_the_bottom_edge_opens_over_it() {
+        a_long_list_near_the_bottom_edge(true, low_page);
+    }
+
+    #[test]
+    fn a_long_list_in_a_panel_aligned_to_the_bottom_stays_in_the_window() {
+        a_long_list_near_the_bottom_edge(false, aligned_low_page);
+    }
+
+    #[test]
+    fn a_long_list_below_a_control_in_a_panel_aligned_to_the_bottom_opens_over_it() {
+        a_long_list_near_the_bottom_edge(true, aligned_low_page);
+    }
+
+    /// Opening brings the chosen row into view, however far down it is. In
+    /// the open list an arrow key moves to the next row and brings it into
+    /// view without choosing it; Return chooses it and shuts the list, and
+    /// the next opening brings it into view, from wherever the list was left.
+    #[test]
+    fn opening_a_capped_list_brings_the_chosen_row_into_view() {
+        crate::on_test_cx(|| {
+            let mut cx = crate::checkout_test_cx();
+            let (root, pick, mut target) = page(&mut cx);
+            pick.as_drop_down().set_selected_item(&mut cx, 80);
+            target.draw(&mut cx, &root);
+            open(&mut cx, &root, &pick, &mut target);
+
+            let list = menu_rect(&mut cx, &pick);
+            let chosen = row(&mut cx, &pick, 80);
+            assert!(inside(chosen, list), "the chosen row {chosen:?} is not in the list {list:?}");
+            assert!(
+                inside(list, Rect { pos: DVec2::default(), size: SIZE }),
+                "the list {list:?} left the window"
+            );
+
+            // Wheel the list to the top, away from the chosen row, then move
+            // the choice with the keyboard.
+            let over_list = list.pos + list.size * 0.5;
+            send(&mut cx, &root, &pick, &[wheel(over_list, -100_000.0)]);
+            target.draw(&mut cx, &root);
+            assert!(!inside(row(&mut cx, &pick, 80), menu_rect(&mut cx, &pick)), "the wheel left the chosen row in view");
+            cx.set_key_focus(pick.area());
+            cx.action(());
+            cx.handle_actions();
+            let chosen = send(&mut cx, &root, &pick, &[key(KeyCode::ArrowDown)]);
+            assert!(chosen.is_empty(), "an arrow key in the open list chose {chosen:?}");
+            assert!(is_open(&pick), "an arrow key shut the list");
+            target.draw(&mut cx, &root);
+            let keyed = row(&mut cx, &pick, 81);
+            assert!(inside(keyed, menu_rect(&mut cx, &pick)), "the row the key moved to {keyed:?} is not in view");
+            let chosen = send(&mut cx, &root, &pick, &[key(KeyCode::ReturnKey)]);
+            assert_eq!(chosen, vec![81], "Return chose the row the key moved to");
+            assert!(!is_open(&pick), "Return shut the list");
+            target.draw(&mut cx, &root);
+
+            open(&mut cx, &root, &pick, &mut target);
+            let list = menu_rect(&mut cx, &pick);
+            let chosen = row(&mut cx, &pick, 81);
+            assert!(inside(chosen, list), "reopened, the chosen row {chosen:?} is not in the list {list:?}");
+
+            // And back up: a row above the view is brought down into it.
+            pick.borrow_mut::<DropDown>().unwrap().set_closed(&mut cx);
+            pick.as_drop_down().set_selected_item(&mut cx, 3);
+            target.draw(&mut cx, &root);
+            open(&mut cx, &root, &pick, &mut target);
+            let list = menu_rect(&mut cx, &pick);
+            let chosen = row(&mut cx, &pick, 3);
+            assert!(inside(chosen, list), "the chosen row {chosen:?} above the view is not in the list {list:?}");
+        });
+    }
+
+    /// A drag on the scroll bar scrolls the list, though the dropdown holds
+    /// the pointer while its list is open. The press is the bar's: no row
+    /// under it is chosen, and the list stays open.
+    #[test]
+    fn a_drag_on_the_bar_scrolls_a_capped_list() {
+        crate::on_test_cx(|| {
+            let mut cx = crate::checkout_test_cx();
+            let (root, pick, mut target) = page(&mut cx);
+            open(&mut cx, &root, &pick, &mut target);
+            assert!(cx.sweep_lock_area().is_some(), "the open list holds the pointer");
+
+            let bar = menu(&mut cx, &pick, |cx, menu| menu.scroll_bars().bar_areas()[1].rect(cx));
+            assert!(bar.size.x > 0.0 && bar.size.y > 0.0, "no scroll bar was drawn");
+            let from = dvec2(bar.pos.x + bar.size.x * 0.5, bar.pos.y + 5.0);
+            let to = from + dvec2(0.0, 60.0);
+            cx.fingers.first_mouse_button = Some((MouseButton::PRIMARY, WINDOW));
+            let chosen = send(&mut cx, &root, &pick, &[press(from), drag(to), release(to)]);
+            cx.fingers.first_mouse_button = None;
+
+            assert!(chosen.is_empty(), "the drag chose {chosen:?}");
+            assert!(extent(&mut cx, &pick).pos.y > 0.0, "the drag on the bar did not scroll the list");
+            assert!(is_open(&pick), "the drag shut the list");
+            assert!(cx.sweep_lock_area().is_some(), "the list let go of the pointer");
+        });
+    }
+}

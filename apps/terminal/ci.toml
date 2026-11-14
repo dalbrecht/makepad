@@ -1,0 +1,27 @@
+# CI (devhub ci): [ci] is hand-written settings; the other sections are proofs devhub writes.
+
+[app.linux]
+capture = ""
+date = "2026-11-05"
+digest = "f0f852e91372bb9437eb22096aa2d84fb461dcec7f201848ce5c28fa98f14be5"
+main = "bac634fd1103ed3453797a04fb1bdf0dd8a1ba9c"
+work = "7954fb8a65f663048b1ea7dfcbc6e4a8c5d65464"
+
+[app.windows]
+capture = ""
+date = "2026-11-13"
+digest = "6435091e095e8b604acf4a391d71068b71fcdbd1eb91ebc2ec16441b36d38538"
+main = "55cec3ecfa5501e0c1fa8fc2af52c395d491fcf8"
+work = "3f13cc2e91a1af0d9980a807a717a3d54c7debaa"
+
+[job.jit_05.linux]
+date = "2026-11-04"
+digest = "593eb196bb2bcdeed11d0a556635f4bbb8da06d265e5c14cbef37236f192434d"
+main = "5f4597d2fb65f354696542829214d4c6b99c39ab"
+work = "7d8695372c6cd232c174a43ee12e1ee51ba72023"
+
+[tests.linux]
+date = "2026-11-05"
+digest = "deae37a1f71aa8562b170218d499ef4bf86bf888fe561ef321d2bea929ec5cfe"
+main = "71832f8fa1c5a3f6f589b89749c6a99c189e3e8e"
+work = "5300f14ac2c7b3d5aa16bd89d98d789111fbbeb8"

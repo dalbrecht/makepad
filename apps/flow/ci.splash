@@ -1,0 +1,21 @@
+// CI smoke test for apps/flow: the default script, on the targets Flow has. Not the web: it runs
+// its studio and client in-process, and those are native only.
+
+use mod.std.*
+use mod.ci;
+
+ci.step("check other platforms", fn(){
+    ci.check_targets({packages: ["makepad-app-flow"] targets: ["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu", "aarch64-linux-android", "aarch64-apple-ios", "x86_64-linux-android", "aarch64-apple-tvos", "aarch64-apple-tvos-sim", "i686-linux-android", "aarch64-apple-ios-sim", "x86_64-apple-ios", "x86_64-apple-tvos", "x86_64-apple-darwin", "x86_64-pc-windows-gnu"]})
+})
+
+let app = ci.launch({package: "makepad-app-flow" binary: "makepad-app-flow" cwd: "."})
+
+ci.step("comes up", fn(){
+    ci.sleep(3.0)
+    app.no_errors()
+    let shot = app.grab("start")
+    ci.accept(shot, "This is a screenshot of one application window. A thin bright red frame runs around the very edge of the picture; it is the test harness's marker and is not part of the application. Ignore it. The window should show a working application: panels, buttons, text, lists, a canvas, a map, a document or some other user interface. 1. Is the whole picture one flat colour from edge to edge, such as entirely black or entirely white? expected NO 2. Is any user interface visible, such as text labels, buttons, icons, panels, lists, input fields, a toolbar, a drawing or a picture? expected YES 3. Does an error panel cover the window: a large block of text with words such as panic, error, failed, backtrace or unwrap? expected NO")
+})
+
+app.quit()
+nil

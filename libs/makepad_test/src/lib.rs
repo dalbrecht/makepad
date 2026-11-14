@@ -1,16 +1,23 @@
 #![doc = include_str!("../README.md")]
 
+mod app_process;
 mod error;
+#[cfg(all(test, unix))]
+mod fixture;
+mod remote;
 mod runtime;
 mod selector;
-mod studio_remote;
 
+pub use app_process::ShutdownOutcome;
 pub use error::{IntoTestResult, TestError, TestResult};
 pub use makepad_studio_protocol::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, StudioToApp, TextInputEvent, WidgetSnapshot,
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, RemoteKeyModifiers, RemoteMouseDown,
+    RemoteMouseMove, RemoteMouseUp, StudioToApp, TextInputEvent,
 };
 pub use makepad_test_macros::makepad_test;
-pub use runtime::{run_with_config, Locator, TestApp, TestConfig, WidgetMatch};
+pub use remote::{WindowInfo, NodeMatch, UiSnapshot, LogTail};
+pub use makepad_a11y::{Node, NodeId, Rect, Role, States, Actions, Toggle};
+pub use runtime::{run_with_config, Locator, PointerDrag, TestApp, TestConfig};
 pub use selector::Selector;
 
 #[doc(hidden)]

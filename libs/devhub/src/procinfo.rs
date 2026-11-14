@@ -1,0 +1,458 @@
+//! Process and machine numbers for the explorer, read from the OS without asking the process:
+//! `/proc` on Linux and Android, `proc_pidinfo` / `sysctl` on macOS. CPU is a percentage over the time since
+//! the previous sample of the same pid ([`CpuMeter`]).
+
+use std::collections::HashMap;
+use std::time::Instant;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Proc {
+    /// user + system CPU time, ns
+    pub cpu_ns: u64,
+    pub rss_bytes: u64,
+    pub threads: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Machine {
+    pub os: &'static str,
+    pub load1: f64,
+    pub mem_total_mb: u64,
+    pub mem_avail_mb: u64,
+    pub uptime_s: u64,
+    pub cpus: u32,
+    /// battery level 0..=100 and charging (a device: the JIT host's [`set_battery_source`])
+    pub battery: Option<(u32, bool)>,
+}
+
+static BATTERY: std::sync::OnceLock<fn() -> Option<(u32, bool)>> = std::sync::OnceLock::new();
+
+/// A JIT host on a battery device (Android: BatteryManager through the HAL) names where the
+/// battery reading comes from; machines without one report none.
+pub fn set_battery_source(f: fn() -> Option<(u32, bool)>) {
+    let _ = BATTERY.set(f);
+}
+
+/// This machine's numbers, with the battery when a source is set.
+pub fn machine() -> Machine {
+    let mut m = os::machine();
+    m.battery = BATTERY.get().and_then(|f| f());
+    m
+}
+
+/// The memory in use that the kernel cannot hand out without paging out or compressing what holds
+/// it, bytes: Linux and Windows total less available; macOS app memory (anonymous, less purgeable
+/// and reusable), wired and compressed (at its compressed size), as the file cache is not in use.
+/// None: not measured here.
+pub fn in_use() -> Option<u64> {
+    os::in_use()
+}
+
+/// Whether a process has ended, reaping it if it is this process's own child (a child of an
+/// earlier image of this process after an exec is a zombie until then, and `alive` calls a zombie
+/// alive): None while it runs; `Some(code)`, its exit code when it can be known (None: a signal,
+/// or not known). One that is gone and was never this process's child has no exit this process
+/// could know: it was taken for a clean exit, and a bucket gate the restarted master adopted,
+/// killed by the Mac's reboot (11-06), read as exit 0, and a failed run of the landings.
+pub fn exited(pid: u32) -> Option<Option<i32>> {
+    // (`waitpid(0)` would reap any child of the group)
+    if pid == 0 {
+        return None;
+    }
+    // one the inherited-children reaper took: its exit as it was
+    if let Some((code, _)) = REAPED.lock().unwrap().remove(&pid) {
+        return Some(code);
+    }
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+        }
+        const WNOHANG: i32 = 1;
+        let mut st = 0i32;
+        match unsafe { waitpid(pid as i32, &mut st, WNOHANG) } {
+            r if r == pid as i32 => {
+                INHERITED.lock().unwrap().retain(|p| *p != pid);
+                return Some((st & 0x7f == 0).then_some((st >> 8) & 0xff));
+            }
+            // a child of this process that runs: the inherited reaper keeps it until it ends (a show
+            // a restarted master followed by its pid stayed a zombie once `--replace` ended it: this
+            // call had dropped it from the reaper's list while it ran, 11-03)
+            0 => return None,
+            _ => {}
+        }
+    }
+    let gone = !alive(pid);
+    #[cfg(unix)]
+    if gone {
+        INHERITED.lock().unwrap().retain(|p| *p != pid);
+    }
+    gone.then_some(None)
+}
+
+/// Children of an earlier image of this process (an exec restart keeps the pid and its children,
+/// but not the `Child` handles that would have waited for them).
+#[cfg(unix)]
+static INHERITED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+/// Exits of inherited children the reaper took, for [`exited`] to answer from (for 10 min: then
+/// the pid may be another process's).
+static REAPED: std::sync::LazyLock<std::sync::Mutex<HashMap<u32, (Option<i32>, Instant)>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Reaps the children this process inherited from the image before its last exec as they end
+/// (each ended one was a zombie for the process's life: the git, cargo and lease children that
+/// ran when the master restarted). Called first thing, before this image starts any child: only
+/// the pids listed now are ever waited for, so a `Child` of this image is never reaped here.
+pub fn reap_inherited() {
+    #[cfg(unix)]
+    {
+        let me = std::process::id();
+        let Ok(child) = std::process::Command::new("ps").args(["-axo", "pid=,ppid="]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn() else { return };
+        let ps = child.id();
+        let Ok(out) = child.wait_with_output() else { return };
+        let pids: Vec<u32> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let (pid, ppid) = (w.next()?.parse::<u32>().ok()?, w.next()?.parse::<u32>().ok()?);
+            (ppid == me && pid != ps).then_some(pid)
+        }).collect();
+        if pids.is_empty() {
+            return;
+        }
+        *INHERITED.lock().unwrap() = pids;
+        let _ = std::thread::Builder::new().name("devhub-reap".into()).spawn(|| loop {
+            extern "C" {
+                fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+            }
+            const WNOHANG: i32 = 1;
+            {
+                let mut inherited = INHERITED.lock().unwrap();
+                inherited.retain(|&pid| {
+                    let mut st = 0i32;
+                    match unsafe { waitpid(pid as i32, &mut st, WNOHANG) } {
+                        0 => true,
+                        r if r == pid as i32 => {
+                            REAPED.lock().unwrap().insert(pid, ((st & 0x7f == 0).then_some((st >> 8) & 0xff), Instant::now()));
+                            false
+                        }
+                        // not (or no longer) a child: someone else reaped it
+                        _ => false,
+                    }
+                });
+                REAPED.lock().unwrap().retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(600));
+                if inherited.is_empty() && REAPED.lock().unwrap().is_empty() {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        });
+    }
+}
+
+pub fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // a zombie answers the signal: an ended show stayed "running" while it waited for a reap (11-03)
+        unsafe { kill(pid as i32, 0) == 0 && !crate::os::zombie(pid) }
+    }
+    #[cfg(not(unix))]
+    {
+        crate::os::pid_alive(pid)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod os {
+    use super::*;
+
+    fn clk_tck() -> u64 {
+        extern "C" {
+            fn sysconf(name: i32) -> i64;
+        }
+        // _SC_CLK_TCK = 2 on Linux
+        let t = unsafe { sysconf(2) };
+        if t > 0 { t as u64 } else { 100 }
+    }
+
+    pub fn proc(pid: u32) -> Option<Proc> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // fields after the parenthesised command name (which may hold spaces)
+        let rest = &stat[stat.rfind(')')? + 2..];
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        // rest[0] is field 3 (state): utime = 14, stime = 15, num_threads = 20, rss pages = 24
+        let utime: u64 = f.get(11)?.parse().ok()?;
+        let stime: u64 = f.get(12)?.parse().ok()?;
+        let threads: u32 = f.get(17)?.parse().ok()?;
+        let rss_pages: u64 = f.get(21)?.parse().ok()?;
+        let tck = clk_tck();
+        Some(Proc { cpu_ns: (utime + stime) * 1_000_000_000 / tck, rss_bytes: rss_pages * 4096, threads })
+    }
+
+    pub fn machine() -> Machine {
+        let mut m = Machine { os: if cfg!(target_os = "android") { "android" } else { "linux" }, ..Machine::default() };
+        if let Ok(l) = std::fs::read_to_string("/proc/loadavg") {
+            m.load1 = l.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        }
+        if let Ok(t) = std::fs::read_to_string("/proc/meminfo") {
+            for line in t.lines() {
+                let kb = || line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) / 1024;
+                if line.starts_with("MemTotal:") {
+                    m.mem_total_mb = kb();
+                } else if line.starts_with("MemAvailable:") {
+                    m.mem_avail_mb = kb();
+                }
+            }
+        }
+        if let Ok(u) = std::fs::read_to_string("/proc/uptime") {
+            m.uptime_s = u.split_whitespace().next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) as u64;
+        } else {
+            // an Android app may not read /proc/uptime (nor /proc/loadavg: its load stays 0)
+            #[repr(C)]
+            struct Timespec {
+                sec: i64,
+                nsec: i64,
+            }
+            extern "C" {
+                fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+            }
+            let mut ts = Timespec { sec: 0, nsec: 0 };
+            // CLOCK_BOOTTIME
+            if unsafe { clock_gettime(7, &mut ts) } == 0 {
+                m.uptime_s = ts.sec.max(0) as u64;
+            }
+        }
+        m.cpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+        m
+    }
+
+    pub fn in_use() -> Option<u64> {
+        let t = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb = |key: &str| t.lines().find(|l| l.starts_with(key)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok());
+        Some(kb("MemTotal:")?.saturating_sub(kb("MemAvailable:")?) * 1024)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod os {
+    use super::*;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcTaskInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        total_user: u64,
+        total_system: u64,
+        threads_user: u64,
+        threads_system: u64,
+        policy: i32,
+        faults: i32,
+        pageins: i32,
+        cow_faults: i32,
+        messages_sent: i32,
+        messages_received: i32,
+        syscalls_mach: i32,
+        syscalls_unix: i32,
+        csw: i32,
+        threadnum: i32,
+        numrunning: i32,
+        priority: i32,
+    }
+
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+
+    extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut core::ffi::c_void, size: i32) -> i32;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+        fn sysctlbyname(name: *const u8, oldp: *mut core::ffi::c_void, oldlenp: *mut usize, newp: *mut core::ffi::c_void, newlen: usize) -> i32;
+        fn getloadavg(loads: *mut f64, n: i32) -> i32;
+        fn mach_host_self() -> u32;
+        fn host_statistics64(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
+    }
+
+    /// `vm_statistics64` (mach/vm_statistics.h), the fields the measure reads; 38 `integer_t`s.
+    #[repr(C, align(8))]
+    #[derive(Default)]
+    #[allow(dead_code)] // the C layout: every field is there so the kernel's writes land in place
+    pub(super) struct VmStats64 {
+        free_count: u32,
+        active_count: u32,
+        inactive_count: u32,
+        wire_count: u32,
+        counters: [u64; 9],
+        purgeable_count: u32,
+        speculative_count: u32,
+        counters2: [u64; 4],
+        compressor_page_count: u32,
+        throttled_count: u32,
+        external_page_count: u32,
+        internal_page_count: u32,
+        total_uncompressed_pages_in_compressor: u64,
+    }
+
+    const HOST_VM_INFO64: i32 = 4;
+
+    /// Available pages: free + inactive (clean file cache the kernel reclaims first) + speculative
+    /// + purgeable. Counting only free (+ speculative, purgeable) read a Mac whose RAM is file cache
+    /// and compressed memory as full ("ram 15.7/16 GB used", every lease on it "node busy" 10-30).
+    fn available_pages() -> Option<u64> {
+        let mut v = VmStats64::default();
+        let mut count = (std::mem::size_of::<VmStats64>() / 4) as u32;
+        if unsafe { host_statistics64(mach_host_self(), HOST_VM_INFO64, &mut v as *mut _ as *mut i32, &mut count) } != 0 {
+            return None;
+        }
+        Some(v.free_count as u64 + v.inactive_count as u64 + v.speculative_count as u64 + v.purgeable_count as u64)
+    }
+
+    pub fn in_use() -> Option<u64> {
+        let mut v = VmStats64::default();
+        let mut count = (std::mem::size_of::<VmStats64>() / 4) as u32;
+        if unsafe { host_statistics64(mach_host_self(), HOST_VM_INFO64, &mut v as *mut _ as *mut i32, &mut count) } != 0 {
+            return None;
+        }
+        // reusable: pages malloc freed (`MADV_FREE_REUSABLE`), still anonymous and resident until
+        // the kernel takes them, which it does before it compresses anything; 1.2 GB of an idle
+        // 16 GB Mac's 6.6 GB "residents" (11-04)
+        let reusable = sysctl_u64("vm.page_reusable_count");
+        let app = (v.internal_page_count as u64).saturating_sub(v.purgeable_count as u64 + reusable);
+        Some((app + v.wire_count as u64 + v.compressor_page_count as u64) * sysctl_u64("hw.pagesize").max(4096))
+    }
+
+    const PROC_PIDTASKINFO: i32 = 4;
+
+    pub fn proc(pid: u32) -> Option<Proc> {
+        let mut info = ProcTaskInfo::default();
+        let size = std::mem::size_of::<ProcTaskInfo>() as i32;
+        if unsafe { proc_pidinfo(pid as i32, PROC_PIDTASKINFO, 0, &mut info as *mut _ as *mut _, size) } != size {
+            return None;
+        }
+        // task times are mach absolute-time units on Apple silicon
+        let mut tb = Timebase { numer: 1, denom: 1 };
+        unsafe { mach_timebase_info(&mut tb) };
+        let ticks = info.total_user + info.total_system;
+        let cpu_ns = (ticks as u128 * tb.numer as u128 / tb.denom.max(1) as u128) as u64;
+        Some(Proc { cpu_ns, rss_bytes: info.resident_size, threads: info.threadnum.max(0) as u32 })
+    }
+
+    fn sysctl_u64(name: &str) -> u64 {
+        let name = format!("{name}\0");
+        let mut v = 0u64;
+        let mut len = std::mem::size_of::<u64>();
+        if unsafe { sysctlbyname(name.as_ptr(), &mut v as *mut _ as *mut _, &mut len, std::ptr::null_mut(), 0) } != 0 {
+            return 0;
+        }
+        v
+    }
+
+    pub fn machine() -> Machine {
+        let mut load = [0f64; 3];
+        unsafe { getloadavg(load.as_mut_ptr(), 3) };
+        let total = sysctl_u64("hw.memsize") >> 20;
+        // memory the kernel hands out without paging anything in use ([`available_pages`])
+        let page = sysctl_u64("hw.pagesize").max(4096);
+        let avail = (available_pages().unwrap_or(0) * page >> 20).min(total);
+        Machine { os: "macos", load1: load[0], mem_total_mb: total, mem_avail_mb: avail, uptime_s: 0, cpus: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1), battery: None }
+    }
+}
+
+#[cfg(windows)]
+mod os {
+    use super::*;
+    pub fn proc(pid: u32) -> Option<Proc> {
+        let (cpu_ns, rss_bytes) = crate::os::proc_numbers(pid)?;
+        let threads = crate::os::processes().into_iter().find(|p| p.0 == pid).map_or(1, |p| p.2);
+        Some(Proc { cpu_ns, rss_bytes, threads })
+    }
+    pub fn machine() -> Machine {
+        let (total, avail) = crate::os::memory();
+        Machine { os: "windows", load1: 0.0, mem_total_mb: total >> 20, mem_avail_mb: avail >> 20, uptime_s: crate::os::uptime_s(), cpus: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1), battery: None }
+    }
+    pub fn in_use() -> Option<u64> {
+        let (total, avail) = crate::os::memory();
+        (total > 0).then(|| total.saturating_sub(avail))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+mod os {
+    use super::*;
+    pub fn proc(_pid: u32) -> Option<Proc> {
+        None
+    }
+    pub fn machine() -> Machine {
+        Machine { os: std::env::consts::OS, ..Machine::default() }
+    }
+    pub fn in_use() -> Option<u64> {
+        None
+    }
+}
+
+pub use os::proc;
+
+/// CPU % per pid between samples (the hub samples every couple of seconds; readers take the
+/// last rate).
+#[derive(Default)]
+pub struct CpuMeter {
+    last: HashMap<u32, (Instant, u64)>,
+    rate: HashMap<u32, f64>,
+}
+
+impl CpuMeter {
+    /// The pid's numbers and its CPU % since the previous call for it (`None` the first time).
+    pub fn sample(&mut self, pid: u32) -> Option<(Proc, Option<f64>)> {
+        let p = proc(pid)?;
+        let now = Instant::now();
+        let pct = self.last.get(&pid).and_then(|(t, ns)| {
+            let wall = now.duration_since(*t).as_nanos() as f64;
+            (wall > 1e7).then(|| p.cpu_ns.saturating_sub(*ns) as f64 * 100.0 / wall)
+        });
+        self.last.insert(pid, (now, p.cpu_ns));
+        if let Some(r) = pct {
+            self.rate.insert(pid, r);
+        }
+        Some((p, pct))
+    }
+
+    /// The rate the last two samples measured.
+    pub fn rate(&self, pid: u32) -> Option<f64> {
+        self.rate.get(&pid).copied()
+    }
+
+    pub fn forget(&mut self, keep: &dyn Fn(u32) -> bool) {
+        self.last.retain(|pid, _| keep(*pid));
+        self.rate.retain(|pid, _| keep(*pid));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn this_process_is_measured() {
+        let p = super::proc(std::process::id());
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            let p = p.unwrap();
+            assert!(p.rss_bytes > 0 && p.threads >= 1);
+        }
+        assert!(super::alive(std::process::id()));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    /// `vm_statistics64` is 38 `integer_t`s (HOST_VM_INFO64_COUNT), and the measure reads a sane
+    /// share of the RAM: some memory is always free or cache, never more than the machine has.
+    #[test]
+    fn available_memory_is_free_plus_cache() {
+        assert_eq!(std::mem::size_of::<super::os::VmStats64>(), 38 * 4);
+        let m = super::machine();
+        assert!(m.mem_avail_mb > 0 && m.mem_avail_mb <= m.mem_total_mb, "{} of {} MB", m.mem_avail_mb, m.mem_total_mb);
+        // in use: the kernel's wired pages at least, never more than the machine has
+        let used = super::in_use().unwrap() >> 20;
+        assert!(used > 0 && used <= m.mem_total_mb, "in use {used} of {} MB", m.mem_total_mb);
+    }
+}

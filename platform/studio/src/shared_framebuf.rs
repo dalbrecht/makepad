@@ -2,6 +2,11 @@ use makepad_micro_serde::*;
 
 pub const SWAPCHAIN_IMAGE_COUNT: usize = match () {
     _ if cfg!(target_os = "linux") => 3,
+    // Android children draw into the host's AHardwareBuffers with no fence
+    // between the processes: a third image keeps the one being written two
+    // frames away from the one the desk samples (run_view paces the child
+    // to one frame per desk paint).
+    _ if cfg!(target_os = "android") => 3,
     _ if cfg!(target_os = "macos") => 1,
     _ if cfg!(target_os = "windows") => 2,
     _ => 2,
@@ -36,7 +41,7 @@ impl PresentableImageId {
     }
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct DrmFormat {
     pub fourcc: u32,
@@ -75,13 +80,13 @@ pub struct SharedSwapchain {
     pub presentable_images: [SharedPresentableImage; SWAPCHAIN_IMAGE_COUNT],
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct AuxChannedImageFd {
     pub _private: Option<u32>,
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct LinuxSharedImagePlane {
     pub dma_buf_fd: AuxChannedImageFd,
@@ -89,21 +94,36 @@ pub struct LinuxSharedImagePlane {
     pub stride: u32,
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
+pub struct LinuxVulkanSharedImage {
+    pub allocation_size: u64,
+    pub memory_type_index: u32,
+    pub device_uuid: [u8; 16],
+    pub driver_uuid: [u8; 16],
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct LinuxSharedImage {
     pub drm_format: DrmFormat,
     pub plane: LinuxSharedImagePlane,
+    /// OPAQUE_FD image memory and a second auxiliary timeline semaphore FD.
+    /// None selects DMA-BUF image memory.
+    pub vulkan: Option<LinuxVulkanSharedImage>,
+    /// DMA-BUF memory followed by an OPAQUE_FD timeline semaphore on the auxiliary
+    /// channel. Separate from `vulkan`, whose image memory is OPAQUE_FD.
+    pub dma_buf_timeline: bool,
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct SharedPresentableImage {
     pub id: PresentableImageId,
     pub image: LinuxSharedImage,
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct SharedSwapchain {
     pub window_id: usize,
@@ -112,22 +132,14 @@ pub struct SharedSwapchain {
     pub presentable_images: [SharedPresentableImage; SWAPCHAIN_IMAGE_COUNT],
 }
 
-#[cfg(not(any(
-    all(target_os = "linux", not(target_env = "ohos")),
-    target_os = "macos",
-    target_os = "windows"
-)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct SharedPresentableImage {
     pub id: PresentableImageId,
     pub _dummy: Option<u32>,
 }
 
-#[cfg(not(any(
-    all(target_os = "linux", not(target_env = "ohos")),
-    target_os = "macos",
-    target_os = "windows"
-)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct SharedSwapchain {
     pub window_id: usize,
@@ -145,4 +157,8 @@ pub struct PresentableDraw {
     pub target_id: PresentableImageId,
     pub width: u32,
     pub height: u32,
+    /// Odd Vulkan timeline value identifying this completed frame; zero for
+    /// transports without an explicit image lease.
+    pub sequence: u64,
 }
+

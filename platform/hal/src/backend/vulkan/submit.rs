@@ -1,0 +1,1021 @@
+//! One command buffer per frame (plus independent upload/readback batches). The submission
+//! worker owns queue access; a separate completion worker waits fences and reads timestamps.
+
+use super::device::{error, lock, Device, Worker};
+use super::pipeline::{Pipeline, RenderPass};
+use super::resources::{buffer_usage, Buffer, Image};
+use super::surface::{Present, Shown};
+use crate::font::FrameProgress;
+use crate::types::*;
+use makepad_vulkan::vk;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[derive(Clone)]
+pub(super) struct Token { pub sid: u32, pub incarnation: Arc<FrameProgress> }
+pub(super) enum Event {
+    #[cfg(target_os = "linux")]
+    Capture { window: Id, surface: Arc<crate::backend::linux::media::capture_surface::Surface> },
+    Presented { target: Id, frame: u64 },
+    /// `gpu_span`: the frame's first and last timestamps in seconds of the device's clock (the
+    /// frame timer orders a frame's passes by it). `ran`: the GPU did the frame's work.
+    Frame { target: Id, kind: u32, frame: u64, window: bool, gpu_ns: u64, gpu_span: [f64; 2], ran: bool },
+    DispatchTime { name: String, gpu_ns: u64 },
+    BufferLeases { req: u32, status: u32, leases: Vec<crate::lease::Lease> },
+    Readback { req: u32, status: u32, rect: [u32; 4], lease: Option<crate::lease::Lease> },
+    Shared { id: Id, handle: u64 },
+}
+pub(super) struct Done { pub token: Token, pub time: u64, pub event: Event }
+
+#[derive(Clone)]
+pub(super) struct Mailbox { events: Arc<Mutex<Vec<Done>>>, pub notify: crate::backend::SessionNotify }
+impl Mailbox {
+    pub fn new(notify: crate::backend::SessionNotify) -> Self { Self { events: Arc::new(Mutex::new(Vec::new())), notify } }
+    /// A completion for its session: that session's pump looks (and drains every completion).
+    pub fn push(&self, token: Token, event: Event) {
+        let sid = token.sid;
+        let window = match &event { Event::Frame { kind, .. } => crate::backend::window_frame(*kind), Event::Presented { .. } => true, _ => false };
+        lock(&self.events).push(Done { token, event, time: crate::clock_ns() }); (self.notify)(sid, window);
+    }
+    pub fn take(&self) -> Vec<Done> { std::mem::take(&mut *lock(&self.events)) }
+}
+
+pub(super) enum Ticket {
+    BufferLeases { token: Token, req: u32, ranges: Vec<(Arc<Buffer>, u64, u64, crate::lease::Lease)> },
+    #[cfg(target_os = "linux")]
+    Capture { token: Token, window: Id, size: [u32;2], format: u32, buffer: Arc<Buffer> },
+    Frame { token: Token, target: Id, kind: u32, frame: u64, window: bool },
+    Read { token: Token, req: u32, rect: [u32; 4], format: u32, staging: Arc<Buffer>, stencil: Option<Arc<Buffer>> },
+    Shared { token: Token, id: Id, handle: u64 },
+    Copy { token: Token, req: u32, rect: [u32; 4] },
+    Host { reply: std::sync::mpsc::SyncSender<Option<crate::backend::Pixels>>, image: Arc<Image>, staging: Arc<Buffer> },
+    /// Frame capture: a texture's storage, every level and layer (`Gpu::capture_texture`).
+    FrameCap { staging: Arc<Buffer>, len: usize, done: Box<dyn FnOnce(Option<Vec<u8>>) + Send> },
+}
+
+/// How a batch ended: its work ran, it was never submitted (its recording or presentation
+/// failed for a reason other than a lost device: its frame is dropped, the device lives on), or
+/// the driver lost the device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outcome { Ran, Dropped, Lost }
+
+/// How long a submission or fence wait that ran out of memory waits before it tries again (the
+/// host has been asked for room, `Device::starved`). The queue keeps its order meanwhile.
+const MEMORY_RETRY: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Out of host or device memory: a submission or wait that may succeed once there is room.
+fn out_of_memory(e: vk::Result) -> bool {
+    matches!(e, vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+}
+
+/// A driver call answered VK_ERROR_DEVICE_LOST (as formatted by `device::error`).
+pub(super) fn lost_error(e: &str) -> bool { e.contains("ERROR_DEVICE_LOST") }
+
+/// How often a frame that found no free swapchain image tries again, and how many tries it gets
+/// (about one second) before it completes unshown.
+const SHOW_RETRY: std::time::Duration = std::time::Duration::from_millis(8);
+const SHOW_TRIES: u32 = 125;
+/// The completion worker waits for a batch's fence in slices of this long, and says once what a
+/// batch still unfinished after FENCE_STALL_SAY waits on (the wait itself never gives up).
+const FENCE_SLICE_NS: u64 = 250_000_000;
+const FENCE_STALL_SAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The Vulkan objects of a finished batch, reset for the next one. A command pool, fence and
+/// timestamp pool made and destroyed per batch cost about a millisecond each way (NVIDIA); a
+/// page of live effects submits dozens of target frames a beat.
+pub(super) struct Slot {
+    dev: Arc<Device>,
+    pool: vk::CommandPool,
+    cb: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// the timestamp pool and how many queries it holds (a profiled frame's batch grew it)
+    query: (vk::QueryPool, u32),
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) { unsafe {
+        if self.query.0 != vk::QueryPool::null() { self.dev.raw.destroy_query_pool(self.query.0, None); }
+        self.dev.raw.destroy_fence(self.fence, None);
+        self.dev.raw.destroy_command_pool(self.pool, None);
+    } }
+}
+
+/// What one backend's finished batches leave for the next ones: the reset slots and the upload
+/// arenas no batch holds. Shared with its batches in flight (each returns its own).
+///
+/// Nothing here waits: a session's event loop bounds its beats by its frames on the GPU
+/// (`FRAMES_IN_FLIGHT`, every path that beats), so the batches in flight are those of a couple
+/// of beats per session, however many target frames a beat has. Unbounded, a submit worker
+/// slower than the renderer queued seconds of frames, each batch on a fresh slot, descriptor
+/// pools and arena (a phone: 1,439 slots made in 27 s). A wait for room here bounded that by
+/// holding the UI thread inside its submit, under the HAL's state lock, for the GPU to finish
+/// the same beat's earlier batches (17 to 19 batches a beat against 8 allowed: a beat of 75 ms
+/// of GPU work held its UI thread 75 ms in the submit, and every other session's submit and
+/// pump with it).
+#[derive(Default)]
+pub(super) struct Spare {
+    slots: Mutex<Vec<Slot>>,
+    arenas: Mutex<Arenas>,
+    /// readback staging (CPU-cached, `readback::STAGING`) whose readback was read: the next
+    /// readback takes one back instead of allocating on the submitting thread (a 3.9 MB one took
+    /// 1 to 4 ms there on NVIDIA, up to 44 ms on a loaded machine, every band of a page export)
+    readbacks: Mutex<Arenas>,
+    /// batches made and not yet dropped (completed or abandoned)
+    in_flight: AtomicUsize,
+    /// the most batches in flight at once since the last sweep (`sweep_slots`), and in the sweep
+    /// interval before it: finished batches keep their slots while the slots alive stay within
+    /// the larger, so steady beats reuse every slot and a burst's extra slots go two sweeps on
+    peak: AtomicUsize,
+    last_peak: AtomicUsize,
+    /// an arena is being made ahead (`make_ahead`)
+    ahead: AtomicBool,
+    /// the thread that makes arenas ahead, started with the first one (`None`: it could not start,
+    /// submits make their arenas)
+    maker: OnceLock<Option<Worker>>,
+}
+pub(super) type Spares = Arc<Spare>;
+
+impl Spare {
+    /// Command buffer slots alive: the batches in flight and the reset ones kept for reuse
+    /// (each with its command and timestamp pools).
+    pub fn slots(&self) -> u64 {
+        (self.in_flight() + lock(&self.slots).len()) as u64
+    }
+
+    /// Batches made and not yet dropped.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// The slots kept for reuse: as many as were alive at the busiest moment of this sweep
+    /// interval or the last one.
+    fn slots_wanted(&self) -> usize {
+        self.peak.load(Ordering::Acquire).max(self.last_peak.load(Ordering::Acquire))
+    }
+
+    /// A sweep (`Vulkan::sweep`): the peak of the interval that ended becomes the last one, and
+    /// spare slots beyond what both intervals needed are destroyed.
+    pub fn sweep_slots(&self) {
+        let now = self.in_flight();
+        self.last_peak.store(self.peak.swap(now, Ordering::AcqRel), Ordering::Release);
+        let keep = self.slots_wanted().saturating_sub(now);
+        let gone: Vec<Slot> = {
+            let mut slots = lock(&self.slots);
+            let n = slots.len().saturating_sub(keep);
+            slots.drain(..n).collect()
+        };
+        drop(gone);
+    }
+
+    /// Releases the free arenas no batch took for `ARENA_IDLE` (an idle app frees its uploads).
+    pub fn trim(&self) {
+        let released = lock(&self.arenas).give(std::iter::empty());
+        let staging = lock(&self.readbacks).give(std::iter::empty());
+        drop((released, staging));
+    }
+
+    /// When `trim` should look again (HAL clock ns): a free arena going idle, or the one a batch took
+    /// last, since a batch with no frame gives its arenas back without waking any pump.
+    pub fn trim_due(&self) -> Option<u64> {
+        let now = crate::clock_ns();
+        let due = |arenas: &Arenas| arenas.free.iter().map(|(_, since)| now.saturating_sub(since.elapsed().as_nanos() as u64)).chain(arenas.lent).min();
+        let (uploads, staging) = (due(&lock(&self.arenas)), due(&lock(&self.readbacks)));
+        uploads.into_iter().chain(staging).min().map(|since| since + ARENA_IDLE.as_nanos() as u64)
+    }
+
+    /// A readback's staging of at least `size` bytes: one a read readback gave back, else a new one.
+    pub fn readback_staging(&self, dev: &Arc<Device>, size: u64) -> Result<Arc<Buffer>, String> {
+        let kept = lock(&self.readbacks).take(size, size);
+        match kept {
+            Some(staging) => Ok(staging),
+            None => Buffer::scratch(dev.clone(), crate::ledger::Pool::Staging, size, super::readback::STAGING),
+        }
+    }
+
+    /// A readback's staging after its pixels were read: kept for the next readback (released once
+    /// idle for `ARENA_IDLE`, or beyond `ARENA_KEEP`).
+    fn readback_read(&self, staging: Arc<Buffer>) {
+        let released = lock(&self.readbacks).give(std::iter::once(staging));
+        drop(released);
+    }
+
+    /// Releases every free arena now (the app went to the background).
+    #[cfg(target_os = "android")]
+    pub fn release_all(&self) {
+        let released = lock(&self.arenas).release_all();
+        let staging = lock(&self.readbacks).release_all();
+        drop((released, staging));
+    }
+
+    /// Makes a free arena of `size` on the arena thread, unless one is already on its way: the
+    /// batch that took the pool's last arena of a size leaves the next one to that thread instead
+    /// of to a later submit (making an 8 MiB arena took 1.4 ms on NVIDIA, a 32 MiB one 5.3 ms).
+    fn make_ahead(self: &Arc<Self>, dev: &Arc<Device>, size: u64) {
+        if self.ahead.swap(true, Ordering::AcqRel) { return; }
+        let maker = self.maker.get_or_init(|| Worker::new("makepad-vulkan-arenas")
+            .map_err(|e| eprintln!("[hal-vulkan] no arena thread ({e}): submits make their upload arenas")).ok());
+        // without the thread `ahead` stays set: nothing is made ahead
+        let Some(maker) = maker else { return };
+        let (spare, dev) = (self.clone(), dev.clone());
+        maker.push(move || {
+            // out of memory: no spare (a submit that needs one asks for room)
+            if let Ok(arena) = Buffer::scratch(dev, crate::ledger::Pool::UploadArena, size, buffer_usage()) {
+                crate::profile::count("upload arena made ahead");
+                let released = lock(&spare.arenas).give(std::iter::once(arena));
+                drop(released);
+            }
+            spare.ahead.store(false, Ordering::Release);
+        });
+    }
+}
+
+/// The smallest upload arena; arenas grow by powers of two up to `ARENA_MAX`.
+const ARENA_MIN: u64 = 256 * 1024;
+/// The largest arena a batch asks for: a frame with more upload bytes spreads them over several
+/// arenas, and so does a texture region (`put_rows`). Only an upload that stays whole (inline
+/// instances, a single texture row) and is larger than this gets an arena of its own size.
+const ARENA_MAX: u64 = 8 << 20;
+/// Free arena bytes kept for the next batches; beyond it the largest free arenas are released.
+const ARENA_KEEP: u64 = 64 << 20;
+/// A free arena no batch took for this long is released (the upload volume went down).
+const ARENA_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The size of a new arena for `need` bytes: a power of two in [ARENA_MIN, ARENA_MAX], or a
+/// single upload larger than ARENA_MAX rounded up to whole ARENA_MIN.
+fn arena_size(need: u64) -> u64 {
+    if need > ARENA_MAX { need.div_ceil(ARENA_MIN) * ARENA_MIN } else { need.next_power_of_two().clamp(ARENA_MIN, ARENA_MAX) }
+}
+
+/// Upload arenas (host-visible buffers for uniforms, inline instances and upload staging) whose
+/// batch's fence signalled. A batch takes them back instead of allocating: making one costs a
+/// vkAllocateMemory + map (NVIDIA: milliseconds for megabytes), and frames with more upload bytes
+/// than the old one-small-spare-per-slot made one every frame.
+#[derive(Default)]
+struct Arenas {
+    free: Vec<(Arc<Buffer>, std::time::Instant)>,
+    bytes: u64,
+    /// when a batch last took one or made its own (HAL clock ns), until `ARENA_IDLE` after
+    lent: Option<u64>,
+}
+
+impl Arenas {
+    /// A batch took an arena within `ARENA_IDLE`: the uploads are going on (a batch that finds no
+    /// arena now is growing the pool, not waking an idle app).
+    fn in_use(&self) -> bool {
+        self.lent.is_some_and(|lent| crate::clock_ns().saturating_sub(lent) <= ARENA_IDLE.as_nanos() as u64)
+    }
+
+    /// A free arena of at least `want` bytes.
+    fn holds(&self, want: u64) -> bool {
+        self.free.iter().any(|(arena, _)| arena.size >= want)
+    }
+
+    /// The smallest free arena of at least `want` bytes, else the largest that holds `len`.
+    fn take(&mut self, want: u64, len: u64) -> Option<Arc<Buffer>> {
+        self.lent = Some(crate::clock_ns());
+        let fits = |min: u64| self.free.iter().enumerate().filter(move |(_, (a, _))| a.size >= min);
+        let i = fits(want).min_by_key(|(_, (a, _))| a.size).or_else(|| fits(len).max_by_key(|(_, (a, _))| a.size)).map(|(i, _)| i)?;
+        let (arena, _) = self.free.swap_remove(i);
+        self.bytes -= arena.bytes;
+        Some(arena)
+    }
+
+    /// Every free arena, to release (the device ran out of memory for a new one).
+    fn release_all(&mut self) -> Vec<Arc<Buffer>> {
+        self.bytes = 0;
+        self.free.drain(..).map(|(arena, _)| arena).collect()
+    }
+
+    /// Takes back a finished batch's arenas; returns those to release (idle ones, then the
+    /// largest while over ARENA_KEEP) for the caller to free outside the lock.
+    fn give(&mut self, arenas: impl Iterator<Item = Arc<Buffer>>) -> Vec<Arc<Buffer>> {
+        let now = std::time::Instant::now();
+        for arena in arenas { self.bytes += arena.bytes; self.free.push((arena, now)); }
+        let mut released = Vec::new();
+        let mut i = 0;
+        while i < self.free.len() {
+            if now.duration_since(self.free[i].1) > ARENA_IDLE {
+                let (arena, _) = self.free.swap_remove(i);
+                self.bytes -= arena.bytes; released.push(arena);
+            } else { i += 1; }
+        }
+        while self.bytes > ARENA_KEEP {
+            let Some(i) = self.free.iter().enumerate().max_by_key(|(_, (a, _))| a.size).map(|(i, _)| i) else { break };
+            let (arena, _) = self.free.swap_remove(i);
+            self.bytes -= arena.bytes; released.push(arena);
+        }
+        self.lent = self.lent.filter(|lent| crate::clock_ns().saturating_sub(*lent) <= ARENA_IDLE.as_nanos() as u64);
+        released
+    }
+}
+
+/// Where an upload landed (`Batch::put`): its arena (the buffer, its size and its serial) and
+/// the byte offset.
+#[derive(Clone, Copy)]
+pub(super) struct Placed { pub buffer: vk::Buffer, pub size: u64, pub serial: u64, pub at: u64 }
+impl Placed { const NONE: Self = Self { buffer: vk::Buffer::null(), size: 0, serial: 0, at: 0 }; }
+
+pub(super) struct Batch {
+    pub dev: Arc<Device>,
+    spares: Spares,
+    /// Set once the GPU finished with this batch: its objects may be reset and reused.
+    reusable: bool,
+    pool: vk::CommandPool,
+    pub cb: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// The timestamp pool this batch writes and its size in queries.
+    query: (vk::QueryPool, u32),
+    /// The slot's timestamp pool when this batch writes no timestamps (kept for the next one).
+    idle_query: (vk::QueryPool, u32),
+    /// The GPU profiler's timed passes when this batch encodes a recorded frame.
+    pub prof: Option<super::prof::BatchProf>,
+    /// The recorded frame this batch presents (its display time goes to the profiler).
+    pub prof_key: Option<crate::gpu_prof::FrameKey>,
+    pub dispatch_query: u32,
+    pub dispatch_times: Vec<(Token, String, u32)>,
+    pub images: Vec<Arc<Image>>,
+    pub buffers: Vec<Arc<Buffer>>,
+    pub pipelines: Vec<Arc<Pipeline>>,
+    pub compute_pipelines: Vec<Arc<super::compute::Program>>,
+    pub compute_descriptors: Vec<super::compute::Descriptors>,
+    pub passes: Vec<Arc<RenderPass>>,
+    pub framebuffers: Vec<vk::Framebuffer>,
+    /// The kept descriptor sets' pools this batch bound sets of (`sets::KeptSets::set`): they go
+    /// once the GPU is done with it.
+    pub generations: Vec<Arc<super::sets::Generation>>,
+    pub tickets: Vec<Ticket>,
+    pub scanout: Option<(Arc<dyn super::surface::FramePresenter>, Arc<Image>, Token, u32, Id, Id, u32, u64)>,
+    pub present: Option<Present>,
+    #[cfg(target_os = "android")]
+    pub native_frame: Option<(crate::backend::android::native_layer::Frame, Option<Arc<super::share::sync::Semaphore>>)>,
+    #[cfg(target_os = "android")]
+    native_signal: Option<Arc<super::share::sync::Semaphore>>,
+    /// The frame image a frame tap gets after the fence (`crate::frame_tap::offer`): its
+    /// window as the core presents it (session, window) and an image nothing writes while held.
+    pub tap: Option<(u32, Id, Arc<Image>)>,
+    /// the arena being filled and its used bytes
+    arena: Option<(Arc<Buffer>, u64)>,
+    arenas: Vec<Arc<Buffer>>,
+    /// the upload bytes this batch still expects (the frame's uniforms and inline instances):
+    /// sizes the next arena it needs
+    reserve: u64,
+    /// arenas this batch had to allocate (none in steady frames): the frame stats' `arena_allocs`
+    pub allocs: u64,
+    /// arenas this batch made while the pool was in use (no spare was ready), their bytes and the
+    /// time it took: said once at `finish`
+    grew: (u64, u64, u64),
+    /// The uniform blocks this pass already uploaded, per binding role (`put_block`).
+    blocks: [(usize, usize, Placed); 8],
+    /// The pick block this pass uploaded last (`put_pick`).
+    pick_block: Option<([u8; 16], Placed)>,
+    /// When `finish` handed the batch to the submit worker, while the frame profile records (0:
+    /// not recording): its submit queue wait, vkQueueSubmit and submit->rendered times.
+    finished_ns: u64,
+    #[cfg(target_os = "linux")]
+    pub external_waits: Vec<(Arc<super::share::sync::Semaphore>, u64)>,
+    #[cfg(target_os = "linux")]
+    pub external_signals: Vec<(Arc<super::share::sync::Semaphore>, u64)>,
+    #[cfg(target_os = "linux")]
+    pub release_fence: Option<(Arc<super::share::sync::Semaphore>, crate::completion::CompletionReply)>,
+    /// Hosted images (a host's shared swapchain image with this writer's timeline) this batch
+    /// rendered a frame into. Only these publish a frame on their timeline (`finish`): a batch
+    /// that merely reads a hosted image (a snapshot or grab of the window) must neither wait
+    /// for the host's release nor publish a value the host never hears of -- that left the
+    /// host rejecting the frame, never releasing the image, and the reading batch waiting on
+    /// the GPU until the driver declared the device lost (`may_read`).
+    #[cfg(target_os = "linux")]
+    pub hosted_frames: Vec<Arc<Image>>,
+}
+
+impl Batch {
+    /// What an unfinished batch waits on, for the GPU-stall message: the host timelines it
+    /// waits for (value wanted against the semaphore's value now) and what it carries.
+    fn stall_report(&self) -> String {
+        let mut out = String::new();
+        #[cfg(target_os = "linux")]
+        {
+            for (sem, want) in &self.external_waits {
+                let now = unsafe { self.dev.raw.get_semaphore_counter_value(sem.raw) };
+                let now = now.map_or_else(|e| format!("{e:?}"), |v| v.to_string());
+                out.push_str(&format!("waits for external timeline {:?} to reach {want} (now {now}); ", sem.raw));
+            }
+            if !self.hosted_frames.is_empty() { out.push_str(&format!("renders {} hosted frame(s); ", self.hosted_frames.len())); }
+            if self.release_fence.is_some() { out.push_str("exports a release fence; "); }
+        }
+        if out.is_empty() { out.push_str("no external waits (the GPU itself is behind or hung); "); }
+        let frames = self.tickets.iter().filter(|t| matches!(t, Ticket::Frame { .. })).count();
+        out.push_str(&format!("{frames} frame(s), {} image(s); later batches queue behind it", self.images.len()));
+        out
+    }
+
+    /// Makes the pumps of the sessions this batch reports to look (an out-of-memory retry asks
+    /// for room: their pumps answer with GpuPressure).
+    fn notify_sessions(&self, mailbox: &Mailbox) {
+        let mut sids: Vec<u32> = Vec::new();
+        for ticket in &self.tickets {
+            let sid = match ticket {
+                #[cfg(target_os = "linux")]
+                Ticket::Capture { token, .. } => token.sid,
+                Ticket::Frame { token, .. } | Ticket::Read { token, .. } | Ticket::Shared { token, .. } | Ticket::Copy { token, .. } | Ticket::BufferLeases { token, .. } => token.sid,
+                Ticket::Host { .. } | Ticket::FrameCap { .. } => continue,
+            };
+            if !sids.contains(&sid) { sids.push(sid); }
+        }
+        if let Some((_, _, token, ..)) = &self.scanout { if !sids.contains(&token.sid) { sids.push(token.sid); } }
+        for sid in sids { (mailbox.notify)(sid, false); }
+    }
+
+    /// A batch on a reset slot. `queries`: timestamps it writes (0: none; 2: its own start and
+    /// end; more: a profiled frame's passes, `prof`).
+    pub fn new(dev: Arc<Device>, spares: &Spares, queries: u32, reserve: u64) -> Result<Self, String> {
+        let n = spares.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        spares.peak.fetch_max(n, Ordering::AcqRel);
+        let spare = lock(&spares.slots).pop();
+        if spare.is_none() { crate::profile::count("vk batch slot made"); }
+        let mut b = Self { dev, spares: spares.clone(), reusable: false, pool: vk::CommandPool::null(), cb: vk::CommandBuffer::null(), fence: vk::Fence::null(),
+            query: (vk::QueryPool::null(), 0), idle_query: (vk::QueryPool::null(), 0), prof: None, prof_key: None, dispatch_query: 2, dispatch_times: Vec::new(),
+            images: Vec::new(), buffers: Vec::new(), pipelines: Vec::new(), compute_pipelines: Vec::new(), compute_descriptors: Vec::new(), passes: Vec::new(), framebuffers: Vec::new(),
+            generations: Vec::new(), tickets: Vec::new(), scanout: None, present: None, tap: None, arena: None, arenas: Vec::new(), reserve, allocs: 0, grew: (0, 0, 0),
+            #[cfg(target_os = "android")] native_frame: None,
+            #[cfg(target_os = "android")] native_signal: None,
+            blocks: [(0, 0, Placed::NONE); 8], pick_block: None, finished_ns: 0,
+            #[cfg(target_os = "linux")] external_waits: Vec::new(),
+            #[cfg(target_os = "linux")] external_signals: Vec::new(),
+            #[cfg(target_os = "linux")] release_fence: None,
+            #[cfg(target_os = "linux")] hosted_frames: Vec::new() };
+        if let Some(mut slot) = spare {
+            // the slot's objects move into this batch; the emptied slot destroys nothing
+            b.pool = std::mem::replace(&mut slot.pool, vk::CommandPool::null());
+            b.cb = slot.cb;
+            b.fence = std::mem::replace(&mut slot.fence, vk::Fence::null());
+            b.idle_query = std::mem::replace(&mut slot.query, (vk::QueryPool::null(), 0));
+        }
+        unsafe {
+            if b.pool == vk::CommandPool::null() {
+                // its one command buffer is reset alone when the batch's objects are reused
+                b.pool = b.dev.raw.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(b.dev.family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).map_err(error)?;
+                b.cb = b.dev.raw.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(b.pool)
+                    .level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).map_err(error)?[0];
+                b.fence = b.dev.raw.create_fence(&vk::FenceCreateInfo::default(), None).map_err(error)?;
+            }
+            b.dev.raw.begin_command_buffer(b.cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(error)?;
+            if queries > 0 && b.dev.timestamp_bits > 0 {
+                let queries = queries.max(2);
+                b.query = std::mem::replace(&mut b.idle_query, (vk::QueryPool::null(), 0));
+                if b.query.1 < queries {
+                    // a profiled frame needs more than the slot's pool holds: a larger one, kept
+                    // with the slot after (sized in powers of two, so steady frames reuse it)
+                    if b.query.0 != vk::QueryPool::null() { b.dev.raw.destroy_query_pool(b.query.0, None); }
+                    let count = queries.next_power_of_two();
+                    b.query = (vk::QueryPool::null(), 0);
+                    b.query = (b.dev.raw.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(count), None).map_err(error)?, count);
+                }
+                b.dev.raw.cmd_reset_query_pool(b.cb, b.query.0, 0, queries);
+                b.dev.raw.cmd_write_timestamp(b.cb, vk::PipelineStageFlags::TOP_OF_PIPE, b.query.0, 0);
+            }
+        }
+        Ok(b)
+    }
+
+    /// The GPU profiler's timestamp at query `q` of this batch's pool, written once all the work
+    /// recorded before it finished (bottom of the pipe: consecutive pairs tile the batch).
+    pub fn stamp(&self, q: u32) {
+        if self.query.0 != vk::QueryPool::null() {
+            unsafe { self.dev.raw.cmd_write_timestamp(self.cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query.0, q); }
+        }
+    }
+
+    /// Whether this batch may read `image`: any image but a hosted one; a hosted image in the
+    /// batch that rendered its frame (the read is recorded before the image goes to the host),
+    /// or while the host has given it back (the writer owns it; nothing is published).
+    pub fn may_read(&self, image: &Arc<Image>) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        if image.timeline.as_ref().is_some_and(|t| t.producer)
+            && !self.hosted_frames.iter().any(|f| Arc::ptr_eq(f, image)) && !image.hosted_writable() {
+            return Err("the hosted window's newest frame is with its host".into());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = image;
+        Ok(())
+    }
+
+    /// `image` received a frame in this batch (a pass rendered into it).
+    pub fn rendered(&mut self, image: &Arc<Image>) {
+        #[cfg(target_os = "linux")]
+        if image.timeline.as_ref().is_some_and(|t| t.producer) && !self.hosted_frames.iter().any(|f| Arc::ptr_eq(f, image)) {
+            self.hosted_frames.push(image.clone());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = image;
+    }
+
+    /// Sixteen also satisfies the byte alignment of HAL's largest texel/compression block.
+    fn align(&self) -> u64 {
+        self.dev.properties.limits.min_uniform_buffer_offset_alignment.max(self.dev.properties.limits.min_storage_buffer_offset_alignment).max(16)
+    }
+
+    /// A readback's staging (`readback::record_read`): one a read readback gave back, else a new one.
+    pub fn readback_staging(&self, size: u64) -> Result<Arc<Buffer>, String> {
+        self.spares.readback_staging(&self.dev, size)
+    }
+
+    pub fn put(&mut self, bytes: &[u8]) -> Result<Placed, String> {
+        let align = self.align();
+        let len = bytes.len().max(16) as u64;
+        let step = len.div_ceil(align) * align;
+        // the arena being filled, when it has room (the usual upload: a draw's uniform block)
+        if let Some((arena, used)) = self.arena.as_mut() {
+            let at = used.div_ceil(align) * align;
+            if at.checked_add(len).is_some_and(|end| end <= arena.size) {
+                arena.write_unflushed(at, bytes)?;
+                *used = at + len;
+                self.reserve = self.reserve.saturating_sub(step);
+                return Ok(Placed { buffer: arena.buffer, size: arena.size, serial: arena.serial, at });
+            }
+        }
+        // the rest of the frame's uploads in one arena when it fits under ARENA_MAX
+        let arena = self.next_arena(arena_size(self.reserve.min(ARENA_MAX).max(len)), len)?;
+        arena.write_unflushed(0, bytes)?;
+        let placed = Placed { buffer: arena.buffer, size: arena.size, serial: arena.serial, at: 0 };
+        self.arena = Some((arena, len));
+        self.reserve = self.reserve.saturating_sub(step);
+        Ok(placed)
+    }
+
+    /// Places an upload of whole rows of `row` bytes (a texture region's texels) over as many
+    /// arenas as it takes and calls `piece(placed, first_row, rows)` for each part: the room left
+    /// in the arena being filled, then free arenas, then new ones. A region larger than an arena
+    /// so spreads over the pool's arenas like the frame's other uploads, and only a single row
+    /// larger than ARENA_MAX gets an arena of its own size (a 32 MiB texture made one at its
+    /// submit: 5.3 ms of the frame).
+    pub fn put_rows(&mut self, bytes: &[u8], row: u64, mut piece: impl FnMut(Placed, u64, u64)) -> Result<(), String> {
+        let align = self.align();
+        let total = bytes.len() as u64 / row;
+        let mut first = 0;
+        while first < total {
+            if let Some((arena, used)) = self.arena.as_mut() {
+                let at = used.div_ceil(align) * align;
+                let rows = (arena.size.saturating_sub(at) / row).min(total - first);
+                if rows > 0 {
+                    arena.write_unflushed(at, &bytes[(first * row) as usize..((first + rows) * row) as usize])?;
+                    *used = at + rows * row;
+                    piece(Placed { buffer: arena.buffer, size: arena.size, serial: arena.serial, at }, first, rows);
+                    first += rows;
+                    continue;
+                }
+            }
+            let left = (total - first) * row;
+            let arena = self.next_arena(arena_size(self.reserve.max(left).min(ARENA_MAX).max(row)), row)?;
+            self.arena = Some((arena, 0));
+        }
+        Ok(())
+    }
+
+    /// The batch's next arena: a free one of at least `want` bytes (else the largest that holds
+    /// `len`), or a new one of `want`. Taking the pool's last arena of that size has the next one
+    /// made ahead on the arena thread; a submit that finds none while the uploads go on makes it
+    /// here and says so at `finish`.
+    fn next_arena(&mut self, want: u64, len: u64) -> Result<Arc<Buffer>, String> {
+        let (reused, in_use, short) = {
+            let mut arenas = lock(&self.spares.arenas);
+            let in_use = arenas.in_use();
+            let reused = arenas.take(want, len);
+            (reused, in_use, !arenas.holds(want))
+        };
+        let arena = match reused {
+            Some(b) => b,
+            None => {
+                self.allocs += 1;
+                crate::profile::count("upload arena allocs");
+                let made_at = std::time::Instant::now();
+                let made = match Buffer::scratch(self.dev.clone(), crate::ledger::Pool::UploadArena, want, buffer_usage()) {
+                    Ok(b) => b,
+                    // out of memory: the pool's free arenas go first (and the host is
+                    // asked for room), then one more try
+                    Err(e) if super::pipeline::out_of_memory(&e) => {
+                        let released = lock(&self.spares.arenas).release_all();
+                        drop(released);
+                        self.dev.refused("upload arena");
+                        Buffer::scratch(self.dev.clone(), crate::ledger::Pool::UploadArena, want, buffer_usage())?
+                    }
+                    Err(e) => return Err(e),
+                };
+                if in_use { self.grew = (self.grew.0 + 1, self.grew.1 + want, self.grew.2 + made_at.elapsed().as_nanos() as u64); }
+                made
+            }
+        };
+        if short { self.spares.make_ahead(&self.dev, want); }
+        self.arenas.push(arena.clone());
+        Ok(arena)
+    }
+
+    /// Upload a uniform block for the binding role `which`, unless this pass's previous upload
+    /// for the role was the same bytes: the pass block, a draw list's block, and the draw blocks
+    /// of a run of draws made with the same values (a part's mesh chunks) are shared.
+    pub fn put_block(&mut self, which: usize, bytes: &[u8]) -> Result<Placed, String> {
+        let memo = (bytes.as_ptr() as usize, bytes.len());
+        if let Some((ptr, len, placed)) = self.blocks.get(which).copied() {
+            // SAFETY: `ptr` is an earlier draw's block of this pass (`forget_blocks` starts a
+            // pass), held for the submit call that encodes it, as `bytes` is
+            if placed.buffer != vk::Buffer::null() && len == memo.1 && (ptr == memo.0 || unsafe { std::slice::from_raw_parts(ptr as *const u8, len) } == bytes) {
+                return Ok(placed);
+            }
+        }
+        let placed = self.put(bytes)?;
+        if let Some(slot) = self.blocks.get_mut(which) { *slot = (memo.0, memo.1, placed); }
+        Ok(placed)
+    }
+
+    /// Upload a draw's pick block (its pick id and pick-twin mask), unless the pass's previous
+    /// one held the same: the draws of one widget or part share it.
+    pub fn put_pick(&mut self, bytes: [u8; 16]) -> Result<Placed, String> {
+        if let Some((_, placed)) = self.pick_block.filter(|(held, _)| *held == bytes) { return Ok(placed); }
+        let placed = self.put(&bytes)?;
+        self.pick_block = Some((bytes, placed));
+        Ok(placed)
+    }
+
+    /// A new pass's command data: no uploaded block is known to match it.
+    pub fn forget_blocks(&mut self) { self.blocks = [(0, 0, Placed::NONE); 8]; self.pick_block = None; }
+
+    pub fn finish(mut self, submit: &Worker, complete: Arc<Worker>, mailbox: Mailbox) {
+        if crate::profile::on() { self.finished_ns = crate::clock_ns(); }
+        if self.grew.0 > 0 {
+            eprintln!("[hal-vulkan] upload arenas: no spare was ready, a submit made {} ({} KB) in {:.2} ms",
+                self.grew.0, self.grew.1 >> 10, self.grew.2 as f64 / 1e6);
+        }
+        let later = submit.later();
+        #[cfg(target_os = "linux")]
+        let mut published: Vec<(Arc<super::share::sync::Timeline>, u64)> = Vec::new();
+        let ended = (|| unsafe {
+            for arena in &self.arenas { arena.flush()?; }
+            // A shared target or imported producer image is handed back after every use.
+            // FrameDone/Readback/TextureShared are delivered only after this release finishes.
+            let mut external = HashSet::new();
+            for image in &self.images {
+                if image.external.is_some() && external.insert(image.image) {
+                    // a hosted frame rendered here waits for the host's release of the previous
+                    // one and publishes this one (`hosted_frames`)
+                    #[cfg(target_os = "linux")]
+                    if let Some(timeline) = image.timeline.as_ref().filter(|t| t.producer && self.hosted_frames.iter().any(|f| Arc::ptr_eq(f, image))) {
+                        let (wait, signal) = timeline.submitted()?;
+                        published.push((timeline.clone(), wait));
+                        self.external_waits.push((timeline.semaphore.clone(), wait));
+                        self.external_signals.push((timeline.semaphore.clone(), signal));
+                    }
+                    image.release_external(self.cb);
+                }
+            }
+            if self.query.0 != vk::QueryPool::null() { self.dev.raw.cmd_write_timestamp(self.cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query.0, 1); }
+            self.dev.raw.end_command_buffer(self.cb).map_err(error)
+        })();
+        // a batch that is not submitted publishes no frame: its hosted images stay the writer's
+        #[cfg(target_os = "linux")]
+        if ended.is_err() { for (timeline, wait) in &published { timeline.unsubmitted(*wait); } }
+        submit.push(move || {
+            let cb = [self.cb];
+            let waits: Vec<vk::Semaphore> = Vec::new();
+            let signals: Vec<vk::Semaphore> = Vec::new();
+            let stages: Vec<vk::PipelineStageFlags> = Vec::new();
+            #[cfg(target_os = "android")]
+            let signals = {
+                let mut signals = signals;
+                self.native_signal = self.native_frame.as_ref().and_then(|(_, sem)| sem.clone());
+                if let Some(sem) = &self.native_signal { signals.push(sem.raw); }
+                signals
+            };
+            #[cfg(target_os = "linux")]
+            let (mut waits, mut signals, mut stages) = (waits, signals, stages);
+            #[cfg(target_os = "linux")]
+            let mut wait_values = vec![0; waits.len()];
+            #[cfg(target_os = "linux")]
+            let mut signal_values = vec![0; signals.len()];
+            #[cfg(target_os = "linux")]
+            {
+                for (sem, value) in &self.external_waits { waits.push(sem.raw); stages.push(vk::PipelineStageFlags::ALL_COMMANDS); wait_values.push(*value); }
+                for (sem, value) in &self.external_signals { signals.push(sem.raw); signal_values.push(*value); }
+                if let Some((sem, _)) = &self.release_fence { signals.push(sem.raw); signal_values.push(0); }
+            }
+            let info = vk::SubmitInfo::default().command_buffers(&cb).wait_semaphores(&waits)
+                .wait_dst_stage_mask(&stages).signal_semaphores(&signals);
+            #[cfg(target_os = "linux")]
+            let mut timeline = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values).signal_semaphore_values(&signal_values);
+            #[cfg(target_os = "linux")]
+            let info = if self.external_waits.iter().chain(&self.external_signals).any(|(_, v)| *v != 0) {
+                info.next_timeline_semaphore_submit_info(&mut timeline)
+            } else { info };
+            let outcome = match &ended {
+                Err(e) if lost_error(e) => { eprintln!("[hal-vulkan] batch recording: {e}"); Outcome::Lost }
+                Err(e) => { eprintln!("[hal-vulkan] batch recording: {e}; its frame is dropped"); Outcome::Dropped }
+                Ok(()) => {
+                    crate::profile::since(crate::profile::Metric::SubmitQueue, self.finished_ns);
+                    let at = if self.finished_ns != 0 { crate::clock_ns() } else { 0 };
+                    let outcome = self.submit_until_room(&info, &mailbox);
+                    crate::profile::since(crate::profile::Metric::QueueSubmit, at);
+                    outcome
+                }
+            };
+            #[cfg(target_os = "android")]
+            if outcome == Outcome::Ran {
+                if let Some(sem) = &self.native_signal {
+                    match sem.export(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD) {
+                        Ok(fd) => { if let Some((frame, _)) = self.native_frame.take() { frame.post(fd); } }
+                        Err(e) => eprintln!("[hal-android-layer] fence export: {e}; posting after GPU completion"),
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if outcome == Outcome::Ran {
+                if let Some((sem, reply)) = &self.release_fence {
+                    // Export only after queue submission. Retain the semaphore in the batch
+                    // through its fence. If export fails, complete with a signaled release
+                    // only after the GPU has actually finished.
+                    match sem.export(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD) {
+                        Ok(fd) => reply.send(Ok(fd)),
+                        Err(error) => eprintln!("[hal-vulkan] release FD export failed; waiting on completion worker: {error}"),
+                    }
+                }
+            }
+            // a presenter that waits on the GPU itself (an XR compositor waits for the work
+            // submitted before an image's release) takes its frame now, not at the fence
+            if outcome == Outcome::Ran && self.scanout.as_ref().is_some_and(|s| s.0.at_queue()) {
+                if let Some(scanout) = self.scanout.take() { hand_over(scanout, self.prof_key, mailbox.clone()); }
+            }
+            match self.present.take() {
+                Some(present) if outcome == Outcome::Ran => {
+                    // A frame of this window still waiting for an image is superseded by this one.
+                    let waiting = lock(&present.chain.pending).take();
+                    if let Some(waiting) = waiting { waiting(true); }
+                    self.show(present, SHOW_TRIES, later, complete, mailbox);
+                }
+                _ => self.deliver(outcome, true, complete, mailbox),
+            }
+        });
+    }
+
+    /// Submit worker: vkQueueSubmit. Out of memory is not a lost device: the host is asked for
+    /// room (`Device::starved`, the backend raises GPU pressure) and the same submission is
+    /// tried again -- a failed vkQueueSubmit leaves its command buffers and semaphores as they
+    /// were -- while the queue keeps its order (later batches wait behind this one).
+    fn submit_until_room(&self, info: &vk::SubmitInfo, mailbox: &Mailbox) -> Outcome {
+        let mut tries = 0u64;
+        loop {
+            let result = { let _queue = lock(&self.dev.queue_lock); unsafe { self.dev.raw.queue_submit(self.dev.queue, std::slice::from_ref(info), self.fence) } };
+            match result {
+                Ok(()) => {
+                    if tries > 0 { eprintln!("[hal-vulkan] submit: went through after {tries} tries out of GPU memory"); }
+                    return Outcome::Ran;
+                }
+                Err(e) if out_of_memory(e) && !self.dev.lost.load(Ordering::Acquire) => {
+                    if tries == 0 { eprintln!("[hal-vulkan] submit: {e:?}; asking for room and trying again"); }
+                    tries += 1;
+                    self.dev.refused("submit");
+                    self.notify_sessions(mailbox);
+                    std::thread::sleep(MEMORY_RETRY);
+                }
+                Err(e) => {
+                    eprintln!("[hal-vulkan] submit: {e:?}");
+                    return if e == vk::Result::ERROR_DEVICE_LOST || self.dev.lost.load(Ordering::Acquire) { Outcome::Lost } else { Outcome::Dropped };
+                }
+            }
+        }
+    }
+
+    /// Queue worker: show the frame in its window (`Swapchain::show`). With no free swapchain
+    /// image it waits on this worker, retried every SHOW_RETRY, without reporting the frame:
+    /// its FrameDone follows the present (or the frame's end: superseded by a newer frame,
+    /// swapchain replaced, worker closing, SHOW_TRIES exhausted -- then it is not presented).
+    fn show(self, present: Present, tries: u32, later: super::device::Later, complete: Arc<Worker>, mailbox: Mailbox) {
+        // (profiled: the acquire, copy and present of one frame on the submit worker)
+        let at = if crate::profile::on() { crate::clock_ns() } else { 0 };
+        let shown = present.chain.show(&present.image);
+        if at != 0 { crate::profile::since(crate::profile::Metric::ToPresent, at); }
+        crate::profile::count(match &shown {
+            Ok(Shown::Presented) => "vk show: presented",
+            Ok(Shown::Dropped) => "vk show: dropped",
+            Ok(Shown::NotReady) => "vk show: no free image (retried)",
+            Err(_) => "vk show: error",
+        });
+        match shown {
+            Ok(Shown::Presented) => self.deliver(Outcome::Ran, true, complete, mailbox),
+            Ok(Shown::Dropped) => self.deliver(Outcome::Ran, false, complete, mailbox),
+            // the frame ran; only its presentation failed (lost only if the driver says so)
+            Err(e) => {
+                eprintln!("[hal-vulkan] present: {e}");
+                self.deliver(if lost_error(&e) { Outcome::Lost } else { Outcome::Ran }, false, complete, mailbox)
+            }
+            Ok(Shown::NotReady) if tries <= 1 => self.deliver(Outcome::Ran, false, complete, mailbox),
+            Ok(Shown::NotReady) => {
+                let chain = present.chain.clone();
+                let frame = present.frame;
+                let retry_list = later.clone();
+                *lock(&chain.pending) = Some(Box::new(move |give_up: bool| {
+                    if give_up { self.deliver(Outcome::Ran, false, complete, mailbox); }
+                    else { self.show(present, tries - 1, retry_list, complete, mailbox); }
+                }));
+                lock(&later).push((std::time::Instant::now() + SHOW_RETRY, Box::new(move |closing: bool| {
+                    let waiting = lock(&chain.pending).take();
+                    if let Some(waiting) = waiting {
+                        waiting(closing || chain.latest.load(Ordering::Acquire) != frame);
+                    }
+                })));
+            }
+        }
+    }
+
+    /// The frame's completion: FrameDone and its events after the GPU fence. `shown == false`
+    /// clears the window flag of its frame tickets (no presentation is reported). Only the
+    /// driver's VK_ERROR_DEVICE_LOST marks the device lost; a wait out of memory waits again.
+    fn deliver(mut self, outcome: Outcome, shown: bool, complete: Arc<Worker>, mailbox: Mailbox) {
+        if !shown || outcome != Outcome::Ran {
+            for t in &mut self.tickets { if let Ticket::Frame { window, .. } = t { *window = false; } }
+        }
+        complete.push(move || {
+            let mut outcome = outcome;
+            let mut tries = 0u64;
+            let waited = std::time::Instant::now();
+            let mut stall_said = false;
+            while outcome == Outcome::Ran {
+                match unsafe { self.dev.raw.wait_for_fences(&[self.fence], true, FENCE_SLICE_NS) } {
+                    Ok(()) => break,
+                    // Not an abort: the wait goes on. A batch the GPU has not finished long after
+                    // its submit says why, once, instead of a silent wait behind which every later
+                    // batch queues (the driver then spins in vkQueueSubmit).
+                    Err(vk::Result::TIMEOUT) => {
+                        if !stall_said && waited.elapsed() >= FENCE_STALL_SAY {
+                            stall_said = true;
+                            eprintln!("[hal-vulkan] GPU stall: a batch submitted {:.1} s ago has not finished; {}",
+                                waited.elapsed().as_secs_f64(), self.stall_report());
+                        }
+                    }
+                    Err(e) if out_of_memory(e) && !self.dev.lost.load(Ordering::Acquire) => {
+                        if tries == 0 { eprintln!("[hal-vulkan] fence: {e:?}; asking for room and waiting again"); }
+                        tries += 1;
+                        self.dev.refused("fence wait");
+                        self.notify_sessions(&mailbox);
+                        std::thread::sleep(MEMORY_RETRY);
+                    }
+                    Err(e) => { eprintln!("[hal-vulkan] fence: {e:?}"); outcome = Outcome::Lost; }
+                }
+            }
+            if stall_said { eprintln!("[hal-vulkan] GPU stall over: the batch finished {:.1} s after its submit", waited.elapsed().as_secs_f64()); }
+            if outcome == Outcome::Lost { self.dev.lost.store(true, Ordering::Release); }
+            self.complete(outcome != Outcome::Ran, mailbox);
+        });
+    }
+
+    fn complete(mut self, failed: bool, mailbox: Mailbox) {
+        crate::profile::since(crate::profile::Metric::SubmitToRendered, self.finished_ns);
+        #[cfg(target_os = "linux")]
+        if let Some((_, reply)) = &self.release_fence {
+            reply.send(if failed { Err("Vulkan release submission failed".into()) } else { Ok(None) });
+        }
+        if let Some(prof) = self.prof.take() { prof.finish(&self.dev, self.query.0, failed); }
+        let mut times = [0u64; 2];
+        let timed = !failed && self.query.0 != vk::QueryPool::null()
+            && unsafe { self.dev.raw.get_query_pool_results(self.query.0, 0, &mut times, vk::QueryResultFlags::TYPE_64) }.is_ok();
+        let bits = self.dev.timestamp_bits;
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let period = self.dev.properties.limits.timestamp_period as f64;
+        let gpu_ns = if timed { ((times[1].wrapping_sub(times[0]) & mask) as f64 * period) as u64 } else { 0 };
+        let gpu_span = if timed {
+            let start = (times[0] & mask) as f64 * period * 1e-9;
+            [start, start + gpu_ns as f64 * 1e-9]
+        } else {
+            [0.0; 2]
+        };
+        // Events are delivered only after every Vulkan object this batch kept alive is destroyed:
+        // whoever observes an event (a test, a process about to exit) then cannot race the driver
+        // calls of this worker, whose ICD exit handlers run concurrently with exit().
+        let mut out: Vec<(Token, Event)> = Vec::new();
+        let mut push = |token: Token, event: Event| out.push((token, event));
+        for (token, name, query) in self.dispatch_times.drain(..) {
+            let mut span = [0u64; 2];
+            if timed && unsafe { self.dev.raw.get_query_pool_results(self.query.0, query, &mut span, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+                let gpu_ns = ((span[1].wrapping_sub(span[0]) & mask) as f64 * period) as u64;
+                push(token, Event::DispatchTime { name, gpu_ns });
+            }
+        }
+        for ticket in self.tickets.drain(..) {
+            match ticket {
+                Ticket::BufferLeases { token, req, ranges } => {
+                    let status = if self.dev.lost.load(Ordering::Acquire) { readback::DEVICE_LOST }
+                        else if failed { readback::FAILED }
+                        else if ranges.iter().all(|(buffer, offset, len, _)| buffer.invalidate_range(*offset, *len).is_ok()) { readback::OK }
+                        else { readback::FAILED };
+                    let leases = if status == readback::OK { ranges.into_iter().map(|(_, _, _, lease)| lease).collect() } else { Vec::new() };
+                    push(token, Event::BufferLeases { req, status, leases });
+                }
+
+                #[cfg(target_os = "linux")]
+                Ticket::Capture { token, window, size, format, buffer } => {
+                    if !failed {
+                        match super::capture_gpu::completed(buffer, size, format) {
+                            Ok(surface) => push(token, Event::Capture { window, surface }),
+                            Err(e) => eprintln!("[hal-capture] {e}"),
+                        }
+                    }
+                }
+                Ticket::Frame { token, target, kind, frame, window } => {
+                    // a frame that did not run (dropped, or its device was lost) is finished
+                    // all the same, never presented: its app paints again (a dropped frame) or
+                    // after DeviceReset (a lost device)
+                    token.incarnation.done(frame);
+                    push(token, Event::Frame { target, kind, frame, window: window && !failed, gpu_ns, gpu_span, ran: !failed });
+                }
+                Ticket::Copy { token, req, rect } => push(token, Event::Readback {
+                    req, rect, status: if failed { readback::FAILED } else { readback::OK }, lease: None,
+                }),
+                Ticket::Shared { token, id, handle } => push(token, Event::Shared { id, handle: if failed { 0 } else { handle } }),
+                Ticket::FrameCap { staging, len, done } => done(if failed { None } else { staging.read(len).ok() }),
+                Ticket::Host { reply, image, staging } => {
+                    let pixels = if failed { None } else { staging.read(image.desc.w as usize * image.desc.h as usize * 4).ok().map(|mut rgba| {
+                        if image.desc.format == format::BGRA8 { for p in rgba.chunks_exact_mut(4) { p.swap(0, 2); } }
+                        crate::backend::Pixels { w: image.desc.w, h: image.desc.h, rgba }
+                    }) };
+                    let _ = reply.try_send(pixels);
+                }
+                Ticket::Read { token, req, rect, format: fmt, staging, stencil } => {
+                    let pixels = if failed { Err("GPU submission failed".into()) } else {
+                        staging.read(format::level_bytes(fmt, rect[2], rect[3]) as usize)
+                    };
+                    if !failed { self.spares.readback_read(staging); }
+                    match pixels {
+                        Ok(mut pixels) => {
+                            if let Some(stencil) = stencil {
+                                match stencil.read(rect[2] as usize * rect[3] as usize) {
+                                    Ok(values) => { for (p, s) in pixels.chunks_exact_mut(4).zip(values) { p[3] = s; } }
+                                    Err(_) => { push(token, Event::Readback { req, rect, status: readback::FAILED, lease: None }); continue; }
+                                }
+                            }
+                            if fmt == format::BGRA8 { for pixel in pixels.chunks_exact_mut(4) { pixel.swap(0, 2); } }
+                            let status = if matches!(fmt, format::RGBA8 | format::BGRA8) { readback::OK } else { readback::NATIVE };
+                            push(token, Event::Readback { req, rect, status, lease: Some(crate::lease::Lease::from_vec(pixels, 0)) });
+                        }
+                        Err(e) => {
+                            eprintln!("[hal-vulkan] readback: {e}");
+                            push(token, Event::Readback { req, rect, status: readback::FAILED, lease: None });
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "android")]
+        if !failed { if let Some((frame, _)) = self.native_frame.take() { frame.post(None); } }
+        let scanout = self.scanout.take();
+        let tap = self.tap.take().filter(|_| !failed);
+        let self_prof_key = self.prof_key;
+        // the fence signalled (or nothing was submitted): the objects may be reset and reused
+        self.reusable = !failed;
+        drop(self);
+        for (token, event) in out { mailbox.push(token, event); }
+        if let Some((sid, window, image)) = tap { crate::frame_tap::offer(sid, window, &image); }
+        if let Some(scanout) = scanout {
+            if failed {
+                scanout.0.dropped(scanout.6, scanout.5);
+            } else {
+                hand_over(scanout, self_prof_key, mailbox);
+            }
+        }
+    }
+}
+
+/// A frame for a presenter: its image, and what reports it shown to its session.
+fn hand_over(scanout: (Arc<dyn super::surface::FramePresenter>, Arc<Image>, Token, u32, Id, Id, u32, u64), prof_key: Option<crate::gpu_prof::FrameKey>, mailbox: Mailbox) {
+    let (presenter, image, token, from, target, native, owner, frame) = scanout;
+    presenter.submit(owner, native, from, image, Box::new(move |time| {
+        // the presenter's time is when the frame reached the display
+        if let Some(key) = prof_key { crate::gpu_prof::shown(key, time); }
+        let sid = token.sid;
+        lock(&mailbox.events).push(Done { token, time, event: Event::Presented { target, frame } });
+        (mailbox.notify)(sid, true);
+    }));
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) { unsafe {
+        // made by `new`, whatever this one's end
+        self.spares.in_flight.fetch_sub(1, Ordering::AcqRel);
+        // a batch dropped before it completed (never submitted): its timed passes answer nothing
+        if let Some(prof) = self.prof.take() { prof.finish(&self.dev, vk::QueryPool::null(), true); }
+        for framebuffer in self.framebuffers.drain(..) { self.dev.raw.destroy_framebuffer(framebuffer, None); }
+        let slot = Slot { dev: self.dev.clone(), pool: self.pool, cb: self.cb, fence: self.fence,
+            query: if self.query.0 != vk::QueryPool::null() { self.query } else { self.idle_query } };
+        if self.query.0 != vk::QueryPool::null() && self.idle_query.0 != vk::QueryPool::null() { self.dev.raw.destroy_query_pool(self.idle_query.0, None); }
+        if !self.reusable { crate::profile::count("vk batch slot destroyed (not reusable)"); return; } // dropping the slot destroys its objects
+        // the arenas go back once nothing else holds them (freed here, outside the lock, if the
+        // pool is full)
+        self.buffers.clear();
+        self.arena = None;
+        let released = lock(&self.spares.arenas).give(self.arenas.drain(..).filter(|arena| Arc::strong_count(arena) == 1));
+        drop(released);
+        let reset = self.dev.raw.reset_command_buffer(slot.cb, vk::CommandBufferResetFlags::default())
+            .and_then(|_| self.dev.raw.reset_fences(&[slot.fence]));
+        if reset.is_err() { crate::profile::count("vk batch slot destroyed (reset failed)"); return; }
+        let wanted = self.spares.slots_wanted().saturating_sub(self.spares.in_flight());
+        let mut slots = lock(&self.spares.slots);
+        if slots.len() < wanted { slots.push(slot); } else { crate::profile::count("vk batch slot destroyed (spares full)"); }
+    } }
+}

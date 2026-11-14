@@ -8,11 +8,8 @@ categories = ["gui"]
 description = "Exposes access to Makepad's context states on Android"
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/makepad/makepad/"
 repository = "https://github.com/makepad/makepad/"
 metadata.makepad-auto-version = "Xn0xvOdZChZbltM8tMBk0zLdOBc="
 
 [dependencies]
-## Note: we must not use local 'path' dependencies on `makepad-jni-sys`
-## in order to guarantee that only one instance of each crate exists in the app binary.
-makepad-jni-sys = {version = "0.4.0"}
+makepad-jni-sys = { path = "../jni-sys", version = "0.4.0" }

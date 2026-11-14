@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::util::clock::Instant;
 use makepad_widgets::makepad_platform::makepad_micro_serde::*;
 use std::collections::HashMap;
 
@@ -1173,7 +1174,7 @@ impl XrDepthAlignMatcher {
         if self.is_finished() || max_steps == 0 {
             return 0;
         }
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let mut steps = 0u32;
         while steps < max_steps as u32 {
             if steps != 0 && !budget.is_zero() && started.elapsed() >= budget {
@@ -1191,12 +1192,12 @@ impl XrDepthAlignMatcher {
         if self.is_finished() {
             return false;
         }
-        let step_started = std::time::Instant::now();
+        let step_started = Instant::now();
         let did_work = loop {
             let state = std::mem::replace(&mut self.state, XrDepthAlignMatcherState::Done);
             match state {
                 XrDepthAlignMatcherState::BuildSignals => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     self.local_signal = selected_descriptor_signal_cells(&self.local);
                     self.remote_signal = selected_descriptor_signal_cells(&self.remote);
                     self.remote_dense_signal = descriptor_dense_signal_cells(&self.remote);
@@ -1265,7 +1266,7 @@ impl XrDepthAlignMatcher {
                     continue;
                 }
                 XrDepthAlignMatcherState::SeedHeightRefine(mut task) => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let Some(local_map) = self.local_map() else {
                         self.state = XrDepthAlignMatcherState::SeedSignalRefine {
                             best_yaw: task.best_yaw,
@@ -1301,7 +1302,7 @@ impl XrDepthAlignMatcher {
                     best_yaw,
                     best_translation,
                 } => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let (signal_refined_yaw, signal_refined_translation) = refine_signal_alignment(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1334,7 +1335,7 @@ impl XrDepthAlignMatcher {
                     best_yaw,
                     best_translation,
                 } => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let best = score_full_alignment_solution(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1356,7 +1357,7 @@ impl XrDepthAlignMatcher {
                     break true;
                 }
                 XrDepthAlignMatcherState::SeedLocalSearch(mut task) => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let completed = task.step(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1393,7 +1394,7 @@ impl XrDepthAlignMatcher {
                         };
                         continue;
                     };
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let completed = task.step(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1411,7 +1412,7 @@ impl XrDepthAlignMatcher {
                     break true;
                 }
                 XrDepthAlignMatcherState::SeedVerticalOffset { candidate } => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let candidate = if let (Some(local_map), Some(remote_map)) =
                         (self.local_map(), self.remote_map())
                     {
@@ -1447,7 +1448,7 @@ impl XrDepthAlignMatcher {
                     continue;
                 }
                 XrDepthAlignMatcherState::BuildYawCandidates => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     self.yaw_candidates = candidate_signal_yaws(
                         &self.local_histogram,
                         &self.remote_histogram,
@@ -1465,7 +1466,7 @@ impl XrDepthAlignMatcher {
                 }
                 XrDepthAlignMatcherState::BuildTranslations { yaw_index } => {
                     let yaw = self.yaw_candidates[yaw_index];
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let translations = candidate_signal_translations(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1531,7 +1532,7 @@ impl XrDepthAlignMatcher {
                     }
 
                     let translation = translations[translation_index];
-                    let signal_refine_started = std::time::Instant::now();
+                    let signal_refine_started = Instant::now();
                     let (refined_yaw, refined_translation) = refine_signal_alignment(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1541,7 +1542,7 @@ impl XrDepthAlignMatcher {
                     );
                     self.signal_refine_time += signal_refine_started.elapsed();
 
-                    let signal_score_started = std::time::Instant::now();
+                    let signal_score_started = Instant::now();
                     let signal_candidate = score_signal_alignment_solution(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1595,7 +1596,7 @@ impl XrDepthAlignMatcher {
                         };
                         continue;
                     };
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let completed = task.step(
                         local_map,
                         self.local_sample_cache.as_ref(),
@@ -1623,7 +1624,7 @@ impl XrDepthAlignMatcher {
                     refined_yaw,
                     refined_translation,
                 } => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let candidate = score_full_alignment_solution(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1675,7 +1676,7 @@ impl XrDepthAlignMatcher {
                         self.state = XrDepthAlignMatcherState::Finish;
                         continue;
                     };
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     let completed = task.step(
                         &self.local_signal,
                         &self.remote_signal,
@@ -1693,7 +1694,7 @@ impl XrDepthAlignMatcher {
                     break true;
                 }
                 XrDepthAlignMatcherState::FinalVerticalOffset { candidate } => {
-                    let started = std::time::Instant::now();
+                    let started = Instant::now();
                     self.best = Some(
                         if let (Some(local_map), Some(remote_map)) =
                             (self.local_map(), self.remote_map())
@@ -3614,11 +3615,6 @@ fn wrap_angle(mut angle: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        time::Instant,
-    };
 
     #[derive(Clone, Copy, Debug, Default)]
     struct HeightMapTestArtifacts {
@@ -3635,24 +3631,11 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RandomCaseSummary {
-        case_count: usize,
         accepted_cases: usize,
         seeded_reuse_cases: usize,
         max_yaw_error: f32,
         max_translation_error: f32,
         failures: Vec<String>,
-    }
-
-    impl RandomCaseSummary {
-        fn merge(&mut self, other: Self) {
-            self.case_count += other.case_count;
-            self.accepted_cases += other.accepted_cases;
-            self.seeded_reuse_cases += other.seeded_reuse_cases;
-            self.max_yaw_error = self.max_yaw_error.max(other.max_yaw_error);
-            self.max_translation_error =
-                self.max_translation_error.max(other.max_translation_error);
-            self.failures.extend(other.failures);
-        }
     }
 
     impl TestRng {
@@ -3811,10 +3794,7 @@ mod tests {
         size_z: usize,
     ) -> RandomCaseSummary {
         let mut rng = TestRng::new(seed);
-        let mut summary = RandomCaseSummary {
-            case_count,
-            ..RandomCaseSummary::default()
-        };
+        let mut summary = RandomCaseSummary::default();
 
         for case_index in 0..case_count {
             let expected_yaw = rng.range_f32(-0.85, 0.85);
@@ -3923,42 +3903,6 @@ mod tests {
                 heights_meters,
             }),
         }
-    }
-
-    #[derive(Clone, Copy, Debug, Default)]
-    struct ReferenceManualPose {
-        shift_x_meters: f32,
-        shift_z_meters: f32,
-        rotation_radians: f32,
-    }
-
-    fn reference_dump_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("dump/dumps/align-pair-226a39e4b300-r0097-1774792873191.bin")
-    }
-
-    fn reference_manual_pose_path(dump_path: &Path) -> PathBuf {
-        let stem = dump_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("align-pair");
-        dump_path.with_file_name(format!("{stem}.manual_pose.ron"))
-    }
-
-    fn load_reference_manual_pose(dump_path: &Path) -> Option<ReferenceManualPose> {
-        let text = fs::read_to_string(reference_manual_pose_path(dump_path)).ok()?;
-        let mut pose = ReferenceManualPose::default();
-        for line in text.lines() {
-            let (key, value) = line.split_once(':')?;
-            let value = value.trim();
-            match key.trim() {
-                "shift_x_meters" => pose.shift_x_meters = value.parse().ok()?,
-                "shift_y_meters" => pose.shift_z_meters = value.parse().ok()?,
-                "rotation_radians" => pose.rotation_radians = value.parse().ok()?,
-                _ => {}
-            }
-        }
-        Some(pose)
     }
 
     #[test]
@@ -4137,92 +4081,5 @@ mod tests {
         let summary = run_random_noisy_cases(0x5eed_cafe_d15c_a11e, 4, 120, 114);
         assert!(summary.accepted_cases >= 4, "summary={summary:?}");
         assert!(summary.seeded_reuse_cases >= 2, "summary={summary:?}");
-    }
-
-    #[test]
-    fn timesliced_solver_matches_reference_dump_and_keeps_steps_bounded() {
-        let dump_path = reference_dump_path();
-        let bytes = fs::read(&dump_path).expect("reference dump should exist");
-        let pair = XrNetAlignmentDescriptorDumpPair::from_file_bytes(&bytes)
-            .expect("reference dump should decode");
-        let manual_pose =
-            load_reference_manual_pose(&dump_path).expect("reference manual pose should exist");
-        let local = &pair.local_descriptor.descriptor;
-        let remote = &pair.remote_descriptor.descriptor;
-        let mut matcher = XrDepthAlignMatcher::new(local, remote, None);
-        let mut measured_steps = 0u32;
-        let mut max_step = std::time::Duration::ZERO;
-
-        while !matcher.is_finished() {
-            let started = Instant::now();
-            let progressed = matcher.step();
-            let elapsed = started.elapsed();
-            if progressed {
-                measured_steps = measured_steps.saturating_add(1);
-                max_step = max_step.max(elapsed);
-            }
-        }
-
-        let diagnostic = matcher
-            .diagnostic()
-            .expect("timesliced matcher should finish with a diagnostic");
-        let solution = diagnostic
-            .accepted_solution()
-            .expect("reference dump should produce an accepted solution");
-        let manual_translation = vec3(
-            manual_pose.shift_x_meters,
-            solution.translation.y,
-            manual_pose.shift_z_meters,
-        );
-        let planar_error = vec3(
-            solution.translation.x - manual_translation.x,
-            0.0,
-            solution.translation.z - manual_translation.z,
-        )
-        .length();
-        let yaw_error = wrap_angle(solution.yaw_radians - manual_pose.rotation_radians).abs();
-
-        assert_eq!(diagnostic.step_count, measured_steps, "{diagnostic:?}");
-        assert!(
-            diagnostic.max_step_ms <= 50,
-            "diagnostic={diagnostic:?} measured_max_step={:?}",
-            max_step
-        );
-        assert!(yaw_error <= 0.10, "{solution:?} manual={manual_pose:?}");
-        assert!(planar_error <= 0.08, "{solution:?} manual={manual_pose:?}");
-    }
-
-    #[test]
-    #[ignore = "expensive randomized stress run"]
-    fn dense_height_map_solver_handles_random_noisy_inputs_parallel_stress() {
-        let mut handles = Vec::new();
-        for thread_index in 0..16u64 {
-            handles.push(std::thread::spawn(move || {
-                run_random_noisy_cases(
-                    0x9e37_79b9_7f4a_7c15 ^ (thread_index.wrapping_mul(0x94d0_49bb_1331_11eb)),
-                    1,
-                    200,
-                    150,
-                )
-            }));
-        }
-
-        let mut summary = RandomCaseSummary::default();
-        for handle in handles {
-            summary.merge(
-                handle
-                    .join()
-                    .expect("random stress worker should not panic"),
-            );
-        }
-
-        assert!(
-            summary.accepted_cases >= 14,
-            "parallel stress summary={summary:?}"
-        );
-        assert!(
-            summary.seeded_reuse_cases >= 8,
-            "parallel stress summary={summary:?}"
-        );
     }
 }

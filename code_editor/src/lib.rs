@@ -1,10 +1,11 @@
-pub use makepad_widgets;
-use makepad_widgets::*;
+pub use makepad_widgets_core;
+use makepad_widgets_core::*;
 
 pub mod char;
 pub mod code_editor;
 pub mod code_view;
 pub mod decoration;
+pub mod diff;
 pub mod document;
 pub mod draw_selection;
 pub mod history;
@@ -22,7 +23,7 @@ pub mod widgets;
 pub mod wrap;
 
 pub use self::{
-    code_editor::CodeEditor, document::CodeDocument, history::History, layout::Line,
+    code_editor::{CodeEditor, TokenColors}, document::CodeDocument, history::History, layout::Line,
     selection::Selection, session::CodeSession, settings::Settings, token::Token,
     tokenizer::Tokenizer,
 };

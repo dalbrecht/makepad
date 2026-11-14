@@ -18,7 +18,6 @@ authors = [
     "Raph Levien <raph.levien@gmail.com>",
     "Marcus Klaas de Vries <mail@marcusklaas.nl>",
 ]
-build = "build.rs"
 exclude = [
     "/third_party/**/*",
     "/tools/**/*",
@@ -39,10 +38,6 @@ repository = "https://github.com/raphlinus/pulldown-cmark"
 version = "2"
 path = "../bitflags"
 
-[dependencies.getopts]
-version = "0.2"
-optional = true
-
 [dependencies.memchr]
 version = "2.7"
 path = "../memchr"
@@ -57,11 +52,8 @@ version = "2.9"
 path = "../unicase"
 
 [features]
-default = [
-    "getopts",
-]
-gen-tests = []
-# html removed - kept as empty feature to silence cfg warnings
+default = []
+# the HTML renderer (`html::push_html`), with its escape helpers in-crate
 html = []
 simd = []
 

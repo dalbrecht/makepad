@@ -46,6 +46,9 @@ impl XrController {
     pub const TOUCH_THUMBSTICK: u16 = 1 << 11;
     pub const TOUCH_TRIGGER: u16 = 1 << 12;
     pub const TOUCH_THUMBREST: u16 = 1 << 13;
+    /// The menu held (a long press): see `makepad_hal::xr_controller::HOLD_MENU`. On the left
+    /// controller, whether or not it is active (a tracked hand's menu gesture sets it too).
+    pub const HOLD_MENU: u16 = 1 << 14;
     pub fn triggered(&self) -> bool {
         self.trigger > 0.8
     }
@@ -70,6 +73,9 @@ impl XrController {
     }
     pub fn click_menu(&self) -> bool {
         self.buttons & Self::CLICK_MENU != 0
+    }
+    pub fn hold_menu(&self) -> bool {
+        self.buttons & Self::HOLD_MENU != 0
     }
 
     pub fn touch_x(&self) -> bool {
@@ -570,6 +576,12 @@ impl XrHand {
         Some((max_bend_angle_degrees, straightness, extension_ratio))
     }
 
+    /// The index finger's (max bend in degrees, straightness, extension ratio) that
+    /// [`Self::grab_intent`] judges a grasp by (`None`: its joints are not valid).
+    pub fn index_release_metrics(&self) -> Option<(f32, f32, f32)> {
+        self.index_grab_release_metrics()
+    }
+
     pub fn grab_intent(&self) -> bool {
         if !self.grabbing() {
             return false;
@@ -973,10 +985,23 @@ pub struct XrSyncAnchor {
     pub anchor: XrAnchor,
 }
 
+/// A controller buzz an XR app asked for (`Cx::xr_haptic`): which hand (0 left, 1 right), how
+/// strong (0..1) and how long.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrHapticPulse {
+    pub hand: u8,
+    pub amplitude: f32,
+    pub seconds: f32,
+}
+
 #[derive(Clone, Debug, Default, SerBin, DeBin)]
 pub struct XrState {
     pub time: f64,
     pub head_pose: Pose,
+    /// The tracking space's generation: it changes when the space is set up again (a headset
+    /// session began, the wearer recentered), when its origin may have moved. Content placed in
+    /// front of the head is placed again ([`XrUpdateEvent::space_changed`]).
+    pub space: u32,
     pub order_counter: u8,
     pub anchor: Option<XrAnchor>,
     pub anchor_persisted: bool,
@@ -993,6 +1018,7 @@ impl XrState {
             order_counter: b.order_counter,
             time: (b.time - a.time) * f as f64 + a.time,
             head_pose: Pose::from_lerp(a.head_pose, b.head_pose, f),
+            space: b.space,
             anchor: b.anchor,
             anchor_persisted: b.anchor_persisted,
             floor_y: b.floor_y,
@@ -1055,6 +1081,15 @@ impl XrUpdateEvent {
     }
     pub fn menu_pressed(&self) -> bool {
         self.state.left_hand.menu_pressed() && !self.last.left_hand.menu_pressed()
+    }
+    /// The frame the menu became a hold ([`XrController::HOLD_MENU`]).
+    pub fn held_menu(&self) -> bool {
+        self.state.left_controller.hold_menu() && !self.last.left_controller.hold_menu()
+    }
+    /// The first frame in a tracking space set up again ([`XrState::space`]): the head's pose
+    /// jumped with the origin, not with the head.
+    pub fn space_changed(&self) -> bool {
+        self.state.space != self.last.space
     }
 }
 
@@ -1188,6 +1223,19 @@ impl XrLocalEvent {
     where
         F: Fn(Vec2d, &Rect, &Option<Inset>) -> bool,
     {
+        self.hits_with_options_and_test_dyn(cx, area, options, &hit_test)
+    }
+
+    /// The body of [`Self::hits_with_options_and_test`], compiled once rather
+    /// than once per hit-test closure.
+    #[inline(never)]
+    pub fn hits_with_options_and_test_dyn(
+        &self,
+        cx: &mut Cx,
+        area: Area,
+        options: HitOptions,
+        hit_test: &dyn Fn(Vec2d, &Rect, &Option<Inset>) -> bool,
+    ) -> Hit {
         if cx.fingers.test_sweep_lock(options.sweep_area) {
             return Hit::Nothing;
         }
@@ -1231,6 +1279,7 @@ impl XrLocalEvent {
                                 rect,
                                 is_over: false,
                                 is_sweep: true,
+                                cancelled: false,
                             })
                         } else {
                             Hit::FingerMove(crate::FingerMoveEvent {
@@ -1262,6 +1311,7 @@ impl XrLocalEvent {
                             rect,
                             is_over: release_is_over,
                             is_sweep: false,
+                            cancelled: false,
                         })
                     }
                 };
@@ -1290,6 +1340,7 @@ impl XrLocalEvent {
                     rect,
                     is_over: false,
                     is_sweep: false,
+                    cancelled: false,
                 });
             }
         }

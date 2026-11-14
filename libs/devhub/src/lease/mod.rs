@@ -1,0 +1,1150 @@
+//! Orchestration: leases instead of locks (DESIGN.md §10; interfaces in the lane's LEASE.SPEC.md).
+//!
+//! A lease is a share of a node (or all of it) for one lane and one kind of work. The master
+//! schedules ([`sched`], [`master`]); the node starts, watches and cleans up what runs under a
+//! lease ([`exec`]), measures what it has ([`caps`]) and guards its disk ([`disk`]). Leases end
+//! on release or when their holder stops beating, never for running long. Native lane leases
+//! use bounded per-lane trees; CI, gates and user boxes keep the work tree. One lease at a time
+//! holds a tree.
+//! Overlay JITs mount pinned stores and lane edits without moving a tree.
+//! Dev stores, overlays, run home, build tree and target live in `<work>/dev`, separate
+//! from deployment. [`jitstore`] owns dev binaries and coalesces builds of pinned inputs.
+//! Timed leases exclude both. Concurrent leases share cores, RAM, GPUs and disk headroom;
+//! small jobs prefer hot boxes, with measured class durations correcting their placement.
+
+pub mod loaders;
+pub mod jitstore;
+#[cfg(feature = "checkout")]
+pub mod overlay_compare;
+#[cfg(feature = "checkout")]
+pub mod overlay_selftest;
+#[cfg(feature = "checkout")]
+pub mod shadow;
+#[cfg(feature = "checkout")]
+pub mod relaxgit;
+pub mod argv;
+pub mod caps;
+pub mod client;
+pub mod jit;
+pub mod disk;
+pub mod exec;
+pub mod master;
+#[cfg(feature = "checkout")]
+pub mod native;
+pub mod panel;
+pub mod patch;
+pub mod prof;
+pub mod replay;
+pub mod sched;
+pub mod ship;
+#[cfg(feature = "checkout")]
+pub mod tree;
+pub mod user;
+pub mod hand;
+pub mod wt;
+
+use makepad_remote::json_str;
+
+/// Leases that warm a box's dev JIT store, code cache or native lane target using idle CPU.
+pub const WARM_LANE_PREFIX: &str = "warm-";
+
+/// The master's per-box dev JIT prebuild of the landed tip: lane-priority, one per box.
+pub const PREBUILD_LANE_PREFIX: &str = "prebuild-";
+
+/// The folder in a lease's tmp where its runs put the logs worth keeping (`DEVHUB_KEEP`: a failed
+/// step's, tools/run/fixture/keep_logs.sh): the holder copies it next to its own log before the
+/// lease ends and the tmp goes ([`client::kept`]).
+pub const KEEP_DIR: &str = "keep";
+
+/// The file in a lease's tmp its node makes when its run is to stop at its next step
+/// (`DEVHUB_YIELD`: a timed run past twice its estimate while a timed ask waits on its box, or a
+/// long one while a short one waits there, [`sched::Sched::say_overruns`]). It holds why. A timed series or bench checks it between steps
+/// and, once it exists, stops after the current step with its partial results and releases.
+pub const YIELD_FILE: &str = "yield";
+
+/// The file in a lease's tmp its node appends the lease's holder's lines to (`DEVHUB_TOLD`,
+/// `lease-tell`): a tests shard's answers from the run's dealer, each unit of the run's one queue
+/// it is to run next (bucket.rs [`crate::bucket`] `Dealer`, land_gate.sh GATE_QUEUE).
+pub const TOLD_FILE: &str = "told";
+
+/// What a lease guards (DESIGN.md §10.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Kind {
+    Build,
+    Test,
+    Screen,
+    Long,
+    Timed,
+    Gpu,
+    Inspect,
+    Gate,
+    Ci,
+}
+
+pub const KINDS: [Kind; 9] = [Kind::Build, Kind::Test, Kind::Screen, Kind::Long, Kind::Timed, Kind::Gpu, Kind::Inspect, Kind::Gate, Kind::Ci];
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Build => "build",
+            Kind::Test => "test",
+            Kind::Screen => "screen",
+            Kind::Long => "long",
+            Kind::Timed => "timed",
+            Kind::Gpu => "gpu",
+            Kind::Inspect => "inspect",
+            Kind::Gate => "gate",
+            Kind::Ci => "ci",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Kind> {
+        KINDS.iter().copied().find(|k| k.as_str() == s)
+    }
+
+    /// Everything but `inspect` writes to the node (builds, runs, windows): off on a node whose
+    /// dev switch is off.
+    pub fn writes(self) -> bool {
+        self != Kind::Inspect
+    }
+
+    /// The nice level of this kind's runs: 10 leaves a program's thread classes their offsets (up to
+    /// +8, libs/cpu_budget), and timed work runs at the level a person's app gets, so its numbers
+    /// are theirs. Linux only: a run's scope keeps the box's desktop ahead of it there. A Mac has no
+    /// scopes, and its classes are QoS, not nice.
+    pub fn nice(self) -> i32 {
+        if self == Kind::Timed && cfg!(target_os = "linux") { 0 } else { 10 }
+    }
+
+    /// Shares the node with other leases, counted against its slots.
+    pub fn shared(self) -> bool {
+        matches!(self, Kind::Build | Kind::Test | Kind::Screen | Kind::Long | Kind::Gate | Kind::Ci)
+    }
+
+    /// Overlays contend only with timed work; ordinary tree writes and CI use separate slots.
+    pub fn conflicts(self, src: Src, other: Kind, other_src: Src) -> bool {
+        if src == Src::Overlay || other_src == Src::Overlay { return self == Kind::Timed || other == Kind::Timed; }
+        self.writes() && other.writes() && (self == Kind::Timed || other == Kind::Timed || (self == Kind::Ci) == (other == Kind::Ci))
+    }
+}
+
+/// The source layer a lease runs from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Src { #[default] Tree, Overlay }
+
+impl Src {
+    pub fn as_str(self) -> &'static str { match self { Self::Tree => "tree", Self::Overlay => "overlay" } }
+    pub fn parse(s: &str) -> Option<Self> { match s { "tree" => Some(Self::Tree), "overlay" => Some(Self::Overlay), _ => None } }
+    /// Lane JIT commands default to overlays; CI gate overlays are selected separately and keyed per pin.
+    pub fn for_run(kind: Kind, argv: &[String], tree: bool) -> Self {
+        if !tree && matches!(kind, Kind::Test | Kind::Screen | Kind::Gpu | Kind::Long | Kind::Build) && loaders::cargo_run_args(argv).is_some() { Self::Overlay } else { Self::Tree }
+    }
+}
+
+/// Interactive work goes ahead of background requests without stopping running work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Priority { #[default] Background, Interactive }
+
+impl Priority {
+    pub fn as_str(self) -> &'static str { match self { Self::Background => "background", Self::Interactive => "interactive" } }
+    pub fn parse(s: &str) -> Option<Self> { match s { "background" => Some(Self::Background), "interactive" => Some(Self::Interactive), _ => None } }
+
+    /// A shared lease's scope CPU weight (Linux) for its `cores`: 100 a core for interactive work
+    /// and live sessions, 1 a core for background work. A background run past its charge then
+    /// yields the box to them under contention, and still takes all of it while they idle. A
+    /// weight, not a nice level: each run has its own scope, a sibling of a live session's, and
+    /// nice orders threads only inside one. Live calls waited 96-125 s behind a prebuild charged
+    /// 4 and a gate charged 8 that ran past their charges (11-06).
+    pub fn cpu_weight(self, cores: f64) -> u32 {
+        let per_core = match self { Self::Background => 1.0, Self::Interactive => 100.0 };
+        (cores * per_core).round().clamp(1.0, 10_000.0) as u32
+    }
+}
+
+/// Placement class from measured walls, estimates or kind defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CostClass { Small, Medium, Large }
+
+impl CostClass {
+    pub fn as_str(self) -> &'static str { match self { Self::Small => "small", Self::Medium => "medium", Self::Large => "large" } }
+    pub fn parse(s: &str) -> Option<Self> { match s { "small" => Some(Self::Small), "medium" => Some(Self::Medium), "large" => Some(Self::Large), _ => None } }
+    pub fn default_for(kind: Kind) -> Self {
+        match kind { Kind::Test | Kind::Screen | Kind::Gpu | Kind::Inspect => Self::Small, Kind::Ci => Self::Medium, _ => Self::Large }
+    }
+    pub fn from_wall(ms: u64, cores: f64) -> Self {
+        if ms < 90_000 && cores <= 4.0 { Self::Small } else if ms < 1_200_000 { Self::Medium } else { Self::Large }
+    }
+}
+
+/// A run class without its test filter (`test:<pkg>[:<target>][?<filter>]`): a filtered run and
+/// the whole suite are measured apart; what reads the package or target reads this.
+pub fn base_class(class: &str) -> &str {
+    class.split_once('?').map_or(class, |(base, _)| base)
+}
+
+/// Default measurement class: kind and three command words, with paths stripped; for the JIT
+/// (`makepad <args>`, through cargo or not) what it runs: `<kind> makepad <subcommand> <package>
+/// [<target>]` ([`jit_class_words`]). Under three words every JIT command was one class, `test
+/// cargo run --profile`: CI shards, minute-long live tests and hour-long sessions measured as one,
+/// whose median moved with whichever ended last (3m07s, then 6m15s, while CI legs ran 6-31 min,
+/// 11-04). Stall warnings and RAM asks read the class. A JIT class names what runs, so lanes share
+/// it; any other command's words say little of what it does (`bash sweep.sh`, `cargo test -p`), so
+/// it is measured per lane, `<kind> <words> @<lane>`, but for devhub's own gates and CI, the same
+/// script whichever lane asks. Over the last 3100 such runs that took the runs a stall check would
+/// call past their measure from 129 to 80.
+pub fn run_class(lane: &str, kind: Kind, argv: &[String]) -> String {
+    let (words, lane): (Vec<String>, Option<&str>) = match loaders::cargo_run_args(argv) {
+        Some(args) => {
+            let mut words: Vec<String> = std::iter::once("makepad".to_string()).chain(jit_class_words(args)).collect();
+            // a filtered test run is measured apart from its whole suite, as `devhub test`'s is
+            // ([`base_class`]: the suite's measure until the filter has its own). One class held
+            // a Fab bin's one-test runs (1-2 min, 2-10 GB) with its whole suite at 4 threads (15-18
+            // min, 28 GB): a run of one test asked 33.5 GB, and waited 12 min for it (L774136, 11-10)
+            if args.first().is_some_and(|s| s == "test") {
+                let rest: Vec<&str> = args.iter().map(String::as_str).skip_while(|a| *a != "--").collect();
+                let filter = filter_key(&rest);
+                if let Some(last) = words.last_mut().filter(|_| !filter.is_empty()) { *last = format!("{last}?{filter}"); }
+            }
+            (words, None)
+        }
+        // an `env [-u K] K=V ..` prefix only sets the run's environment: the class is its command
+        // (a fast gate's GATE_PROVEN list made every gate a class of its own, never measured)
+        None => (loaders::command_of(argv).iter().take(3).map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s).to_string()).collect(), (!matches!(kind, Kind::Gate | Kind::Ci)).then_some(lane)),
+    };
+    let class = std::iter::once(kind.as_str().to_string()).chain(words).collect::<Vec<_>>().join(" ");
+    lane.map_or(class.clone(), |lane| format!("{class} @{lane}"))
+}
+
+/// What a JIT run's class adds when its box keeps no binary of its tree and cargo builds the JIT
+/// first: that build is its job then, minutes, where the kept binary's run of the same command is
+/// a fraction of a second. One class for both held CI's JIT pre-build, `ci makepad --version`,
+/// building for 6 min, to its warm runs' 0 s, and called it stalled (11-07).
+pub const JIT_BUILD_RUN: &str = " +jit-build";
+
+/// The class a lease is measured by: the one it asked, else its first run's ([`run_class`]); and
+/// when its box said cargo builds its JIT first ([`JIT_BUILD_RUN`]), that job.
+pub fn lease_class(asked: &str, run: &str) -> String {
+    match asked {
+        "" => run.to_string(),
+        asked if run.ends_with(JIT_BUILD_RUN) && !asked.ends_with(JIT_BUILD_RUN) => format!("{asked}{JIT_BUILD_RUN}"),
+        asked => asked.to_string(),
+    }
+}
+
+/// A run class without the lane [`run_class`] measures it under: what tables across lanes group by.
+pub fn class_command(class: &str) -> &str {
+    class.rsplit_once(" @").map_or(class, |(command, _)| command)
+}
+
+/// A run class that is a lane's own script: its name says nothing of its work (one `bash sweep.sh`
+/// ran 9 s, the next 14 min), so its walls judge no run ([`sched::Sched::say_stalled`]). devhub's
+/// own scripts (a gate, a CI leg) do one job: their classes have no lane.
+pub fn lane_script(class: &str) -> bool {
+    class.rsplit_once(" @").is_some_and(|(command, _)| matches!(command.split(' ').nth(1), Some("bash" | "sh" | "zsh" | "cmd" | "powershell" | "pwsh" | "python" | "python3" | "node")))
+}
+
+/// A test run's filter (libtest's words after `--`, without its output and thread flags) as one
+/// class word: `test:<pkg>[:<target>]?<filter>` is measured apart from the whole suite.
+pub(crate) fn filter_key(args: &[&str]) -> String {
+    let mut out = Vec::new();
+    let mut words = args.iter().skip_while(|a| **a == "--");
+    while let Some(w) = words.next() {
+        match *w {
+            "--nocapture" | "--show-output" | "-q" | "--quiet" => {}
+            "--test-threads" | "--color" | "--format" => { words.next(); }
+            w if ["--test-threads=", "--color=", "--format="].iter().any(|p| w.starts_with(p)) => {}
+            w => out.push(w.split_whitespace().collect::<Vec<_>>().join("_")),
+        }
+    }
+    out.join(",")
+}
+
+/// The JIT's flags that take a value (the value is no package).
+const JIT_VALUE_FLAGS: &[&str] = &["--report-to", "--run-dir", "--cfg", "--boundary", "--workspace-dir", "--features", "-F", "--target", "--logfile", "--agent", "--domain", "--idle-min", "--print", "--crate-name", "--crate-type", "--check-cfg", "--cap-lints", "--harness", "--manifest-path"];
+
+/// What a JIT command runs, from its arguments (before any `--`): its subcommand, its package (the
+/// first word that is no flag and no flag's value, or `-p`'s), and the test, bin or example it
+/// names (`--lib`, `--tests` too). Its test filters ([`run_class`] adds them) and app arguments are
+/// no part of it.
+fn jit_class_words(args: &[String]) -> Vec<String> {
+    let mut it = args.iter().take_while(|a| *a != "--");
+    let Some(sub) = it.next() else { return Vec::new() };
+    let (mut package, mut target) = (None, None);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--test" | "--bin" | "--example" => target = it.next().map(|v| format!("{a} {v}")),
+            "--lib" | "--tests" | "--bins" => target = Some(a.clone()),
+            "-p" | "--package" => package = package.or(it.next().cloned()),
+            f if JIT_VALUE_FLAGS.contains(&f) => { it.next(); }
+            f if f.starts_with('-') => {}
+            p => package = package.or(Some(p.to_string())),
+        }
+    }
+    std::iter::once(sub.clone()).chain(package).chain(target).collect()
+}
+
+/// The program a JIT `run` starts, named as cargo names its binary and the run its own executable
+/// (relax-compiler selfexe.rs program_name): `--bin`'s value, else its package's last part. None
+/// for any other JIT command (`makepad test` starts its targets from links of its own).
+pub fn run_program(args: &[String]) -> Option<String> {
+    let words = jit_class_words(args);
+    if words.first().map(String::as_str) != Some("run") {
+        return None;
+    }
+    let flags: Vec<&String> = args.iter().take_while(|a| *a != "--").collect();
+    let bin = flags.iter().position(|f| *f == "--bin").and_then(|i| flags.get(i + 1)).map(|v| v.to_string())
+        .or_else(|| flags.iter().find_map(|f| f.strip_prefix("--bin=").map(str::to_string)));
+    bin.or_else(|| words.get(1).filter(|p| !p.starts_with('-')).and_then(|p| std::path::Path::new(p).file_stem()).map(|s| s.to_string_lossy().into_owned()))
+}
+
+/// Reserved cores, RAM and disk in GB, and GPUs. Concurrent leases sum these costs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cost {
+    pub cores: f64,
+    pub ram_gb: f64,
+    pub disk_gb: f64,
+    pub gpus: u32,
+}
+
+impl Cost {
+    /// The kind's default (DESIGN.md §10.8); `warm` = the lane already has a target on the node.
+    pub fn default_for(kind: Kind, warm: bool) -> Cost {
+        let c = |cores, ram_gb, disk_gb, gpus| Cost { cores, ram_gb, disk_gb, gpus };
+        match kind {
+            Kind::Build => c(8.0, 12.0, if warm { 2.0 } else { 20.0 }, 0),
+            Kind::Gate => c(8.0, 12.0, if warm { 2.0 } else { 20.0 }, 0),
+            Kind::Test => c(4.0, 6.0, 2.0, 0),
+            Kind::Screen | Kind::Ci => c(2.0, 4.0, 1.0, 0),
+            Kind::Long => c(4.0, 8.0, 5.0, 0),
+            Kind::Gpu => c(2.0, 4.0, 1.0, 1),
+            Kind::Inspect => c(0.0, 0.0, 0.0, 0),
+            Kind::Timed => c(0.0, 0.0, 2.0, 0),
+        }
+    }
+}
+
+/// A node's role (`lease.conf role =`): user WMs and devices differ in budgets and disk policy, not in the dev switch (default on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Pool,
+    /// long-cycle pool box: native tree leases (land gates, native builds) go here, CI never
+    Long,
+    Hot,
+    Suite,
+    Bench,
+    UserWm,
+    Device,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Pool => "pool",
+            Role::Long => "long",
+            Role::Hot => "hot",
+            Role::Suite => "suite",
+            Role::Bench => "bench",
+            Role::UserWm => "user-wm",
+            Role::Device => "device",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Role> {
+        [Role::Pool, Role::Long, Role::Hot, Role::Suite, Role::Bench, Role::UserWm, Role::Device].into_iter().find(|r| r.as_str() == s)
+    }
+
+    /// User machines take named jobs only, with no CI slots.
+    pub fn users(self) -> bool {
+        matches!(self, Role::UserWm | Role::Device)
+    }
+}
+
+/// Pinned lane work gets its own native tree on work boxes; CI and landings keep the shared tree.
+pub fn native_lane(lane: &str, kind: Kind, role: Role) -> bool {
+    kind.writes() && !matches!(kind, Kind::Ci | Kind::Gate) && !matches!(lane, sched::CI_LANE | sched::LANDING_LANE) && !role.users()
+}
+
+/// A node's capabilities and health, as its hub measures them (`caps` service).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Caps {
+    /// None on older hubs and Windows; measured by the node, never inferred by the master.
+    pub exec_limits: Option<crate::os::ExecLimits>,
+    pub node: String,
+    pub arch: String,
+    pub os: String,
+    pub cpu: String,
+    /// the `-C target-cpu` every program it runs may be built for ([`caps::cpu_target`]): what a
+    /// build `--for` it takes in place of `native` (empty: an older hub)
+    pub cpu_target: String,
+    pub cores: u32,
+    /// The CPUs its lease.conf pins shared kinds (`cpus.shared`) and timed leases (`cpus.timed`)
+    /// to, counted (0: not pinned, all of `cores`): what a lease of each can use
+    /// ([`Caps::cores_for`]). Budgeted at all 32 cores, a box's shared leases were charged 32 on the
+    /// 16 CPUs they are pinned to: load 66 with 70 threads runnable (11-06).
+    pub cpus_shared: u32,
+    pub cpus_timed: u32,
+    pub load1: f64,
+    pub ram_gb: f64,
+    pub ram_avail_gb: f64,
+    /// What the box holds in RAM outside its leases (its WM, services, hub, kernel, tmpfs; on a
+    /// Mac the OS's own and every app's too): the memory in use, less the leases' own at the same
+    /// look, measured each caps poll (0: an older hub)
+    pub ram_resident_gb: f64,
+    pub disk_free_gb: f64,
+    pub disk_total_gb: f64,
+    /// `name:vram_gb` per GPU
+    pub gpus: Vec<(String, f64)>,
+    /// per GPU, in the order of `gpus`: (use %, VRAM used GB)
+    pub gpu_busy: Vec<(f64, f64)>,
+    /// CPU use of all cores since the previous measure (None: the first one)
+    pub cpu_pct: Option<f64>,
+    /// the box's CPU since the previous measure by whose it was ([`crate::top::cpu_split`]), cores
+    /// on average: each lease's, and the busiest processes outside them (what, pid). A box measured
+    /// busier than its leases' charges names a lease past its charge and these as what took the rest
+    pub busy_leases: Vec<(String, f64)>,
+    pub busy_outside: Vec<(String, u32, f64)>,
+    /// A Mac's GPU used outside every lease since the previous look, % of the GPU, and its
+    /// busiest three outside users (what, pid, % of the GPU), what a GPU timing waits on
+    /// ([`sched::Req::gpu`]); None off a Mac, on the first look, or if the registry could not be read
+    pub mac_gpu: Option<(f64, Vec<(String, u32, f64)>)>,
+    /// a display / WM session the node can show windows on
+    pub display: Option<String>,
+    /// what a WM of ours there answered on another hosted wire (its probe): it hosts no app of
+    /// today, so the box takes no screen or gui lease until that WM restarts; empty: none such
+    pub wm_wire: String,
+    /// why the box's live WM shows nothing ([`caps::dark_of`]): every window opened there times
+    /// out on its first frame, so the box takes no screen or gui lease until it shows one; empty:
+    /// it shows one, or could not say
+    pub wm_dark: String,
+    /// what the box's waiting WM restart waits on when only leases hold it: it drains, taking no
+    /// new lease the restart would wait for until it has restarted ([`sched::Req::cut_by_wm_restart`]);
+    /// empty: none waits, or a person's reason holds it (it never drains for those)
+    pub wm_drain: String,
+    /// percent and charging, on devices with a battery
+    pub battery: Option<(u32, bool)>,
+    pub role: Option<Role>,
+    pub spec: String,
+    /// slots per kind from the node's lease.conf (kind, n)
+    pub slots: Vec<(Kind, u32)>,
+    pub disk_floor_gb: f64,
+    pub disk_warn_gb: f64,
+    pub timed: bool,
+    /// a pool box that takes timed work while the bench boxes that meet it are taken by it
+    /// (`timed = spare`, [`sched`]'s spare rule)
+    pub timed_spare: bool,
+    /// `checkout` (desktop) or `store` (JIT hosts): DEVHUB2's applier
+    pub apply: String,
+    /// The Desk Link endpoint of a JIT host that embeds one ([`crate::embed`]); None elsewhere.
+    pub desk_link: Option<crate::embed::DeskLinkState>,
+    /// A dev switch flip made on the node itself (its tray / task view), not yet taken by the
+    /// master: the master adopts it (saves, pushes), and the push clears it here.
+    pub dev_req: Option<bool>,
+    /// the commits the node's work tree holds (`<makepad sha>[,<commercial sha>]`, [`tree::Pin`];
+    /// empty: unknown): the scheduler prefers a node already there for a lease of those commits
+    pub tree: String,
+    /// Lanes with native trees (and warm targets) on this box; the configured capacity.
+    pub native: Vec<String>,
+    pub native_trees: u32,
+    /// the deployment checkout's commits, in the same form as `tree`; empty: no deployment
+    pub deploy: String,
+    /// a sync apply moves and builds the deployment now: no timed lease starts until it ends
+    pub applying: bool,
+    /// the hub builds itself now ([`exec::build_hub`]): no timed lease starts beside it (its cores
+    /// are the self-update's lease, [`sched::Req::hub_build`])
+    pub hub_building: bool,
+    /// the hub's pre-warm runs now (sync/prewarm.rs): a lease start stops it, and the RAM it holds
+    /// among the residents passes
+    pub prewarming: bool,
+    /// the commit the node's hub was started from (empty: a hub from before it said so)
+    pub hub_rev: String,
+    /// the hub's resident memory and its live heap ([`crate::heap`]), MB (0: not said)
+    pub hub_rss_mb: u64,
+    pub hub_heap_mb: u64,
+    /// why this box cannot link a program (its toolchain probe); empty: it can
+    pub sick: String,
+    /// the kernel's clock source on an x86 Linux box (`tsc`, `hpet`); empty elsewhere
+    /// ([`caps::slow_clock`])
+    pub clocksource: String,
+    /// a Mac's memory pressure (`kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4
+    /// critical); 0 elsewhere ([`caps::mac_pressure`])
+    pub mem_pressure: u32,
+    /// a Linux box's memory stall: PSI `full avg10` in percent; 0 elsewhere
+    /// ([`caps::memory_stall`])
+    pub mem_stall: f64,
+    /// the outage of this hub its WM recorded before it ran ([`makepad_devhub_conf::Trouble`]):
+    /// handed out in one caps answer, which the master says as a warning; empty: none
+    pub trouble: String,
+    /// what the node's hub waits on now, one line each ([`crate::held::stalls`]): `<waiter>
+    /// waits on <lock> held by <holder>` (a deadlock said as one)
+    pub stalls: Vec<String>,
+    /// the node's rustc (`1.97.1`; empty: not known)
+    pub rustc: String,
+    /// the facilities the hub has ([`FEATURES`]); empty: a hub from before feature reports
+    pub features: Vec<String>,
+    /// Optional per-box dev JIT store report.
+    pub jit_store: Option<std::sync::Arc<jitstore::Snapshot>>,
+    /// the services the node's WM supervises (`~/.makepad/wm/<name>.state`): name, start wall ms
+    pub services: Vec<(String, u64)>,
+    /// a person at the node, as its WM saw their input ([`UserSense`]); None: no WM of ours
+    /// runs there (the Macs, Windows): the dev switch alone decides
+    pub user: Option<UserSense>,
+    /// an app of ours that runs outside every lease and that a person uses now, or did within
+    /// [`hand::GRACE_MS`] ([`HandHeld`]): the box takes no work that does not name it
+    pub hand_held: Option<HandHeld>,
+}
+
+/// An app of ours running outside devhub that a person uses ([`hand`]): through input at the
+/// box, a Desk Link viewer watching it, or its own say (an XR headset streaming its view).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct HandHeld {
+    /// the registry's label (`Fab`)
+    pub app: String,
+    pub pid: u32,
+    /// how a person uses it: `an XR headset (Quest 3)`, `a Desk Link viewer`, `input at the box
+    /// (key from its device)`, and since when it ended while its grace lasts
+    pub how: String,
+}
+
+impl HandHeld {
+    pub fn to_json(&self) -> String {
+        format!("{{\"app\":{},\"pid\":{},\"how\":{}}}", json_str(&self.app), self.pid, json_str(&self.how))
+    }
+
+    pub fn parse(v: &makepad_strict_json::Value) -> Option<HandHeld> {
+        Some(HandHeld { app: v.get("app")?.as_str()?.to_string(), pid: v.get("pid").and_then(num).unwrap_or(0.0) as u32, how: v.get("how").and_then(|x| x.as_str()).unwrap_or("").to_string() })
+    }
+
+    /// `held: Fab in use by a person via an XR headset (Quest 3)`.
+    pub fn line(&self) -> String {
+        format!("held: {} in use by a person via {}", self.app, self.how)
+    }
+}
+
+/// One hub build that finished on a node: when (wall ms), how long, the CPU seconds of its
+/// processes and the most RAM they held at once (None: not measured there, Windows). Its hub's
+/// restart answer carries it to the master's ledger, the measure of its class.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HubMeasure {
+    pub end_ms: u64,
+    pub wall_ms: u64,
+    pub cpu_s: Option<f64>,
+    pub peak_gb: Option<f64>,
+}
+
+impl HubMeasure {
+    pub fn to_json(&self) -> String {
+        let n = |x: Option<f64>| x.map_or("null".to_string(), |x| format!("{x:.3}"));
+        format!("{{\"end_ms\":{},\"wall_ms\":{},\"cpu_s\":{},\"peak_gb\":{}}}", self.end_ms, self.wall_ms, n(self.cpu_s), n(self.peak_gb))
+    }
+
+    pub fn parse(v: &makepad_strict_json::Value) -> Option<HubMeasure> {
+        let n = |k: &str| v.get(k).and_then(num).filter(|x| x.is_finite() && *x >= 0.0);
+        Some(HubMeasure { end_ms: n("end_ms")? as u64, wall_ms: n("wall_ms")? as u64, cpu_s: n("cpu_s"), peak_gb: n("peak_gb") })
+    }
+}
+
+/// A person using a node with our WM: the node hub asks the WM (`makepad-wm activity`) how long
+/// ago its device readers took input from a physical device or the user's Desk Link viewer (a
+/// Mac: its HID system's idle time, `user::hid_idle_ms`)
+/// (never injected or agent input, never what runs). Input within `idle_min` minutes: the node
+/// drains on its own (no new lease, no network writes; running leases finish) until that long
+/// without input. The user's own dev switch stays as it is: auto-sensing never turns on a node
+/// the user switched off.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct UserSense {
+    pub present: bool,
+    /// ms since the last input (None: none seen since the hub started)
+    pub idle_ms: Option<u64>,
+    /// the last input: `key`, `pointer` or `gamepad`, from its `device` or `desk link`; a Mac's
+    /// HID idle time says `input` from its `device`
+    pub what: String,
+    /// minutes without input before the node takes work again (`lease.conf user_idle_min`)
+    pub idle_min: u32,
+}
+
+impl UserSense {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"present\":{},\"idle_ms\":{},\"what\":{},\"idle_min\":{}}}",
+            self.present,
+            self.idle_ms.map_or("null".to_string(), |m| m.to_string()),
+            json_str(&self.what),
+            self.idle_min
+        )
+    }
+
+    pub fn parse(v: &makepad_strict_json::Value) -> Option<UserSense> {
+        v.get("present")?;
+        Some(UserSense {
+            present: v.get("present").and_then(|x| x.as_bool()).unwrap_or(false),
+            idle_ms: v.get("idle_ms").and_then(num).map(|m| m as u64),
+            what: v.get("what").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            idle_min: v.get("idle_min").and_then(num).unwrap_or(0.0) as u32,
+        })
+    }
+
+    /// `user (key from its device 40 s ago)`.
+    pub fn line(&self) -> String {
+        let ago = self.idle_ms.map_or(String::new(), |m| format!(" {} ago", if m >= 60_000 { format!("{} min", m / 60_000) } else { format!("{} s", m / 1000) }));
+        format!("user ({}{ago})", if self.what.is_empty() { "input" } else { &self.what })
+    }
+}
+
+/// The facilities this build's hub has, by name, reported in its caps ([`Caps::features`]). A
+/// request lists the ones its fields need and goes only to a hub that reports them all, in place
+/// of the one protocol number a facility used to raise. A new facility is a new
+/// name here; none is ever renamed or reused.
+pub const FEATURES: &[&str] = &[
+    "ship-done", // a tree lease's shipped sources
+    "overlay", // overlay sources and base blobs
+    "native-trees", // per-lane native trees
+    "detach", // detachable live runs
+    "jit-inputs", // compiled-file dev JIT inputs, a dep-info mismatch never fails
+    "handover", // its restart ends nothing, so it restarts for its update at once
+    "warm-trees", // warm leases use another lane's native tree and target
+    "overlay-edits", // each overlay lease has its own edits
+    "hub-jobs", // a hub build takes the jobs its room was granted, `hub-restart <sha> jobs=N`
+    "shared-native", // the shards of one tests bucket run share their native tree
+    "tell", // `lease-tell`, the lease's `$DEVHUB_TOLD` file, the tests run's queue
+    "jit-ask", // an explicit `--jit` is the run's JIT for any command, held for it at `$MAKEPAD_LOADER`
+    "jit-copy", // `jit-read` / `jit-put`, a `--jit` copied to the box a lease is granted on
+    "nested", // a rev names any nested repository
+    "for-cpu", // a lease builds `--for` another box's CPU
+    "deploy-jobs", // an apply's prebuild takes the jobs its room was granted, `apply ... jobs=N`
+    "gpu-quiet", // a GPU timing (`gpu` in its lease-start) waits for its GPU, not the box's CPU
+    "jit-jobs", // a lease's JIT build admitted on fewer cores than it measures builds on those, `cost.jit_jobs`
+];
+
+/// Whether `t` can be a `-C target-cpu` a lease builds for (it goes into the build's flags):
+/// lowercase letters, digits, `-` and `.`.
+pub fn valid_cpu_target(t: &str) -> bool {
+    !t.is_empty() && t.len() <= 40 && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+}
+/// In a box's refusal of a timed lease's start: something builds there, and the master places the
+/// lease again on a new look at the box.
+pub const TIMED_AFTER: &str = "timed work starts after it";
+
+impl Caps {
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+
+    pub fn role(&self) -> Role {
+        self.role.unwrap_or(Role::Pool)
+    }
+
+    /// The cores a lease of `kind` runs on: the CPUs its kind is pinned to, else all of them.
+    pub fn cores_for(&self, kind: Kind) -> u32 {
+        let pinned = if kind == Kind::Timed { self.cpus_timed } else { self.cpus_shared };
+        if pinned > 0 { pinned.min(self.cores) } else { self.cores }
+    }
+
+    pub fn slots(&self, kind: Kind) -> u32 {
+        self.slots.iter().find(|(k, _)| *k == kind).map_or(0, |(_, n)| *n)
+    }
+
+    pub fn to_json(&self) -> String {
+        let gpus: Vec<String> = self
+            .gpus
+            .iter()
+            .enumerate()
+            .map(|(i, (n, v))| {
+                let busy = self.gpu_busy.get(i).map_or(String::new(), |(u, m)| format!(",\"util_pct\":{u:.0},\"used_gb\":{m:.1}"));
+                format!("{{\"name\":{},\"vram_gb\":{v:.1}{busy}}}", json_str(n))
+            })
+            .collect();
+        let exec_limits = self.exec_limits.map_or("null".into(), |l| l.to_json());
+        let slots: Vec<String> = self.slots.iter().map(|(k, n)| format!("\"{}\":{n}", k.as_str())).collect();
+        format!(
+            "{{\"exec_limits\":{exec_limits},\"rustc\":{},\"node\":{},\"arch\":{},\"os\":{},\"cpu\":{},\"cpu_target\":{},\"cores\":{},\"cpus_shared\":{},\"cpus_timed\":{},\"cpu_pct\":{},\"load1\":{:.2},\"ram_gb\":{:.1},\"ram_avail_gb\":{:.1},\"ram_resident_gb\":{:.1},\"disk_free_gb\":{:.1},\"disk_total_gb\":{:.1},\"gpus\":[{}],\"display\":{},\"battery\":{},\"role\":\"{}\",\"spec\":{},\"slots\":{{{}}},\"disk_floor_gb\":{:.0},\"disk_warn_gb\":{:.0},\"timed\":{},\"timed_spare\":{},\"apply\":{},\"desk_link\":{},\"dev_req\":{},\"tree\":{},\"deploy\":{},\"applying\":{},\"stalls\":[{}],\"sick\":{},\"clocksource\":{},\"mem_pressure\":{},\"mem_stall\":{:.1},\"trouble\":{},\"wm_wire\":{},\"wm_dark\":{},\"wm_drain\":{},\"hub_rev\":{},\"hub_rss_mb\":{},\"hub_heap_mb\":{},\"features\":[{}]{}{},\"services\":{{{}}},\"user\":{},\"hand_held\":{}}}",
+            json_str(&self.rustc),
+            json_str(&self.node),
+            json_str(&self.arch),
+            json_str(&self.os),
+            json_str(&self.cpu),
+            json_str(&self.cpu_target),
+            self.cores,
+            self.cpus_shared,
+            self.cpus_timed,
+            self.cpu_pct.map_or("null".to_string(), |p| format!("{p:.1}")),
+            self.load1,
+            self.ram_gb,
+            self.ram_avail_gb,
+            self.ram_resident_gb,
+            self.disk_free_gb,
+            self.disk_total_gb,
+            gpus.join(","),
+            self.display.as_deref().map_or("null".to_string(), json_str),
+            self.battery.map_or("null".to_string(), |(p, c)| format!("{{\"pct\":{p},\"charging\":{c}}}")),
+            self.role().as_str(),
+            json_str(&self.spec),
+            slots.join(","),
+            self.disk_floor_gb,
+            self.disk_warn_gb,
+            self.timed,
+            self.timed_spare,
+            json_str(&self.apply),
+            self.desk_link.as_ref().map_or("null".to_string(), |d| d.to_json()),
+            match self.dev_req { Some(true) => "true", Some(false) => "false", None => "null" },
+            json_str(&self.tree),
+            json_str(&self.deploy),
+            self.applying,
+            self.stalls.iter().map(|l| json_str(l)).collect::<Vec<_>>().join(","),
+            json_str(&self.sick),
+            json_str(&self.clocksource),
+            self.mem_pressure,
+            self.mem_stall,
+            json_str(&self.trouble),
+            json_str(&self.wm_wire),
+            json_str(&self.wm_dark),
+            json_str(&self.wm_drain),
+            json_str(&self.hub_rev),
+            self.hub_rss_mb,
+            self.hub_heap_mb,
+            self.features.iter().map(|f| json_str(f)).collect::<Vec<_>>().join(","),
+            format!(",\"native\":[{}],\"native_trees\":{}{},\"hub_building\":{},\"prewarming\":{},\"busy_leases\":[{}],\"busy_outside\":[{}]", self.native.iter().map(|l| json_str(l)).collect::<Vec<_>>().join(","), self.native_trees, self.jit_store.as_ref().map_or(String::new(), |v| format!(",\"jit_store\":{}", v.to_json())), self.hub_building, self.prewarming,
+                self.busy_leases.iter().map(|(lease, cores)| format!("{{\"lease\":{},\"cores\":{cores:.2}}}", json_str(lease))).collect::<Vec<_>>().join(","),
+                self.busy_outside.iter().map(|(what, pid, cores)| format!("{{\"what\":{},\"pid\":{pid},\"cores\":{cores:.2}}}", json_str(what))).collect::<Vec<_>>().join(",")),
+            self.mac_gpu.as_ref().map_or(String::new(), |(pct, on)| format!(",\"mac_gpu\":{{\"pct\":{pct:.0},\"on\":[{}]}}", on.iter().map(|(what, pid, pct)| format!("{{\"what\":{},\"pid\":{pid},\"pct\":{pct:.2}}}", json_str(what))).collect::<Vec<_>>().join(","))),
+            self.services.iter().map(|(n, t)| format!("{}:{t}", json_str(n))).collect::<Vec<_>>().join(","),
+            self.user.as_ref().map_or("null".to_string(), |u| u.to_json()),
+            self.hand_held.as_ref().map_or("null".to_string(), |h| h.to_json()),
+        )
+    }
+
+    pub fn parse(text: &str) -> Option<Caps> {
+        let v = makepad_strict_json::parse(text.as_bytes()).ok()?;
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let f = |k: &str| v.get(k).and_then(num).unwrap_or(0.0);
+        let mut c = Caps {
+            exec_limits: v.get("exec_limits").and_then(crate::os::ExecLimits::parse),
+            node: s("node"),
+            arch: s("arch"),
+            os: s("os"),
+            cpu: s("cpu"),
+            cpu_target: s("cpu_target"),
+            cores: f("cores") as u32,
+            cpus_shared: f("cpus_shared") as u32,
+            cpus_timed: f("cpus_timed") as u32,
+            cpu_pct: v.get("cpu_pct").and_then(num),
+            load1: f("load1"),
+            ram_gb: f("ram_gb"),
+            ram_avail_gb: f("ram_avail_gb"),
+            ram_resident_gb: f("ram_resident_gb"),
+            disk_free_gb: f("disk_free_gb"),
+            disk_total_gb: f("disk_total_gb"),
+            display: v.get("display").and_then(|x| x.as_str()).map(str::to_string),
+            role: Role::parse(&s("role")),
+            spec: s("spec"),
+            disk_floor_gb: f("disk_floor_gb"),
+            disk_warn_gb: f("disk_warn_gb"),
+            timed: v.get("timed").and_then(|x| x.as_bool()).unwrap_or(false),
+            timed_spare: v.get("timed_spare").and_then(|x| x.as_bool()).unwrap_or(false),
+            apply: s("apply"),
+            desk_link: v.get("desk_link").and_then(crate::embed::DeskLinkState::parse),
+            dev_req: v.get("dev_req").and_then(|x| x.as_bool()),
+            tree: s("tree"),
+            native: v.get("native").and_then(|v| v.as_arr()).unwrap_or(&[]).iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            native_trees: v.get("native_trees").and_then(num).map_or(caps::NATIVE_TREES, |n| n as u32),
+            deploy: s("deploy"),
+            applying: v.get("applying").and_then(|x| x.as_bool()).unwrap_or(false),
+            hub_building: v.get("hub_building").and_then(|x| x.as_bool()).unwrap_or(false),
+            prewarming: v.get("prewarming").and_then(|x| x.as_bool()).unwrap_or(false),
+            hub_rev: s("hub_rev"),
+            hub_rss_mb: f("hub_rss_mb") as u64,
+            hub_heap_mb: f("hub_heap_mb") as u64,
+            sick: s("sick"),
+            clocksource: s("clocksource"),
+            mem_pressure: f("mem_pressure") as u32,
+            mem_stall: f("mem_stall"),
+            trouble: s("trouble"),
+            stalls: v.get("stalls").and_then(|v| v.as_arr()).unwrap_or(&[]).iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            wm_wire: s("wm_wire"),
+            wm_dark: s("wm_dark"),
+            wm_drain: s("wm_drain"),
+            rustc: s("rustc"),
+            features: v.get("features").and_then(|v| v.as_arr()).unwrap_or(&[]).iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            jit_store: v.get("jit_store").filter(|v| !v.is_null()).map(|v| std::sync::Arc::new(jitstore::Snapshot::parse(v))),
+            services: match v.get("services") {
+                Some(makepad_strict_json::Value::Obj(o)) => o.iter().filter_map(|(k, x)| num(x).map(|t| (k.clone(), t as u64))).collect(),
+                _ => Vec::new(),
+            },
+            user: v.get("user").and_then(UserSense::parse),
+            hand_held: v.get("hand_held").and_then(HandHeld::parse),
+            ..Default::default()
+        };
+        if let Some(a) = v.get("gpus").and_then(|x| x.as_arr()) {
+            for g in a {
+                c.gpus.push((g.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(), g.get("vram_gb").and_then(num).unwrap_or(0.0)));
+                if let Some(u) = g.get("util_pct").and_then(num) {
+                    c.gpu_busy.push((u, g.get("used_gb").and_then(num).unwrap_or(0.0)));
+                }
+            }
+        }
+        for b in v.get("busy_leases").and_then(|x| x.as_arr()).unwrap_or(&[]) {
+            c.busy_leases.push((b.get("lease").and_then(|x| x.as_str()).unwrap_or("").to_string(), b.get("cores").and_then(num).unwrap_or(0.0)));
+        }
+        let busy = |b: &makepad_strict_json::Value, unit: &str| (b.get("what").and_then(|x| x.as_str()).unwrap_or("").to_string(), b.get("pid").and_then(num).unwrap_or(0.0) as u32, b.get(unit).and_then(num).unwrap_or(0.0));
+        c.busy_outside = v.get("busy_outside").and_then(|x| x.as_arr()).unwrap_or(&[]).iter().map(|b| busy(b, "cores")).collect();
+        c.mac_gpu = v.get("mac_gpu").and_then(|g| Some((g.get("pct").and_then(num)?, g.get("on").and_then(|x| x.as_arr()).unwrap_or(&[]).iter().map(|b| busy(b, "pct")).collect())));
+        if let Some(b) = v.get("battery").filter(|b| b.get("pct").is_some()) {
+            c.battery = Some((b.get("pct").and_then(num).unwrap_or(0.0) as u32, b.get("charging").and_then(|x| x.as_bool()).unwrap_or(false)));
+        }
+        if let Some(sl) = v.get("slots") {
+            for k in KINDS {
+                if let Some(n) = sl.get(k.as_str()).and_then(num) {
+                    c.slots.push((k, n as u32));
+                }
+            }
+        }
+        Some(c)
+    }
+}
+
+/// A JSON number as f64 (strict-json keeps integers and floats apart).
+pub fn num(v: &makepad_strict_json::Value) -> Option<f64> {
+    match v {
+        makepad_strict_json::Value::Int(i) => Some(*i as f64),
+        makepad_strict_json::Value::F64(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// The lease words of `makepad devhub` (`wt` runs locally; the rest talk to the master).
+pub fn cli(args: &[&str]) -> Option<i32> {
+    if let Some(code) = wt::cli(args) {
+        return Some(code);
+    }
+    client::cli(args)
+}
+
+/// The commits a lease runs at: makepad, and each nested repository it named
+/// ([`crate::nested`]), by name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pin {
+    pub makepad: String,
+    pub nested: std::collections::BTreeMap<String, String>,
+}
+
+impl Pin {
+    /// makepad at `makepad`, no nested repository.
+    pub fn at(makepad: &str) -> Pin {
+        Pin { makepad: makepad.to_string(), nested: Default::default() }
+    }
+
+    /// The pin with nested repository `name` at `sha`.
+    pub fn with(mut self, name: &str, sha: &str) -> Pin {
+        self.nested.insert(name.to_string(), sha.to_string());
+        self
+    }
+
+    /// A tree at this pin serves a lease at `other` without moving: the same makepad commit, and
+    /// the same commit of each nested repository both name (a lease that names none of one takes
+    /// the tree's as it is).
+    pub fn fits(&self, other: &Pin) -> bool {
+        self.makepad == other.makepad && self.nested.iter().all(|(name, sha)| other.nested.get(name).is_none_or(|o| o == sha))
+    }
+
+    /// `<makepad sha>[,<name>=<sha>]...` (the ledger's and caps' form).
+    pub fn key(&self) -> String {
+        self.nested.iter().fold(self.makepad.clone(), |k, (name, sha)| format!("{k},{name}={sha}"))
+    }
+
+    pub fn parse(key: &str) -> Option<Pin> {
+        let mut it = key.split(',');
+        let mut pin = Pin::at(it.next().filter(|s| hex40(s))?);
+        for side in it {
+            let (name, sha) = side.split_once('=')?;
+            if !crate::nested::valid(name) || !hex40(sha) || pin.nested.insert(name.to_string(), sha.to_string()).is_some() {
+                return None;
+            }
+        }
+        Some(pin)
+    }
+
+    /// The commits of a pinned `--rev` (`branch@sha[,<name>=branch@sha]...`, [`pin_revs`]).
+    pub fn of_rev(spec: &str) -> Option<Pin> {
+        let (mk, nested) = parse_pinned(spec).ok()?;
+        Some(Pin { makepad: mk.sha, nested: nested.into_iter().map(|(name, side)| (name, side.sha)).collect() })
+    }
+
+    pub fn short(&self) -> String {
+        let s = |x: &str| x[..10.min(x.len())].to_string();
+        self.nested.iter().fold(s(&self.makepad), |k, (name, sha)| format!("{k},{name}={}", s(sha)))
+    }
+
+    /// Each repository of the pin: its name, its commit and what its paths start with in the tree
+    /// (makepad's nothing, a nested one's `apps/<name>/`).
+    pub fn repos(&self) -> Vec<(&str, &str, String)> {
+        std::iter::once(("makepad", self.makepad.as_str(), String::new())).chain(self.nested.iter().map(|(name, sha)| (name.as_str(), sha.as_str(), crate::nested::prefix(name)))).collect()
+    }
+
+    /// The repository of the pin a tree path is in, its commit and the path inside it.
+    pub fn repo_of<'a>(&'a self, path: &'a str) -> (&'a str, &'a str, &'a str) {
+        match crate::nested::split(path, self.nested.keys().map(String::as_str)) {
+            Some((name, rest)) => (name, self.nested[name].as_str(), rest),
+            None => ("makepad", self.makepad.as_str(), path),
+        }
+    }
+
+    /// The bucket and CI ledgers' pair of the pin ([`crate::state::Pair`]: makepad, and the nested
+    /// repository it pairs).
+    pub fn pair(&self) -> crate::state::Pair {
+        crate::state::Pair::new(&self.makepad, self.nested.get(crate::state::PAIRED).map_or("", String::as_str))
+    }
+}
+
+fn hex40(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// One side of a lease's `--rev`: the branch and the commit it named when the lease was ordered.
+/// A node's word for a pinned commit its store does not hold (a push the master thought done).
+pub const NO_COMMIT: &str = "this box's store has no commit";
+
+/// A node's word for objects of a pinned commit's tree its store lacks, though it holds the
+/// commit: `<NO_OBJECTS> <repo> <id>..: <why>`. Every bundle leaves out what the store's refs
+/// reach, so only a fill of exactly these brings them ([`lacking_objects`]).
+pub const NO_OBJECTS: &str = "this box's store lacks objects of";
+
+/// The repository and the object ids of a [`NO_OBJECTS`] answer.
+pub fn lacking_objects(e: &str) -> Option<(String, Vec<String>)> {
+    let rest = &e[e.find(NO_OBJECTS)? + NO_OBJECTS.len()..];
+    let mut words = rest.split(':').next()?.split_whitespace();
+    let repo = words.next()?.to_string();
+    let ids: Vec<String> = words.filter(|w| hex40(w)).map(str::to_string).collect();
+    (!ids.is_empty()).then_some((repo, ids))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevPin {
+    pub branch: String,
+    pub sha: String,
+}
+
+/// Pins `--rev <branch>[@<sha>][,<name>=<branch>[@<sha>]]...` once, at order time, in the lane's
+/// repo (`repo_dir`; nested repository `name`'s side in its `apps/<name>`): every branch name
+/// becomes `branch@<full sha>`. The master then ships exactly those commits, so a branch that
+/// another landing moves while this lease queues or ships can neither mismatch the bundle nor
+/// pair a makepad commit with a later nested one.
+pub fn pin_revs(repo_dir: &std::path::Path, spec: &str) -> Result<String, String> {
+    let mut out = Vec::new();
+    let mut named = std::collections::BTreeSet::new();
+    for (i, part) in spec.split(',').enumerate() {
+        let (name, part) = if i == 0 { (None, part) } else { let (name, side) = nested_side(spec, part)?; (Some(name), side) };
+        if let Some(name) = name.filter(|n| !named.insert(*n)) {
+            return Err(format!("--rev `{spec}`: {name} twice"));
+        }
+        let dir = name.map_or_else(|| repo_dir.to_path_buf(), |n| repo_dir.join(crate::nested::dir(n)));
+        let (branch, sha) = part.split_once('@').map_or((part, None), |(b, s)| (b, Some(s)));
+        if branch.is_empty() || branch.starts_with('-') || branch.contains(char::is_whitespace) {
+            return Err(format!("--rev `{spec}`: `{branch}` is not a branch name"));
+        }
+        let what = match sha {
+            Some(s) if (7..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) => format!("{s}^{{commit}}"),
+            Some(s) => return Err(format!("--rev `{spec}`: `{s}` is not a commit id")),
+            None => format!("refs/heads/{branch}^{{commit}}"),
+        };
+        let side = |full: String| name.map_or_else(|| format!("{branch}@{full}"), |n| format!("{n}={branch}@{full}"));
+        // a branch or a full id: read in-process; an abbreviated id, or one that read missed, asks
+        // git (one of four `devhub test`s a lane started together was told `--rev: .. has no
+        // commit` of the commit all four ran, 11-13: git's read lists the packs again as a repack
+        // moves them)
+        if let Some(full) = sha.is_none_or(|s| s.len() == 40).then(|| crate::gitread::rev(&dir, &what)).flatten() {
+            out.push(side(full));
+            continue;
+        }
+        let o = crate::git_exec::command()
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "-q", "--verify", &what])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+        let full = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !o.status.success() || full.len() != 40 {
+            return Err(format!("--rev: {} has no {}", dir.display(), sha.map_or(format!("branch {branch}"), |s| format!("commit {s}"))));
+        }
+        out.push(side(full));
+    }
+    Ok(out.join(","))
+}
+
+/// A nested side of a `--rev` (`<name>=<branch>[@<sha>]`): the repository's name and the side.
+fn nested_side<'a>(spec: &str, part: &'a str) -> Result<(&'a str, &'a str), String> {
+    match part.split_once('=') {
+        Some((name, side)) if crate::nested::valid(name) => Ok((name, side)),
+        Some((name, _)) => Err(format!("--rev `{spec}`: `{name}` is not a nested repository's name")),
+        None => Err(format!("--rev `{spec}`: `{part}` names no nested repository: write `<name>=<branch>`, as in `work,commercial=main`")),
+    }
+}
+
+/// The pinned sides of a `--rev` ([`pin_revs`]'s output): makepad's, and each nested repository's
+/// by name.
+pub fn parse_pinned(spec: &str) -> Result<(RevPin, Vec<(String, RevPin)>), String> {
+    let one = |p: &str| {
+        let (branch, sha) = p.split_once('@').ok_or_else(|| format!("rev `{p}` names no commit (branch@sha): the CLI pins it at order time"))?;
+        if branch.is_empty() || sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+            return Err(format!("rev `{p}` is not branch@<40-hex sha>"));
+        }
+        Ok(RevPin { branch: branch.to_string(), sha: sha.to_string() })
+    };
+    let mut it = spec.split(',');
+    let mk = one(it.next().unwrap_or(""))?;
+    let mut nested: Vec<(String, RevPin)> = Vec::new();
+    for part in it {
+        let (name, side) = nested_side(spec, part)?;
+        if nested.iter().any(|(n, _)| n == name) {
+            return Err(format!("rev `{spec}`: {name} twice"));
+        }
+        nested.push((name.to_string(), one(side)?));
+    }
+    Ok((mk, nested))
+}
+
+/// A pinned `--rev` ([`pin_revs`]) as a lease's lines say it: each repository's branch and short
+/// commit, nested ones by name (`rc-x@621f4e19c4,source-library=slmain@06739bed58`).
+pub fn rev_said(spec: &str) -> String {
+    let side = |p: &RevPin| format!("{}@{}", p.branch, &p.sha[..10]);
+    match parse_pinned(spec) {
+        Ok((mk, nested)) => nested.iter().fold(side(&mk), |k, (name, p)| format!("{k},{name}={}", side(p))),
+        Err(_) => spec.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A nested build's lease line said only "sources at the worktree's HEAD" (11-07: a lane's
+    /// nested tree was right, and nothing said which it was).
+    #[test]
+    fn a_leases_line_names_each_repositorys_branch_and_commit() {
+        let (a, b) = ("1".repeat(40), "2".repeat(40));
+        assert_eq!(rev_said(&format!("rc-x@{a},source-library=slmain@{b}")), "rc-x@1111111111,source-library=slmain@2222222222");
+        assert_eq!(rev_said(&format!("work@{a}")), "work@1111111111");
+    }
+
+    #[test]
+    fn a_runs_class_is_its_command_past_an_env_prefix() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let gate = |proven: &str| run_class("lane", Kind::Gate, &argv(&["env", proven, "-u", "X", "bash", "tools/run/fixture/land_gate.sh", "fast", "a1"]));
+        assert_eq!(gate("GATE_PROVEN=check a"), "gate bash land_gate.sh fast");
+        assert_eq!(gate("GATE_PROVEN=check a"), gate("GATE_PROVEN=check b;suite c"), "one class whatever is proven");
+        assert_eq!(run_class("lane", Kind::Test, &argv(&["cargo", "run", "--profile"])), "test cargo run --profile @lane", "no JIT invocation: its words, in its lane");
+        assert_ne!(run_class("a", Kind::Long, &argv(&["bash", "sweep.sh"])), run_class("b", Kind::Long, &argv(&["bash", "sweep.sh"])), "one script's name in two lanes is two commands");
+        assert_eq!(class_command(&run_class("a", Kind::Long, &argv(&["bash", "sweep.sh"]))), "long bash sweep.sh");
+        assert_eq!(run_class("a", Kind::Ci, &argv(&["bash", "ci.sh"])), run_class("b", Kind::Ci, &argv(&["bash", "ci.sh"])), "devhub's own scripts: one class");
+        assert!(lane_script(&run_class("a", Kind::Long, &argv(&["bash", "sweep.sh"]))));
+        assert!(!lane_script(&run_class("a", Kind::Ci, &argv(&["bash", "ci.sh"]))), "devhub's own script");
+        assert!(!lane_script(&run_class("a", Kind::Long, &argv(&["cargo", "build"]))));
+        // the JIT: what it runs, whichever way it is called; its app args are no part, a test
+        // filter measures apart from its whole suite, whose measure it falls back to
+        let cargo = |args: &[&str]| run_class("lane", Kind::Test, &argv(&[&["cargo", "run", "--profile", "host", "-q", "-p", "makepad-run", "--bin", "makepad", "--"][..], args].concat()));
+        assert_eq!(cargo(&["test", "makepad-baz", "--lib", "--", "--exact", "a::b"]), "test makepad test makepad-baz --lib?--exact,a::b");
+        assert_eq!(run_class("lane", Kind::Test, &argv(&["makepad", "test", "-p", "makepad-baz", "--bin", "baz", "--", "a b", "--nocapture", "--test-threads", "2"])), "test makepad test makepad-baz --bin baz?a_b", "its output and thread flags are no part");
+        assert_eq!(base_class(&cargo(&["test", "makepad-baz", "--lib", "--", "--exact", "a::b"])), cargo(&["test", "makepad-baz", "--lib", "--", "--nocapture"]), "the suite's class");
+        assert_eq!(cargo(&["test", "makepad-baz"]), "test makepad test makepad-baz");
+        assert_eq!(cargo(&["test", "-p", "makepad-foo", "--test", "it", "--features", "gpu"]), "test makepad test makepad-foo --test it");
+        assert_eq!(cargo(&["run", "--report-to", "/s/calculator.report", "makepad-app-calculator", "--no-default-features", "--features", "standalone", "--", "--remote"]), "test makepad run makepad-app-calculator");
+        assert_eq!(run_class("lane", Kind::Build, &argv(&["env", "FOO_MUTE=1", "makepad", "check", "makepad-bar"])), "build makepad check makepad-bar", "lanes share what names its package");
+        assert_eq!(run_class("lane", Kind::Build, &argv(&["makepad", "--version"])), "build makepad --version");
+        assert_ne!(cargo(&["test", "makepad-baz"]), cargo(&["run", "makepad-app-foo"]), "a CI shard and a session are measured apart");
+        // the program a JIT run starts, which its process is named after (exec.rs launch_link)
+        let program = |args: &[&str]| run_program(&argv(args));
+        assert_eq!(program(&["run", "--report-to", "/s/r", "makepad-app-calculator", "--features", "standalone", "--", "--remote", "--bin", "x"]).as_deref(), Some("makepad-app-calculator"), "the package; app arguments are no part");
+        assert_eq!(program(&["run", "apps/demo", "--bin", "demo-bin"]).as_deref(), Some("demo-bin"));
+        assert_eq!(program(&["run", "apps/demo", "--bin=demo-bin"]).as_deref(), Some("demo-bin"));
+        assert_eq!(program(&["run", "https://example.com/org/robrix"]).as_deref(), Some("robrix"), "a source's last part");
+        assert_eq!(program(&["test", "makepad-baz"]), None, "a test's targets start from its own links");
+        // a run cargo builds its JIT for is that job, whether its lease asked a class or not
+        let built = format!("ci makepad --version{JIT_BUILD_RUN}");
+        assert_eq!(lease_class("", &built), built);
+        assert_eq!(lease_class("", "ci makepad --version"), "ci makepad --version");
+        assert_eq!(lease_class("timed makepad run makepad-foo", &format!("timed makepad run makepad-foo{JIT_BUILD_RUN}")), format!("timed makepad run makepad-foo{JIT_BUILD_RUN}"));
+        assert_eq!(lease_class(&built, &built), built, "said once");
+        assert_eq!(lease_class("test cargo test", "test git rev-parse HEAD"), "test cargo test", "otherwise the asked class stays");
+        // and the JIT past an env prefix runs on the overlay, never a native checkout's build
+        let jit = argv(&["env", "RELAX_O3=1", "cargo", "run", "--profile", "host", "-q", "-p", "makepad-run", "--bin", "makepad", "--", "live", "a"]);
+        assert_eq!(Src::for_run(Kind::Test, &jit, false), Src::Overlay);
+        assert_eq!(Src::for_run(Kind::Test, &jit, true), Src::Tree);
+    }
+
+    #[test]
+    fn caps_round_trip() {
+        let empty = Caps::default();
+        assert!(Caps::parse(&empty.to_json()).unwrap().features.is_empty());
+        assert!(Caps::parse("{}").unwrap().features.is_empty());
+        let c = Caps {
+            exec_limits: Some(crate::os::ExecLimits { total: 2 * 1024 * 1024, per_string: Some(128 * 1024) }),
+            node: "node-a".into(),
+            arch: "x86_64".into(),
+            os: "linux".into(),
+            cpu: "CPU-B".into(),
+            cpu_target: "x86-64-v3".into(),
+            cores: 16,
+            cpus_shared: 8,
+            cpus_timed: 6,
+            load1: 3.5,
+            ram_gb: 60.0,
+            ram_avail_gb: 40.0,
+            ram_resident_gb: 4.5,
+            disk_free_gb: 105.0,
+            disk_total_gb: 1200.0,
+            gpus: vec![("GPU-B".into(), 32.0)],
+            gpu_busy: vec![(37.0, 4.5)],
+            cpu_pct: Some(12.5),
+            busy_leases: vec![("L7".into(), 11.5), ("L9".into(), 0.25)],
+            busy_outside: vec![("indexer --all".into(), 4_000_021, 2.25), ("dumper".into(), 4_000_020, 0.75)],
+            mac_gpu: Some((14.0, vec![("dumper".into(), 4_000_020, 14.0)])),
+            display: Some("wm".into()),
+            battery: None,
+            role: Some(Role::Pool),
+            spec: "CPU-B+GPU-B".into(),
+            slots: vec![(Kind::Build, 2), (Kind::Test, 2)],
+            disk_floor_gb: 25.0,
+            disk_warn_gb: 50.0,
+            timed: true,
+            timed_spare: true,
+            apply: "checkout".into(),
+            desk_link: Some(crate::embed::DeskLinkState { on: true, port: 8790, note: "listens on 192.0.2.85:8790".into() }),
+            dev_req: Some(true),
+            tree: format!("{},commercial={}", "a".repeat(40), "c".repeat(40)),
+            native: vec!["lane-a".into()],
+            native_trees: caps::NATIVE_TREES,
+            deploy: format!("{},commercial={}", "b".repeat(40), "d".repeat(40)),
+            applying: true,
+            hub_building: true,
+            prewarming: true,
+            rustc: "1.97.1".into(),
+            hub_rev: "b".repeat(40),
+            hub_rss_mb: 3_840,
+            hub_heap_mb: 410,
+            sick: String::new(),
+            clocksource: "hpet".into(),
+            mem_pressure: 2,
+            mem_stall: 12.5,
+            trouble: "devhub on node-a could not run for 12 s (2 tries): exited (signal: 9 (SIGKILL))".into(),
+            stalls: vec!["lease/exec.rs:1184 (makepad-remote-7) waits on lease start held by lease/exec.rs:1763 (makepad-remote-3) (for 12 s)".into()],
+            wm_wire: "makepad-wm-0 answered \"makepad-wm mismatch 0123\"".into(),
+            wm_dark: "its WM's window is 0x0: no output shows it".into(),
+            wm_drain: "screen lease L9 of lane-s (its windows)".into(),
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
+            jit_store: None,
+            services: vec![("ai-hub".into(), 1_700_000_000_000)],
+            user: Some(UserSense { present: true, idle_ms: Some(42_000), what: "key from its device".into(), idle_min: 3 }),
+            hand_held: Some(HandHeld { app: "Fab".into(), pid: 41, how: "an XR headset".into() }),
+        };
+        assert_eq!(Caps::parse(&c.to_json()), Some(c.clone()));
+        let wire = c.to_json();
+        let value = makepad_strict_json::parse(wire.as_bytes()).unwrap();
+        let user = &value.get("mac_gpu").unwrap().get("on").unwrap().as_arr().unwrap()[0];
+        assert_eq!(user.get("pct").and_then(num), Some(14.0), "GPU users carry percent of the GPU on the wire");
+        assert!(user.get("cores").is_none(), "GPU use is not CPU cores");
+        let none = Caps { desk_link: None, user: None, mac_gpu: None, hand_held: None, ..c };
+        assert_eq!(Caps::parse(&none.to_json()), Some(none.clone()));
+        assert_eq!((none.cores_for(Kind::Build), none.cores_for(Kind::Test), none.cores_for(Kind::Timed)), (8, 8, 6), "each kind runs on the CPUs it is pinned to");
+        let unpinned = Caps { cpus_shared: 0, cpus_timed: 0, ..none };
+        assert_eq!((unpinned.cores_for(Kind::Build), unpinned.cores_for(Kind::Timed)), (16, 16), "an unpinned box's leases use all its cores");
+    }
+}

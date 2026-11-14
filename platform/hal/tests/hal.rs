@@ -1,0 +1,843 @@
+use makepad_hal::buffers::{pack_drag_items, read_drag_items, read_items, read_pairs, read_rects, read_strs, PipelineBlob, Wire};
+use makepad_hal::events::{sample_events, EVENT_TABLE};
+use makepad_hal::session::{Miss, Table, World};
+use makepad_hal::*;
+use std::time::{Duration, Instant};
+
+fn open(hal: &Hal, key: u64) -> u32 {
+    let info = hal.open(&OpenReq { backend: backend_id::HEADLESS, app_key: key, flags: 0, dpi_hint: 2.0, parent: 0 });
+    assert_ne!(info.session, 0);
+    assert_eq!(info.dpi, 2.0);
+    info.session
+}
+
+fn pump(hal: &Hal, store: &mut EventStore, timeout_ns: u64) -> Vec<(u64, String)> {
+    let mut buf = store.buf();
+    let n = hal.pump(timeout_ns, &mut buf);
+    store.reader(n, buf.arena_len).map(|(t, e)| (t, format!("{e:?}"))).collect()
+}
+
+#[test]
+fn every_event_round_trips() {
+    let mut q = EventQueue::new();
+    q.set_time(77);
+    let expected = sample_events(&mut q);
+    assert_eq!(expected.len(), EVENT_TABLE.len());
+    assert_eq!(EVENT_TABLE.len(), 108, "57 core (incl. BufferLeases, Clipboard, GpuBudget, PayloadSize, MouseCancel, AppMessage, DeviceReset, BackendChanged, GpuPressure, Redraw, DispatchTime), 6 parent/child (85-90), 13 media, 4 font, 4 direct display/input 1 GL interop and 9 mobile (LongPress, ImeState, ImeAction, ImeResize, PhysicalKeyboard, SelectionHandle, TouchCancel, SafeArea, ImeAnimate) and 2 system back (BackGesture, BackPressed) and 2 tray (TrayMenu, TrayClick) and 3 XR (XrFrame, XrDepth, XrSpace) and 2 accessibility (A11yState, A11yAction) and 1 native layer events and 1 hosted native relay (HostedNativeOut) and 1 GPU profiler readout (GpuProfRecording) and 1 print result (PrintResult)");
+    assert_eq!(EVENT_TABLE.iter().filter(|t| (120..133).contains(&t.0)).count(), 13);
+    assert_eq!(EVENT_TABLE.iter().filter(|t| (100..104).contains(&t.0)).count(), 4);
+    let tags: std::collections::HashSet<u16> = EVENT_TABLE.iter().map(|t| t.0).collect();
+    assert_eq!(tags.len(), EVENT_TABLE.len(), "tags are unique");
+    let mut store = EventStore::new(1, 128, 4096);
+    let mut buf = store.buf();
+    let n = q.drain_into(&mut buf) as usize;
+    assert_eq!(n, EVENT_TABLE.len());
+    let got: Vec<(u64, String)> = store.reader(n as u32, buf.arena_len).map(|(t, e)| (t, format!("{e:?}"))).collect();
+    for (((t, g), want), (_, name, _)) in got.iter().zip(&expected).zip(EVENT_TABLE) {
+        assert_eq!(g, want, "{name}");
+        assert_eq!(*t, 77);
+    }
+}
+
+#[test]
+fn device_loss_reports_only_unfinished_compute() {
+    use makepad_hal::session::InFlightDispatch;
+    let mut world = World::new();
+    let sid = world.open(71);
+    let session = world.session_mut(sid).unwrap();
+    session.strings.insert(11, "completed_kernel".into());
+    session.strings.insert(12, "pending_kernel".into());
+    for (frame, kernel, indirect_buffer) in [(1, 11, Id::NONE), (2, 12, Id::NONE), (3, 12, Id::new(4, 1))] {
+        session.compute_in_flight.push_back(InFlightDispatch { frame, kernel, groups: [3, 2, 1], indirect_buffer, indirect_offset: 16 });
+    }
+    world.frame_done(sid, Id::NONE, target::COMPUTE, 1, 10, 20, [0.0; 2]);
+    makepad_hal::backend::exec::device_lost(&mut world);
+    let mut store = EventStore::new(sid, 32, 4096);
+    let mut buf = store.buf();
+    let count = world.session_mut(sid).unwrap().events.drain_into(&mut buf);
+    let mut losses = 0;
+    for (_, event) in store.reader(count, buf.arena_len) {
+        if let HalEvent::DeviceLost { dispatches, .. } = event {
+            losses += 1;
+            let text = std::str::from_utf8(dispatches).unwrap();
+            assert!(!text.contains("completed_kernel"), "completed work is not blamed: {text}");
+            assert!(text.contains("kernel=\"pending_kernel\" groups=[3, 2, 1]"), "direct dimensions: {text}");
+            assert!(text.contains("groups=indirect") && text.contains("offset=16"), "indirect provenance: {text}");
+        }
+    }
+    assert_eq!(losses, 1, "one loss event includes all pending dispatches");
+}
+
+#[test]
+fn small_event_buffer_delivers_in_order_without_loss() {
+    let mut q = EventQueue::new();
+    for i in 0..10 {
+        q.text(Id::new(1, 1), input::text::TYPED, format!("event number {i}").as_bytes());
+    }
+    let mut store = EventStore::new(1, 3, 40);
+    let mut seen = Vec::new();
+    while !q.is_empty() {
+        let mut buf = store.buf();
+        let n = q.drain_into(&mut buf);
+        assert!(n > 0);
+        seen.extend(store.reader(n, buf.arena_len).map(|(_, e)| format!("{e:?}")));
+    }
+    assert_eq!(seen.len(), 10);
+    assert!(seen[9].contains(&format!("{:?}", b"event number 9".as_slice())));
+}
+
+/// A payload larger than the caller's event arena is announced (`PayloadSize`) and held: a
+/// caller that grows gets it whole on the next pump; one that pumps again with the same arena
+/// gets a cut event, never a silent cut and never a stuck queue. Leased pixels fit a small arena.
+#[test]
+fn a_payload_larger_than_the_event_arena_is_announced_and_held() {
+    let window = Id::new(1, 1);
+    let mut q = EventQueue::new();
+    for _ in 0..2 {
+        q.text(window, input::text::TYPED, &[9u8; 16384]);
+        q.text(window, input::text::TYPED, b"after");
+    }
+    q.text(window, input::text::TYPED, &[7u8; 8192]);
+    q.readback(1, readback::OK, [0, 0, 64, 64], Some(lease::Lease::from_vec(vec![9u8; 64 * 64 * 4], 0)));
+    let pump = |q: &mut EventQueue, store: &mut EventStore| -> Vec<String> {
+        let mut buf = store.buf();
+        let n = q.drain_into(&mut buf);
+        store.reader(n, buf.arena_len).map(|(_, e)| match e {
+            HalEvent::PayloadSize { bytes } => format!("size {bytes}"),
+            HalEvent::Readback { req, status, rect, lease } => {
+                assert_eq!(lease.len(), 32, "only the lease record travels in the arena");
+                // SAFETY: this process pumped the event and takes its lease once.
+                let pixels = unsafe { lease::Held::from_payload(lease) }.unwrap();
+                format!("readback {req} status {status} {rect:?} {} bytes{}", pixels.len(), if pixels.iter().all(|&b| b == 9) { "" } else { " WRONG" })
+            }
+            HalEvent::Text { text, .. } => {
+                if text.len() == 16384 {
+                    assert!(text.iter().all(|&b| b == 9), "the grown arena retains the whole text");
+                }
+                format!("text {} bytes", text.len())
+            }
+            e => format!("{e:?}"),
+        }).collect()
+    };
+    let rect = [0, 0, 64, 64];
+    let mut store = EventStore::new(1, 8, 4096);
+    assert_eq!(pump(&mut q, &mut store), ["size 16384"], "announced alone, held");
+    let mut grown = EventStore::new(1, 8, 16384);
+    assert_eq!(pump(&mut q, &mut grown), ["text 16384 bytes"], "whole from the grown arena");
+    assert_eq!(pump(&mut q, &mut grown), ["text 5 bytes"]);
+    assert_eq!(pump(&mut q, &mut store), ["size 16384"], "the next one is announced too");
+    assert_eq!(pump(&mut q, &mut store), ["text 4096 bytes"], "an arena that did not grow cuts the text");
+    assert_eq!(pump(&mut q, &mut store), ["text 5 bytes"], "the queue goes on");
+    assert_eq!(pump(&mut q, &mut store), ["size 8192"]);
+    assert_eq!(pump(&mut q, &mut store), ["text 4096 bytes"], "another event is cut to the arena");
+    let mut small = EventStore::new(1, 8, 32);
+    assert_eq!(pump(&mut q, &mut small), [format!("readback 1 status {} {rect:?} 16384 bytes", readback::OK)], "leased pixels arrive through a 32-byte arena");
+    assert!(q.is_empty());
+    assert_eq!(q.truncated, 2);
+}
+
+#[test]
+fn arrays_and_blobs_round_trip() {
+    let mut w = CmdWriter::new(1);
+    let items = [DragItem { kind: 1, str: 2 }, DragItem { kind: 3, str: 4 }];
+    let r = w.put_items(&items);
+    let back: Vec<DragItem> = read_items(&w.arena()[r.off as usize..(r.off + r.len) as usize], 2).collect();
+    assert_eq!(back, items);
+    let strs = w.put_strs(&["a.png", "b.txt"]);
+    assert_eq!(read_strs(&w.arena()[strs.off as usize..(strs.off + strs.len) as usize], 2), ["a.png", "b.txt"]);
+    let desc = PipelineDesc { shader: 9, name: 3, source: 4, instance_stride: 12, varyings: 5, blend: 1, color_formats: [1, 0, 0, 0], ..Default::default() };
+    let blob = CmdWriter::pipeline_blob(desc, b"shader code", &[1, 2, 3], &[7, 8]);
+    let p = PipelineBlob::parse(&blob).unwrap();
+    assert_eq!((p.code, p.bindings.as_slice(), p.vertex_layout.as_slice()), (&b"shader code"[..], &[1, 2, 3][..], &[7, 8][..]));
+    assert_eq!((p.desc.shader, p.desc.name, p.desc.instance_stride, p.desc.varyings), (9, 3, 12, 5));
+    assert!(PipelineBlob::parse(&blob[..20]).is_none());
+    let layer = Layer {
+        kind: Layer::NATIVE, native: Id::new(7, 3), draws: Range { off: 4, len: 9 },
+        rect: [2.0, 3.0, 80.0, 90.0], clip: [5.0, 6.0, 40.0, 50.0],
+        radius: [1.0, 2.0, 3.0, 4.0], opacity: 0.75,
+        transform: std::array::from_fn(|i| i as f32 * 0.125),
+        flags: native_layer::layer_flags::VISIBLE | native_layer::layer_flags::INPUT_PASSTHROUGH,
+        occluders: Range { off: 2, len: 3 }, ..Default::default()
+    };
+    let r = w.put_items(&[layer]);
+    assert_eq!(r.len as usize, Layer::SIZE);
+    assert_eq!(read_items::<Layer>(&w.arena()[r.off as usize..], 1).collect::<Vec<_>>(), [layer]);
+    assert_eq!(Layer::default().transform, NativeLayerGeom::default().transform);
+}
+
+#[test]
+fn native_layer_segments_use_only_later_draws_in_the_split_pass() {
+    let mut w = CmdWriter::new(1);
+    let win = Id::new(0, 1);
+    let geom = NativeLayerGeom { rect: [10.0, 10.0, 100.0, 100.0], clip: [20.0, 20.0, 60.0, 60.0], ..Default::default() };
+    // The next frame's element ranges must still address the batch, not restart at zero.
+    w.frame_begin(1, FrameMeta::default());
+    w.pass(Pass::default());
+    w.pass_native_layer(Id::new(9, 1), geom);
+    w.draw(Draw::default());
+    w.frame_end(win, target::WINDOW);
+    w.frame_begin(2, FrameMeta::default());
+    w.pass(Pass::default());
+    w.draw(Draw { bounds: geom.clip, ..Default::default() });
+    w.pass(Pass::default());
+    w.draw(Draw { bounds: geom.clip, ..Default::default() });
+    w.pass_native_layer(Id::new(1, 1), geom);
+    w.draw(Draw { bounds: [10.0, 30.0, 30.0, 30.0], ..Default::default() });
+    w.draw(Draw { bounds: geom.clip, flags: Draw::INPUT_TRANSPARENT, ..Default::default() });
+    w.draw(Draw { bounds: [f32::NAN; 4], ..Default::default() });
+    w.draw(Draw { bounds: [80.0, 20.0, 10.0, 10.0], ..Default::default() });
+    w.pass_native_layer(Id::new(2, 1), geom);
+    w.draw(Draw { bounds: [50.0, 50.0, 40.0, 40.0], ..Default::default() });
+    // Closing the split pass must finish its segment before another pass starts.
+    w.pass(Pass::default());
+    w.draw(Draw { bounds: geom.clip, ..Default::default() });
+    w.frame_end(win, target::WINDOW);
+    let buf = w.buf();
+    let view = unsafe { buf.view() }.unwrap();
+    assert_eq!(view.frames[1].layers, Range { off: 3, len: 5 });
+    let layers = &view.layers[3..8];
+    assert_eq!(layers.iter().map(|l| l.kind).collect::<Vec<_>>(), [Layer::DRAWS, Layer::NATIVE, Layer::DRAWS, Layer::NATIVE, Layer::DRAWS]);
+    assert_eq!(layers[0].draws, Range { off: 2, len: 1 });
+    assert_eq!(layers[2].draws, Range { off: 3, len: 4 });
+    assert_eq!(layers[4].draws, Range { off: 7, len: 1 });
+    assert_eq!(read_rects(view.arena, layers[1].occluders).collect::<Vec<_>>(), [[20.0, 30.0, 20.0, 30.0], [50.0, 50.0, 30.0, 30.0]]);
+    assert_eq!(read_rects(view.arena, layers[3].occluders).collect::<Vec<_>>(), [[50.0, 50.0, 30.0, 30.0]]);
+    // Retained packets rebase draws and layers, retaining the arena's occluder data.
+    let kept = session::KeptFrame::keep(&view, 1).unwrap();
+    let kept = kept.view();
+    assert_eq!(kept.frames[0].layers, Range { off: 0, len: 5 });
+    assert_eq!(kept.layers[0].draws, Range { off: 1, len: 1 });
+    assert_eq!(read_rects(kept.arena, kept.layers[1].occluders).count(), 2);
+}
+
+#[test]
+fn native_layer_occluders_merge_without_losing_coverage_or_growing_steady_state() {
+    let mut w = CmdWriter::new(1);
+    let rects: Vec<_> = (0..17).map(|i| [i as f32 * 4.0, 10.0, 2.0, 3.0]).collect();
+    let mut capacities = None;
+    for frame in 0..4 {
+        w.clear();
+        w.frame_begin(frame, FrameMeta::default());
+        w.pass(Pass::default());
+        w.pass_native_layer(Id::new(1, 1), NativeLayerGeom { rect: [0.0, 0.0, 100.0, 100.0], clip: [0.0, 0.0, 100.0, 100.0], ..Default::default() });
+        for rect in &rects { w.draw(Draw { bounds: *rect, ..Default::default() }); }
+        w.frame_end(Id::new(0, 1), target::WINDOW);
+        let buf = w.buf();
+        let view = unsafe { buf.view() }.unwrap();
+        let merged: Vec<_> = read_rects(view.arena, view.layers[1].occluders).collect();
+        assert_eq!(merged.len(), 8);
+        for r in &rects {
+            assert!(merged.iter().any(|m| m[0] <= r[0] && m[1] <= r[1] && m[0] + m[2] >= r[0] + r[2] && m[1] + m[3] >= r[1] + r[3]), "lost {r:?} in {merged:?}");
+        }
+        assert_eq!(view.layers[0].draws.len, 0);
+        if let Some(cap) = capacities { assert_eq!(w.capacities(), cap); }
+        capacities = Some(w.capacities());
+    }
+}
+
+/// An upload is the writer's copy from the call on: the caller's memory may be freed and handed
+/// out again before the submit (a `&vec![..]` temporary was read after it was gone). Earlier
+/// runs stay put while later ones spill into new chunks; a chunk a turn leaves unused is freed,
+/// so a one-off upload does not stay resident.
+#[test]
+fn an_upload_is_the_writers_copy_from_the_call_on() {
+    let mut w = CmdWriter::new(1);
+    let runs: Vec<Vec<u8>> = (0..24u32).map(|n| (0..(n * 40_009) % 200_000 + 1).map(|i| (i ^ n * 31) as u8).collect()).collect();
+    for (n, run) in runs.iter().enumerate() {
+        let id = Id::new(n as u32, 1);
+        // each clone is a temporary, freed at the end of its statement
+        if n % 2 == 0 { w.buffer_update(id, 0, &run.clone()); } else { w.texture_update(id, 0, [0, 0, 1, 1], 0, &run.clone()); }
+    }
+    let kept = w.keep(&[1.5f32, -2.0]);
+    // the temporaries' blocks go back to the allocator: take them again and scribble over them
+    let scribble: Vec<Vec<u8>> = runs.iter().map(|r| vec![0xee; r.len()]).collect();
+    for (n, (cmd, run)) in w.cmds().iter().zip(&runs).enumerate() {
+        let bytes = match cmd.decode(w.arena()) {
+            Some(HalCmd::BufferUpdate { bytes, .. } | HalCmd::TextureUpdate { bytes, .. }) => bytes,
+            other => panic!("{other:?}"),
+        };
+        // SAFETY: the writer is alive and unchanged since it encoded the command
+        assert!(unsafe { bytes.as_bytes() } == &run[..], "upload {n} is not the bytes of its call");
+    }
+    // SAFETY: as above
+    assert_eq!(unsafe { kept.as_slice::<f32>() }, Some(&[1.5f32, -2.0][..]));
+    drop(scribble);
+    assert!(w.capacities()[6] >= runs.iter().map(Vec::len).sum::<usize>());
+    // the next turn uploads a little: only the first chunk stays
+    w.clear();
+    w.buffer_update(Id::new(0, 1), 0, &[7; 16]);
+    w.clear();
+    assert!(w.capacities()[6] <= 256 << 10, "{} bytes of upload memory stayed after a small turn", w.capacities()[6]);
+}
+
+#[test]
+fn native_layers_cannot_split_two_passes_of_one_frame() {
+    let mut w = CmdWriter::new(1);
+    w.frame_begin(1, FrameMeta::default());
+    w.pass(Pass::default());
+    w.pass_native_layer(Id::new(1, 1), NativeLayerGeom::default());
+    w.pass(Pass::default());
+    let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.pass_native_layer(Id::new(2, 1), NativeLayerGeom::default())));
+    assert_eq!(second.is_err(), cfg!(debug_assertions));
+    w.frame_end(Id::new(0, 1), target::WINDOW);
+    let buf = w.buf();
+    let view = unsafe { buf.view() }.unwrap();
+    assert_eq!(view.frames[0].layers.len, 3);
+    assert_eq!(view.layers.iter().filter(|l| l.kind == Layer::NATIVE).map(|l| l.native).collect::<Vec<_>>(), [Id::new(1, 1)]);
+}
+
+#[test]
+fn headless_reports_native_layers_unsupported_and_keeps_last_frame_geometry() {
+    let hal = Hal::new();
+    let sid = open(&hal, 0);
+    let mut w = CmdWriter::new(sid);
+    let window = Id::new(0, 1);
+    let layer = Id::new(2, 3);
+    w.window_create(window, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 80.0, 80.0], false);
+    w.native_layer_create(layer, native_layer::kind::WEB, b"https://example.com");
+    w.frame_begin(1, FrameMeta::default());
+    w.pass(Pass::default());
+    w.pass_native_layer(layer, NativeLayerGeom { rect: [10.0, 10.0, 40.0, 40.0], clip: [10.0, 10.0, 30.0, 30.0], ..Default::default() });
+    w.draw(Draw { bounds: [20.0, 20.0, 40.0, 40.0], ..Default::default() });
+    w.frame_end(window, target::WINDOW);
+    hal.submit(&w.buf());
+    let mut store = EventStore::new(sid, 64, 4096);
+    let mut buf = store.buf();
+    let n = hal.pump(0, &mut buf);
+    assert!(store.reader(n, buf.arena_len).any(|(_, e)| matches!(e, HalEvent::NativeLayerState { id, what: native_layer::state::REALIZED, a: native_layer::mode::UNSUPPORTED, .. } if id == layer)));
+    hal.with_world(|world| {
+        let s = world.session(sid).unwrap();
+        assert_eq!(s.last_frame_layers.len(), 3);
+        assert_eq!(s.last_frame_layers[1].native, layer);
+        assert_eq!(s.last_frame_layers[1].occluders, Range { off: 0, len: 1 });
+        assert_eq!(s.last_frame_occluders, [[20.0, 20.0, 20.0, 20.0]]);
+    });
+    w.clear();
+    w.frame_begin(2, FrameMeta::default());
+    w.pass(Pass::default());
+    w.frame_end(window, target::WINDOW);
+    let buf = w.buf();
+    assert_eq!(unsafe { buf.view() }.unwrap().frames[0].layers.len, 0);
+    hal.submit(&buf);
+    hal.with_world(|world| {
+        let s = world.session(sid).unwrap();
+        assert!(s.last_frame_layers.is_empty());
+        assert!(s.last_frame_occluders.is_empty());
+    });
+}
+
+/// A texture the device cannot hold (no room, past its limits) is reported gone as an
+/// evicted one, so the app makes it again when it next needs it instead of drawing with an id
+/// that never got storage (on a Linux node: a window maximised on a full GPU then showed only its outline).
+#[test]
+fn a_texture_the_device_cannot_hold_is_reported_evicted() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut store = EventStore::new(s, 128, 4096);
+    let mut w = CmdWriter::new(s);
+    w.texture_create(Id::new(1, 1), usage::SAMPLED | usage::RENDER_TARGET, format::BGRA8, 1200, 800, [1, 1], Attr::default());
+    w.texture_create(Id::new(2, 1), usage::SAMPLED | usage::RENDER_TARGET, format::BGRA8, 40000, 800, [1, 1], Attr::default());
+    hal.submit(&w.buf());
+    let evs: Vec<String> = pump(&hal, &mut store, 0).into_iter().map(|e| e.1).collect();
+    assert_eq!(evs.iter().filter(|e| e.contains("TextureEvicted")).count(), 1, "{evs:?}");
+    assert!(evs.iter().any(|e| e.contains("TextureEvicted") && e.contains("index: 2")), "{evs:?}");
+    assert_eq!(hal.with_world(|w| w.count(ledger::Kind::Texture)), 1);
+    // made again at a size the device holds (the window restored): it is there
+    w.clear();
+    w.texture_create(Id::new(2, 2), usage::SAMPLED | usage::RENDER_TARGET, format::BGRA8, 1200, 800, [1, 1], Attr::default());
+    hal.submit(&w.buf());
+    assert!(pump(&hal, &mut store, 0).iter().all(|e| !e.1.contains("TextureEvicted")));
+    assert_eq!(hal.with_world(|w| w.count(ledger::Kind::Texture)), 2);
+}
+
+#[test]
+fn stale_ids_are_counted_and_ignored() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut w = CmdWriter::new(s);
+    let t = Id::new(4, 2);
+    w.texture_create(t, usage::SAMPLED, format::RGBA8, 16, 16, [1, 1], Attr::default());
+    w.texture_destroy(t);
+    w.texture_destroy(t); // stale: already gone
+    w.texture_create(Id::new(4, 1), usage::SAMPLED, format::RGBA8, 16, 16, [1, 1], Attr::default()); // older generation than the freed one
+    w.texture_update(Id::new(4, 2), 0, [0, 0, 1, 1], 0, &[0; 4]); // dead
+    w.buffer_destroy(Id::new(99, 1)); // never existed
+    hal.submit(&w.buf());
+    let stats = hal.with_world(|w| w.session(s).unwrap().stats);
+    assert_eq!(stats.stale_ids, 4);
+    assert_eq!(hal.with_world(|w| w.count(ledger::Kind::Texture)), 0);
+    // a newer generation of the slot is fine
+    w.clear();
+    w.texture_create(Id::new(4, 3), usage::SAMPLED, format::RGBA8, 16, 16, [1, 1], Attr::default());
+    hal.submit(&w.buf());
+    assert_eq!(hal.with_world(|w| w.count(ledger::Kind::Texture)), 1);
+    // generic table behaviour
+    let mut t: Table<u8> = Table::default();
+    t.insert(1, Id::new(0, 5), 1, 7).unwrap();
+    assert_eq!(t.get(1, Id::new(0, 4)).err(), Some(Miss::Stale));
+    assert_eq!(t.insert(1, Id::new(0, 4), 1, 8).err(), Some(Miss::Stale));
+}
+
+#[test]
+fn data_formats_mips_cube_faces_and_blocks_are_validated() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut w = CmdWriter::new(s);
+    // a cube (6 layers) of RG16F with 2 mips: level 0 is 8x8x4 bytes, level 1 is 4x4x4 bytes
+    w.texture_create(Id::new(0, 1), usage::SAMPLED, format::RG16F, 8, 8, [6, 2], Attr::default());
+    w.texture_update(Id::new(0, 1), 0, [0, 0, 8, 8], 5, &[0; 256]); // face 5, level 0
+    w.texture_update(Id::new(0, 1), 1, [0, 0, 4, 4], 3, &[0; 64]); // face 3, level 1
+    w.texture_update(Id::new(0, 1), 0, [0, 0, 8, 8], 6, &[0; 256]); // face 6 does not exist
+    w.texture_update(Id::new(0, 1), 2, [0, 0, 2, 2], 0, &[0; 16]); // level 2 does not exist
+    // a BC7 image of 9x5 texels is 3x2 blocks of 16 bytes
+    w.texture_create(Id::new(1, 1), usage::SAMPLED, format::BC7, 9, 5, [1, 1], Attr::default());
+    w.texture_update(Id::new(1, 1), 0, [0, 0, 9, 5], 0, &[0; 96]);
+    w.texture_update(Id::new(1, 1), 0, [0, 0, 9, 5], 0, &[0; 45]); // texel count, not block bytes
+    w.texture_create(Id::new(2, 1), usage::RENDER_TARGET, format::R32UINT, 4, 4, [1, 1], Attr::default());
+    hal.submit(&w.buf());
+    let st = hal.with_world(|w| w.session(s).unwrap().stats);
+    assert_eq!((st.bad_args, st.stale_ids), (3, 0));
+    assert_eq!(format::level_bytes(format::BC7, 9, 5), 96);
+    assert_eq!(headless_bytes(format::BC7, 9, 5, 1, 1), 96);
+    assert_eq!(headless_bytes(format::RG16F, 8, 8, 6, 2), 6 * (8 * 8 * 4 + 4 * 4 * 4));
+}
+
+#[test]
+fn drag_items_in_events_carry_their_strings() {
+    let payload = pack_drag_items(&[(input::drag_item::FILE, "/tmp/a.png"), (input::drag_item::STRING, "héllo")]);
+    let mut q = EventQueue::new();
+    q.drag_over(Id::new(1, 1), 3.0, 4.0, 0, 2, &payload);
+    let mut store = EventStore::new(1, 8, 4096);
+    let mut buf = store.buf();
+    let n = q.drain_into(&mut buf);
+    let evs: Vec<_> = store.reader(n, buf.arena_len).collect();
+    match evs[0].1 {
+        HalEvent::DragOver { count, items, .. } => {
+            let got = read_drag_items(items, count);
+            assert_eq!(got, vec![(input::drag_item::FILE, "/tmp/a.png".to_string()), (input::drag_item::STRING, "héllo".to_string())]);
+        }
+        ref e => panic!("{e:?}"),
+    }
+    // a truncated payload ends the list instead of reading out of bounds
+    assert_eq!(read_drag_items(&payload[..payload.len() - 3], 2).len(), 1);
+}
+
+#[test]
+fn instance_ranges_are_element_ranges() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut w = CmdWriter::new(s);
+    w.str_def(1, b"padding that moves the arena off an 8 multiple");
+    let r = w.put_pairs(&[[0, 4], [10, 2], [20, 1]]);
+    assert_eq!(r.len, 3);
+    assert_eq!(read_pairs(w.arena(), r).collect::<Vec<_>>(), vec![[0, 4], [10, 2], [20, 1]]);
+    w.pipeline_create(Id::new(0, 1), dialect::NONE, Attr::default(), &CmdWriter::pipeline_blob(PipelineDesc::default(), &[], &[], &[]));
+    w.frame_begin(1, FrameMeta::default());
+    w.pass(Pass { color: [Id::NONE; 4], depth: Id::NONE, ..Default::default() });
+    w.draw(Draw { pipeline: Id::new(0, 1), inst_ranges: r, ..Default::default() });
+    w.frame_end(Id::new(0, 1), target::WINDOW);
+    w.window_create(Id::new(0, 1), window_kind::NORMAL, Id::NONE, [0.0, 0.0, 10.0, 10.0], false);
+    hal.submit(&w.buf());
+    assert_eq!(hal.with_world(|w| w.session(s).unwrap().stats.bad_args), 0);
+}
+
+fn headless_bytes(f: u32, w: u32, h: u32, d: u32, m: u32) -> u64 {
+    makepad_hal::backend::headless::texture_bytes(f, w, h, d, m)
+}
+
+#[test]
+fn session_close_frees_everything_and_keeps_adoptable_windows() {
+    let hal = Hal::new();
+    let host = hal.with_world(|w| w.host_window([0.0, 0.0, 800.0, 600.0], true));
+    let s = open(&hal, 42);
+    let mut w = CmdWriter::new(s);
+    w.window_create(Id::new(0, 1), window_kind::NORMAL, Id::NONE, [0.0, 0.0, 1.0, 1.0], true); // adopts the host window
+    w.window_create(Id::new(1, 1), window_kind::NORMAL, Id::NONE, [0.0, 0.0, 100.0, 100.0], false);
+    w.texture_create(Id::new(0, 1), usage::RENDER_TARGET, format::RGBA8, 64, 64, [1, 1], Attr::default());
+    w.buffer_create(Id::new(0, 1), buffer_kind::VERTEX, 1024, Attr::default());
+    w.timer_start(5, 1_000_000, true);
+    hal.submit(&w.buf());
+    assert_eq!(hal.with_world(|w| w.lent_to(host)), Some(s));
+    // the adopted window carries the host's geometry
+    let mut store = EventStore::new(s, 32, 1024);
+    let evs = pump(&hal, &mut store, 0);
+    assert!(evs.iter().any(|(_, e)| e.contains("Geom") && e.contains("800.0")), "{evs:?}");
+    assert_eq!(hal.with_world(|w| (w.count(ledger::Kind::Window), w.count(ledger::Kind::Texture), w.count(ledger::Kind::Buffer))), (3, 1, 1));
+    // a second open with the same app key = relaunch: the old session is closed
+    let s2 = open(&hal, 42);
+    assert_ne!(s, s2);
+    assert!(hal.with_world(|w| w.session(s).is_none()));
+    assert_eq!(hal.with_world(|w| (w.count(ledger::Kind::Texture), w.count(ledger::Kind::Buffer))), (0, 0));
+    // the host window survived, lent to nobody
+    assert!(hal.with_world(|w| w.host_window_alive(host)));
+    assert_eq!(hal.with_world(|w| w.lent_to(host)), None);
+    // and can be adopted again; detaching returns it as well
+    let mut w2 = CmdWriter::new(s2);
+    w2.window_create(Id::new(7, 1), window_kind::NORMAL, Id::NONE, [0.0; 4], true);
+    hal.submit(&w2.buf());
+    assert_eq!(hal.with_world(|w| w.lent_to(host)), Some(s2));
+    w2.clear();
+    w2.window_close(Id::new(7, 1));
+    hal.submit(&w2.buf());
+    assert_eq!(hal.with_world(|w| w.lent_to(host)), None);
+    assert!(hal.with_world(|w| w.host_window_alive(host)));
+    // nothing to adopt -> a normal window
+    let mut w3 = World::new();
+    let s3 = w3.open(0);
+    assert!(w3.adopt_window(s3, Id::new(0, 1)).is_none());
+}
+
+#[test]
+fn ledger_totals_and_idle() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut w = CmdWriter::new(s);
+    w.str_def(1, b"vj/effects");
+    w.str_def(2, b"effects.rs:10:5");
+    w.str_def(3, b"main.rs:3:1");
+    w.str_def(4, b"explicit-label");
+    let a = Attr { owner: 1, site: 2, label: 0, kind: 0 };
+    w.texture_create(Id::new(0, 1), usage::RENDER_TARGET, format::RGBA8, 100, 100, [1, 1], a);
+    w.texture_create(Id::new(1, 1), usage::RENDER_TARGET, format::RGBA8, 10, 10, [1, 3], Attr { owner: 1, site: 2, label: 4, kind: 0 });
+    w.texture_create(Id::new(2, 1), usage::RENDER_TARGET, format::DEPTH32F, 100, 100, [1, 1], Attr { owner: 0, site: 3, label: 0, kind: 0 });
+    w.buffer_create(Id::new(0, 1), buffer_kind::INSTANCE, 5000, a);
+    hal.submit(&w.buf());
+    let r = hal.report(s, 30).unwrap();
+    let mip_chain = 10 * 10 * 4 + 5 * 5 * 4 + 2 * 2 * 4;
+    assert_eq!(r.total_bytes, 100 * 100 * 4 + mip_chain + 100 * 100 * 4 + 5000);
+    let kind = |k: &str| r.by_kind.iter().find(|g| g.key == k).map(|g| (g.count, g.bytes));
+    assert_eq!(kind("render target"), Some((2, 40_000 + mip_chain)));
+    assert_eq!(kind("depth"), Some((1, 40_000)));
+    assert_eq!(kind("instance buffers"), Some((1, 5000)));
+    // owner = label, else scope, else site
+    let owner = |k: &str| r.by_owner.iter().find(|g| g.key == k).map(|g| g.bytes);
+    assert_eq!(owner("explicit-label"), Some(mip_chain));
+    assert_eq!(owner("vj/effects"), Some(40_000 + 5000));
+    assert_eq!(owner("main.rs:3:1"), Some(40_000));
+    assert_eq!(r.by_site.iter().find(|g| g.key == "effects.rs:10:5").map(|g| g.count), Some(3));
+    assert_eq!(r.idle.len(), 3, "never used textures are idle");
+    // a frame that samples one texture makes it non-idle
+    w.clear();
+    w.frame_begin(5, FrameMeta::default());
+    w.pass(Pass { color: [Id::new(0, 1), Id::NONE, Id::NONE, Id::NONE], depth: Id::NONE, ..Default::default() });
+    w.frame_end(Id::new(0, 1), target::TEXTURE);
+    hal.submit(&w.buf());
+    let r = hal.report(s, 30).unwrap();
+    assert_eq!(r.idle.len(), 2);
+    assert_eq!(r.items.iter().find(|i| i.index == 0 && i.detail == "render target").unwrap().last_used_frame, 5);
+    // destroying removes from the ledger
+    w.clear();
+    w.texture_destroy(Id::new(0, 1));
+    hal.submit(&w.buf());
+    assert_eq!(hal.report(s, 30).unwrap().total_bytes, r.total_bytes - 40_000);
+    assert_eq!(hal.report_all(30).total_bytes, hal.report(s, 30).unwrap().total_bytes);
+}
+
+#[test]
+fn frame_packet_with_two_passes_three_draws_yields_frame_done() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut w = CmdWriter::new(s);
+    let win = Id::new(0, 1);
+    w.window_create(win, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 640.0, 480.0], false);
+    let blob = CmdWriter::pipeline_blob(PipelineDesc { name: 1, ..Default::default() }, b"code", &[], &[]);
+    w.pipeline_create(Id::new(0, 1), dialect::MSL, Attr::default(), &blob);
+    w.texture_create(Id::new(0, 1), usage::RENDER_TARGET | usage::SAMPLED, format::RGBA8, 64, 64, [1, 1], Attr::default());
+    w.buffer_create(Id::new(0, 1), buffer_kind::VERTEX, 256, Attr::default());
+    let ranges = w.put_items(&[[0u32, 3]]);
+    w.frame_begin(7, FrameMeta { input_ns: 1, ..Default::default() });
+    w.pass(Pass { color: [Id::new(0, 1), Id::NONE, Id::NONE, Id::NONE], depth: Id::NONE, viewport: [0.0, 0.0, 64.0, 64.0], ..Default::default() });
+    // the frames below reuse this draw after `clear`: its instances live in a static
+    static INSTANCES: [f32; 8] = [0.0; 8];
+    // SAFETY: a static outlives every submit
+    let draw = Draw { pipeline: Id::new(0, 1), vb: Id::new(0, 1), ib: Id::NONE, inst: Inst::inline(unsafe { Slice::of(&INSTANCES) }, 2), inst_ranges: ranges, ubufs: [Id::NONE; 4], ..Default::default() };
+    w.draw(draw);
+    w.draw(draw);
+    w.pass(Pass { color: [Id::NONE; 4], depth: Id::NONE, ..Default::default() });
+    let tex = w.put_ids(&[Id::new(0, 1)]);
+    w.draw(Draw { tex, ..draw });
+    w.frame_end(win, target::WINDOW);
+    hal.submit(&w.buf());
+    let mut store = EventStore::new(s, 64, 4096);
+    let evs = pump(&hal, &mut store, 0);
+    let done: Vec<_> = evs.iter().filter(|(_, e)| e.starts_with("FrameDone")).collect();
+    assert_eq!(done.len(), 1, "{evs:?}");
+    assert!(done[0].1.contains("frame: 7"));
+    assert!(evs.iter().any(|(_, e)| e.starts_with("PipelineReady")));
+    assert!(evs.iter().any(|(_, e)| e.starts_with("Startup")));
+    let st = hal.with_world(|w| w.session(s).unwrap().stats);
+    assert_eq!((st.frames, st.passes, st.draws, st.skipped_draws, st.stale_ids), (1, 2, 3, 0, 0));
+    assert!(hal.await_frame_done(s, 7, Duration::from_millis(10)));
+    assert!(!hal.await_frame_done(s, 8, Duration::from_millis(10)));
+    // a draw with a dead pipeline is skipped, counted, and the frame still completes
+    w.clear();
+    w.frame_begin(8, FrameMeta::default());
+    w.pass(Pass { color: [Id::NONE; 4], depth: Id::NONE, ..Default::default() });
+    w.draw(Draw { pipeline: Id::new(5, 1), ..draw });
+    w.frame_end(win, target::WINDOW);
+    hal.submit(&w.buf());
+    assert!(hal.await_frame_done(s, 8, Duration::from_millis(10)));
+    assert_eq!(hal.with_world(|w| w.session(s).unwrap().stats.skipped_draws), 1);
+    // steady state: the writer does not grow
+    let cap = w.capacities();
+    for f in 9..20 {
+        w.clear();
+        w.frame_begin(f, FrameMeta::default());
+        w.pass(Pass { color: [Id::NONE; 4], depth: Id::NONE, ..Default::default() });
+        w.draw(Draw { pipeline: Id::new(0, 1), ..draw });
+        w.frame_end(win, target::WINDOW);
+        hal.submit(&w.buf());
+    }
+    assert_eq!(w.capacities(), cap);
+}
+
+#[test]
+fn readback_and_snapshot_say_no_raster() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut w = CmdWriter::new(s);
+    w.window_create(Id::new(0, 1), window_kind::NORMAL, Id::NONE, [0.0, 0.0, 320.0, 200.0], false);
+    w.texture_create(Id::new(0, 1), usage::RENDER_TARGET, format::RGBA8, 8, 8, [1, 1], Attr::default());
+    w.texture_readback(Id::new(0, 1), 11, [0, 0, 8, 8]);
+    w.texture_readback(Id::new(9, 1), 12, [0, 0, 8, 8]);
+    w.snapshot(Id::new(0, 1), 13);
+    hal.submit(&w.buf());
+    let mut store = EventStore::new(s, 64, 1024);
+    let evs: Vec<String> = pump(&hal, &mut store, 0).into_iter().map(|e| e.1).collect();
+    let rb = |req: &str| evs.iter().find(|e| e.starts_with("Readback") && e.contains(req)).cloned().unwrap_or_default();
+    assert!(rb("req: 11").contains("status: 2"), "{evs:?}");
+    assert!(rb("req: 12").contains("status: 1"));
+    assert!(rb("req: 13").contains("status: 2") && rb("req: 13").contains("320"));
+}
+
+#[test]
+fn timers_follow_the_manual_clock() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    hal.clock_set(1_000);
+    let mut w = CmdWriter::new(s);
+    w.timer_start(1, 500, true);
+    w.timer_start(2, 700, false);
+    hal.submit(&w.buf());
+    let mut store = EventStore::new(s, 16, 256);
+    assert!(pump(&hal, &mut store, 0).iter().all(|e| !e.1.starts_with("Timer")));
+    hal.clock_advance(600);
+    let e = pump(&hal, &mut store, 0);
+    assert_eq!(e.iter().filter(|e| e.1.starts_with("Timer { timer: 1")).count(), 1);
+    assert!(e.iter().all(|e| e.0 == 1_600 || e.1.starts_with("Startup")));
+    hal.clock_advance(200);
+    let e = pump(&hal, &mut store, 0);
+    assert_eq!(e.iter().filter(|e| e.1.starts_with("Timer { timer: 2")).count(), 1);
+    assert_eq!(hal.now(), 1_800);
+    w.clear();
+    w.timer_stop(1);
+    hal.submit(&w.buf());
+    hal.clock_advance(10_000);
+    assert!(pump(&hal, &mut store, 0).is_empty());
+}
+
+#[test]
+fn inject_delivers_with_its_time() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut store = EventStore::new(s, 16, 256);
+    pump(&hal, &mut store, 0);
+    hal.clock_set(555);
+    let mut e = RawEvent::key_down(Id::new(1, 1), 65, false, 0);
+    e.time_ns = 999;
+    hal.inject(s, e);
+    hal.inject(s, RawEvent::key_up(Id::new(1, 1), 65, 0));
+    let got = pump(&hal, &mut store, 0);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, 999);
+    assert!(got[0].1.starts_with("KeyDown"));
+}
+
+#[test]
+fn wake_from_another_thread_unblocks_pump() {
+    let hal = Hal::new();
+    let s = open(&hal, 0);
+    let mut store = EventStore::new(s, 16, 256);
+    pump(&hal, &mut store, 0);
+    let h = hal.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        h.wake();
+    });
+    let t0 = Instant::now();
+    let got = pump(&hal, &mut store, 20_000_000_000);
+    let took = t0.elapsed();
+    t.join().unwrap();
+    assert!(took >= Duration::from_millis(80) && took < Duration::from_secs(10), "{took:?}");
+    assert_eq!(got.len(), 1);
+    assert!(got[0].1.starts_with("Wake"));
+    // a wake that arrives before the pump is not lost
+    hal.wake();
+    let t0 = Instant::now();
+    assert_eq!(pump(&hal, &mut store, 20_000_000_000).len(), 1);
+    assert!(t0.elapsed() < Duration::from_secs(5));
+    // plain timeout with nothing to deliver
+    let t0 = Instant::now();
+    assert!(pump(&hal, &mut store, 50_000_000).is_empty());
+    assert!(t0.elapsed() >= Duration::from_millis(40));
+}
+
+#[test]
+fn clock_is_monotonic_and_absolute() {
+    let a = clock_ns();
+    let b = clock_ns();
+    assert!(a > 0 && b >= a);
+}
+
+#[test]
+fn relaunch_keeps_the_backend_and_frees_only_the_old_session() {
+    let hal = Hal::new();
+    let host = hal.with_world(|w| w.host_window([0.0, 0.0, 800.0, 600.0], true));
+    let a = open(&hal, 7);
+    assert_eq!(hal.backend_inits(), 1);
+    let mut w = CmdWriter::new(a);
+    w.window_create(Id::new(0, 1), window_kind::NORMAL, Id::NONE, [0.0; 4], true);
+    w.texture_create(Id::new(3, 1), usage::RENDER_TARGET, format::RGBA8, 32, 32, [1, 1], Attr::default());
+    hal.submit(&w.buf());
+    assert_eq!(hal.with_world(|w| w.lent_to(host)), Some(a));
+    assert_eq!(hal.report(a, 30).unwrap().total_bytes, 32 * 32 * 4);
+    // another app is not touched by A's relaunch
+    let b = open(&hal, 8);
+    let mut wb = CmdWriter::new(b);
+    wb.texture_create(Id::new(0, 1), usage::SAMPLED, format::RGBA8, 4, 4, [1, 1], Attr::default());
+    hal.submit(&wb.buf());
+    // relaunch A
+    let a2 = open(&hal, 7);
+    assert_ne!(a, a2);
+    assert_eq!(hal.backend_inits(), 1, "same backend instance");
+    assert!(hal.report(a, 30).is_none(), "old session gone");
+    assert_eq!(hal.report_all(30).total_bytes, 4 * 4 * 4, "A's texture freed, B's kept");
+    assert_eq!(hal.with_world(|w| w.lent_to(host)), None);
+    assert!(hal.with_world(|w| w.host_window_alive(host)));
+    // a different backend id on a Hal that has one is refused
+    assert_eq!(hal.open(&OpenReq { backend: 5, ..Default::default() }).session, 0);
+    assert_eq!(hal.backend_inits(), 1);
+    // explicit close frees too
+    assert!(hal.close(b));
+    assert_eq!(hal.report_all(30).total_bytes, 0);
+}
+
+/// A draw names any number of sampled textures (no fixed slot count): the ids round-trip
+/// through the arena, and a slot past the range reads as none.
+#[test]
+fn draw_texture_ids_have_no_slot_limit() {
+    use makepad_hal::buffers::{id_at, read_ids};
+    let mut w = CmdWriter::new(1);
+    let ids: Vec<Id> = (0..13).map(|i| Id::new(i, i + 1)).collect();
+    w.put_strs(&["odd"]); // leaves the arena unaligned
+    let r = w.put_ids(&ids);
+    assert_eq!(r.len, 13);
+    assert_eq!(read_ids(w.arena(), r).collect::<Vec<_>>(), ids);
+    assert_eq!(id_at(w.arena(), r, 12), Id::new(12, 13));
+    assert_eq!(id_at(w.arena(), r, 13), Id::NONE);
+}
+
+#[test]
+fn dropped_frames_retire_their_serials_so_in_flight_never_stalls() {
+    use makepad_hal::session::HOST;
+    let hal = Hal::new();
+    let req = OpenReq {
+        backend: backend_id::HEADLESS,
+        app_key: 0,
+        flags: open_flags::RETAIN_WINDOWS,
+        dpi_hint: 2.0,
+        parent: 0,
+    };
+    assert_eq!(hal.open_host(&req).backend, backend_id::HEADLESS);
+    const HOST_WINDOW: Id = Id::new(3, 1);
+    const APP_WINDOW: Id = Id::new(7, 1);
+    const BADGE: Id = Id::new(9, 1);
+    let mut host = CmdWriter::new(HOST);
+    host.window_create(HOST_WINDOW, window_kind::NORMAL, Id::NONE, [0.0, 0.0, 1000.0, 700.0], false);
+    host.window_create(BADGE, window_kind::BADGE, HOST_WINDOW, [960.0, 2.0, 24.0, 24.0], false);
+    hal.submit(&host.buf());
+    let sid = hal.open(&OpenReq { app_key: 99, ..req }).session;
+    let mut app = CmdWriter::new(sid);
+    app.window_create(APP_WINDOW, window_kind::NORMAL, Id::NONE, [0.0; 4], true);
+    hal.submit(&app.buf());
+    hal.with_world(|w| w.trace_exec = true);
+
+    let submit_frame = |sid: u32, window: Id, serial: u64, kind: u32| {
+        let mut cmd = CmdWriter::new(sid);
+        cmd.frame_begin(serial, FrameMeta::default());
+        cmd.pass(Pass {
+            viewport: [0.0, 0.0, 2000.0, 1400.0],
+            load: [pass_load::CLEAR; 5],
+            ..Default::default()
+        });
+        cmd.frame_end(window, kind);
+        hal.submit(&cmd.buf());
+    };
+    let pump_done = |store: &mut EventStore| -> Vec<u64> {
+        let mut buf = store.buf();
+        let n = hal.pump(0, &mut buf);
+        store
+            .reader(n, buf.arena_len)
+            .filter_map(|(_, ev)| match ev {
+                HalEvent::FrameDone { frame, .. } => Some(frame),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut host_store = EventStore::new(HOST, 32, 512);
+    let mut app_store = EventStore::new(sid, 32, 512);
+
+    // Borrower presents frame 11 so `borrower_frame` is true on `HOST_WINDOW`.
+    submit_frame(sid, APP_WINDOW, 11, target::WINDOW);
+    let _ = pump_done(&mut host_store);
+    let _ = pump_done(&mut app_store);
+    let exec_before = hal.with_world(|w| w.exec_log.len());
+
+    // 1. Lent-window adoption race: HOST submits 3 consecutive frames to HOST_WINDOW while
+    //    `sid` owns the loan and `overlay` is off, followed by a badge target and stale targets.
+    for serial in 201..=203 {
+        submit_frame(HOST, HOST_WINDOW, serial, target::WINDOW);
+    }
+    submit_frame(HOST, BADGE, 204, target::WINDOW);
+    submit_frame(HOST, Id::new(99, 1), 205, target::WINDOW);
+    submit_frame(HOST, Id::new(99, 1), 206, target::TEXTURE);
+    assert_eq!(hal.with_world(|w| w.exec_log.len()), exec_before);
+    let host_done = pump_done(&mut host_store);
+    assert_eq!(host_done, vec![201, 202, 203, 204, 205, 206]);
+    assert_eq!(hal.with_world(|w| w.session(HOST).unwrap().last_frame_done), 206);
+
+    // 2. Stale targets and bad flags on `sid`: more than FRAMES_IN_FLIGHT (2) consecutive
+    //    dropped frames all emit FrameDone, then the next valid beat succeeds.
+    submit_frame(sid, Id::new(77, 1), 21, target::WINDOW);
+    submit_frame(sid, Id::new(77, 1), 22, target::TEXTURE);
+    submit_frame(sid, APP_WINDOW, 23, target::WINDOW | target::OVERLAY);
+    submit_frame(sid, APP_WINDOW, 24, target::WINDOW | target::REPLAY);
+    submit_frame(sid, APP_WINDOW, 25, target::WINDOW | target::BADGES);
+    assert_eq!(hal.with_world(|w| w.exec_log.len()), exec_before);
+    let app_done = pump_done(&mut app_store);
+    assert_eq!(app_done, vec![21, 22, 23, 24, 25]);
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().last_frame_done), 25);
+
+    // 3. Subsequent valid frame on `sid` executes and completes normally:
+    submit_frame(sid, APP_WINDOW, 26, target::WINDOW);
+    assert_eq!(hal.with_world(|w| w.exec_log.last().unwrap().frame), 26);
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().last_frame_done), 26);
+    let _ = pump_done(&mut app_store);
+
+    // 4. Out-of-order guard: while an earlier submitted frame (30) is still in flight on the GPU
+    //    (`s.last_frame_done < s.frame`), dropped frames (31, 32) hold their `FrameDone` until
+    //    frame 30 completes, then retire in order `[30, 31, 32]`.
+    hal.with_world(|w| {
+        w.session_mut(sid).unwrap().frame = 30;
+    });
+    submit_frame(sid, Id::new(77, 1), 31, target::WINDOW);
+    submit_frame(sid, Id::new(77, 1), 32, target::TEXTURE);
+    assert_eq!(pump_done(&mut app_store), Vec::<u64>::new());
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().last_frame_done), 26);
+
+    hal.with_world(|w| {
+        w.frame_done(sid, APP_WINDOW, target::WINDOW, 30, 1000, 2000, [0.0; 2]);
+    });
+    assert_eq!(pump_done(&mut app_store), vec![30, 31, 32]);
+    assert_eq!(hal.with_world(|w| w.session(sid).unwrap().last_frame_done), 32);
+}

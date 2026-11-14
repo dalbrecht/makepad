@@ -1,16 +1,20 @@
+#[cfg(target_arch = "wasm32")]
+use crate::os::web::CxOsDrawShader;
 use {
     crate::{
         cx::Cx,
         draw_vars::{DrawVars, DRAW_CALL_UNIFORM_BUFFER_SLOTS},
-        geometry::GeometryId,
+        geometry::{Geometry, GeometryId},
         makepad_live_id::*,
         makepad_script::heap::ScriptHeap,
         makepad_script::pod::{ScriptPodTy, ScriptPodVec},
         makepad_script::shader::*,
-        makepad_script::value::{ScriptObject, ScriptPodType},
+        makepad_script::shader_reflection::DrawShaderDesc,
+        makepad_script::literal::{LiteralOrigin, LiteralReach, LiteralSite, LiteralValue},
+        makepad_script::value::{ScriptIp, ScriptObject, ScriptPodType},
         makepad_script::NoTrap,
+        makepad_script::ScriptVm,
         makepad_script::ScriptObjectRef,
-        os::CxOsDrawShader,
     },
     std::{
         collections::BTreeSet,
@@ -27,8 +31,31 @@ pub struct CxDrawShaderOptions {
     pub draw_call_group: LiveId,
     pub debug_id: Option<LiveId>,
     pub depth_write: bool,
+    /// Strict greater-than depth test for occluded-surface overlays; default is less-equal.
+    pub depth_test_greater: bool,
+    /// Premultiplied source-over blending for this draw call. `false` makes a
+    /// fragment replace the destination, alpha included. Honoured per draw
+    /// call by every backend: Metal binds a second pipeline state with
+    /// blending disabled (BGRA8 window targets only; data formats keep their
+    /// never-blending pipeline), D3D11 binds a blend state with BlendEnable
+    /// off, Vulkan keys its pipeline on the flag, GL and WebGL toggle
+    /// GL_BLEND around the call; native backends blend only
+    /// when the target is BGRA8 AND the flag is set. With `true`, GL, WebGL,
+    /// D3D11 and Vulkan blend into any target format the pass gives them;
+    /// only Metal's data formats stay unblended. Shaders declared with
+    /// `alpha_blend: false` must output alpha 1.0 or intend a raw write.
     pub alpha_blend: bool,
     pub backface_culling: bool,
+    /// How many times a second a shader that animates from `draw_pass.time` needs its pass repainted,
+    /// or 0 to repaint it every frame. A small or slow animation looks the same at far fewer frames.
+    pub time_fps: f64,
+    /// Scissor rectangle (x, y, width, height) in target pixels, row 0 at
+    /// the top; `None` = the whole target. Fragments outside are dropped
+    /// before shading, which a `discard` cannot do: a pass that renders
+    /// several tiles of one target (the sun's shadow cascades) confines
+    /// each draw to its tile with it. Honoured by Metal and Vulkan; the
+    /// other backends ignore it, so a draw must stay correct without it.
+    pub scissor: Option<[u32; 4]>,
 }
 
 impl Default for CxDrawShaderOptions {
@@ -37,8 +64,11 @@ impl Default for CxDrawShaderOptions {
             draw_call_group: LiveId(0),
             debug_id: None,
             depth_write: true,
+            depth_test_greater: false,
             alpha_blend: true,
             backface_culling: false,
+            time_fps: 0.0,
+            scissor: None,
         }
     }
 }
@@ -73,6 +103,28 @@ impl CxDrawShaderOptions {
     }
 }
 
+/// A shader cached by its draw object's own functions and fields (`shader_functions_hash`). The
+/// functions its compile reached beyond those (a helper fn in another module) are not in that
+/// key: `reached` names their bodies with what their code was (`shader_reached_key`), and the
+/// shader stands for a later object with that key while that code is the same: a design re-run
+/// that gave one of those bodies new text compiles again. (None: not known, a shader pack's
+/// entry, which a design re-run drops.)
+pub struct FnCachedShader {
+    pub shader: DrawShaderId,
+    pub reached: Option<(Box<[ScriptIp]>, u64)>,
+}
+
+impl FnCachedShader {
+    /// What a compile reached: its bodies, and their code now.
+    #[cfg(not(all(target_arch = "wasm32", makepad_precompiled_shaders)))]
+    pub fn reached(vm: &ScriptVm, output: &crate::makepad_script::shader_compile::CompiledShader) -> (Box<[ScriptIp]>, u64) {
+        let mut ips = Vec::new();
+        output.reached_bodies_into(vm.heap(), &mut crate::makepad_script::object_heap::ScriptIpsOut::new(&mut ips));
+        let key = crate::makepad_script::shader_compile::shader_reached_key(vm.bx.code_ref(), &ips);
+        (ips.into_boxed_slice(), key)
+    }
+}
+
 /*
 #[derive(Default)]
 pub struct CxDrawShaderItem {
@@ -83,13 +135,28 @@ pub struct CxDrawShaderItem {
 #[derive(Default)]
 pub struct CxDrawShaders {
     pub shaders: Vec<CxDrawShader>,
+    #[cfg(target_arch = "wasm32")]
     pub os_shaders: Vec<CxOsDrawShader>,
     pub compile_set: BTreeSet<usize>,
+    /// Explicit const-table mode override; None = decide from the
+    /// environment / remote bridge (see `Cx::shader_const_table_mode`).
+    pub const_table_mode: Option<bool>,
 
     pub cache_object_reuse_epoch_seen: u64,
-    pub cache_object_id_to_shader: HashMap<ScriptObject, DrawShaderId>,
-    pub cache_functions_to_shader: LiveIdMap<LiveId, DrawShaderId>,
-    pub cache_code_to_shader: HashMap<CxDrawShaderCode, DrawShaderId>,
+    /// Keyed by (heap key, object): an isolate's objects share index space
+    /// with the app heap's and must never hit its entries. Each object keeps
+    /// its own geometry beside the shader: objects of the same functions
+    /// share one shader over different geometries.
+    pub cache_object_id_to_shader: HashMap<(usize, ScriptObject), (DrawShaderId, Option<GeometryId>)>,
+    pub cache_functions_to_shader: LiveIdMap<LiveId, FnCachedShader>,
+    /// Keyed by the generated code and the pipeline state
+    /// (`DrawVars::pipeline_state_hash`): one code with another colour
+    /// format or blend op is another shader.
+    // Every lookup hashes whole generated shader sources, so use a fast hasher.
+    pub cache_code_to_shader: HashMap<(CxDrawShaderCode, LiveId), DrawShaderId, foldhash::fast::RandomState>,
+    /// Installed shader packs and, on native, a recording
+    /// ([`crate::shader_pack`]).
+    pub packs: crate::makepad_script::shader_pack::ShaderPacks,
     //pub ptr_to_item: HashMap<DrawShaderPtr, CxDrawShaderItem>,
     //pub fingerprints: Vec<DrawShaderFingerprint>,
     //pub error_set: HashSet<DrawShaderPtr>,
@@ -101,17 +168,192 @@ impl CxDrawShaders {
         self.cache_object_id_to_shader.clear();
         self.cache_functions_to_shader.clear();
     }
+
+    /// After a design re-run (a `script_mod!` edit): its draw objects are new objects, so the
+    /// object-keyed cache goes. The function-keyed cache stays: its keys are the functions'
+    /// content (their module's text and their place in it, `fn_content_key`) and the fields'
+    /// kinds and types, and an entry stands only while the code its compile reached is the same
+    /// (`FnCachedShader`), so a draw object the edit left alone gets the shader it had, and only
+    /// the edited modules' shaders generate their code again.
+    pub fn reset_for_design_rerun(&mut self) {
+        self.cache_object_id_to_shader.clear();
+        self.cache_functions_to_shader.retain(|_, e| e.reached.is_some());
+    }
+
+    /// The shader cached for draw objects with these functions and fields
+    /// (`shader_functions_hash`), while the code its compile reached is the same.
+    pub fn fn_cached(&self, code: &crate::makepad_script::vm::ScriptCode, fnhash: LiveId) -> Option<DrawShaderId> {
+        let e = self.cache_functions_to_shader.get(&fnhash)?;
+        match &e.reached {
+            Some((ips, key)) => (crate::makepad_script::shader_compile::shader_reached_key(code, ips) == *key).then_some(e.shader),
+            None => Some(e.shader),
+        }
+    }
 }
 
 impl Cx {
-    pub fn flush_draw_shaders(&mut self) {
-        /*
-        self.shader_registry.flush_registry();
-        self.draw_shaders.shaders.clear();
-        self.draw_shaders.ptr_to_item.clear();
-        self.draw_shaders.fingerprints.clear();
-        self.draw_shaders.error_set.clear();
-        self.draw_shaders.error_fingerprints.clear();*/
+    /// Whether draw shaders compile with the constant table: annotated float
+    /// literals in fn bodies become hot-patchable scope-uniform slots
+    /// instead of folded code. Explicit `set_shader_const_table_mode` wins;
+    /// else `MAKEPAD_SHADER_CONST_TABLE=1|0`; else on exactly when the
+    /// remote bridge (the tweaker's channel) is active. Off, codegen is
+    /// byte-identical to a build without the feature.
+    pub fn shader_const_table_mode(&self) -> bool {
+        if let Some(on) = self.draw_shaders.const_table_mode {
+            return on;
+        }
+        match std::env::var("MAKEPAD_SHADER_CONST_TABLE").as_deref() {
+            Ok("1") | Ok("true") | Ok("on") => true,
+            Ok("0") | Ok("false") | Ok("off") => false,
+            _ => crate::remote::requested(),
+        }
+    }
+
+    /// Force the const-table mode. Takes effect for shaders compiled from
+    /// now on: the shader caches are dropped so a re-applied draw object
+    /// recompiles, but a DrawVars holding a compiled shader keeps it until
+    /// it is re-applied (live edit / script reapply).
+    pub fn set_shader_const_table_mode(&mut self, on: bool) {
+        if self.draw_shaders.const_table_mode == Some(on) {
+            return;
+        }
+        self.draw_shaders.const_table_mode = Some(on);
+        self.draw_shaders.reset_for_live_reload();
+        self.draw_shaders.cache_code_to_shader.clear();
+    }
+
+    /// The hot-patchable constants of a compiled shader (empty when it was
+    /// compiled with the table off or has no annotated literals).
+    pub fn shader_const_table(&self, shader_id: DrawShaderId) -> &[DrawShaderTableConst] {
+        match self.draw_shaders.shaders.get(shader_id.index) {
+            Some(sh) => &sh.mapping.table_consts,
+            None => &[],
+        }
+    }
+
+    /// Hot-patch one table constant: the new value reaches the GPU on the
+    /// next frame through the scope-uniform buffer — no recompile, and the
+    /// shader source is untouched. Every draw sharing this compiled shader
+    /// changes together. Returns false for an unknown shader or index.
+    pub fn shader_const_patch(&mut self, shader_id: DrawShaderId, index: usize, value: f32) -> bool {
+        let uniforms_gen = self.next_uniform_gen();
+        let Some(sh) = self.draw_shaders.shaders.get_mut(shader_id.index) else {
+            return false;
+        };
+        if !sh.mapping.patch_table_const(index, value, uniforms_gen) {
+            return false;
+        }
+        self.redraw_all();
+        true
+    }
+
+    /// Put one table constant back to the literal in the source.
+    pub fn shader_const_reset(&mut self, shader_id: DrawShaderId, index: usize) -> bool {
+        let initial = match self
+            .draw_shaders
+            .shaders
+            .get(shader_id.index)
+            .and_then(|sh| sh.mapping.table_consts.get(index))
+        {
+            Some(tc) => tc.initial,
+            None => return false,
+        };
+        self.shader_const_patch(shader_id, index, initial)
+    }
+
+    /// Edit mode's literal-site map for the files `edited` (the names their
+    /// compiled copies' origins give, see [`Self::set_literal_source`];
+    /// none = off). On, every float and colour literal a compiled text
+    /// copies from an edited file lands somewhere [`Self::patch_literal`]
+    /// reaches: shaders read it from a uniform slot, kernels from a hidden
+    /// parameter, a running program's VM from its code and what load
+    /// stored it in (see [`makepad_script::literal`]). A literal-only edit of
+    /// the source then compiles to the same program text (the GPU program
+    /// is reused). Off (the default, and for shipped or web playback)
+    /// literals fold and compiled code is byte-identical to a build without
+    /// the map. Takes effect for what compiles from now on.
+    pub fn set_live_literals(&mut self, edited: Vec<String>) {
+        if !crate::makepad_script::literal::set_edited(edited) {
+            return;
+        }
+        self.draw_shaders.reset_for_live_reload();
+        self.draw_shaders.cache_code_to_shader.clear();
+    }
+
+    pub fn live_literals_on(&self) -> bool {
+        crate::makepad_script::literal::edit_mode()
+    }
+
+    /// Name the rows of compiled text `module` (a `ScriptMod::file`, a
+    /// kernel's name) that are copies of an edited file: its literals there
+    /// compile live. Replaces what was registered under that name; an empty
+    /// list removes it. A host that compiles text copied out of a document
+    /// (a layer's shader fn, a pass) registers its origins just before.
+    pub fn set_literal_source(&mut self, module: &str, origins: Vec<LiteralOrigin>) {
+        // The same text compiled where it now sits names other sites: the
+        // function-keyed caches would hand back the old ones.
+        if crate::makepad_script::literal::set_source(module, origins) && self.live_literals_on() {
+            self.draw_shaders.reset_for_live_reload();
+        }
+    }
+
+    /// Set the literal at `site` to `value` everywhere it landed, for the
+    /// next frame: every compiled shader slot made from it, and every
+    /// registered sink (kernel parameters, a running program's VM). What it
+    /// reached, and whether a reload is still needed (the literal also fed
+    /// a value computed while the program loaded).
+    pub fn patch_literal(&mut self, site: &LiteralSite, value: LiteralValue) -> LiteralReach {
+        let uniforms_gen = self.next_uniform_gen();
+        let mut wrote = 0;
+        for sh in self.draw_shaders.shaders.iter_mut() {
+            if !sh.mapping.table_consts.is_empty() {
+                wrote += sh.mapping.patch_literal(site, value, uniforms_gen);
+            }
+        }
+        let mut reach = crate::makepad_script::literal::patch_sinks(site, value);
+        reach.set_places(reach.places() + wrote);
+        if self.draw_shaders.shaders.iter().any(|sh| sh.mapping.folded_sites.contains(site)) {
+            reach.add_reload("compiled into a shader as a constant (an integer)");
+        }
+        if reach.places() > 0 {
+            self.redraw_all();
+        }
+        reach
+    }
+
+    /// Every live literal site the compiled shaders hold, with its value
+    /// now (an editor's or a test's view of what patches will reach).
+    pub fn shader_literal_sites(&self) -> Vec<(DrawShaderId, LiteralSite, LiteralValue)> {
+        let mut out = Vec::new();
+        for (index, sh) in self.draw_shaders.shaders.iter().enumerate() {
+            for tc in &sh.mapping.table_consts {
+                let Some(site) = &tc.site else { continue };
+                let value = match tc.color {
+                    Some(c) => LiteralValue::color(c),
+                    None => LiteralValue::number(if tc.negated { -tc.value } else { tc.value } as f64),
+                };
+                out.push((DrawShaderId { index }, site.clone(), value));
+            }
+        }
+        out
+    }
+}
+
+impl CxDrawShaders {
+    /// The shader compiled before from the same code, when it can stand
+    /// for this compile. A table constant's value is the shader's own (a
+    /// live literal compiles to the same text whatever it says), so a
+    /// compile whose table holds other values or sites is a shader of its
+    /// own: it gets its own mapping, and the backend reuses the GPU
+    /// program by its source.
+    pub fn code_hit(&self, code: &CxDrawShaderCode, pipe: LiveId, table: &[ShaderTableConst]) -> Option<DrawShaderId> {
+        let id = *self.cache_code_to_shader.get(&(code.clone(), pipe))?;
+        let have = &self.shaders.get(id.index)?.mapping.table_consts;
+        let same = have.len() == table.len()
+            && have.iter().zip(table).all(|(h, t)| {
+                h.initial == t.value() as f32 && h.initial_color == t.color() && h.site.as_ref() == t.site() && h.doc == t.doc()
+            });
+        same.then_some(id)
     }
 }
 
@@ -142,7 +384,7 @@ impl DrawShaderId {
 
 pub struct CxDrawShader {
     pub debug_id: LiveId,
-    pub os_shader_id: Option<usize>,
+    pub pipeline_id: Option<usize>,
     pub mapping: CxDrawShaderMapping,
 }
 
@@ -150,7 +392,14 @@ pub struct CxDrawShader {
 pub struct DrawShaderInputs {
     pub inputs: Vec<DrawShaderInput>,
     pub packing_method: DrawShaderInputPacking,
+    /// f32-lane count. For the all-F32xN case this is also `stride_bytes / 4`.
     pub total_slots: usize,
+    /// Packed byte stride. Equals `total_slots * 4` whenever every input is F32xN.
+    pub stride_bytes: usize,
+    max_byte_align: usize,
+    /// Each input's index by id, built as the inputs are placed: a uniform write by id is one
+    /// probe, not a scan of every input (`find`).
+    by_id: LiveIdMap<LiveId, u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,27 +413,243 @@ pub enum DrawShaderInputPacking {
     UniformsMetal,
 }
 
+/// Physical vertex/instance fetch format. The existing f32 path is the `F32xN`
+/// case of this enum; compact formats convert to `vec2f`/`vec4f` at fetch.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawShaderAttrFormat {
+    F32x1,
+    F32x2,
+    F32x3,
+    F32x4,
+    F16x2,
+    F16x4,
+    U16x2,
+    I16x2,
+    U16x2Norm,
+    I16x2Norm,
+    U8x4Norm,
+    I8x4Norm,
+    U32x1,
+    I32x1,
+}
+
+#[allow(non_upper_case_globals)]
+impl DrawShaderAttrFormat {
+    /// Old three-variant names kept as aliases so remaining matches compile.
+    pub const Float: Self = Self::F32x1;
+    pub const UInt: Self = Self::U32x1;
+    pub const SInt: Self = Self::I32x1;
+}
+
+impl Default for DrawShaderAttrFormat {
+    fn default() -> Self {
+        Self::F32x1
+    }
+}
+
+impl DrawShaderAttrFormat {
+    pub fn from_slots_f32(slots: usize) -> Self {
+        match slots {
+            1 => Self::F32x1,
+            2 => Self::F32x2,
+            3 => Self::F32x3,
+            _ => Self::F32x4,
+        }
+    }
+
+    pub fn is_f32_lane(self) -> bool {
+        matches!(self, Self::F32x1 | Self::F32x2 | Self::F32x3 | Self::F32x4)
+    }
+
+    pub fn is_compact(self) -> bool {
+        !self.is_f32_lane() && !matches!(self, Self::U32x1 | Self::I32x1)
+    }
+
+    /// Integer vertexAttribIPointer / DXGI *_UINT/SINT (not normalized).
+    pub fn is_integer_fetch(self) -> bool {
+        matches!(self, Self::U32x1 | Self::I32x1)
+    }
+
+    pub fn byte_align(self) -> usize {
+        match self {
+            Self::U8x4Norm | Self::I8x4Norm => 1,
+            Self::F16x2
+            | Self::F16x4
+            | Self::U16x2
+            | Self::I16x2
+            | Self::U16x2Norm
+            | Self::I16x2Norm => 2,
+            _ => 4,
+        }
+    }
+
+    pub fn byte_size(self) -> usize {
+        match self {
+            Self::F32x1 | Self::U32x1 | Self::I32x1 => 4,
+            Self::F32x2 => 8,
+            Self::F32x3 => 12,
+            Self::F32x4 => 16,
+            Self::F16x2
+            | Self::U16x2
+            | Self::I16x2
+            | Self::U16x2Norm
+            | Self::I16x2Norm
+            | Self::U8x4Norm
+            | Self::I8x4Norm => 4,
+            Self::F16x4 => 8,
+        }
+    }
+
+    pub fn component_count(self) -> usize {
+        match self {
+            Self::F32x1 | Self::U32x1 | Self::I32x1 => 1,
+            Self::F32x2
+            | Self::F16x2
+            | Self::U16x2
+            | Self::I16x2
+            | Self::U16x2Norm
+            | Self::I16x2Norm => 2,
+            Self::F32x3 => 3,
+            Self::F32x4 | Self::F16x4 | Self::U8x4Norm | Self::I8x4Norm => 4,
+        }
+    }
+
+    pub fn logical_slots(self) -> usize {
+        self.component_count()
+    }
+
+    pub fn is_normalized(self) -> bool {
+        matches!(
+            self,
+            Self::U16x2Norm | Self::I16x2Norm | Self::U8x4Norm | Self::I8x4Norm
+        )
+    }
+
+    /// WebGL/OpenGL type token: FLOAT=0, HALF_FLOAT=1, UNSIGNED_SHORT=2,
+    /// SHORT=3, UNSIGNED_BYTE=4, BYTE=5, UNSIGNED_INT=6, INT=7.
+    pub fn decode_to_f32(self, bytes: &[u8]) -> [f32; 4] {
+        fn f16(b: &[u8], i: usize) -> f32 {
+            if i + 1 >= b.len() {
+                return 0.0;
+            }
+            crate::f16_bits_to_f32(u16::from_le_bytes([b[i], b[i + 1]]))
+        }
+        fn u16v(b: &[u8], i: usize) -> u16 {
+            if i + 1 >= b.len() {
+                return 0;
+            }
+            u16::from_le_bytes([b[i], b[i + 1]])
+        }
+        fn i16v(b: &[u8], i: usize) -> i16 {
+            if i + 1 >= b.len() {
+                return 0;
+            }
+            i16::from_le_bytes([b[i], b[i + 1]])
+        }
+        match self {
+            Self::F32x1 | Self::F32x2 | Self::F32x3 | Self::F32x4 => {
+                let n = self.component_count();
+                let mut out = [0.0f32; 4];
+                for i in 0..n {
+                    let o = i * 4;
+                    if o + 3 < bytes.len() {
+                        out[i] = f32::from_le_bytes([
+                            bytes[o],
+                            bytes[o + 1],
+                            bytes[o + 2],
+                            bytes[o + 3],
+                        ]);
+                    }
+                }
+                out
+            }
+            Self::F16x2 => [f16(bytes, 0), f16(bytes, 2), 0.0, 0.0],
+            Self::F16x4 => [f16(bytes, 0), f16(bytes, 2), f16(bytes, 4), f16(bytes, 6)],
+            Self::U16x2 => [u16v(bytes, 0) as f32, u16v(bytes, 2) as f32, 0.0, 0.0],
+            Self::I16x2 => [i16v(bytes, 0) as f32, i16v(bytes, 2) as f32, 0.0, 0.0],
+            Self::U16x2Norm => [
+                u16v(bytes, 0) as f32 / 65535.0,
+                u16v(bytes, 2) as f32 / 65535.0,
+                0.0,
+                0.0,
+            ],
+            Self::I16x2Norm => [
+                (i16v(bytes, 0) as f32 / 32767.0).max(-1.0),
+                (i16v(bytes, 2) as f32 / 32767.0).max(-1.0),
+                0.0,
+                0.0,
+            ],
+            Self::U8x4Norm => {
+                let b = |i| bytes.get(i).copied().unwrap_or(0) as f32 / 255.0;
+                [b(0), b(1), b(2), b(3)]
+            }
+            Self::I8x4Norm => {
+                let b = |i| {
+                    (bytes.get(i).copied().unwrap_or(0) as i8 as f32 / 127.0).max(-1.0)
+                };
+                [b(0), b(1), b(2), b(3)]
+            }
+            Self::U32x1 => {
+                if bytes.len() >= 4 {
+                    [f32::from_bits(u32::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                    ])), 0.0, 0.0, 0.0]
+                } else {
+                    [0.0; 4]
+                }
+            }
+            Self::I32x1 => {
+                if bytes.len() >= 4 {
+                    [f32::from_bits(i32::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                    ]) as u32), 0.0, 0.0, 0.0]
+                } else {
+                    [0.0; 4]
+                }
+            }
+        }
+    }
+
+    pub fn gl_type_code(self) -> u32 {
+        match self {
+            Self::F32x1 | Self::F32x2 | Self::F32x3 | Self::F32x4 => 0,
+            Self::F16x2 | Self::F16x4 => 1,
+            Self::U16x2 | Self::U16x2Norm => 2,
+            Self::I16x2 | Self::I16x2Norm => 3,
+            Self::U8x4Norm => 4,
+            Self::I8x4Norm => 5,
+            Self::U32x1 => 6,
+            Self::I32x1 => 7,
+        }
+    }
+
+    /// Kind used by the f32 instance/uniform write path (bit-cast ints).
+    pub fn f32_write_kind(self) -> DrawShaderF32WriteKind {
+        match self {
+            Self::U32x1 => DrawShaderF32WriteKind::UInt,
+            Self::I32x1 => DrawShaderF32WriteKind::SInt,
+            _ => DrawShaderF32WriteKind::Float,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawShaderF32WriteKind {
     Float,
     UInt,
     SInt,
 }
 
-impl Default for DrawShaderAttrFormat {
-    fn default() -> Self {
-        Self::Float
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct DrawShaderInput {
     pub id: LiveId,
-    //pub ty: ShaderTy,
+    /// f32-lane offset. For all-F32 inputs this is `byte_offset / 4`.
     pub offset: usize,
     pub slots: usize,
     pub attr_format: DrawShaderAttrFormat,
-    // pub live_ptr: Option<LivePtr>
+    pub byte_offset: usize,
+    pub byte_size: usize,
 }
 
 fn uniform_packing() -> DrawShaderInputPacking {
@@ -215,110 +680,140 @@ impl DrawShaderInputs {
             inputs: Vec::new(),
             packing_method,
             total_slots: 0,
+            stride_bytes: 0,
+            max_byte_align: 1,
+            by_id: LiveIdMap::default(),
         }
+    }
+
+    /// The input of this id (the first, if a layout repeats one).
+    #[inline]
+    pub fn find(&self, id: LiveId) -> Option<&DrawShaderInput> {
+        self.by_id.get(&id).and_then(|index| self.inputs.get(*index as usize))
+    }
+
+    /// Place an input whose offsets the caller computed.
+    pub fn push_placed(&mut self, input: DrawShaderInput) {
+        self.by_id.entry(input.id).or_insert(self.inputs.len() as u32);
+        self.inputs.push(input);
+    }
+
+    pub fn has_compact(&self) -> bool {
+        self.inputs.iter().any(|i| i.attr_format.is_compact())
+    }
+
+    pub fn all_f32_lanes(&self) -> bool {
+        !self.inputs.is_empty() && self.inputs.iter().all(|i| i.attr_format.is_f32_lane())
+    }
+
+    /// Stable signature of the physical fetch record. Field names are not
+    /// included: only byte interpretation and ordering affect buffer safety.
+    pub fn layout_signature(&self) -> u64 {
+        fn mix(hash: &mut u64, value: usize) {
+            for byte in value.to_le_bytes() {
+                *hash ^= byte as u64;
+                *hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+
+        let mut hash = 0xcbf29ce484222325;
+        mix(&mut hash, self.stride_bytes);
+        mix(&mut hash, self.total_slots);
+        mix(&mut hash, self.inputs.len());
+        for input in &self.inputs {
+            mix(&mut hash, input.attr_format as usize);
+            mix(&mut hash, input.byte_offset);
+            mix(&mut hash, input.byte_size);
+            mix(&mut hash, input.slots);
+        }
+        hash
+    }
+
+    fn push_input(
+        &mut self,
+        id: LiveId,
+        offset: usize,
+        slots: usize,
+        attr_format: DrawShaderAttrFormat,
+        byte_offset: usize,
+        byte_size: usize,
+    ) {
+        self.push_placed(DrawShaderInput {
+            id,
+            offset,
+            slots,
+            attr_format,
+            byte_offset,
+            byte_size,
+        });
     }
 
     pub fn push(&mut self, id: LiveId, slots: usize, attr_format: DrawShaderAttrFormat) {
         match self.packing_method {
             DrawShaderInputPacking::Attribute => {
-                let needs_int_align = attr_format != DrawShaderAttrFormat::Float && slots > 1;
+                let byte_size = if attr_format.is_f32_lane() || attr_format.is_integer_fetch() {
+                    // F32xN / U32x1 / I32x1: size follows the f32-lane count so a
+                    // 19-slot f32 blob stays 76 bytes (the packed-geometry path).
+                    slots * 4
+                } else {
+                    attr_format.byte_size()
+                };
+                let align = attr_format.byte_align();
+                self.max_byte_align = self.max_byte_align.max(align);
+                if align > 1 && self.stride_bytes % align != 0 {
+                    self.stride_bytes += align - (self.stride_bytes % align);
+                }
+                let byte_offset = self.stride_bytes;
+                // Keep the old vec4-slot pad for integer *lane* vectors so
+                // existing UInt/SInt f32-slot layouts stay byte-identical.
+                let needs_int_align = attr_format.is_integer_fetch() && slots > 1;
                 if needs_int_align && (self.total_slots & 3) != 0 {
                     self.total_slots += 4 - (self.total_slots & 3);
                 }
-                self.inputs.push(DrawShaderInput {
-                    id,
-                    offset: self.total_slots,
-                    slots,
-                    attr_format,
-                });
+                let offset = self.total_slots;
+                self.push_input(id, offset, slots, attr_format, byte_offset, byte_size);
+                self.stride_bytes += byte_size;
                 self.total_slots += slots;
                 if needs_int_align && (self.total_slots & 3) != 0 {
                     self.total_slots += 4 - (self.total_slots & 3);
                 }
             }
-            DrawShaderInputPacking::UniformsGLSLTight => {
-                self.inputs.push(DrawShaderInput {
-                    id,
-                    offset: self.total_slots,
-                    slots,
-                    attr_format,
-                });
-                self.total_slots += slots;
-            }
-            DrawShaderInputPacking::UniformsGLSL140 => {
-                // std140 alignment rules:
-                // scalar (1 slot): no alignment requirement
-                // vec2 (2 slots): 2-slot aligned
-                // vec3/vec4 (3-4 slots): 4-slot aligned
-                // larger (matrices, arrays): 4-slot aligned
-                let alignment = match slots {
-                    1 => 1,
-                    2 => 2,
-                    _ => 4,
+            packing => {
+                use crate::makepad_script::makepad_shader::uniform_packing::UniformPacking;
+                let packing = match packing {
+                    DrawShaderInputPacking::UniformsGLSLTight => UniformPacking::Tight,
+                    DrawShaderInputPacking::UniformsGLSL140 => UniformPacking::Std140,
+                    DrawShaderInputPacking::UniformsHLSL => UniformPacking::Hlsl,
+                    DrawShaderInputPacking::UniformsMetal => UniformPacking::Metal,
+                    DrawShaderInputPacking::Attribute => unreachable!(),
                 };
-                if self.total_slots % alignment != 0 {
-                    self.total_slots += alignment - (self.total_slots % alignment);
-                }
-                self.inputs.push(DrawShaderInput {
-                    id,
-                    offset: self.total_slots,
-                    slots,
-                    attr_format,
-                });
-                self.total_slots += slots;
-            }
-            DrawShaderInputPacking::UniformsHLSL => {
-                if slots > 4 {
-                    if (self.total_slots & 3) != 0 {
-                        self.total_slots += 4 - (self.total_slots & 3);
-                    }
-                } else if (self.total_slots & 3) + slots > 4 {
-                    self.total_slots += 4 - (self.total_slots & 3);
-                }
-                self.inputs.push(DrawShaderInput {
-                    id,
-                    offset: self.total_slots,
-                    slots,
-                    attr_format,
-                });
-                self.total_slots += slots;
-            }
-            DrawShaderInputPacking::UniformsMetal => {
-                // Metal struct alignment rules:
-                // float (1 slot): 4-byte aligned (1-float)
-                // float2 (2 slots): 8-byte aligned (2-float)
-                // float3/float4 (3-4 slots): 16-byte aligned (4-float)
-                // larger (matrices, arrays): 16-byte aligned (4-float)
-                let aligned_slots = if slots == 3 { 4 } else { slots };
-                let alignment = match aligned_slots {
-                    1 => 1,
-                    2 => 2,
-                    _ => 4,
-                };
-                if self.total_slots % alignment != 0 {
-                    self.total_slots += alignment - (self.total_slots % alignment);
-                }
-                self.inputs.push(DrawShaderInput {
-                    id,
-                    offset: self.total_slots,
-                    slots,
-                    attr_format,
-                });
-                self.total_slots += aligned_slots;
+                let offset = packing.place(&mut self.total_slots, slots);
+                self.push_input(id, offset, slots, attr_format, offset * 4, (self.total_slots - offset) * 4);
+                self.stride_bytes = self.total_slots * 4;
             }
         }
     }
 
     pub fn finalize(&mut self) {
         match self.packing_method {
-            DrawShaderInputPacking::Attribute => (),
-            DrawShaderInputPacking::UniformsGLSLTight => (),
+            DrawShaderInputPacking::Attribute => {
+                if self.inputs.iter().all(|i| !i.attr_format.is_compact()) {
+                    self.stride_bytes = self.total_slots * 4;
+                } else if self.stride_bytes % self.max_byte_align != 0 {
+                    self.stride_bytes +=
+                        self.max_byte_align - (self.stride_bytes % self.max_byte_align);
+                }
+            }
+            DrawShaderInputPacking::UniformsGLSLTight => {
+                self.stride_bytes = self.total_slots * 4;
+            }
             DrawShaderInputPacking::UniformsHLSL
             | DrawShaderInputPacking::UniformsMetal
             | DrawShaderInputPacking::UniformsGLSL140 => {
                 if self.total_slots & 3 > 0 {
                     self.total_slots += 4 - (self.total_slots & 3);
                 }
+                self.stride_bytes = self.total_slots * 4;
             }
         }
     }
@@ -340,6 +835,60 @@ pub struct DrawShaderUniformBufferInput {
     pub buffer_index: usize,
 }
 
+/// The pixel format of the color attachment a shader renders into. Backends
+/// that bake the target format into their pipeline state (Metal, D3D,
+/// Vulkan) read this when building the pipeline; GL-family backends ignore
+/// it (the FBO's texture format decides). Declared in the shader DSL as
+/// `color_format: @Rf32`; the default is the swapchain's BGRA8.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub enum DrawShaderColorFormat {
+    #[default]
+    Bgra8Unorm,
+    /// BGRA8 with blending DISABLED: raw component writes for data passes
+    /// whose alpha channel is payload, not opacity (an SDF byte, a coverage
+    /// flag). Under the default premultiplied-over pipeline dst alpha can
+    /// only ever grow (`a_out = a_src + a_dst·(1-a_src)`), so alpha-as-data
+    /// is unwritable without this. Declared as `color_format: @Bgra8NoBlend`.
+    Bgra8NoBlend,
+    /// Single-channel 32-bit float (pairs with `TextureFormat::RenderRf32`).
+    /// Blending is disabled on such pipelines — float blending is not
+    /// universally supported and the consumers are data passes.
+    Rf32,
+    /// Four-channel 16-bit float (pairs with `TextureFormat::RenderRGBAf16`).
+    /// Blending disabled — simulation/data passes write whole texels.
+    /// Declared as `color_format: @Rgba16F`.
+    Rgba16F,
+    /// Four-channel 32-bit float (pairs with `TextureFormat::RenderRGBAf32`):
+    /// the GPU-simulation state format (particle pos/vel, fluid fields).
+    /// Blending disabled — simulation/data passes write whole texels.
+    /// Declared as `color_format: @Rgba32F`.
+    Rgba32F,
+    /// Single-channel 16-bit float (pairs with `TextureFormat::RenderRf16`):
+    /// a filterable data copy. Blending disabled. Declared as
+    /// `color_format: @Rf16`.
+    Rf16,
+    /// Single-channel 8-bit unorm (pairs with `TextureFormat::RenderRu8`):
+    /// small per-texel data such as slot ids written as `id / 255`.
+    /// Blending disabled. Declared as `color_format: @Ru8`.
+    Ru8,
+}
+
+/// How a blending pipeline combines a fragment with the target. Declared in
+/// the shader DSL as `blend_op: @Max`; the default is premultiplied over.
+/// Baked into the shader's pipelines on every backend (a per-shader
+/// property, like `color_format`); `alpha_blend: false` draw calls still
+/// write raw.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum DrawShaderBlendOp {
+    /// `src + dst * (1 - src.a)` (premultiplied source-over; additive when
+    /// the shader outputs alpha 0).
+    #[default]
+    Over,
+    /// Per-channel `max(src, dst)`: overlapping glows and lines keep the
+    /// brightest value instead of summing.
+    Max,
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct DrawShaderFlags {
     pub debug_draw: bool,
@@ -347,6 +896,7 @@ pub struct DrawShaderFlags {
     pub debug_code: bool,
     pub draw_call_nocompare: bool,
     pub draw_call_always: bool,
+    pub async_compile: bool,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -355,16 +905,87 @@ pub enum CxDrawShaderCode {
     Combined { code: String },
 }
 
+/// What fills one scope-uniform slot: a script scope value read from the
+/// heap, or one of the shader's table constants.
+#[derive(Clone, Copy, Debug)]
+pub enum ScopeUniformSlot {
+    Scope(ScriptObject, LiveId),
+    Const(usize),
+    /// A value written when the mapping was built (a prebuilt shader's
+    /// recorded value, where its source could not be found again).
+    Fixed,
+}
+
+/// One io of a draw shader as the mapping reads it: the compiler's
+/// `ShaderIo` with its pod type resolved out of the heap, so a mapping is
+/// built the same way from a compile and from a prebuilt shader.
+/// A hot-patchable shader constant: a float literal in a shader fn body
+/// that carried a `/** name [min..max] [step s] */` annotation and was
+/// compiled under const-table mode. Patching writes the scope-uniform slot
+/// (`input`) and never touches the source; `ip` names the literal for the
+/// change ledger.
+#[derive(Clone, Debug)]
+pub struct DrawShaderTableConst {
+    /// Scope-uniform io name (`ct<n>`).
+    pub shader_name: LiveId,
+    /// Annotation text as written.
+    pub doc: String,
+    /// Parsed hint: friendly name and optional range/step.
+    pub name: String,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub step: Option<f64>,
+    /// The literal in the source.
+    pub initial: f32,
+    /// The live value (what the GPU reads).
+    pub value: f32,
+    /// Index into `scope_uniforms.inputs`.
+    pub input: usize,
+    /// The literal's immediate ip (file:line:col via the script code).
+    pub ip: ScriptIp,
+    /// A live literal's place in its edited file (edit mode, see
+    /// `Cx::set_shader_live_literals`); `None` for a tweaker constant.
+    pub site: Option<LiteralSite>,
+    /// A colour literal's live value (its slot is a vec4); `value` and
+    /// `initial` are unused then.
+    pub color: Option<[f32; 4]>,
+    pub initial_color: Option<[f32; 4]>,
+    /// The slot holds the literal negated (`/**x*/ -0.5`).
+    pub negated: bool,
+}
+
+/// Where a shader's vertices can land, so a draw call that changed knows which pixels it touched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VertexExtent {
+    #[default]
+    Unknown,
+    /// Inside each instance's `rect_pos` and `rect_size`, clipped to its `draw_clip` and the draw list's clip.
+    Rect,
+}
+
 #[derive(Clone)]
 pub struct CxDrawShaderMapping {
     pub source: ScriptObjectRef,
     pub code: CxDrawShaderCode,
+    /// The pick variant's source (`Cx::enable_pick_variants`).
+    pub pick_code: Option<String>,
+    /// The `PipelineCreate` code payload of the HAL's dialect when it is not the plain combined
+    /// source: Vulkan's SPIR-V stages (`makepad_hal::spirv`) or D3D11's HLSL with its texture
+    /// shapes and sampler states (`makepad_hal::hlsl`), generated Cx-side by the shader compiler.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub hal_code: Option<Vec<u8>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub hal_pick_code: Option<Vec<u8>>,
     pub flags: DrawShaderFlags,
     pub instances: DrawShaderInputs,
     pub dyn_instances: DrawShaderInputs,
     pub dyn_uniforms: DrawShaderInputs,
     pub geometries: DrawShaderInputs,
     pub textures: Vec<DrawShaderTextureInput>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub storage_buffers: Vec<crate::makepad_script::shader_ir_compute::ComputeBufferBinding>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub storage_push_size: u32,
     pub uniform_buffers: Vec<DrawShaderUniformBufferInput>,
     pub samplers: Vec<ShaderSampler>,
     pub texture_sampler_indices: Vec<usize>,
@@ -372,36 +993,106 @@ pub struct CxDrawShaderMapping {
     pub rect_pos: Option<usize>,
     pub rect_size: Option<usize>,
     pub draw_clip: Option<usize>,
+    pub vertex_extent: VertexExtent,
+    /// The stock quad's geometry, which a draw call needs for `vertex_extent` to hold.
+    pub stock_rect_geometry: Option<GeometryId>,
+    /// Where an instance keeps the depth it is drawn at, when it keeps one:
+    /// the slot `Cx2d::lift_align_range` adds to so already-drawn ink wins
+    /// the depth test against ink painted after it.
+    pub draw_depth: Option<usize>,
     pub uniform_buffer_bindings: UniformBufferBindings,
     pub scope_uniforms: DrawShaderInputs,
-    pub scope_uniform_sources: Vec<(ScriptObject, LiveId)>,
+    pub scope_uniform_sources: Vec<ScopeUniformSlot>,
     pub scope_uniforms_buf: Vec<f32>,
-    pub geometry_id: Option<GeometryId>,
+    /// The shader's hot-patchable constants (annotated literals compiled
+    /// under const-table mode), each backed by one scope-uniform slot.
+    pub table_consts: Vec<DrawShaderTableConst>,
+    /// Live literals compiled in as constants: a patch of one needs a new
+    /// program.
+    pub folded_sites: Vec<LiteralSite>,
+    /// Bumped by every patch of `scope_uniforms_buf`; backends that keep a
+    /// GPU-side copy of the buffer re-upload when it moves.
+    pub scope_uniforms_gen: u64,
     /// Total f32 slots in the varying buffer (instances + explicit varyings).
-    /// Set by the headless backend during shader compilation.
+    /// Produced by shader compilation for frame-packet reflection.
     pub varying_total_slots: usize,
+    /// The color-attachment format this shader's pipeline targets.
+    pub color_format: DrawShaderColorFormat,
+    /// The blend operation of this shader's blending pipelines.
+    pub blend_op: DrawShaderBlendOp,
+    /// `precise_math: true`: the pipeline is compiled without fast math and
+    /// its float ops are never contracted (bit-exact data passes).
+    pub precise_math: bool,
+    /// Bit `i` set when the shader declares `fragment_output(i, …)`. In a
+    /// pass with several color attachments (MRT) an attachment the shader
+    /// does not write keeps its contents: its write mask is off.
+    pub fragment_outputs: u8,
+    /// The typed instance and vertex fields, for `layout_of`.
+    pub reflection: crate::draw_shader_layout::DrawShaderReflection,
+    /// `file:line:col` of the shader's script function, for the HAL's ledger and traces (HAL
+    /// builds only). Read at registration, see [`Self::read_source`].
+    pub source_loc: Option<String>,
 }
 
 impl CxDrawShaderMapping {
-    fn attr_format_from_pod_type(ty: &ScriptPodTy) -> DrawShaderAttrFormat {
-        match ty {
-            ScriptPodTy::U32 | ScriptPodTy::AtomicU32 => DrawShaderAttrFormat::UInt,
-            ScriptPodTy::I32 | ScriptPodTy::AtomicI32 => DrawShaderAttrFormat::SInt,
-            ScriptPodTy::Bool => DrawShaderAttrFormat::UInt,
-            ScriptPodTy::Vec(vec_ty) => match vec_ty {
+    pub(crate) fn attr_format_from_pod_type(ty: &ScriptPodTy) -> DrawShaderAttrFormat {
+        match ty.kind() {
+            crate::makepad_script::pod::ScriptPodTyTag::Packed => match ty.packed().unwrap() {
+                crate::makepad_script::pod::ScriptPodPacked::F16x2 => DrawShaderAttrFormat::F16x2,
+                crate::makepad_script::pod::ScriptPodPacked::F16x4 => DrawShaderAttrFormat::F16x4,
+                crate::makepad_script::pod::ScriptPodPacked::U16x2 => DrawShaderAttrFormat::U16x2,
+                crate::makepad_script::pod::ScriptPodPacked::I16x2 => DrawShaderAttrFormat::I16x2,
+                crate::makepad_script::pod::ScriptPodPacked::U16x2Norm => {
+                    DrawShaderAttrFormat::U16x2Norm
+                }
+                crate::makepad_script::pod::ScriptPodPacked::I16x2Norm => {
+                    DrawShaderAttrFormat::I16x2Norm
+                }
+                crate::makepad_script::pod::ScriptPodPacked::U8x4Norm => {
+                    DrawShaderAttrFormat::U8x4Norm
+                }
+                crate::makepad_script::pod::ScriptPodPacked::I8x4Norm => {
+                    DrawShaderAttrFormat::I8x4Norm
+                }
+            },
+            crate::makepad_script::pod::ScriptPodTyTag::U32 | crate::makepad_script::pod::ScriptPodTyTag::AtomicU32 => DrawShaderAttrFormat::U32x1,
+            crate::makepad_script::pod::ScriptPodTyTag::I32 | crate::makepad_script::pod::ScriptPodTyTag::AtomicI32 => DrawShaderAttrFormat::I32x1,
+            crate::makepad_script::pod::ScriptPodTyTag::Bool => DrawShaderAttrFormat::U32x1,
+            crate::makepad_script::pod::ScriptPodTyTag::F32 | crate::makepad_script::pod::ScriptPodTyTag::F16 => DrawShaderAttrFormat::F32x1,
+            crate::makepad_script::pod::ScriptPodTyTag::Vec => match ty.as_vec().unwrap() {
                 ScriptPodVec::Vec2u | ScriptPodVec::Vec3u | ScriptPodVec::Vec4u => {
-                    DrawShaderAttrFormat::UInt
+                    DrawShaderAttrFormat::U32x1
                 }
                 ScriptPodVec::Vec2i | ScriptPodVec::Vec3i | ScriptPodVec::Vec4i => {
-                    DrawShaderAttrFormat::SInt
+                    DrawShaderAttrFormat::I32x1
                 }
                 ScriptPodVec::Vec2b | ScriptPodVec::Vec3b | ScriptPodVec::Vec4b => {
-                    DrawShaderAttrFormat::UInt
+                    DrawShaderAttrFormat::U32x1
                 }
-                _ => DrawShaderAttrFormat::Float,
+                ScriptPodVec::Vec2f | ScriptPodVec::Vec2h => DrawShaderAttrFormat::F32x2,
+                ScriptPodVec::Vec3f | ScriptPodVec::Vec3h => DrawShaderAttrFormat::F32x3,
+                ScriptPodVec::Vec4f | ScriptPodVec::Vec4h => DrawShaderAttrFormat::F32x4,
             },
-            _ => DrawShaderAttrFormat::Float,
+            _ => DrawShaderAttrFormat::from_slots_f32(ty.slots().max(1).min(4)),
         }
+    }
+
+    pub(crate) fn push_pod_fields(
+        inputs: &mut DrawShaderInputs,
+        ty: &ScriptPodTy,
+        fallback_id: LiveId,
+    ) {
+        if let Some(fields) = ty.struct_fields() {
+            if ty.has_compact_format() {
+                for field in fields {
+                    Self::push_pod_fields(inputs, field.ty().data().ty(), field.name());
+                }
+                return;
+            }
+        }
+        let slots = ty.slots();
+        let attr_format = Self::attr_format_from_pod_type(ty);
+        inputs.push(fallback_id, slots, attr_format);
     }
 
     pub fn debug_dump_shader_draw_call(
@@ -484,10 +1175,45 @@ impl CxDrawShaderMapping {
     pub fn from_shader_output(
         source: ScriptObjectRef,
         code: CxDrawShaderCode,
-        heap: &ScriptHeap,
-        output: &ShaderOutput,
-        geometry_id: Option<GeometryId>,
+        vm: &mut ScriptVm,
+        output: &crate::makepad_script::shader_compile::CompiledShader,
     ) -> CxDrawShaderMapping {
+        let desc = DrawShaderDesc::from_output(vm.heap(), output);
+        Self::from_desc(source, code, vm, &desc)
+    }
+
+    /// What is asked later about the shader's script source (where its function is written)
+    /// answered now, in `vm`, the VM whose heap holds `source`. A shader compiled while a
+    /// Splash isolate is installed keeps its source in the isolate's heap, and the frame is
+    /// built with the app VM installed: asked then, the app heap answered for whatever its slot
+    /// of that index held (a use-after-free panic every frame in CUT, or a wrong answer).
+    fn read_source(vm: &mut ScriptVm, object: ScriptObject) -> Option<String> {
+        fn fn_ip(vm: &ScriptVm, object: ScriptObject, name: LiveId) -> Option<ScriptIp> {
+            vm.object_method(object, name).as_object().and_then(|f| vm.heap().fn_script_ip(f))
+        }
+        if cfg!(not(target_arch = "wasm32")) {
+            // `pixel` first: every DrawQuad derivative inherits DrawQuad's `fragment`, so its
+            // location named them all draw_quad.rs:62; the pixel fn is the shader's own code
+            [id!(pixel), id!(fragment), id!(vertex)]
+                .iter()
+                .find_map(|m| vm.ip_to_loc(fn_ip(vm, object, *m)?).map(|loc| loc.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// The mapping of a draw shader from its io description, a compile's
+    /// ([`Self::from_shader_output`]) or a prebuilt shader's: the draw-call
+    /// flags and pipeline state come from the shader object, the instance,
+    /// uniform and geometry layouts from the io with this target's packing.
+    pub fn from_desc(
+        source: ScriptObjectRef,
+        code: CxDrawShaderCode,
+        vm: &mut ScriptVm,
+        desc: &DrawShaderDesc,
+    ) -> CxDrawShaderMapping {
+        let source_loc = Self::read_source(vm, source.as_object());
+        let heap = vm.heap();
         let debug_draw = heap
             .value(source.as_object(), id!(debug_draw).into(), NoTrap)
             .as_bool()
@@ -500,7 +1226,35 @@ impl CxDrawShaderMapping {
             .value(source.as_object(), id!(debug_code).into(), NoTrap)
             .as_bool()
             == Some(true);
-        // Use attribute packing for instances (they're vertex attributes)
+        let async_compile = heap
+            .value(source.as_object(), id!(async_compile).into(), NoTrap)
+            .as_bool()
+            == Some(true);
+        // Color-attachment format: `color_format: @Rf32` selects the float
+        // render-target pipeline; anything else keeps the BGRA8 default.
+        let color_format = match heap
+            .value(source.as_object(), id!(color_format).into(), NoTrap)
+            .as_id()
+        {
+            Some(id) if id == id!(Rf32) => DrawShaderColorFormat::Rf32,
+            Some(id) if id == id!(Rgba16F) => DrawShaderColorFormat::Rgba16F,
+            Some(id) if id == id!(Rgba32F) => DrawShaderColorFormat::Rgba32F,
+            Some(id) if id == id!(Rf16) => DrawShaderColorFormat::Rf16,
+            Some(id) if id == id!(Ru8) => DrawShaderColorFormat::Ru8,
+            Some(id) if id == id!(Bgra8NoBlend) => DrawShaderColorFormat::Bgra8NoBlend,
+            _ => DrawShaderColorFormat::Bgra8Unorm,
+        };
+        let precise_math = heap.value(source.as_object(), id!(precise_math).into(), NoTrap).as_bool() == Some(true);
+        let blend_op = match heap.value(source.as_object(), id!(blend_op).into(), NoTrap).as_id() {
+            Some(id) if id == id!(Max) => DrawShaderBlendOp::Max,
+            _ => DrawShaderBlendOp::Over,
+        };
+        let fragment_outputs = desc.io().iter().fold(0u8, |mask, io| match io.kind().fragment_output() {
+            Some(index) if index < 8 => mask | (1 << index),
+            _ => mask,
+        });
+        // The instance record's word layout (attribute packing), which the
+        // backends read by instance index (`ShaderOutput::instance_record`);
         // instances contains ALL instance fields (dyn first, then rust)
         let mut instances = DrawShaderInputs::new(DrawShaderInputPacking::Attribute);
         // dyn_instances tracks just the dynamic portion for offset calculations
@@ -516,105 +1270,91 @@ impl CxDrawShaderMapping {
         let mut rect_pos = None;
         let mut rect_size = None;
         let mut draw_clip = None;
+        let mut draw_depth = None;
 
         // Memory layout: DynInstance fields first, then RustInstance fields
         // This matches metal_create_instance_struct
 
         // 1. Process DynInstance fields first (added to both instances and dyn_instances)
-        for io in &output.io {
-            if let ShaderIoKind::DynInstance = io.kind {
-                let pod_ty = heap.pod_type_ref(io.ty);
-                let slots = pod_ty.ty.slots();
-                let attr_format = Self::attr_format_from_pod_type(&pod_ty.ty);
-                instances.push(io.name, slots, attr_format);
-                dyn_instances.push(io.name, slots, attr_format);
+        for io in desc.io() {
+            if let ShaderIoKindTag::DynInstance = io.kind().kind() {
+                let slots = io.ty().slots();
+                let attr_format = Self::attr_format_from_pod_type(io.ty());
+                Self::push_pod_fields(&mut instances, io.ty(), io.name());
+                dyn_instances.push(io.name(), slots, attr_format);
             }
         }
 
         // 2. Process RustInstance fields after (already in correct order from pre_collect_rust_instance_io)
-        for io in output
-            .io
+        for io in desc.io()
             .iter()
-            .filter(|io| matches!(io.kind, ShaderIoKind::RustInstance))
+            .filter(|io| matches!(io.kind().kind(), ShaderIoKindTag::RustInstance))
         {
-            let pod_ty = heap.pod_type_ref(io.ty);
-            let slots = pod_ty.ty.slots();
-            let attr_format = Self::attr_format_from_pod_type(&pod_ty.ty);
-
             // Track special field offsets
-            if io.name == live_id!(rect_pos) {
+            if io.name() == live_id!(rect_pos) {
                 rect_pos = Some(instances.total_slots);
             }
-            if io.name == live_id!(rect_size) {
+            if io.name() == live_id!(rect_size) {
                 rect_size = Some(instances.total_slots);
             }
-            if io.name == live_id!(draw_clip) {
+            if io.name() == live_id!(draw_clip) {
                 draw_clip = Some(instances.total_slots);
             }
+            // The depth slot, under either of the two names the shaders in
+            // this repo give it: quads, vectors and SVGs call it
+            // `draw_depth`, the glyph shaders `glyph_depth`. No shader has
+            // both, so one slot names the depth of any instance.
+            if io.name() == live_id!(draw_depth) || io.name() == live_id!(glyph_depth) {
+                draw_depth = Some(instances.total_slots);
+            }
 
-            instances.push(io.name, slots, attr_format);
+            Self::push_pod_fields(&mut instances, io.ty(), io.name());
         }
 
         // Process Uniform fields
-        for io in &output.io {
-            if let ShaderIoKind::Uniform = io.kind {
-                let pod_ty = heap.pod_type_ref(io.ty);
-                let slots = pod_ty.ty.slots();
-                dyn_uniforms.push(io.name, slots, DrawShaderAttrFormat::Float);
+        for io in desc.io() {
+            if let ShaderIoKindTag::Uniform = io.kind().kind() {
+                dyn_uniforms.push(io.name(), io.ty().slots(), DrawShaderAttrFormat::Float);
             }
         }
 
-        // Process VertexBuffer (geometry) fields
-        for io in &output.io {
-            if let ShaderIoKind::VertexBuffer = io.kind {
-                let pod_ty = heap.pod_type_ref(io.ty);
-                let slots = pod_ty.ty.slots();
-                let attr_format = Self::attr_format_from_pod_type(&pod_ty.ty);
-                geometries.push(io.name, slots, attr_format);
+        // Process VertexBuffer (geometry) fields. Compact POD structs are
+        // flattened to per-field physical formats; all-F32 structs stay one
+        // blob so packed_geometry_N codegen remains byte-identical.
+        for io in desc.io() {
+            if let ShaderIoKindTag::VertexBuffer = io.kind().kind() {
+                Self::push_pod_fields(&mut geometries, io.ty(), io.name());
             }
         }
 
         // Process texture fields.
-        for io in &output.io {
-            match &io.kind {
-                ShaderIoKind::Texture(tex_type) => {
-                    textures.push(DrawShaderTextureInput {
-                        id: io.name,
-                        tex_type: *tex_type,
-                    });
-                    let texture_name = format!("tex_{}", io.name);
-                    let sampler_idx = output
-                        .texture_sampler_bindings
-                        .iter()
-                        .find(|(bound_texture, _)| bound_texture == &texture_name)
-                        .map(|(_, idx)| *idx)
-                        .unwrap_or(0);
-                    texture_sampler_indices.push(sampler_idx);
-                }
-                _ => (),
+        for io in desc.io() {
+            if let Some(tex_type) = io.kind().as_texture() {
+                textures.push(DrawShaderTextureInput {
+                    id: io.name(),
+                    tex_type,
+                });
+                texture_sampler_indices.push(io.sampler());
             }
         }
 
-        for io in &output.io {
-            if let ShaderIoKind::UniformBuffer = io.kind {
-                let pod_ty = heap.pod_type_ref(io.ty);
+        for io in desc.io() {
+            if let ShaderIoKindTag::UniformBuffer = io.kind().kind() {
                 if matches!(
-                    pod_ty.name,
+                    io.pod_name(),
                     Some(id!(DrawPassUniforms))
                         | Some(id!(DrawListUniforms))
                         | Some(id!(DrawCallUniforms))
                 ) {
                     continue;
                 }
-                let io_name = output.backend.map_io_name(io.name);
                 uniform_buffers.push(DrawShaderUniformBufferInput {
-                    id: io.name,
-                    block_name: format!("{}_Uniforms", io_name),
-                    ty: io.ty,
-                    size: pod_ty.ty.size_of(),
-                    align: pod_ty.ty.align_of(),
-                    buffer_index: io
-                        .buffer_index
+                    id: io.name(),
+                    block_name: io.block_name().to_owned(),
+                    ty: io.pod_type(),
+                    size: io.ty().size_of(),
+                    align: io.ty().align_of(),
+                    buffer_index: io.buffer_index()
                         .expect("UniformBuffer must have buffer_index assigned"),
                 });
             }
@@ -634,34 +1374,55 @@ impl CxDrawShaderMapping {
         dyn_uniforms.finalize();
         geometries.finalize();
 
-        // Get uniform buffer bindings from the shader output
-        // (must call assign_uniform_buffer_indices before from_shader_output)
-        let uniform_buffer_bindings = output.get_uniform_buffer_bindings(heap);
+        let uniform_buffer_bindings = desc.uniform_buffer_bindings().clone();
 
         // Build scope uniforms layout using DrawShaderInputs (4-byte slot alignment)
         let mut scope_uniforms = DrawShaderInputs::new(uniform_packing());
         let mut scope_uniform_sources = Vec::new();
 
-        // Process scope uniforms in order - same order as they appear in the io list
-        for io in &output.io {
-            if let ShaderIoKind::ScopeUniform = io.kind {
-                // Find the corresponding ScopeUniformSource
-                if let Some(source) = output
-                    .scope_uniforms
-                    .iter()
-                    .find(|su| su.shader_name == io.name)
-                {
-                    let pod_ty = heap.pod_type_ref(source.ty);
-                    let slots = pod_ty.ty.slots();
-                    scope_uniforms.push(io.name, slots, DrawShaderAttrFormat::Float);
-                    scope_uniform_sources.push((source.source_obj, source.key));
-                }
+        // Scope uniforms in the order they appear in the io list.
+        let mut table_consts: Vec<DrawShaderTableConst> = Vec::new();
+        let mut fixed = Vec::new();
+        for su in desc.scope_uniforms() {
+            let input = scope_uniforms.inputs.len();
+            scope_uniforms.push(su.shader_name(), su.slots(), DrawShaderAttrFormat::Float);
+            if let Some(ci) = su.table_const() {
+                let tc = &desc.table_consts()[ci];
+                let hint = crate::makepad_script::docs::parse_doc_hint(tc.doc());
+                scope_uniform_sources.push(ScopeUniformSlot::Const(table_consts.len()));
+                table_consts.push(DrawShaderTableConst {
+                    shader_name: tc.shader_name(),
+                    doc: tc.doc().to_owned(),
+                    name: hint.name().to_owned(),
+                    min: hint.min(),
+                    max: hint.max(),
+                    step: hint.step(),
+                    initial: tc.value() as f32,
+                    value: tc.value() as f32,
+                    input,
+                    ip: tc.ip(),
+                    site: tc.site().cloned(),
+                    color: tc.color(),
+                    initial_color: tc.color(),
+                    negated: tc.negated(),
+                });
+            } else if let Some(obj) = su.source_obj() {
+                scope_uniform_sources.push(ScopeUniformSlot::Scope(obj, su.source_key()));
+            } else {
+                scope_uniform_sources.push(ScopeUniformSlot::Fixed);
+                fixed.push((input, su.fixed()));
             }
         }
         scope_uniforms.finalize();
 
         // Allocate the buffer for scope uniforms (as f32 slots)
-        let scope_uniforms_buf = vec![0.0f32; scope_uniforms.total_slots];
+        let mut scope_uniforms_buf = vec![0.0f32; scope_uniforms.total_slots];
+        for (input, values) in fixed {
+            let input = &scope_uniforms.inputs[input];
+            for (slot, value) in values.iter().take(input.slots).enumerate() {
+                scope_uniforms_buf[input.offset + slot] = *value;
+            }
+        }
 
         if debug_layout {
             crate::log!(
@@ -673,22 +1434,20 @@ impl CxDrawShaderMapping {
                 dyn_uniforms.packing_method
             );
 
-            for io in output
-                .io
+            for io in desc.io()
                 .iter()
-                .filter(|io| matches!(io.kind, ShaderIoKind::DynInstance))
+                .filter(|io| matches!(io.kind().kind(), ShaderIoKindTag::DynInstance))
             {
-                let pod_ty = heap.pod_type_ref(io.ty);
                 if let Some(input) = dyn_instances
                     .inputs
                     .iter()
-                    .find(|input| input.id == io.name)
+                    .find(|input| input.id == io.name())
                 {
                     crate::log!(
                         "debug_layout shader {:?}: dyn_instance {:?} ty={:?} slots={} offset={} attr={:?}",
                         source.as_object(),
-                        io.name,
-                        pod_ty.ty,
+                        io.name(),
+                        io.ty(),
                         input.slots,
                         input.offset,
                         input.attr_format
@@ -696,18 +1455,16 @@ impl CxDrawShaderMapping {
                 }
             }
 
-            for io in output
-                .io
+            for io in desc.io()
                 .iter()
-                .filter(|io| matches!(io.kind, ShaderIoKind::RustInstance))
+                .filter(|io| matches!(io.kind().kind(), ShaderIoKindTag::RustInstance))
             {
-                let pod_ty = heap.pod_type_ref(io.ty);
-                if let Some(input) = instances.inputs.iter().find(|input| input.id == io.name) {
+                if let Some(input) = instances.inputs.iter().find(|input| input.id == io.name()) {
                     crate::log!(
                         "debug_layout shader {:?}: rust_instance {:?} ty={:?} slots={} offset={} attr={:?}",
                         source.as_object(),
-                        io.name,
-                        pod_ty.ty,
+                        io.name(),
+                        io.ty(),
                         input.slots,
                         input.offset,
                         input.attr_format
@@ -715,19 +1472,17 @@ impl CxDrawShaderMapping {
                 }
             }
 
-            for io in output
-                .io
+            for io in desc.io()
                 .iter()
-                .filter(|io| matches!(io.kind, ShaderIoKind::Uniform))
+                .filter(|io| matches!(io.kind().kind(), ShaderIoKindTag::Uniform))
             {
-                let pod_ty = heap.pod_type_ref(io.ty);
-                if let Some(input) = dyn_uniforms.inputs.iter().find(|input| input.id == io.name) {
+                if let Some(input) = dyn_uniforms.inputs.iter().find(|input| input.id == io.name()) {
                     crate::log!(
                         "debug_layout shader {:?}: dyn_uniform {:?} ty={:?} size={} slots={} offset={} attr={:?}",
                         source.as_object(),
-                        io.name,
-                        pod_ty.ty,
-                        pod_ty.ty.size_of(),
+                        io.name(),
+                        io.ty(),
+                        io.ty().size_of(),
                         input.slots,
                         input.offset,
                         input.attr_format
@@ -735,18 +1490,16 @@ impl CxDrawShaderMapping {
                 }
             }
 
-            for io in output
-                .io
+            for io in desc.io()
                 .iter()
-                .filter(|io| matches!(io.kind, ShaderIoKind::VertexBuffer))
+                .filter(|io| matches!(io.kind().kind(), ShaderIoKindTag::VertexBuffer))
             {
-                let pod_ty = heap.pod_type_ref(io.ty);
-                if let Some(input) = geometries.inputs.iter().find(|input| input.id == io.name) {
+                if let Some(input) = geometries.inputs.iter().find(|input| input.id == io.name()) {
                     crate::log!(
                         "debug_layout shader {:?}: vertex_buffer {:?} ty={:?} slots={} offset={} attr={:?}",
                         source.as_object(),
-                        io.name,
-                        pod_ty.ty,
+                        io.name(),
+                        io.ty(),
                         input.slots,
                         input.offset,
                         input.attr_format
@@ -765,7 +1518,9 @@ impl CxDrawShaderMapping {
                 );
             }
 
-            for (type_name, idx) in &uniform_buffer_bindings.bindings {
+            for binding in 0..uniform_buffer_bindings.len() {
+                let type_name = uniform_buffer_bindings.binding_name(binding);
+                let idx = uniform_buffer_bindings.binding_index(binding);
                 crate::log!(
                     "debug_layout shader {:?}: uniform_buffer {} -> b{}",
                     source.as_object(),
@@ -786,21 +1541,54 @@ impl CxDrawShaderMapping {
             );
         }
 
-        // Check if shader uses draw_pass->time (requires repaint every frame)
-        let uses_time = match &code {
-            CxDrawShaderCode::Combined { code } => code.contains("draw_pass->time"),
-            CxDrawShaderCode::Separate { vertex, fragment } => {
-                vertex.contains("draw_pass->time") || fragment.contains("draw_pass->time")
-            }
+        // The stock `DrawQuad` and `DrawText` vertex functions keep every vertex of their stock quad inside
+        // the instance's rect, so we only trust a shader that uses them unchanged.
+        let heap = vm.heap();
+        let get_fn_ip = |object: ScriptObject, name: LiveId| {
+            heap.value(object, name.into(), NoTrap).as_object().and_then(|f| heap.fn_script_ip(f))
         };
-
+        // A shader is shared by objects of different geometries here, so the stock quad is the geometry
+        // of the base whose functions it uses unchanged, and a draw call keeps the rect only with that geometry.
+        let stock_rect_geometry = if rect_pos.is_some() && rect_size.is_some() {
+            heap.value(heap.modules_root(), id!(draw).into(), NoTrap).as_object().and_then(|draw| {
+                [(id!(DrawQuad), id!(clip_and_transform_vertex)), (id!(DrawText), id!(slug_dilate))]
+                    .into_iter()
+                    .find_map(|(base, helper)| {
+                        let base = heap.value(draw, base.into(), NoTrap).as_object()?;
+                        let stock_fns = [id!(vertex), helper].into_iter().all(|name| {
+                            get_fn_ip(base, name).is_some_and(|ip| get_fn_ip(source.as_object(), name) == Some(ip))
+                        });
+                        if !stock_fns {
+                            return None;
+                        }
+                        heap.value(base, id!(geom).into(), NoTrap)
+                            .as_object()
+                            .and_then(|geom| heap.value(geom, id!(buffer).into(), NoTrap).as_handle())
+                            .and_then(|buffer| heap.handle_ref::<Geometry>(buffer))
+                            .map(Geometry::geometry_id)
+                    })
+            })
+        } else {
+            None
+        };
+        let vertex_extent = if stock_rect_geometry.is_some() { VertexExtent::Rect } else { VertexExtent::Unknown };
         CxDrawShaderMapping {
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_buffers: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_push_size: 0,
             source,
             code,
+            pick_code: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            hal_code: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            hal_pick_code: None,
             flags: DrawShaderFlags {
                 debug_draw,
                 debug_layout,
                 debug_code,
+                async_compile,
                 ..DrawShaderFlags::default()
             },
             instances,
@@ -809,19 +1597,94 @@ impl CxDrawShaderMapping {
             geometries,
             textures,
             uniform_buffers,
-            samplers: output.samplers.clone(),
+            samplers: desc.samplers().to_vec(),
             texture_sampler_indices,
-            uses_time,
+            uses_time: desc.uses_time(),
             rect_pos,
             rect_size,
             draw_clip,
+            vertex_extent,
+            stock_rect_geometry,
+            draw_depth,
             uniform_buffer_bindings,
             scope_uniforms,
             scope_uniform_sources,
             scope_uniforms_buf,
-            geometry_id,
+            table_consts,
+            folded_sites: desc.folded_sites().to_vec(),
+            scope_uniforms_gen: 0,
             varying_total_slots: 0,
+            color_format,
+            blend_op,
+            precise_math,
+            fragment_outputs,
+            reflection: crate::draw_shader_layout::DrawShaderReflection::from_desc(desc),
+            source_loc,
         }
+    }
+
+    /// Shader-side geom stride in bytes. All-F32 shaders report `total_slots * 4`.
+    pub fn geometry_stride_bytes(&self) -> usize {
+        if self.geometries.stride_bytes != 0 {
+            self.geometries.stride_bytes
+        } else {
+            self.geometries.total_slots.saturating_mul(4)
+        }
+    }
+
+    pub fn geometry_is_compact(&self) -> bool {
+        self.geometries.has_compact()
+    }
+
+    /// Write one table constant's live value into its scope-uniform slot
+    /// and bump the generation so GPU-side copies refresh. Returns false
+    /// for an index the shader does not have.
+    pub fn patch_table_const(&mut self, index: usize, value: f32, uniforms_gen: u64) -> bool {
+        let Some(tc) = self.table_consts.get_mut(index) else {
+            return false;
+        };
+        tc.value = value;
+        let input = &self.scope_uniforms.inputs[tc.input];
+        if let Some(slot) = self.scope_uniforms_buf.get_mut(input.offset) {
+            *slot = value;
+        }
+        debug_assert_ne!(uniforms_gen, 0);
+        self.scope_uniforms_gen = uniforms_gen;
+        true
+    }
+
+    /// Write `value` into every live literal slot compiled from `site`;
+    /// how many it wrote (a number never lands in a colour's slot, nor the
+    /// reverse).
+    pub fn patch_literal(&mut self, site: &LiteralSite, value: LiteralValue, uniforms_gen: u64) -> usize {
+        let mut wrote = 0;
+        for tc in self.table_consts.iter_mut() {
+            if tc.site.as_ref() != Some(site) {
+                continue;
+            }
+            let offset = self.scope_uniforms.inputs[tc.input].offset;
+            match (value.as_number(), value.as_color(), tc.color.is_some()) {
+                (Some(v), _, false) => {
+                    let v = if tc.negated { -v } else { v } as f32;
+                    tc.value = v;
+                    if let Some(slot) = self.scope_uniforms_buf.get_mut(offset) {
+                        *slot = v;
+                    }
+                }
+                (_, Some(c), true) => {
+                    tc.color = Some(c);
+                    if let Some(slots) = self.scope_uniforms_buf.get_mut(offset..offset + 4) {
+                        slots.copy_from_slice(&c);
+                    }
+                }
+                _ => continue,
+            }
+            wrote += 1;
+        }
+        if wrote > 0 {
+            self.scope_uniforms_gen = uniforms_gen;
+        }
+        wrote
     }
 
     /// Fill the scope uniform buffer from script values.
@@ -837,7 +1700,29 @@ impl CxDrawShaderMapping {
             if i >= self.scope_uniform_sources.len() {
                 break;
             }
-            let (source_obj, key) = self.scope_uniform_sources[i];
+            let (source_obj, key) = match self.scope_uniform_sources[i] {
+                ScopeUniformSlot::Scope(obj, key) => (obj, key),
+                ScopeUniformSlot::Const(ci) => {
+                    // A table constant: its live value, never the heap.
+                    let tc = &self.table_consts[ci];
+                    match tc.color {
+                        Some(c) => {
+                            if let Some(slots) = self.scope_uniforms_buf.get_mut(input.offset..input.offset + 4) {
+                                slots.copy_from_slice(&c);
+                            }
+                        }
+                        None => {
+                            if let Some(slot) = self.scope_uniforms_buf.get_mut(input.offset) {
+                                *slot = tc.value;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                ScopeUniformSlot::Fixed => continue,
+            };
+
+            // Read the value from the heap
             let value = heap.scope_value(source_obj, key, *trap);
 
             // Write value to buffer at the input's offset
@@ -893,7 +1778,7 @@ impl CxDrawShaderMapping {
                     }
                     instances.push(field.ident.0, ty, None);
                     if let LiveFieldKind::Live = live_field_kind {
-                        live_instances.inputs.push(instances.inputs.last().unwrap().clone());
+                        live_instances.push_placed(instances.inputs.last().unwrap().clone());
                     }
                 }
                 DrawShaderFieldKind::Uniform {block_ident, ..} => {
@@ -934,13 +1819,16 @@ impl CxDrawShaderMapping {
 
         // fill up the default values for the user uniforms
 
-
         // ok now the live uniforms
         for (value_node_ptr, ty) in draw_shader_def.all_live_refs.borrow().iter() {
             live_uniforms.push(LiveId(0), ty.clone(), Some(value_node_ptr.0));
         }
 
         CxDrawShaderMapping {
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_buffers: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_push_size: 0,
             const_table,
             uses_time: draw_shader_def.uses_time.get(),
             flags: draw_shader_def.flags,

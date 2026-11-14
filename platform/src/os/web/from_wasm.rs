@@ -6,6 +6,19 @@ use crate::{
 // WebBrowser API
 
 #[derive(FromWasm)]
+pub struct FromWasmA11yUpdate {
+    pub window: u32,
+    pub bytes: WasmDataU8,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmA11yActionDone {
+    pub req_lo: u32,
+    pub req_hi: u32,
+    pub result: u32,
+}
+
+#[derive(FromWasm)]
 pub struct FromWasmStartTimer {
     pub repeats: bool,
     pub timer_id: f64,
@@ -18,6 +31,12 @@ pub struct FromWasmStopTimer {
 }
 
 #[derive(FromWasm)]
+pub struct FromWasmStartLocationUpdates {}
+
+#[derive(FromWasm)]
+pub struct FromWasmStopLocationUpdates {}
+
+#[derive(FromWasm)]
 pub struct FromWasmFullScreen {}
 
 #[derive(FromWasm)]
@@ -25,6 +44,12 @@ pub struct FromWasmNormalScreen {}
 
 #[derive(FromWasm)]
 pub struct FromWasmRequestAnimationFrame {}
+
+/// Asks for an animation frame once `performance.now()` reaches `at`, in seconds.
+#[derive(FromWasm)]
+pub struct FromWasmRequestAnimationFrameAt {
+    pub at: f64,
+}
 
 #[derive(FromWasm)]
 pub struct FromWasmSetDocumentTitle {
@@ -75,6 +100,105 @@ impl FromWasmSetMouseCursor {
 #[derive(FromWasm)]
 pub struct FromWasmTextCopyResponse {
     pub response: String,
+    pub html: String,
+    pub markdown: String,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmCopyToClipboard {
+    pub text: String,
+    pub html: String,
+}
+
+/// Measure each frame's GPU time where the browser offers a timer query
+/// (EXT_disjoint_timer_query_webgl2), for `gpu_frame_timer`.
+#[derive(FromWasm)]
+pub struct FromWasmGpuFrameTimer {
+    pub on: bool,
+}
+
+/// The GPU inventory (`Cx::gpu_inventory`) as JSON, answering
+/// `ToWasmGpuInventory`.
+#[derive(FromWasm)]
+pub struct FromWasmGpuInventory {
+    pub request_id: u32,
+    pub json: String,
+}
+
+/// A runtime-generated module to instantiate against this module's memory
+/// and link into its function table (see `wasm_link`).
+#[derive(FromWasm)]
+pub struct FromWasmLinkModule {
+    pub request_id: u32,
+    pub bytes: WasmDataU8,
+}
+
+/// Table slots of linked modules to empty.
+#[derive(FromWasm)]
+pub struct FromWasmUnlinkSlots {
+    pub slots: Vec<u32>,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmStorageGet {
+    pub request_id_lo: u32,
+    pub request_id_hi: u32,
+    pub namespace: String,
+    pub key: String,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmStorageSet {
+    pub request_id_lo: u32,
+    pub request_id_hi: u32,
+    pub namespace: String,
+    pub key: String,
+    pub value: WasmDataU8,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmStorageDelete {
+    pub request_id_lo: u32,
+    pub request_id_hi: u32,
+    pub namespace: String,
+    pub key: String,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmStorageList {
+    pub request_id_lo: u32,
+    pub request_id_hi: u32,
+    pub namespace: String,
+    pub prefix: String,
+    pub after: String,
+    pub has_after: bool,
+    pub limit: u32,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmStorageGetRange {
+    pub request_id_lo: u32,
+    pub request_id_hi: u32,
+    pub namespace: String,
+    pub key: String,
+    pub offset_lo: u32,
+    pub offset_hi: u32,
+    pub len: u32,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmStorageStat {
+    pub request_id_lo: u32,
+    pub request_id_hi: u32,
+    pub namespace: String,
+    pub key: String,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmStorageEstimate {
+    pub request_id_lo: u32,
+    pub request_id_hi: u32,
+    pub namespace: String,
 }
 
 #[derive(FromWasm)]
@@ -102,6 +226,22 @@ pub struct FromWasmShowTextIME {
 
 #[derive(FromWasm)]
 pub struct FromWasmHideTextIME {}
+
+#[derive(FromWasm)]
+pub struct FromWasmSetVirtualFileLimits {
+    pub max_file_size: f64,
+    pub max_total_size: f64,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmSelectFileDialog {
+    pub id_lo: u32,
+    pub id_hi: u32,
+    pub accept: String,
+    pub multiple: bool,
+    pub max_file_size: f64,
+    pub max_total_size: f64,
+}
 /*
 #[derive(FromWasm)]
 pub struct FromWasmWebSocketOpen {
@@ -136,7 +276,9 @@ pub struct WTextureInput {
 impl DrawShaderTextureInput {
     pub fn to_from_wasm_texture_input(&self) -> WTextureInput {
         let ty = match self.tex_type {
+            TextureType::TextureDepth => "sampler2DShadow",
             TextureType::TextureCube | TextureType::TextureCubeArray => "samplerCube",
+            TextureType::Texture2dArray => "sampler2DArray",
             _ => "sampler2D",
         };
         WTextureInput {
@@ -144,13 +286,6 @@ impl DrawShaderTextureInput {
             name: self.id.to_string(),
         }
     }
-}
-
-#[cfg(target_feature = "atomics")]
-#[derive(FromWasm)]
-pub struct FromWasmCreateThread {
-    pub context_ptr: u32,
-    pub timer: u32,
 }
 
 #[derive(FromWasm)]
@@ -186,6 +321,23 @@ pub struct FromWasmRequestPermission {
 // WebGL API
 
 #[derive(FromWasm)]
+pub struct WVertexAttrib {
+    pub name: String,
+    pub offset: u32,
+    pub size: u32,
+    pub stride: u32,
+    pub gl_type: u32,
+    pub normalized: u32,
+    pub integer: u32,
+}
+
+/// Each program's first draw in a frame of its own (`Cx::spread_first_draws`).
+#[derive(FromWasm)]
+pub struct FromWasmSpreadFirstDraws {
+    pub on: bool,
+}
+
+#[derive(FromWasm)]
 pub struct FromWasmCompileWebGLShader {
     pub shader_id: usize,
     pub vertex: String,
@@ -193,18 +345,61 @@ pub struct FromWasmCompileWebGLShader {
     pub geometry_slots: usize,
     pub instance_slots: usize,
     pub textures: Vec<WTextureInput>,
+    pub geom_attribs: Vec<WVertexAttrib>,
+    pub inst_attribs: Vec<WVertexAttrib>,
 }
 
 #[derive(FromWasm)]
 pub struct FromWasmAllocArrayBuffer {
     pub buffer_id: usize,
     pub data: WasmPtrF32,
+    pub byte_data: WasmPtrU8,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmRetainedArrayBuffer {
+    pub buffer_id: usize,
+    pub data: WasmPtrF32,
+    pub first_slot: usize,
+}
+
+#[derive(FromWasm)]
+pub struct WRetainedBufferCopy {
+    pub source_slot: usize,
+    pub destination_slot: usize,
+    pub slot_count: usize,
+}
+
+#[derive(FromWasm)]
+pub struct WRetainedBufferWrite {
+    pub destination_slot: usize,
+    pub data: WasmPtrF32,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmRetainedArrayUpdate {
+    pub buffer_id: usize,
+    pub slot_count: usize,
+    pub capacity_bytes: usize,
+    pub replace: bool,
+    pub copies: Vec<WRetainedBufferCopy>,
+    pub writes: Vec<WRetainedBufferWrite>,
+}
+
+#[derive(FromWasm)]
+pub struct WCustomUniformBuffer {
+    pub block_name: String,
+    pub data: WasmPtrU8,
+    pub generation_lo: u32,
+    pub generation_hi: u32,
 }
 
 #[derive(FromWasm)]
 pub struct FromWasmAllocIndexBuffer {
     pub buffer_id: usize,
     pub data: WasmPtrU32,
+    pub byte_data: WasmPtrU8,
+    pub index_width: u32,
 }
 
 #[derive(FromWasm)]
@@ -214,6 +409,24 @@ pub struct FromWasmAllocVao {
     pub geom_ib_id: usize,
     pub geom_vb_id: usize,
     pub inst_vb_id: usize,
+}
+
+/// Deletes WebGL objects whose owning Rust pool slots are genuinely free.
+/// Each list contains the exact JavaScript table ids; the consumer also
+/// invalidates VAOs which depend on a retired vertex/index buffer.
+#[derive(FromWasm)]
+pub struct FromWasmFreeWebGLResources {
+    pub array_buffer_ids: Vec<usize>,
+    pub index_buffer_ids: Vec<usize>,
+    pub vao_ids: Vec<usize>,
+    pub texture_ids: Vec<usize>,
+    pub framebuffer_ids: Vec<usize>,
+}
+
+#[derive(FromWasm)]
+pub struct FromWasmPollGpuCompletion {
+    pub serial_lo: u32,
+    pub serial_hi: u32,
 }
 
 #[derive(FromWasm, Default)]
@@ -246,6 +459,19 @@ pub struct FromWasmAllocTextureImage2D_BGRAu8_32 {
 
 #[allow(non_camel_case_types)]
 #[derive(FromWasm)]
+pub struct FromWasmUpdateTextureRect_BGRAu8_32 {
+    pub texture_id: usize,
+    pub image_width: usize,
+    pub image_height: usize,
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub data: WasmPtrU32,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(FromWasm)]
 pub struct FromWasmAllocTextureImage2D_Ru8 {
     pub texture_id: usize,
     pub width: usize,
@@ -271,15 +497,32 @@ pub struct FromWasmAllocTextureCube_BGRAu8_32 {
     pub data: WasmPtrU32,
 }
 
+/// A 2D array's level 0: `layers` images of width x height, layer-major.
+#[allow(non_camel_case_types)]
+#[derive(FromWasm)]
+pub struct FromWasmAllocTextureArray_BGRAu8_32 {
+    pub texture_id: usize,
+    pub width: usize,
+    pub height: usize,
+    pub layers: usize,
+    pub data: WasmPtrU32,
+}
+
 #[derive(FromWasm, Default)]
 pub struct WColorTarget {
     pub texture_id: usize,
     pub init_only: bool,
     pub clear_color: WColor,
+    /// Attachment format: 0 RGBA8, 1 R32F, 2 RGBA32F, 3 RGBA16F.
+    /// Float color attachments require EXT_color_buffer_float.
+    pub format: u32,
 }
 
 #[derive(FromWasm, Default)]
 pub struct WDepthTarget {
+    /// false = the pass has no depth texture (`Default`); a texture id of 0 is
+    /// a real texture, so absence needs its own flag.
+    pub attached: bool,
     pub texture_id: usize,
     pub init_only: bool,
     pub clear_depth: f32,
@@ -290,8 +533,22 @@ pub struct FromWasmBeginRenderTexture {
     pub pass_id: usize,
     pub width: usize,
     pub height: usize,
-    pub color_targets: [WColorTarget; 1],
+    /// One per color attachment (several: MRT, written through drawBuffers).
+    pub color_targets: Vec<WColorTarget>,
     pub depth_target: WDepthTarget,
+}
+
+/// Starts an asynchronous WebGL2 readback of a render-target texture.
+/// JavaScript uses a pixel-pack buffer plus a fence and reports the bytes
+/// through `ToWasmRenderTextureCapture` on a later animation frame.
+#[derive(FromWasm)]
+pub struct FromWasmRequestRenderTextureCapture {
+    pub texture_id: usize,
+    pub register_only: bool,
+    pub ticket_lo: u32,
+    pub ticket_hi: u32,
+    pub width: usize,
+    pub height: usize,
 }
 
 #[derive(FromWasm)]
@@ -305,15 +562,32 @@ pub struct FromWasmSetDefaultDepthAndBlendMode {}
 
 #[derive(FromWasm)]
 pub struct FromWasmDrawCall {
+    pub custom_uniforms: Vec<WCustomUniformBuffer>,
     pub vao_id: usize,
     pub shader_id: usize,
+    pub index_width: u32,
     pub depth_write: bool,
+    pub depth_test_greater: bool,
+    pub alpha_blend: bool,
+    /// The shader's `blend_op: @Max`: blend by per-channel max.
+    pub blend_max: bool,
     pub backface_culling: bool,
     pub pass_uniforms: WasmPtrF32,
+    pub pass_uniforms_gen_lo: u32,
+    pub pass_uniforms_gen_hi: u32,
     pub draw_list_uniforms: WasmPtrF32,
+    pub draw_list_uniforms_gen_lo: u32,
+    pub draw_list_uniforms_gen_hi: u32,
     pub draw_call_uniforms: WasmPtrF32,
+    pub draw_call_uniforms_gen_lo: u32,
+    pub draw_call_uniforms_gen_hi: u32,
     pub user_uniforms: WasmPtrF32,
+    pub user_uniforms_gen_lo: u32,
+    pub user_uniforms_gen_hi: u32,
     pub live_uniforms: WasmPtrF32,
+    pub live_uniforms_gen_lo: u32,
+    pub live_uniforms_gen_hi: u32,
+    pub reset_draw_uniforms: bool,
     pub const_table: WasmPtrF32,
     pub textures: [Option<usize>; DRAW_CALL_TEXTURE_SLOTS],
 }
@@ -350,6 +624,17 @@ pub struct FromWasmStartAudioOutput {
 
 #[derive(FromWasm)]
 pub struct FromWasmStopAudioOutput {}
+
+/// A page opened with `?test=1`: an app's media clock for a test harness
+/// (`Cx::web_test_clock`). `film`: the time the picture shows; `rendered`:
+/// the media time at the end of the audio rendered so far; `speed`: media
+/// seconds per second there.
+#[derive(FromWasm)]
+pub struct FromWasmTestClock {
+    pub film: f64,
+    pub rendered: f64,
+    pub speed: f64,
+}
 
 // Video Playback API
 

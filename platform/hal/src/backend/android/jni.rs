@@ -1,0 +1,811 @@
+//! Host-native entry points. The host calls register_natives from its JNI_OnLoad; no JNI
+//! symbol is exported here, so app-side services can register their remaining methods.
+use super::{shell::{lock, AndroidParams, Shared}, state::{self, Pointer}, surface::Window};
+use crate::{backend::exec::OsCmd, buffers::Wire, clipboard::ClipboardData, clock_ns, input, lifecycle};
+use makepad_jni_sys::{registration as reg, *};
+use std::{ffi::{c_long, c_void, CStr}, sync::{atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}, Mutex, OnceLock}, time::Duration};
+
+static ACTIVITY: Mutex<usize> = Mutex::new(0);
+static VM: AtomicUsize = AtomicUsize::new(0);
+static CHOREOGRAPHER: AtomicUsize = AtomicUsize::new(0);
+static FRAME_POSTED: AtomicBool = AtomicBool::new(false);
+/// Whether we asked Java for the fastest mode: held across each call to Java, so its calls go
+/// out in the order we decided them.
+static FRAME_RATE_BOOST: Mutex<bool> = Mutex::new(false);
+static FRAME_RATE_BOOST_TIME: AtomicU64 = AtomicU64::new(0);
+/// The Activity covers its surface until a frame shows on it: at the start and across a pause or
+/// a lost surface.
+static SURFACE_COVERED: AtomicBool = AtomicBool::new(true);
+/// The Activity went to the background since the Vulkan backend last looked (`take_backgrounded`).
+static BACKGROUNDED: AtomicBool = AtomicBool::new(false);
+
+#[link(name = "android")]
+extern "C" {
+    fn AChoreographer_getInstance() -> *mut c_void;
+    fn AChoreographer_postFrameCallback(choreographer: *mut c_void, callback: unsafe extern "C" fn(c_long, *mut c_void), data: *mut c_void);
+}
+/// The Choreographer calls newer than the app's minimum API level, looked up when it's set up.
+struct ChoreographerCalls {
+    /// `AChoreographer_postVsyncCallback` and the frame data its callback reads (API 33)
+    vsync: Option<VsyncCalls>,
+    /// `AChoreographer_registerRefreshRateCallback` (API 30)
+    register_refresh_rate: Option<unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(i64, *mut c_void), *mut c_void)>,
+}
+struct VsyncCalls {
+    post: unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*const c_void, *mut c_void), *mut c_void),
+    frame_time: unsafe extern "C" fn(*const c_void) -> i64,
+    timelines: unsafe extern "C" fn(*const c_void) -> usize,
+    present_time: unsafe extern "C" fn(*const c_void, usize) -> i64,
+}
+static CHOREOGRAPHER_CALLS: OnceLock<ChoreographerCalls> = OnceLock::new();
+fn choreographer_calls() -> &'static ChoreographerCalls {
+    CHOREOGRAPHER_CALLS.get_or_init(|| {
+        let Ok(lib) = super::xr::sys::ModuleLoader::load("libandroid.so") else { return ChoreographerCalls { vsync: None, register_refresh_rate: None } };
+        let vsync = (|| Some(VsyncCalls {
+            post: lib.get_symbol("AChoreographer_postVsyncCallback").ok()?,
+            frame_time: lib.get_symbol("AChoreographerFrameCallbackData_getFrameTimeNanos").ok()?,
+            timelines: lib.get_symbol("AChoreographerFrameCallbackData_getFrameTimelinesLength").ok()?,
+            present_time: lib.get_symbol("AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos").ok()?,
+        }))();
+        ChoreographerCalls { vsync, register_refresh_rate: lib.get_symbol("AChoreographer_registerRefreshRateCallback").ok() }
+    })
+}
+
+pub(super) fn request_frame() {
+    // an XR session paces frames itself (xrWaitFrame)
+    if super::xr::active() { return; }
+    if !lock(&Shared::global().state).pending.is_empty() { post_frame_callback(); }
+}
+/// While the app is paused or has no surface its frame requests wait here, and `resume` and
+/// `set_surface` post them, so the app needn't ask again meanwhile.
+pub fn frame_requests_held() -> bool { !super::xr::active() && !can_show() }
+fn can_show() -> bool {
+    let shared = Shared::global();
+    lock(&shared.registry).window.is_some() && lock(&shared.state).active
+}
+fn post_frame_callback() {
+    let p = CHOREOGRAPHER.load(Ordering::Acquire);
+    if p != 0 && can_show() && !FRAME_POSTED.swap(true, Ordering::AcqRel) {
+        unsafe {
+            match &choreographer_calls().vsync {
+                Some(vsync) => (vsync.post)(p as _, vsync_callback, std::ptr::null_mut()),
+                None => AChoreographer_postFrameCallback(p as _, frame_callback, std::ptr::null_mut()),
+            }
+        }
+    }
+}
+unsafe extern "C" fn vsync_callback(data: *const c_void, _: *mut c_void) {
+    let Some(vsync) = &choreographer_calls().vsync else { return };
+    // the frame timelines are one frame interval apart, at the rate the app's frames come
+    let interval = if (vsync.timelines)(data) > 1 { (vsync.present_time)(data, 1) - (vsync.present_time)(data, 0) } else { 0 };
+    deliver_frame((vsync.frame_time)(data) as u64, interval);
+}
+/// Below API 30 nothing tells us the display's rate after a mode switch (a boost), so the frame callbacks do. We take
+/// the second shortest of the last five gaps between callbacks in a row: late callbacks and one odd short gap drop out.
+struct CallbackGaps { last: u64, in_a_row: bool, gaps: [u64; 5], count: usize }
+static CALLBACK_GAPS: Mutex<CallbackGaps> = Mutex::new(CallbackGaps { last: 0, in_a_row: false, gaps: [0; 5], count: 0 });
+unsafe extern "C" fn frame_callback(time: c_long, _: *mut c_void) {
+    // a 32-bit `long` only keeps the low bits of the vsync time, which was a moment ago
+    let time = if std::mem::size_of::<c_long>() < 8 {
+        let now = clock_ns();
+        let time = (now & !0xffff_ffff) | time as u32 as u64;
+        if time > now { time.saturating_sub(1 << 32) } else { time }
+    } else { time as u64 };
+    let measured = choreographer_calls().register_refresh_rate.is_none();
+    let interval = if !measured { 0 } else {
+        let mut g = lock(&CALLBACK_GAPS);
+        if g.in_a_row && time > g.last { let i = g.count % 5; g.gaps[i] = time - g.last; g.count += 1; }
+        g.last = time;
+        let mut gaps = g.gaps;
+        gaps.sort_unstable();
+        if g.count >= 5 { gaps[1] as i64 } else { 0 }
+    };
+    deliver_frame(time, interval);
+    // a callback posted while this one ran comes at the next vsync
+    if measured { lock(&CALLBACK_GAPS).in_a_row = FRAME_POSTED.load(Ordering::Acquire); }
+}
+fn deliver_frame(time: u64, interval: i64) {
+    FRAME_POSTED.store(false, Ordering::Release);
+    let shared = Shared::global();
+    let asked = {
+        let mut s = lock(&shared.state);
+        if interval > 0 { s.refresh = 1e9 / interval as f32; }
+        !s.pending.is_empty()
+    };
+    shared.frame(time);
+    // After a frame we post the next callback right away, so the app's ask for its next frame still
+    // gets the next vsync when it comes late in this one. A callback with nothing asked posts no more.
+    if asked { post_frame_callback(); }
+}
+unsafe extern "C" fn refresh_rate_changed(period: i64, _: *mut c_void) {
+    // an XR session's frame loop owns the rate
+    if period > 0 && !super::xr::active() { lock(&Shared::global().state).refresh = 1e9 / period as f32; }
+}
+
+const FRAME_RATE_BOOST_NS: u64 = 1_000_000_000;
+/// Some Android skins hold apps to 60Hz, so while the user interacts or content keeps moving, we
+/// ask for the display's fastest mode, and stop once a second passes with neither.
+pub(crate) fn boost_frame_rate() {
+    // An XR session paces itself, and without the Choreographer nothing follows the faster mode.
+    if super::xr::active() || CHOREOGRAPHER.load(Ordering::Acquire) == 0 { return; }
+    FRAME_RATE_BOOST_TIME.store(clock_ns(), Ordering::Release);
+    let mut boosted = lock(&FRAME_RATE_BOOST);
+    if std::mem::replace(&mut *boosted, true) { return; }
+    set_frame_rate_boost(true);
+    drop(boosted);
+    std::thread::spawn(|| loop {
+        let mut boosted = lock(&FRAME_RATE_BOOST);
+        let idle = clock_ns().saturating_sub(FRAME_RATE_BOOST_TIME.load(Ordering::Acquire));
+        if idle >= FRAME_RATE_BOOST_NS {
+            *boosted = false;
+            set_frame_rate_boost(false);
+            return;
+        }
+        drop(boosted);
+        std::thread::sleep(Duration::from_nanos(FRAME_RATE_BOOST_NS - idle));
+    });
+}
+fn set_frame_rate_boost(boost: bool) {
+    let _ = with_activity(|env, activity| unsafe {
+        void(env, activity, c"setFrameRateBoost", c"(Z)V", &[jvalue { z: boost as jboolean }])
+    });
+}
+
+/// A frame was presented: the first one on a surface lifts the Activity's cover, and refreshes
+/// the snapshot it shows next time.
+pub(crate) fn surface_presented() {
+    if SURFACE_COVERED.swap(false, Ordering::AcqRel) { hide_surface_cover(); }
+}
+/// Whether the Activity went to the background since the last call, so nothing draws for a while.
+pub(crate) fn take_backgrounded() -> bool { BACKGROUNDED.swap(false, Ordering::AcqRel) }
+pub(super) fn hide_surface_cover() {
+    SURFACE_COVERED.store(false, Ordering::Release);
+    let _ = with_activity(|env, activity| unsafe {
+        void(env, activity, c"setSurfaceCoverVisible", c"(Z)V", &[jvalue { z: 0 }]);
+        void(env, activity, c"requestSurfaceSnapshotRefresh", c"()V", &[]);
+    });
+}
+pub(super) fn set_native_appearance(value: u32) -> bool {
+    with_activity(|env, activity| unsafe { void(env, activity, c"setNativeAppearance", c"(I)V", &[jvalue { i: value as jint }]) }).unwrap_or(false)
+}
+pub(super) fn set_system_bar_appearance(dark_icons: bool) -> bool {
+    with_activity(|env, activity| unsafe { void(env, activity, c"setSystemBarAppearance", c"(Z)V", &[jvalue { z: dark_icons as jboolean }]) }).unwrap_or(false)
+}
+pub(super) fn set_screen_orientation(orientation: u32) -> bool {
+    // ActivityInfo's SCREEN_ORIENTATION_SENSOR_PORTRAIT, _SENSOR_LANDSCAPE and _UNSPECIFIED (no lock)
+    let value = match orientation { crate::mobile_ui::orientation::PORTRAIT => 7, crate::mobile_ui::orientation::LANDSCAPE => 6, _ => -1 };
+    with_activity(|env, activity| unsafe { void(env, activity, c"setScreenOrientation", c"(I)V", &[jvalue { i: value }]) }).unwrap_or(false)
+}
+pub(super) fn set_keep_screen_on(on: bool) -> bool {
+    with_activity(|env, activity| unsafe { void(env, activity, c"setKeepScreenOn", c"(Z)V", &[jvalue { z: on as jboolean }]) }).unwrap_or(false)
+}
+pub(super) fn set_full_screen(fullscreen: bool) -> bool {
+    with_activity(|env, activity| unsafe { void(env, activity, c"setFullScreen", c"(Z)V", &[jvalue { z: fullscreen as jboolean }]) }).unwrap_or(false)
+}
+pub(super) fn set_app_background(argb: u32) -> bool {
+    with_activity(|env, activity| unsafe { void(env, activity, c"setAppBackgroundColor", c"(I)V", &[jvalue { i: argb as jint }]) }).unwrap_or(false)
+}
+pub(super) fn show_shader_compile_screen() -> bool {
+    with_activity(|env, activity| unsafe { void(env, activity, c"showShaderCompileScreen", c"()V", &[]) }).unwrap_or(false)
+}
+
+unsafe fn method(env: *mut JNIEnv, object: jobject, name: &CStr, sig: &CStr) -> jmethodID {
+    let cls = ((**env).GetObjectClass.unwrap())(env, object);
+    let id = ((**env).GetMethodID.unwrap())(env, cls, name.as_ptr(), sig.as_ptr());
+    ((**env).DeleteLocalRef.unwrap())(env, cls);
+    id
+}
+unsafe fn int(env: *mut JNIEnv, object: jobject, name: &CStr, sig: &CStr, args: &[jvalue]) -> i32 {
+    let id = method(env, object, name, sig);
+    if id.is_null() { return 0; }
+    ((**env).CallIntMethodA.unwrap())(env, object, id, args.as_ptr())
+}
+unsafe fn float(env: *mut JNIEnv, object: jobject, name: &CStr, sig: &CStr, args: &[jvalue]) -> f32 {
+    let id = method(env, object, name, sig);
+    if id.is_null() { return 0.; }
+    ((**env).CallFloatMethodA.unwrap())(env, object, id, args.as_ptr())
+}
+unsafe fn void(env: *mut JNIEnv, object: jobject, name: &CStr, sig: &CStr, args: &[jvalue]) -> bool {
+    let id = method(env, object, name, sig);
+    if id.is_null() { return false; }
+    ((**env).CallVoidMethodA.unwrap())(env, object, id, args.as_ptr());
+    ((**env).ExceptionCheck.unwrap())(env) == 0
+}
+
+/// The app's Android state, which gets each new Activity (a global reference it keeps). The host
+/// sets it before the first Activity exists.
+pub(super) static ACTIVITY_READY: std::sync::OnceLock<unsafe fn(jobject)> = std::sync::OnceLock::new();
+unsafe extern "system" fn create(env: *mut JNIEnv, _: jclass, activity: jobject) {
+    let mut vm = std::ptr::null_mut();
+    ((**env).GetJavaVM.unwrap())(env, &mut vm);
+    VM.store(vm as usize, Ordering::Release);
+    let new = ((**env).NewGlobalRef.unwrap())(env, activity);
+    if new.is_null() { return; }
+    let old = std::mem::replace(&mut *lock(&ACTIVITY), new as usize);
+    if old != 0 { ((**env).DeleteGlobalRef.unwrap())(env, old as _); }
+    if let Some(ready) = ACTIVITY_READY.get() { ready(((**env).NewGlobalRef.unwrap())(env, activity)); }
+    emit_lifecycle(lifecycle::FOREGROUND);
+}
+fn emit_lifecycle(kind: u32) { Shared::global().emit(clock_ns(), |q, _| q.lifecycle(kind)); }
+unsafe extern "system" fn start(_: *mut JNIEnv, _: jclass) { emit_lifecycle(lifecycle::FOREGROUND); }
+unsafe extern "system" fn resume(_: *mut JNIEnv, _: jclass) {
+    lock(&Shared::global().state).active = true;
+    SURFACE_COVERED.store(true, Ordering::Release);
+    emit_lifecycle(lifecycle::RESUME); request_frame();
+    // Android may have shown the system bars again while the app was away
+    if lock(&Shared::global().state).fullscreen.is_some() { set_full_screen(true); }
+}
+unsafe extern "system" fn pause(_: *mut JNIEnv, _: jclass) {
+    // an XR session keeps drawing while the Activity pauses (its state decides)
+    if !super::xr::active() { lock(&Shared::global().state).active = false; }
+    emit_lifecycle(lifecycle::PAUSE);
+}
+unsafe extern "system" fn stop(_: *mut JNIEnv, _: jclass) {
+    if !super::xr::active() {
+        lock(&Shared::global().state).active = false;
+        BACKGROUNDED.store(true, Ordering::Release);
+    }
+    emit_lifecycle(lifecycle::BACKGROUND);
+    crate::background_hook();
+}
+/// How many Activities were destroyed for good (not recreated for a config change).
+pub(super) static ACTIVITIES_DESTROYED: AtomicUsize = AtomicUsize::new(0);
+unsafe extern "system" fn destroy(env: *mut JNIEnv, _: jclass) {
+    lock(&Shared::global().state).active = false;
+    surface_destroyed(env, std::ptr::null_mut(), std::ptr::null_mut());
+    let old = std::mem::take(&mut *lock(&ACTIVITY));
+    if old != 0 { ((**env).DeleteGlobalRef.unwrap())(env, old as _); }
+    ACTIVITIES_DESTROYED.fetch_add(1, Ordering::AcqRel);
+    emit_lifecycle(lifecycle::DESTROYED);
+}
+unsafe extern "system" fn focus(_: *mut JNIEnv, _: jclass, on: jboolean) {
+    // the XR session's state is the focus of an immersive app
+    if super::xr::active() { return; }
+    lock(&Shared::global().state).focused = on != 0;
+    Shared::global().emit(clock_ns(), |q, id| { q.focus(id, on != 0); q.lifecycle(if on != 0 { lifecycle::FOCUS_GAINED } else { lifecycle::FOCUS_LOST }); });
+}
+unsafe extern "system" fn params(env: *mut JNIEnv, _: jclass, cache: jstring, data: jstring, density: jfloat, emulator: jboolean, version: jstring, build: jstring, app_build: jstring, night: jboolean) {
+    let params = AndroidParams { cache_path: reg::string(env, cache), data_path: reg::string(env, data), density: if density.is_finite() && density > 0. { density } else { 1. }, emulator: emulator != 0, android_version: reg::string(env, version), build_number: reg::string(env, build), app_build: reg::string(env, app_build), night_mode: night != 0, rotation: 0 };
+    // sent again on every configuration change (a new density after a fold or a display
+    // change); the rotation comes on its own (onDisplayRotation), so keep the last one
+    let mut state = lock(&Shared::global().state);
+    let params = AndroidParams { rotation: state.params.rotation, ..params };
+    state.params = params;
+    drop(state);
+    Shared::global().display();
+    // The old Android backend kept its GL program binaries in the cache root, and nothing reads them now.
+    static OLD_BINARIES: std::sync::Once = std::sync::Once::new();
+    OLD_BINARIES.call_once(|| {
+        let cache = lock(&Shared::global().state).params.cache_path.clone();
+        std::thread::spawn(move || for entry in std::fs::read_dir(cache).into_iter().flatten().flatten() {
+            if entry.file_name().to_str().is_some_and(|n| n.starts_with("shader_") && n.contains("_av")) { let _ = std::fs::remove_file(entry.path()); }
+        });
+    });
+}
+unsafe extern "system" fn night_mode(_: *mut JNIEnv, _: jclass, night: jboolean) { lock(&Shared::global().state).params.night_mode = night != 0; }
+unsafe extern "system" fn display_rotation(_: *mut JNIEnv, _: jclass, rotation: jint) { lock(&Shared::global().state).params.rotation = rotation.rem_euclid(4) as u32; }
+unsafe extern "system" fn choreographer(_: *mut JNIEnv, _: jclass, refresh: jfloat, _: jint) {
+    let choreographer = AChoreographer_getInstance();
+    CHOREOGRAPHER.store(choreographer as usize, Ordering::Release);
+    if refresh.is_finite() && refresh > 0. { lock(&Shared::global().state).refresh = refresh; }
+    // keeps the rate current where the vsync callback can't tell it (a second registration is ignored)
+    if let Some(register) = choreographer_calls().register_refresh_rate.filter(|_| !choreographer.is_null()) {
+        register(choreographer, refresh_rate_changed, std::ptr::null_mut());
+    }
+    Shared::global().display(); request_frame();
+}
+unsafe fn set_surface(env: *mut JNIEnv, surface: jobject, size: Option<[u32; 2]>) {
+    // an immersive app shows its window in the XR session, never on the Activity's surface
+    if super::xr::active() { return; }
+    let Some(window) = Window::from_java(env, surface) else {
+        eprintln!("[hal-android] ANativeWindow_fromSurface failed");
+        surface_destroyed(env, std::ptr::null_mut(), surface);
+        return;
+    };
+    let dimensions = size.unwrap_or_else(|| window.size());
+    let shared = Shared::global();
+    let old = {
+        let mut r = lock(&shared.registry);
+        if size.is_some() { r.state.changed(window.0, dimensions); } else { r.state.created(window.0, dimensions); crate::backend::shell::window_made(); }
+        r.window.replace(window)
+    };
+    drop(old);
+    SURFACE_COVERED.store(true, Ordering::Release);
+    emit_lifecycle(lifecycle::SURFACE_AVAILABLE); shared.display(); request_frame();
+}
+unsafe extern "system" fn surface_created(env: *mut JNIEnv, _: jclass, surface: jobject) { set_surface(env, surface, None); }
+unsafe extern "system" fn surface_changed(env: *mut JNIEnv, _: jclass, surface: jobject, w: jint, h: jint) {
+    // The window may be new or on another panel now, like after a fold, so we ask again for the
+    // fastest mode of the display it's on.
+    let boosted = lock(&FRAME_RATE_BOOST);
+    if *boosted && !super::xr::active() { set_frame_rate_boost(true); }
+    drop(boosted);
+    set_surface(env, surface, Some([w.max(0) as u32, h.max(0) as u32]));
+}
+unsafe extern "system" fn surface_destroyed(_: *mut JNIEnv, _: jclass, _: jobject) {
+    if super::xr::active() { return; }
+    let shared = Shared::global();
+    let old = { let mut r = lock(&shared.registry); r.state.destroyed(); r.window.take() };
+    if let Some(release) = &*lock(&shared.release_window) { release(); }
+    drop(old);
+    emit_lifecycle(lifecycle::SURFACE_LOST); shared.display();
+}
+
+unsafe fn motion(env: *mut JNIEnv, event: jobject, history: Option<i32>, time: u64) {
+    boost_frame_rate();
+    let action = if history.is_some() { 2 } else { int(env, event, c"getActionMasked", c"()I", &[]) };
+    let index = int(env, event, c"getActionIndex", c"()I", &[]) as usize;
+    let count = int(env, event, c"getPointerCount", c"()I", &[]).max(0);
+    let mut pointers = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let args = [jvalue { i }, jvalue { i: history.unwrap_or(0) }];
+        let id = int(env, event, c"getPointerId", c"(I)I", &args[..1]) as u32;
+        let (x, y, pressure) = if history.is_some() {
+            (float(env, event, c"getHistoricalX", c"(II)F", &args), float(env, event, c"getHistoricalY", c"(II)F", &args), float(env, event, c"getHistoricalPressure", c"(II)F", &args))
+        } else {
+            (float(env, event, c"getX", c"(I)F", &args[..1]), float(env, event, c"getY", c"(I)F", &args[..1]), float(env, event, c"getPressure", c"(I)F", &args[..1]))
+        };
+        pointers.push(Pointer { id, x, y, pressure });
+    }
+    if ((**env).ExceptionCheck.unwrap())(env) != 0 { return; }
+    let shared = Shared::global();
+    let sample = state::sample(action, index, &pointers, shared.dpi(), time, history.is_some());
+    if sample.points.is_empty() { return; }
+    let mut bytes = Vec::with_capacity(sample.points.len() * crate::TouchPoint::SIZE);
+    for p in &sample.points { p.write(&mut bytes); }
+    shared.emit(sample.time_ns, |q, id| {
+        if sample.cancelled { q.touch_cancel(id, sample.points.len() as u32, &bytes); }
+        else { q.touch(id, sample.points.len() as u32, &bytes); }
+    });
+}
+unsafe extern "system" fn touch(env: *mut JNIEnv, _: jclass, event: jobject) {
+    let id = method(env, event, c"getEventTime", c"()J");
+    if id.is_null() { return; }
+    let time = ((**env).CallLongMethodA.unwrap())(env, event, id, std::ptr::null());
+    motion(env, event, None, time as u64 * 1_000_000);
+}
+unsafe extern "system" fn touch_nanos(env: *mut JNIEnv, _: jclass, event: jobject, time: jlong) { motion(env, event, None, time as u64); }
+unsafe extern "system" fn touch_history(env: *mut JNIEnv, _: jclass, event: jobject, history: jint, time: jlong) { motion(env, event, Some(history), time as u64); }
+unsafe extern "system" fn long_click(_: *mut JNIEnv, _: jclass, x: jfloat, y: jfloat, pointer: jint, time: jlong) {
+    boost_frame_rate();
+    let dpi = Shared::global().dpi() as f64;
+    Shared::global().emit(time as u64 * 1_000_000, |q, id| q.long_press(id, x as f64 / dpi, y as f64 / dpi, pointer as u32));
+}
+fn mods(meta: i32) -> u32 {
+    u32::from(meta & 0x1 != 0) * input::MOD_SHIFT | u32::from(meta & 0x1000 != 0) * input::MOD_CONTROL |
+    u32::from(meta & 0x2 != 0) * input::MOD_ALT | u32::from(meta & 0x10000 != 0) * input::MOD_LOGO
+}
+fn key(code: i32) -> u32 {
+    let key = makepad_key_code::android::android_to_makepad_key_code(code as u32);
+    key.to_index()
+}
+unsafe extern "system" fn key_down(_: *mut JNIEnv, _: jclass, code: jint, meta: jint, repeat: jboolean) { boost_frame_rate();
+    let (code, mods) = (key(code), mods(meta));
+    // the paste chord brings the clipboard's text, ahead of the key (as AppKit's shell does)
+    let paste = if mods & input::MOD_CONTROL != 0 && code == makepad_key_code::KeyCode::KeyV.to_index() {
+        with_activity(|env, activity| {
+            let text = reg::object(env, activity, c"pasteFromClipboard", c"()Ljava/lang/String;", &[]);
+            if ((**env).ExceptionCheck.unwrap())(env) != 0 { ((**env).ExceptionDescribe.unwrap())(env); ((**env).ExceptionClear.unwrap())(env); }
+            let out = reg::string(env, text);
+            if !text.is_null() { ((**env).DeleteLocalRef.unwrap())(env, text); }
+            out
+        }).unwrap_or_default()
+    } else { String::new() };
+    Shared::global().emit(clock_ns(), |q, id| {
+        if !paste.is_empty() { q.text(id, input::text::PASTE, paste.as_bytes()); }
+        q.key_down(id, code, repeat != 0, mods);
+    });
+}
+unsafe extern "system" fn key_up(_: *mut JNIEnv, _: jclass, code: jint, meta: jint) { boost_frame_rate(); Shared::global().emit(clock_ns(), |q, id| q.key_up(id, key(code), mods(meta))); }
+unsafe extern "system" fn back(_: *mut JNIEnv, _: jclass) { boost_frame_rate(); Shared::global().emit(clock_ns(), |q, id| q.back_pressed(id)); }
+/// `x`, `y` are surface pixels (NaN for the back button), `time` the uptime in milliseconds.
+unsafe extern "system" fn back_gesture(_: *mut JNIEnv, _: jclass, state: jint, x: jfloat, y: jfloat, progress: jfloat, edge: jint, time: jlong) { boost_frame_rate();
+    let dpi = Shared::global().dpi() as f64;
+    Shared::global().emit(time as u64 * 1_000_000, |q, id| q.back_gesture(id, state as u32, x as f64 / dpi, y as f64 / dpi, progress as f64, edge as u32));
+}
+/// The app did not take a back press: the activity does the system default.
+pub(super) fn back_unhandled() -> bool {
+    with_activity(|env, activity| unsafe {
+        let ok = void(env, activity, c"onBackUnhandled", c"()V", &[]);
+        if ((**env).ExceptionCheck.unwrap())(env) != 0 { ((**env).ExceptionDescribe.unwrap())(env); ((**env).ExceptionClear.unwrap())(env); }
+        ok
+    }).unwrap_or(false)
+}
+unsafe extern "system" fn character(_: *mut JNIEnv, _: jclass, code: jint) { boost_frame_rate();
+    if let Some(c) = char::from_u32(code as u32) { let mut bytes = [0; 4]; let text = c.encode_utf8(&mut bytes); Shared::global().emit(clock_ns(), |q, id| q.text(id, input::text::TYPED, text.as_bytes())); }
+}
+unsafe extern "system" fn resize_ime(_: *mut JNIEnv, _: jclass, height: jint, open: jboolean) {
+    // Every layout pass (onGlobalLayout) reports the IME state again, a boost's own window update
+    // too. An unchanged open report is no news, and only an open keyboard's slide boosts. A closed
+    // report always goes on: it clears LAST_IME here and the app's record of its last show
+    // (`ImeResize` in hal_intake), repeated or not, so the next ImeShow is sent.
+    if open == 0 { *lock(&LAST_IME) = None; }
+    let changed = state::report_changed(&mut lock(&Shared::global().state).ime, Some((height.max(0), open != 0)));
+    if open != 0 {
+        if !changed { return; }
+        boost_frame_rate();
+    }
+    let height = height.max(0) as f64 / Shared::global().dpi() as f64;
+    Shared::global().emit(clock_ns(), |q, id| q.ime_resize(id, height, open != 0));
+}
+unsafe extern "system" fn physical_keyboard(_: *mut JNIEnv, _: jclass, connected: jboolean) {
+    lock(&Shared::global().state).physical_keyboard = Some(connected != 0);
+    Shared::global().emit(clock_ns(), |q, id| q.physical_keyboard(id, connected != 0));
+}
+unsafe extern "system" fn insets(_: *mut JNIEnv, _: jclass, top: jfloat, right: jfloat, bottom: jfloat, left: jfloat) {
+    // an unchanged report would emit an unchanged geometry
+    if !state::report_changed(&mut lock(&Shared::global().state).insets, [top, right, bottom, left]) { return; }
+    Shared::global().display();
+}
+unsafe extern "system" fn ime_state(env: *mut JNIEnv, _: jclass, text: jstring, ss: jint, se: jint, cs: jint, ce: jint) { boost_frame_rate();
+    let text = reg::string(env, text);
+    Shared::global().emit(clock_ns(), |q, id| q.ime_state(id, ss as u32, se as u32, cs as u32, ce as u32, text.as_bytes()));
+}
+unsafe extern "system" fn ime_action(_: *mut JNIEnv, _: jclass, action: jint) { boost_frame_rate(); Shared::global().emit(clock_ns(), |q, id| q.ime_action(id, action as u32)); }
+unsafe extern "system" fn selection_handle(_: *mut JNIEnv, _: jclass, handle: jint, phase: jint, x: jfloat, y: jfloat, time: jlong) { boost_frame_rate();
+    let dpi = Shared::global().dpi() as f64;
+    Shared::global().emit(time as u64 * 1_000_000, |q, id| q.selection_handle(id, handle as u32, phase as u32, x as f64 / dpi, y as f64 / dpi));
+}
+/// The copy / paste toolbar's actions, as the app already understands them: the copy, cut and
+/// select all chords, and pasted text.
+unsafe extern "system" fn clipboard_action(env: *mut JNIEnv, _: jclass, action: jstring) { boost_frame_rate();
+    let key = match reg::string(env, action).as_str() {
+        "copy" => makepad_key_code::KeyCode::KeyC,
+        "cut" => makepad_key_code::KeyCode::KeyX,
+        "select_all" => makepad_key_code::KeyCode::KeyA,
+        _ => return,
+    }.to_index();
+    Shared::global().emit(clock_ns(), |q, id| { q.key_down(id, key, false, input::MOD_CONTROL); q.key_up(id, key, input::MOD_CONTROL); });
+}
+unsafe extern "system" fn clipboard_paste(env: *mut JNIEnv, _: jclass, content: jstring) { boost_frame_rate();
+    let text = reg::string(env, content);
+    if !text.is_empty() { Shared::global().emit(clock_ns(), |q, id| q.text(id, input::text::PASTE, text.as_bytes())); }
+}
+
+/// The config of the soft keyboard last asked for, while it is up: a focused text input re-sends
+/// its show on every draw, and each one reaches Android's IME tracker (a show/cancel loop).
+static LAST_IME: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The JavaVM and the global reference to the Activity (an XR loader keeps both); `None` before
+/// the Activity exists.
+pub(super) fn vm_and_activity() -> Option<(*mut c_void, *mut c_void)> {
+    let vm = VM.load(Ordering::Acquire);
+    let activity = *lock(&ACTIVITY);
+    (vm != 0 && activity != 0).then_some((vm as *mut c_void, activity as *mut c_void))
+}
+
+type JavaJob = Box<dyn FnOnce(*mut JNIEnv) + Send>;
+
+std::thread_local! {
+    /// This thread's companion: an ordinary thread attached to the VM that makes its Java calls.
+    static COMPANION: std::cell::OnceCell<Option<std::sync::mpsc::Sender<JavaJob>>> = const { std::cell::OnceCell::new() };
+}
+
+/// Runs `f` with a JNI environment: on this thread when the VM knows it, else on the thread's
+/// companion (made at its first call, gone with the thread). A native thread is never attached
+/// here: the JIT runs programs on stacks of its own, and attaching a thread while it runs on one
+/// aborts in ART's stack check. The companion keeps the caller's blocking (a socket read waits on
+/// its own companion, not on other threads' calls). `None`: no VM yet.
+pub(super) fn on_java<R>(f: impl FnOnce(*mut JNIEnv) -> R) -> Option<R> {
+    unsafe {
+        let vm = VM.load(Ordering::Acquire) as *mut JavaVM;
+        if vm.is_null() { return None; }
+        let mut env: *mut JNIEnv = std::ptr::null_mut();
+        if ((**vm).GetEnv.unwrap())(vm, &mut env as *mut _ as _, JNI_VERSION_1_6) == 0 {
+            return Some(f(env));
+        }
+        let tx = COMPANION.with(|c| c.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<JavaJob>();
+            let vm = vm as usize;
+            std::thread::Builder::new().name("java-companion".into()).spawn(move || {
+                let vm = vm as *mut JavaVM;
+                let mut env: *mut JNIEnv = std::ptr::null_mut();
+                if ((**vm).AttachCurrentThread.unwrap())(vm, &mut env, std::ptr::null_mut()) != 0 { return; }
+                for job in rx { job(env); }
+                ((**vm).DetachCurrentThread.unwrap())(vm);
+            }).ok().map(|_| tx)
+        }).clone())?;
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<R>(1);
+        let job: Box<dyn FnOnce(*mut JNIEnv) + '_> = Box::new(move |env| { let _ = done_tx.send(f(env)); });
+        // SAFETY: the caller waits below until the job ran (or was dropped unrun), so what it
+        // borrows outlives it, and nothing it holds is used on two threads at once
+        let job: JavaJob = std::mem::transmute(job);
+        tx.send(job).ok()?;
+        done_rx.recv().ok()
+    }
+}
+
+/// Runs `f` with a JNI environment ([`on_java`]) and the Activity; `None` before the Activity exists.
+pub(super) fn with_activity<R>(f: impl FnOnce(*mut JNIEnv, jobject) -> R) -> Option<R> {
+    on_java(|env| unsafe {
+        let global = *lock(&ACTIVITY);
+        let out = if global == 0 { None } else {
+            let activity = ((**env).NewLocalRef.unwrap())(env, global as _);
+            let r = f(env, activity);
+            ((**env).DeleteLocalRef.unwrap())(env, activity);
+            Some(r)
+        };
+        out
+    }).flatten()
+}
+
+/// Ends the process once the app returned. If an Activity was destroyed since the app started (`destroyed`
+/// is the count then) and the one here now never drew, it came as the app closed, so it starts again.
+pub(super) fn end_process(destroyed: usize) -> ! {
+    // Held through the end, so an Activity created from here on waits in `create` and dies before
+    // it resumes, and the system starts it again in a new process.
+    let current = lock(&ACTIVITY);
+    if *current != 0 && ACTIVITIES_DESTROYED.load(Ordering::Acquire) != destroyed && SURFACE_COVERED.load(Ordering::Acquire) {
+        let activity = *current as jobject;
+        on_java(|env| unsafe {
+            void(env, activity, c"restartTaskInNewProcess", c"()V", &[]);
+            if ((**env).ExceptionCheck.unwrap())(env) != 0 { ((**env).ExceptionDescribe.unwrap())(env); ((**env).ExceptionClear.unwrap())(env); }
+        });
+    }
+    // the process's exit work (its endpoint's files), the flushes, then `_exit`, as every process ends
+    makepad_core_util::process_end::end(0)
+}
+
+pub(super) fn ime_command(cmd: OsCmd) -> bool {
+    match &cmd {
+        OsCmd::ImeShow { config, .. } => {
+            let mut last = lock(&LAST_IME);
+            if *last == Some(*config) { return true; }
+            *last = Some(*config);
+        }
+        OsCmd::ImeHide { .. } => *lock(&LAST_IME) = None,
+        _ => {}
+    }
+    on_java(|env| unsafe {
+        let activity = {
+            let global = lock(&ACTIVITY);
+            if *global == 0 { std::ptr::null_mut() } else { ((**env).NewLocalRef.unwrap())(env, *global as _) }
+        };
+        let ok = if activity.is_null() { false } else { match cmd {
+            OsCmd::ImeShow { config, .. } => {
+                use input::ime_config as cfg;
+                // the Cx enums' variants in declaration order (see `ime_config`), as MakepadSurface's constants
+                let input_mode = match cfg::field(config, cfg::INPUT_MODE_SHIFT, 4) {
+                    // Text Ascii Url Numeric Tel Email Decimal Search
+                    mode @ 1..=8 if config & cfg::READ_ONLY == 0 => mode as i32 - 1,
+                    // None, and a read-only field: no keyboard
+                    _ => 8,
+                };
+                // None Words Sentences AllCharacters, and Default Enabled Disabled: the same numbers in Java
+                let autocapitalize = cfg::field(config, cfg::AUTOCAPITALIZE_SHIFT, 2) as i32;
+                let autocorrect = cfg::field(config, cfg::AUTOCORRECT_SHIFT, 2) as i32;
+                // Default None Go Google Join Next Route Search Send Yahoo Done EmergencyCall Continue Previous,
+                // each as the closest RETURN_KEY_* Java has
+                let return_key = [0, 6, 1, 2, 1, 4, 1, 2, 3, 2, 5, 5, 4, 7].get(cfg::field(config, cfg::RETURN_KEY_SHIFT, 4) as usize).copied().unwrap_or(0);
+                let ok = void(env, activity, c"configureKeyboard", c"(IIIIZZ)V", &[jvalue { i: input_mode }, jvalue { i: autocapitalize }, jvalue { i: autocorrect }, jvalue { i: return_key }, jvalue { z: (config & cfg::MULTILINE != 0) as u8 }, jvalue { z: (config & cfg::SECURE != 0) as u8 }]);
+                ok && void(env, activity, c"showKeyboard", c"(Z)V", &[jvalue { z: (config & cfg::READ_ONLY == 0) as u8 }])
+            }
+            OsCmd::ImeHide { .. } => void(env, activity, c"showKeyboard", c"(Z)V", &[jvalue { z: 0 }]),
+            OsCmd::ImeSync { selection, composition, text, .. } => {
+                // Cx commands use character offsets; Android's editor uses UTF-16 units.
+                let offset = |n: u32| if n == u32::MAX { -1 } else { text.chars().take(n as usize).map(char::len_utf16).sum::<usize>() as i32 };
+                let selection = selection.map(offset);
+                let composition = if composition[0] == composition[1] { [-1; 2] } else { composition.map(offset) };
+                let utf16: Vec<u16> = text.encode_utf16().collect();
+                let s = ((**env).NewString.unwrap())(env, utf16.as_ptr(), utf16.len() as i32);
+                let ok = !s.is_null() && void(env, activity, c"updateImeTextState", c"(Ljava/lang/String;IIII)V", &[jvalue { l: s }, jvalue { i: selection[0] as i32 }, jvalue { i: selection[1] as i32 }, jvalue { i: composition[0] as i32 }, jvalue { i: composition[1] as i32 }]);
+                ((**env).DeleteLocalRef.unwrap())(env, s); ok
+            }
+            _ => false,
+        }};
+        if ((**env).ExceptionCheck.unwrap())(env) != 0 { ((**env).ExceptionDescribe.unwrap())(env); ((**env).ExceptionClear.unwrap())(env); }
+        if !activity.is_null() { ((**env).DeleteLocalRef.unwrap())(env, activity); }
+        if !ok { eprintln!("[hal-android] IME command failed"); }
+        ok
+    }).unwrap_or(false)
+}
+
+unsafe fn clipboard_manager(env: *mut JNIEnv, activity: jobject) -> jobject {
+    let service = ((**env).NewStringUTF.unwrap())(env, c"clipboard".as_ptr());
+    if service.is_null() { return std::ptr::null_mut(); }
+    let manager = reg::object(env, activity, c"getSystemService", c"(Ljava/lang/String;)Ljava/lang/Object;", &[jvalue { l: service }]);
+    ((**env).DeleteLocalRef.unwrap())(env, service);
+    manager
+}
+
+/// A Java string of `text` (null when the VM is out of memory).
+unsafe fn java_string(env: *mut JNIEnv, text: &str) -> jstring {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    ((**env).NewString.unwrap())(env, utf16.as_ptr(), utf16.len() as i32)
+}
+
+/// A new `class` made by its constructor `sig` (null on any failure, with its exception pending).
+unsafe fn new_object(env: *mut JNIEnv, class: &CStr, sig: &CStr, args: &[jvalue]) -> jobject {
+    let class = ((**env).FindClass.unwrap())(env, class.as_ptr());
+    if class.is_null() { return std::ptr::null_mut(); }
+    let init = ((**env).GetMethodID.unwrap())(env, class, c"<init>".as_ptr(), sig.as_ptr());
+    if init.is_null() { return std::ptr::null_mut(); }
+    ((**env).NewObjectA.unwrap())(env, class, init, args.as_ptr())
+}
+
+/// The extra of a clip item's intent that holds the copy's Markdown: Android has no Markdown type, and
+/// a second item would be pasted as more text by a text field elsewhere, which ignores the intent.
+const MARKDOWN_EXTRA: &CStr = c"text/markdown";
+
+pub(super) fn copy_to_clipboard(data: &ClipboardData) -> bool {
+    with_activity(|env, activity| unsafe {
+        if activity.is_null() { return false; }
+        if ((**env).PushLocalFrame.unwrap())(env, 32) != 0 {
+            ((**env).ExceptionDescribe.unwrap())(env); ((**env).ExceptionClear.unwrap())(env);
+            return false;
+        }
+        let ok = (|| {
+            let s = java_string(env, &data.text);
+            if s.is_null() { return false; }
+            if data.html.is_empty() && data.markdown.is_empty() {
+                return void(env, activity, c"copyToClipboard", c"(Ljava/lang/String;)V", &[jvalue { l: s }]);
+            }
+            // one item: the text, its HTML and an intent holding its Markdown
+            let null = std::ptr::null_mut();
+            let html = if data.html.is_empty() { null } else { java_string(env, &data.html) };
+            let intent = if data.markdown.is_empty() {
+                null
+            } else {
+                let intent = new_object(env, c"android/content/Intent", c"()V", &[]);
+                let key = ((**env).NewStringUTF.unwrap())(env, MARKDOWN_EXTRA.as_ptr());
+                let markdown = java_string(env, &data.markdown);
+                if intent.is_null() || key.is_null() || markdown.is_null() { return false; }
+                reg::object(env, intent, c"putExtra", c"(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", &[jvalue { l: key }, jvalue { l: markdown }]);
+                intent
+            };
+            let item = new_object(env, c"android/content/ClipData$Item", c"(Ljava/lang/CharSequence;Ljava/lang/String;Landroid/content/Intent;Landroid/net/Uri;)V", &[jvalue { l: s }, jvalue { l: html }, jvalue { l: intent }, jvalue { l: null }]);
+            let string = ((**env).FindClass.unwrap())(env, c"java/lang/String".as_ptr());
+            if item.is_null() || string.is_null() { return false; }
+            let types: &[&CStr] = if html.is_null() { &[c"text/plain"] } else { &[c"text/plain", c"text/html"] };
+            let mimes = ((**env).NewObjectArray.unwrap())(env, types.len() as i32, string, null);
+            if mimes.is_null() { return false; }
+            for (at, mime) in types.iter().enumerate() {
+                let mime = ((**env).NewStringUTF.unwrap())(env, mime.as_ptr());
+                if mime.is_null() { return false; }
+                ((**env).SetObjectArrayElement.unwrap())(env, mimes, at as i32, mime);
+            }
+            let label = ((**env).NewStringUTF.unwrap())(env, c"text".as_ptr());
+            if label.is_null() { return false; }
+            let description = new_object(env, c"android/content/ClipDescription", c"(Ljava/lang/CharSequence;[Ljava/lang/String;)V", &[jvalue { l: label }, jvalue { l: mimes }]);
+            if description.is_null() { return false; }
+            let clip = new_object(env, c"android/content/ClipData", c"(Landroid/content/ClipDescription;Landroid/content/ClipData$Item;)V", &[jvalue { l: description }, jvalue { l: item }]);
+            let manager = clipboard_manager(env, activity);
+            !clip.is_null() && !manager.is_null() && void(env, manager, c"setPrimaryClip", c"(Landroid/content/ClipData;)V", &[jvalue { l: clip }])
+        })();
+        if ((**env).ExceptionCheck.unwrap())(env) != 0 { ((**env).ExceptionDescribe.unwrap())(env); ((**env).ExceptionClear.unwrap())(env); }
+        ((**env).PopLocalFrame.unwrap())(env, std::ptr::null_mut());
+        ok
+    }).unwrap_or(false)
+}
+
+pub(super) fn read_clipboard() -> Option<ClipboardData> {
+    with_activity(|env, activity| unsafe {
+        if activity.is_null() { return None; }
+        if ((**env).PushLocalFrame.unwrap())(env, 16) != 0 {
+            ((**env).ExceptionDescribe.unwrap())(env); ((**env).ExceptionClear.unwrap())(env);
+            return None;
+        }
+        let mut content = (|| {
+            let mut content = ClipboardData::default();
+            let manager = clipboard_manager(env, activity);
+            if manager.is_null() { return None; }
+            let clip = reg::object(env, manager, c"getPrimaryClip", c"()Landroid/content/ClipData;", &[]);
+            if clip.is_null() { return Some(content); }
+            if int(env, clip, c"getItemCount", c"()I", &[]) == 0 { return Some(content); }
+            let item = reg::object(env, clip, c"getItemAt", c"(I)Landroid/content/ClipData$Item;", &[jvalue { i: 0 }]);
+            if item.is_null() { return None; }
+            let text = reg::object(env, item, c"getText", c"()Ljava/lang/CharSequence;", &[]);
+            if ((**env).ExceptionCheck.unwrap())(env) != 0 { return None; }
+            if !text.is_null() {
+                let string = reg::object(env, text, c"toString", c"()Ljava/lang/String;", &[]);
+                if string.is_null() { return None; }
+                content.text = reg::string(env, string);
+                if ((**env).ExceptionCheck.unwrap())(env) != 0 { return None; }
+            }
+            let html = reg::object(env, item, c"getHtmlText", c"()Ljava/lang/String;", &[]);
+            if ((**env).ExceptionCheck.unwrap())(env) != 0 { return None; }
+            content.html = reg::string(env, html);
+            let intent = reg::object(env, item, c"getIntent", c"()Landroid/content/Intent;", &[]);
+            if ((**env).ExceptionCheck.unwrap())(env) != 0 { return None; }
+            if !intent.is_null() {
+                let key = ((**env).NewStringUTF.unwrap())(env, MARKDOWN_EXTRA.as_ptr());
+                if key.is_null() { return None; }
+                let markdown = reg::object(env, intent, c"getStringExtra", c"(Ljava/lang/String;)Ljava/lang/String;", &[jvalue { l: key }]);
+                if ((**env).ExceptionCheck.unwrap())(env) != 0 { return None; }
+                content.markdown = reg::string(env, markdown);
+            }
+            Some(content)
+        })();
+        if ((**env).ExceptionCheck.unwrap())(env) != 0 { ((**env).ExceptionDescribe.unwrap())(env); ((**env).ExceptionClear.unwrap())(env); content = None; }
+        ((**env).PopLocalFrame.unwrap())(env, std::ptr::null_mut());
+        content
+    }).flatten()
+}
+
+/// The selection's drag handles at `start` / `end`, in window points (the Activity takes pixels).
+pub(super) fn selection_handles(action: u32, start: [f32; 2], end: [f32; 2]) -> bool {
+    let dpi = Shared::global().dpi();
+    let args = [start[0], start[1], end[0], end[1]].map(|v| jvalue { f: v * dpi });
+    with_activity(|env, activity| unsafe { match action {
+        crate::selection_handles::SHOW => void(env, activity, c"showSelectionHandles", c"(FFFF)V", &args),
+        crate::selection_handles::MOVE => void(env, activity, c"updateSelectionHandles", c"(FFFF)V", &args),
+        _ => void(env, activity, c"hideSelectionHandles", c"()V", &[]),
+    } }).unwrap_or(false)
+}
+
+/// The copy / paste toolbar over `area` (window points), or none.
+pub(super) fn clipboard_actions(show: bool, area: [f32; 4], selection: bool) -> bool {
+    let dpi = Shared::global().dpi();
+    let [x, y, w, h] = area.map(|v| v * dpi);
+    with_activity(|env, activity| unsafe {
+        if !show { return void(env, activity, c"dismissClipboardActions", c"()V", &[]); }
+        // the last one is the keyboard's shift, which the Activity doesn't use
+        void(env, activity, c"showClipboardActions", c"(ZIIIII)V", &[jvalue { z: selection as jboolean }, jvalue { i: x as jint }, jvalue { i: y as jint }, jvalue { i: (x + w) as jint }, jvalue { i: (y + h) as jint }, jvalue { i: 0 }])
+    }).unwrap_or(false)
+}
+
+/// Registers the shell's, and the media services' natives in one strict pass. The
+/// returned names are the Java natives no HAL module owns (app-side services); they are never
+/// filled with no-op functions.
+/// # Safety
+/// Called on a JVM-attached thread with the live MakepadNative class. The host owns JNI_OnLoad.
+pub unsafe fn register_natives(env: *mut JNIEnv, class: jclass) -> Result<Vec<String>, String> {
+    // the VM from the start: Java calls work before the Activity exists (on_java)
+    let mut vm = std::ptr::null_mut();
+    ((**env).GetJavaVM.unwrap())(env, &mut vm);
+    VM.store(vm as usize, Ordering::Release);
+    // fleet crypto and device stats (FleetTls): optional, an APK without the class only lacks them
+    if let Err(e) = super::fleet::init(env) {
+        eprintln!("[hal-android] fleet: {e}");
+    }
+    let natives = reg::reflect(env, class)?;
+    super::a11y::check_natives(&natives)?;
+    let mut table = native_methods();
+    table.extend(super::media::native_methods());
+    table.extend(super::native_layer::native_methods());
+    reg::register(env, class, &natives, |name, sig| {
+        let Some((_, expected, ptr)) = table.iter().find(|(n, _, _)| *n == name) else { return Ok(None); };
+        if sig != *expected { return Err(format!("MakepadNative.{name}: expected {expected}, reflected {sig}")); }
+        Ok(Some(*ptr))
+    })
+}
+
+/// Names and ABI checks, never a second source of Java's reflected registration descriptors.
+pub fn native_methods() -> Vec<(&'static str, &'static str, *mut c_void)> {
+    let mut methods = vec![
+        ("activityOnCreate", "(Ljava/lang/Object;)V", create as *mut c_void),
+        ("activityOnStart", "()V", start as *mut c_void),
+        ("activityOnResume", "()V", resume as *mut c_void),
+        ("activityOnPause", "()V", pause as *mut c_void),
+        ("activityOnStop", "()V", stop as *mut c_void),
+        ("activityOnDestroy", "()V", destroy as *mut c_void),
+        ("activityOnWindowFocusChanged", "(Z)V", focus as *mut c_void),
+        ("onAndroidParams", "(Ljava/lang/String;Ljava/lang/String;FZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V", params as *mut c_void),
+        ("onNightModeChanged", "(Z)V", night_mode as *mut c_void),
+        ("onDisplayRotation", "(I)V", display_rotation as *mut c_void),
+        ("onAppHalBackend", "(Ljava/lang/String;)V", super::shell::app_hal_backend as *mut c_void),
+        ("initChoreographer", "(FI)V", choreographer as *mut c_void),
+        ("onBackPressed", "()V", back as *mut c_void),
+        ("onBackGesture", "(IFFFIJ)V", back_gesture as *mut c_void),
+        ("surfaceOnSurfaceCreated", "(Landroid/view/Surface;)V", surface_created as *mut c_void),
+        ("surfaceOnSurfaceChanged", "(Landroid/view/Surface;II)V", surface_changed as *mut c_void),
+        ("surfaceOnSurfaceDestroyed", "(Landroid/view/Surface;)V", surface_destroyed as *mut c_void),
+        ("surfaceOnTouch", "(Landroid/view/MotionEvent;)V", touch as *mut c_void),
+        ("surfaceOnTouchNanos", "(Landroid/view/MotionEvent;J)V", touch_nanos as *mut c_void),
+        ("surfaceOnTouchHistory", "(Landroid/view/MotionEvent;IJ)V", touch_history as *mut c_void),
+        ("surfaceOnLongClick", "(FFIJ)V", long_click as *mut c_void),
+        ("surfaceOnKeyDown", "(IIZ)V", key_down as *mut c_void),
+        ("surfaceOnKeyUp", "(II)V", key_up as *mut c_void),
+        ("surfaceOnCharacter", "(I)V", character as *mut c_void),
+        ("surfaceOnResizeTextIME", "(IZ)V", resize_ime as *mut c_void),
+        ("surfaceOnPhysicalKeyboardChanged", "(Z)V", physical_keyboard as *mut c_void),
+        ("surfaceOnSafeAreaInsets", "(FFFF)V", insets as *mut c_void),
+        ("onImeTextStateChanged", "(Ljava/lang/String;IIII)V", ime_state as *mut c_void),
+        ("onImeEditorAction", "(I)V", ime_action as *mut c_void),
+        ("onSelectionHandleDrag", "(IIFFJ)V", selection_handle as *mut c_void),
+        ("onClipboardAction", "(Ljava/lang/String;)V", clipboard_action as *mut c_void),
+        ("onClipboardPaste", "(Ljava/lang/String;)V", clipboard_paste as *mut c_void),
+    ];
+    methods.extend(super::a11y::native_methods());
+    methods
+}

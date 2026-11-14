@@ -1,13 +1,14 @@
 #![allow(dead_code)]
+use relax_api::relax_api;
 
 use std::{
     collections::HashMap,
     fmt,
     ops::{Deref, DerefMut, Index, IndexMut},
     sync::atomic::{AtomicU64, Ordering},
-    sync::Mutex,
     sync::Once,
 };
+use relax_api::sync::Mutex;
 
 impl LiveIdInterner {
     pub fn add(&mut self, val: &str) {
@@ -23,12 +24,20 @@ impl LiveIdInterner {
     where
         F: FnOnce(&mut Self) -> R,
     {
+        // (the process's table, whichever program's op interns a name)
+        relax_api::process_heap(|| Self::with_table(f))
+    }
+
+    fn with_table<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
         static IDMAP: Mutex<Option<LiveIdInterner>> = Mutex::new(None);
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             let mut map = LiveIdInterner {
                 //alloc: 0,
-                id_to_string: HashMap::new(),
+                id_to_string: LiveIdMap::default(),
             };
             // pre-seed list for debugging purposes
             let fill = [
@@ -54,10 +63,61 @@ impl LiveIdInterner {
     }
 }
 
+/// Bumped when [`LiveId::lut_insert`] with `replace` puts another name where the table held one:
+/// a name a thread found before may no longer be the table's ([`KNOWN_NAMES`]).
+static NAMES_REPLACED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The names this thread found in the table, by id, and the [`NAMES_REPLACED`] count they
+    /// hold for. The table only gains names, and a name it holds changes only by a replace,
+    /// which bumps that count: until then a name found once is still the table's, read again
+    /// without the table's lock. Every identifier a lexer reads asks the table; with its one
+    /// lock, 16 threads lexing a 140 KB text at once took 42 ms each, one alone 2.9 ms; with
+    /// these, 3.9 ms each (11-07).
+    static KNOWN_NAMES: std::cell::RefCell<(u64, LiveIdMap<LiveId, Box<str>>)> = std::cell::RefCell::new((0, LiveIdMap::default()));
+}
+
+/// `f` of `id`'s name as this thread found it in the table, if it did and no name was replaced
+/// since; None sends the caller to the table.
+fn known_name<R>(id: LiveId, f: impl FnOnce(&str) -> R) -> Option<R> {
+    // (the process's blocks, like the table's: a program's op can fill them on a thread that
+    // outlives the program)
+    relax_api::process_heap(|| {
+        KNOWN_NAMES
+            .try_with(|known| {
+                let mut known = known.borrow_mut();
+                let replaced = NAMES_REPLACED.load(Ordering::Acquire);
+                if known.0 != replaced {
+                    known.1.clear();
+                    known.0 = replaced;
+                    return None;
+                }
+                known.1.get(&id).map(|name| f(name))
+            })
+            .ok()
+            .flatten()
+    })
+}
+
+/// Notes `name`, read from the table under its lock, as `id`'s for this thread; `replaced` is
+/// the [`NAMES_REPLACED`] count read before the table was: after a replace it is not noted.
+fn remember_name(id: LiveId, name: &str, replaced: u64) {
+    relax_api::process_heap(|| {
+        let _ = KNOWN_NAMES.try_with(|known| {
+            let mut known = known.borrow_mut();
+            if known.0 == replaced {
+                known.1.insert(id, name.into());
+            }
+        });
+    })
+}
+
+#[relax_api(plain)]
 #[derive(Clone, Default, Eq, Hash, Copy, Ord, PartialOrd, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(transparent)]
 pub struct LiveId(pub u64);
 
+#[relax_api]
 impl LiveId {
     pub const SEED: u64 = 0xd6e8_feb8_6659_fd93;
 
@@ -185,56 +245,127 @@ impl LiveId {
         Self::from_bytes(seed, &num.to_be_bytes(), 0, 8, 0)
     }
 
+    // The name table is one per process: the functions below are non-generic with C-shaped
+    // signatures, so under `makepad run` (this crate provided by the loader, loader-core.md
+    // section 8) every caller reaches the loader's copy.
+
+    /// Records `id_str` as the name of `id`. `replace`: overwrite an existing name; otherwise an
+    /// existing different name is kept and false returned.
+    #[relax_api]
+    pub fn lut_insert(id: LiveId, id_str: &str, replace: bool) -> bool {
+        if !replace {
+            if let Some(same) = known_name(id, |name| name == id_str) {
+                return same;
+            }
+        }
+        let replaced = NAMES_REPLACED.load(Ordering::Acquire);
+        LiveIdInterner::with(|idmap| {
+            if !replace {
+                if let Some(stored) = idmap.id_to_string.get(&id) {
+                    remember_name(id, stored, replaced);
+                    return stored == id_str;
+                }
+            }
+            let before = idmap.id_to_string.insert(id, id_str.to_string());
+            // A name the table held, now another: what threads found before no longer holds.
+            if before.is_some_and(|before| before != id_str) {
+                NAMES_REPLACED.fetch_add(1, Ordering::Release);
+            }
+            remember_name(id, id_str, replaced);
+            true
+        })
+    }
+
+    /// The byte length of `id`'s recorded name; usize::MAX when it has none.
+    #[relax_api]
+    pub fn lut_name_len(id: LiveId) -> usize {
+        if let Some(len) = known_name(id, str::len) {
+            return len;
+        }
+        let replaced = NAMES_REPLACED.load(Ordering::Acquire);
+        LiveIdInterner::with(|idmap| match idmap.id_to_string.get(&id) {
+            Some(s) => {
+                remember_name(id, s, replaced);
+                s.len()
+            }
+            None => usize::MAX,
+        })
+    }
+
+    /// Copies `id`'s recorded name into `out` (as much as fits); returns the bytes copied.
+    #[relax_api]
+    pub fn lut_name_copy(id: LiveId, out: &mut [u8]) -> usize {
+        let copy = |s: &str, out: &mut [u8]| {
+            let n = s.len().min(out.len());
+            out[..n].copy_from_slice(&s.as_bytes()[..n]);
+            n
+        };
+        if let Some(n) = known_name(id, |s| copy(s, &mut *out)) {
+            return n;
+        }
+        let replaced = NAMES_REPLACED.load(Ordering::Acquire);
+        LiveIdInterner::with(|idmap| match idmap.id_to_string.get(&id) {
+            Some(s) => {
+                remember_name(id, s, replaced);
+                copy(s, out)
+            }
+            None => 0,
+        })
+    }
+
     pub fn from_str_with_lut(id_str: &str) -> Result<Self, String> {
         let id = Self::from_str(id_str);
-        LiveIdInterner::with(|idmap| {
-            if let Some(stored) = idmap.id_to_string.get(&id) {
-                if stored != id_str {
-                    return Err(stored.clone());
-                }
-            } else {
-                idmap.id_to_string.insert(id, id_str.to_string());
-            }
+        if Self::lut_insert(id, id_str, false) {
             Ok(id)
-        })
+        } else {
+            Err(id.as_string(|s| s.unwrap_or("").to_string()))
+        }
     }
 
     pub fn from_str_with_intern(id_str: &str, intern: InternLiveId) -> Self {
         let id = Self::from_str(id_str);
         if let InternLiveId::Yes = intern {
-            LiveIdInterner::with(|idmap| idmap.id_to_string.insert(id, id_str.to_string()));
+            Self::lut_insert(id, id_str, true);
         }
         id
     }
 
     pub fn from_str_num_with_lut(id_str: &str, num: u64) -> Result<Self, String> {
         let id = Self::from_str_num(id_str, num);
-        LiveIdInterner::with(|idmap| {
-            idmap.id_to_string.insert(id, format!("{}{}", id_str, num));
-            Ok(id)
-        })
+        Self::lut_insert(id, &format!("{}{}", id_str, num), true);
+        Ok(id)
     }
 
     pub fn as_string<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<&str>) -> R,
     {
-        LiveIdInterner::with(|idmap| match idmap.id_to_string.get(self) {
-            Some(v) => f(Some(v)),
-            None => f(None),
-        })
+        let n = Self::lut_name_len(*self);
+        if n == usize::MAX {
+            return f(None);
+        }
+        // A stack buffer for ordinary names: ids are printed per frame
+        // (labels, logs, script keys) and a heap copy per call added up.
+        let mut stack = [0u8; 128];
+        let mut heap;
+        let buf: &mut [u8] = if n <= stack.len() { &mut stack[..n] } else { heap = vec![0u8; n]; &mut heap };
+        let m = Self::lut_name_copy(*self, buf);
+        f(Some(std::str::from_utf8(&buf[..m]).unwrap_or("")))
     }
 
     pub fn not_empty(&self) -> bool {
         self.0 != 0
     }
 
+    #[relax_api]
     pub fn unique() -> Self {
         LiveId(UNIQUE_LIVE_ID.fetch_add(1, Ordering::SeqCst))
     }
 }
 
+#[relax_api(plain)]
 #[derive(Clone, Copy)]
+#[repr(u8)]
 pub enum InternLiveId {
     Yes,
     No,
@@ -278,7 +409,7 @@ impl fmt::Display for LiveId {
         else {
             self.as_string(|string| {
                 if let Some(id) = string {
-                    write!(f, "{}", id)
+                    f.write_str(id)
                 } else {
                     write!(f, "{:016x}", self.0)
                 }
@@ -295,12 +426,13 @@ impl fmt::LowerHex for LiveId {
 
 pub struct LiveIdInterner {
     //alloc: u64,
-    id_to_string: HashMap<LiveId, String>,
+    id_to_string: LiveIdMap<LiveId, String>,
 }
 
 // ----------------------------------------------------------------------------
 
 // Idea taken from the `nohash_hasher` crate.
+#[relax_api(plain)]
 #[derive(Default)]
 pub struct LiveIdHasher(u64);
 
@@ -350,6 +482,7 @@ impl std::hash::Hasher for LiveIdHasher {
     }
 }
 
+#[relax_api(plain)]
 #[derive(Copy, Clone, Default)]
 pub struct LiveIdHasherBuilder {}
 
@@ -457,5 +590,60 @@ where
 {
     fn index_mut(&mut self, index: K) -> &mut Self::Output {
         self.map.get_mut(&index).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name_of(id: LiveId) -> Option<String> {
+        id.as_string(|s| s.map(str::to_string))
+    }
+
+    /// Names interned from many threads at once, some shared by all of them, each read back as
+    /// itself, by its own thread (from what it found) and by another (from the table).
+    #[test]
+    fn names_interned_from_many_threads_read_back() {
+        let threads: Vec<_> = (0..16)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for round in 0..2 {
+                        for i in 0..2000 {
+                            let own = format!("interner_test_{t}_{i}");
+                            let shared = format!("interner_shared_{i}");
+                            assert_eq!(LiveId::from_str_with_lut(&own), Ok(LiveId::from_str(&own)), "round {round}");
+                            assert_eq!(LiveId::from_str_with_lut(&shared), Ok(LiveId::from_str(&shared)), "round {round}");
+                            assert_eq!(name_of(LiveId::from_str(&own)), Some(own));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        for t in 0..16 {
+            for i in (0..2000).step_by(97) {
+                let own = format!("interner_test_{t}_{i}");
+                assert_eq!(name_of(LiveId::from_str(&own)), Some(own));
+            }
+        }
+        assert_eq!(name_of(LiveId::from_str("buffer")), Some("buffer".to_string()));
+        assert_eq!(name_of(LiveId::from_str("interner_never_named")), None);
+    }
+
+    /// A name replaced in the table is the new one for a thread that found the old one before.
+    #[test]
+    fn a_replaced_name_is_read_anew() {
+        let id = LiveId::from_str("interner_replaced");
+        assert!(LiveId::lut_insert(id, "interner_replaced", false));
+        assert!(LiveId::lut_insert(id, "interner_replaced", false), "found again");
+        assert_eq!(name_of(id), Some("interner_replaced".to_string()));
+        let elsewhere = std::thread::spawn(move || LiveId::lut_insert(id, "interner_replacement", true));
+        assert!(elsewhere.join().unwrap());
+        assert!(!LiveId::lut_insert(id, "interner_replaced", false), "the table holds the replacement");
+        assert!(LiveId::lut_insert(id, "interner_replacement", false));
+        assert_eq!(name_of(id), Some("interner_replacement".to_string()));
     }
 }

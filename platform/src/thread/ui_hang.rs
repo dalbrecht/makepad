@@ -1,0 +1,260 @@
+//! Always-on UI stall sampling. The UI publishes atomics; only the watchdog
+//! unwinds/symbolizes/logs. No timer, repaint, lock, or worker wait on the UI.
+use std::{marker::PhantomData, rc::Rc};
+#[path = "ui_hash.rs"]
+pub mod hashing;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+use std::cell::Cell;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u32)]
+pub enum UiPhase {
+    NativeEvent = 256,
+    DrawList,
+    WidgetDraw,
+    CodePageInstall,
+    CodePrepare,
+    FontAtlas,
+    StagePlacement,
+    WorkerPump,
+    Present,
+    GpuWait,
+    EditorAttach,
+    CodeCache,
+    CodeHover,
+    Beat,
+    ShaderCompile,
+    PipelineUpload,
+    GlyphWait,
+    FrameBuild,
+    ScriptGc,
+    Submit,
+    Signals,
+    PlatformOps,
+    Tasks,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn phase_name(id: u32) -> &'static str {
+    match id {
+        256 => "native-event",
+        257 => "draw-list",
+        258 => "widget-draw",
+        259 => "code-page-install",
+        260 => "code-prepare",
+        261 => "font-atlas",
+        262 => "stage-placement",
+        263 => "worker-pump",
+        264 => "present",
+        265 => "gpu-wait",
+        266 => "editor-attach",
+        267 => "code-cache",
+        268 => "code-hover",
+        269 => "beat",
+        270 => "shader-compile",
+        271 => "pipeline-upload",
+        272 => "glyph-wait",
+        273 => "frame-build",
+        274 => "script-gc",
+        275 => "submit",
+        276 => "signals",
+        277 => "platform-ops",
+        278 => "tasks",
+        id => crate::event::Event::name_from_u32(id.saturating_sub(1)),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod native;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+use native::State;
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+thread_local! {
+    static CURRENT: Cell<*const State> = const { Cell::new(std::ptr::null()) };
+}
+
+/// Register the calling UI thread once, at Cx construction. Workers never
+/// register and their phase scopes are no-ops. No thread is spawned per frame.
+pub fn initialize() {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    native::initialize();
+}
+
+/// Nesting restores the previous phase. The outermost scope defines one busy
+/// event/frame; the event loop's idle wait must remain outside that scope.
+#[must_use]
+pub struct UiPhaseGuard {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    state: *const State,
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    previous: u64,
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    root: bool,
+    /// the phase reported to makepad inspect's timeline at entry (0: none)
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    traced: u64,
+    _thread: PhantomData<Rc<()>>,
+}
+
+/// The UI thread waits in the event loop for input, a wake or the next frame;
+/// makepad inspect leaves this time out of a frame.
+#[must_use]
+pub struct UiIdleGuard {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    hooks: Option<&'static relax_timeline::Hooks>,
+    _thread: PhantomData<Rc<()>>,
+}
+
+/// The UI thread waits in the event loop for input, a wake or the next frame;
+/// makepad inspect leaves this time out of a frame.
+#[inline]
+pub fn ui_idle() -> UiIdleGuard {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    let hooks = relax_timeline::hooks();
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    if let Some(h) = hooks {
+        (h.begin)("idle".as_ptr(), "idle".len());
+    }
+    UiIdleGuard {
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        hooks,
+        _thread: PhantomData,
+    }
+}
+
+impl Drop for UiIdleGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        if let Some(h) = self.hooks {
+            (h.end)("idle".as_ptr(), "idle".len());
+        }
+    }
+}
+
+/// makepad inspect's timeline under `makepad run` (dlsym'd once; absent in a rustc build): the
+/// loader's recording flag and its span entries. Off, a phase costs one load.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+pub(crate) mod relax_timeline {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+
+    pub struct Hooks {
+        pub flag: &'static AtomicBool,
+        pub begin: extern "C" fn(*const u8, usize),
+        pub end: extern "C" fn(*const u8, usize),
+    }
+
+    pub fn hooks() -> Option<&'static Hooks> {
+        static H: OnceLock<Option<Hooks>> = OnceLock::new();
+        H.get_or_init(|| {
+            extern "C" {
+                fn dlsym(handle: *mut std::ffi::c_void, name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+            }
+            // RTLD_DEFAULT: -2 on Apple targets, null on Linux
+            #[cfg(target_vendor = "apple")]
+            let default = -2isize as *mut std::ffi::c_void;
+            #[cfg(not(target_vendor = "apple"))]
+            let default = std::ptr::null_mut();
+            let flag = unsafe { dlsym(default, c"relax_recording".as_ptr()) };
+            let begin = unsafe { dlsym(default, c"relax_span_begin".as_ptr()) };
+            let end = unsafe { dlsym(default, c"relax_span_end".as_ptr()) };
+            if flag.is_null() || begin.is_null() || end.is_null() {
+                return None;
+            }
+            Some(unsafe {
+                Hooks {
+                    flag: &*(flag as *const AtomicBool),
+                    begin: std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn(*const u8, usize)>(begin),
+                    end: std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn(*const u8, usize)>(end),
+                }
+            })
+        })
+        .as_ref()
+        .filter(|h| h.flag.load(Ordering::Relaxed))
+    }
+}
+
+#[inline]
+pub fn ui_phase(phase: UiPhase) -> UiPhaseGuard {
+    ui_phase_detail(phase, 0)
+}
+
+#[inline]
+pub fn ui_phase_detail(phase: UiPhase, detail: u32) -> UiPhaseGuard {
+    enter(phase as u64 | ((detail as u64) << 32))
+}
+
+#[inline]
+pub fn ui_event_phase(event: &crate::event::Event) -> UiPhaseGuard {
+    enter(event.to_u32() as u64 + 1)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn enter(phase: u64) -> UiPhaseGuard {
+    let state = CURRENT.with(Cell::get);
+    let mut guard = UiPhaseGuard {
+        state,
+        previous: 0,
+        root: false,
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        traced: 0,
+        _thread: PhantomData,
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(h) = relax_timeline::hooks() {
+        let name = phase_name(phase as u32);
+        (h.begin)(name.as_ptr(), name.len());
+        guard.traced = phase;
+    }
+    // a native build's profiler stream (a viewer is attached)
+    #[cfg(all(not(relax), any(target_os = "macos", target_os = "linux")))]
+    if guard.traced == 0 && crate::prof_native::on() {
+        crate::prof_native::begin(phase_name(phase as u32));
+        guard.traced = phase;
+    }
+    if !state.is_null() {
+        // Registration and guards are confined to this thread. The sampler
+        // owns another Arc, so State also outlives TLS teardown.
+        let state = unsafe { &*state };
+        guard.previous = state.phase.load(std::sync::atomic::Ordering::Relaxed);
+        state.phase.store(phase, std::sync::atomic::Ordering::Relaxed);
+        guard.root = guard.previous == 0;
+        if guard.root {
+            state.begin();
+        }
+    }
+    guard
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[inline]
+fn enter(_: u64) -> UiPhaseGuard {
+    UiPhaseGuard { _thread: PhantomData }
+}
+
+impl Drop for UiPhaseGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.traced != 0 {
+            if let Some(h) = relax_timeline::hooks() {
+                let name = phase_name(self.traced as u32);
+                (h.end)(name.as_ptr(), name.len());
+            } else {
+                #[cfg(not(relax))]
+                crate::prof_native::end(phase_name(self.traced as u32));
+            }
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        if !self.state.is_null() {
+            let state = unsafe { &*self.state };
+            if self.root {
+                state.end();
+            }
+            state.phase.store(self.previous, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}

@@ -53,7 +53,17 @@ pub fn calc_crc_with_bytes(data: &[u8], value: u32) -> u32 {
 
 #[test]
 fn test_crc_same() {
-    let data: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    use alloc::vec;
+
+    // A xorshift64 fills the input: any bytes do, the two CRCs must agree.
+    let mut state: u64 = 8966548;
+    let mut data = vec![0_u8; 1000];
+    for byte in &mut data {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *byte = (state >> 24) as u8;
+    }
 
     let crc_simple = _crc32_slice1(&data, 0);
     let crc_table8 = crc32_slice8(&data, 0);

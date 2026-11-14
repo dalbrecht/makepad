@@ -15,7 +15,6 @@ rust-version = "1.65"
 name = "wayland-client"
 version = "0.31.12"
 authors = ["Elinor Berger <elinor@safaradeg.net>"]
-build = "build.rs"
 autolib = false
 autobins = false
 autoexamples = false
@@ -60,17 +59,21 @@ path = "examples/simple_window.rs"
 
 [dependencies.bitflags]
 version = "2"
+path = "../../bitflags"
 
 [dependencies.log]
-version = "0.4"
+package = "makepad-error-log"
+path = "../../error_log"
+version = "1.0.0"
 optional = true
-
-[dependencies.libc]
-version = "0.2"
 
 [dependencies.wayland-backend]
 path = "../wayland-backend"
 features = ["client_system"]
+
+[dependencies.wayland-sys]
+path = "../wayland-sys"
+features = []
 
 [dev-dependencies.futures-channel]
 version = "0.3.16"
@@ -80,3 +83,6 @@ version = "0.3"
 
 [dev-dependencies.tempfile]
 version = "3.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(unstable_coverage)"] }
