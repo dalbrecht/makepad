@@ -65,6 +65,7 @@ const SPIRV_VIEW_INDEX: [u32; 4] = [(4 << 16) | 71, 0, 11, 4440];
 #[test]
 fn fragment_position_reaches_every_backend() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
+    cx.init_script_vm();
     cx.with_vm(|vm| {
         probe(vm);
         let [m, h, g, w, s, wx, sx] = sources(vm);
@@ -97,6 +98,7 @@ fn fragment_position_reaches_every_backend() {
 #[test]
 fn fragment_position_costs_no_varying() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
+    cx.init_script_vm();
     cx.with_vm(|vm| {
         probe(vm);
         // the same quad without it has the same varyings: Metal's VertexOut
@@ -114,6 +116,7 @@ fn fragment_position_costs_no_varying() {
 #[test]
 fn a_vertex_stage_cannot_read_fragment_position() {
     let mut cx = Cx::new(Box::new(|_, _| {}));
+    cx.init_script_vm();
     cx.with_vm(|vm| {
         probe(vm);
         let src = { let v = script_eval!(vm, {mod.shader.test_compile_draw_source(mod.draw.PositionInVertex, "metal", false)}); text(vm, v) };

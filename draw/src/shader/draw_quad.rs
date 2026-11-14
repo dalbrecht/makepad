@@ -464,6 +464,7 @@ mod tests {
     #[test]
     fn draws_of_one_shader_keep_their_own_geometry() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_script_vm();
         cx.with_vm(|vm| {
             crate::makepad_platform::script::script_mod(vm);
             crate::script_mod(vm);
