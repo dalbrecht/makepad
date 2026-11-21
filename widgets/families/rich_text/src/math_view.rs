@@ -254,7 +254,7 @@ impl MathView {
         self.source_style.ensure_fonts_loaded(cx.cx.cx);
         let mut fonts = cx.fonts.borrow_mut();
         let family = fonts.get_or_load_font_family(self.source_style.font_family_id());
-        family.fonts().first().cloned()
+        family.and_then(|f| f.fonts().first().cloned())
     }
 
     fn compile_math(&mut self, cx: &mut Cx2d) {
