@@ -1,4 +1,5 @@
 mod compile;
+mod info_plist;
 mod sdk;
 use crate::utils::{get_build_crate_from_args, get_package_binary_name};
 use compile::*;
@@ -20,6 +21,19 @@ impl AppleTarget {
         match self {
             Self::aarch64_tvos | Self::aarch64_tvos_sim | Self::x86_64_tvos_sim => true,
             _ => false,
+        }
+    }
+    /// rustup channel used to build this target.
+    ///
+    /// tier-3 targets (tvOS) require `-Z build-std`, which is nightly-only, so
+    /// they always resolve to `nightly` regardless of `prefer_stable`. tier-2
+    /// targets (iOS) have prebuilt std and build on `stable` unless the caller
+    /// explicitly opted into nightly (`--nightly`).
+    fn rust_channel(&self, prefer_stable: bool) -> &'static str {
+        if self.needs_build_std() || !prefer_stable {
+            "nightly"
+        } else {
+            "stable"
         }
     }
     fn os(&self) -> AppleOs {
@@ -73,7 +87,10 @@ pub fn handle_apple(args: &[String]) -> Result<(), String> {
     let mut device_identifier = None;
     let mut app = None;
     let mut org = None;
-    let mut stable = false;
+    // Default to the stable toolchain. iOS targets build fine on stable; tvOS
+    // targets transparently fall back to nightly (see AppleTarget::rust_channel)
+    // because they need `-Z build-std`. Pass `--nightly` to force nightly.
+    let mut stable = true;
     if args.len() < 1 {
         return Err(format!("not enough args"));
     }
@@ -116,7 +133,7 @@ pub fn handle_apple(args: &[String]) -> Result<(), String> {
                 AppleTarget::sim_target(apple_os),
                 AppleTarget::device_target(apple_os),
             ];
-            sdk::rustup_toolchain_install(&toolchains)
+            sdk::rustup_toolchain_install(&toolchains, stable)
         }
         "build" => {
             let build_crate = get_build_crate_from_args(&args[1..])?;
@@ -135,6 +152,7 @@ pub fn handle_apple(args: &[String]) -> Result<(), String> {
                 build_crate,
                 &result.build_dir,
                 apple_target,
+                &result.font_manifest,
             )?;
             Ok(())
         }
@@ -153,6 +171,32 @@ pub fn handle_apple(args: &[String]) -> Result<(), String> {
                 AppleTarget::device_target(apple_os),
             )?;
             Ok(())
+        }
+        // the makepad run host (compile.rs build_host): `<package> [--env=K=V].. [--font-set=System|Latin|International] [cargo flags]`
+        "build-host" | "build-host-sim" | "run-host-sim" => {
+            let package = args.get(1).filter(|a| !a.starts_with('-')).ok_or("build-host / run-host-sim need the app's package")?.clone();
+            let mut env = Vec::new();
+            let mut flags = Vec::new();
+            // the app's `app_main!` font set: which of the crates' font files the bundle carries
+            // (an app that names none is `System` on iOS: the OS draws CJK, emoji, other scripts)
+            let mut font_set = "System".to_string();
+            for a in &args[2..] {
+                if let Some(kv) = a.strip_prefix("--env=") {
+                    env.push(kv.to_string());
+                } else if let Some(s) = a.strip_prefix("--font-set=") {
+                    font_set = s.to_string();
+                } else {
+                    flags.push(a.clone());
+                }
+            }
+            let target = if args[0] == "build-host" { AppleTarget::device_target(apple_os) } else { AppleTarget::sim_target(apple_os) };
+            let org = org.unwrap_or("dev.makepad".to_string());
+            let product = app.unwrap_or_else(|| package.trim_start_matches("makepad-").replace("app-", "").replace('-', ""));
+            if args[0] == "run-host-sim" {
+                compile::run_host_sim(stable, &org, &product, &package, &flags, &font_set, &env, target)
+            } else {
+                compile::build_host(stable, &org, &product, &package, &flags, &font_set, target).map(|_| ())
+            }
         }
         "run-sim" => {
             compile::run_on_sim(

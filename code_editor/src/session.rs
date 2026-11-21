@@ -1,7 +1,7 @@
 use {
     crate::{
         char::CharExt,
-        document::CodeDocument,
+        document::{valid_position, AnchorRange, CodeDocument, PreparedDocument},
         history::{EditKind, NewGroup},
         layout::{BlockElement, Layout, WrappedElement},
         selection::{Affinity, Cursor, SelectionSet},
@@ -16,6 +16,7 @@ use {
         collections::HashSet,
         fmt::Write,
         iter, mem,
+        ops::Range,
         rc::Rc,
         sync::{atomic, atomic::AtomicUsize, mpsc, mpsc::Receiver},
     },
@@ -30,26 +31,118 @@ pub struct CodeSession {
     selection_state: RefCell<SelectionState>,
     wrap_column: Cell<Option<usize>>,
     fold_state: RefCell<FoldState>,
+    view_range: Cell<Option<AnchorRange>>,
+    owned_view_anchors: Cell<Option<AnchorRange>>,
     edit_receiver: Receiver<(Option<SelectionSet>, Vec<Edit>)>,
 }
 
 impl CodeSession {
     pub fn new(document: CodeDocument) -> Self {
-        static ID: AtomicUsize = AtomicUsize::new(0);
-
-        let (edit_sender, edit_receiver) = mpsc::channel();
         let line_count = document.as_text().as_lines().len();
+        let session = Self::attach(
+            document,
+            SessionLayout {
+                y: Vec::new(),
+                column_count: vec![None; line_count],
+                fold_column: vec![0; line_count],
+                scale: vec![1.0; line_count],
+                wrap_data: vec![None; line_count],
+            },
+        );
+        for line in 0..line_count {
+            session.update_wrap_data(line);
+        }
+        session.update_y();
+        session
+    }
+
+    /// Prepare the default unwrapped layout on a worker. Range positions are
+    /// document-global UTF-8 boundaries; invalid ranges are rejected on attachment.
+    pub fn prepare_view(
+        document: &PreparedDocument,
+        range: Option<Range<Position>>,
+    ) -> PreparedView {
+        let lines = document.as_text().as_lines();
+        let count = lines.len();
+        PreparedView {
+            digest: document.digest(),
+            version: document.version(),
+            schema: 1,
+            range,
+            layout: SessionLayout {
+                y: (0..=count).map(|line| line as f64).collect(),
+                column_count: lines
+                    .iter()
+                    .map(|line| Some(line.column_count_at(0, Settings::default().tab_column_count)))
+                    .collect(),
+                fold_column: vec![0; count],
+                scale: vec![1.0; count],
+                wrap_data: vec![Some(WrapData::default()); count],
+            },
+        }
+    }
+
+    /// Prepare immutable snapshot text for an existing document's exact version.
+    /// Capture the version beside the text on its owning thread; attachment still
+    /// checks both version and digest. Never infer it from a registry revision.
+    pub fn prepare_view_at_version(
+        document: &PreparedDocument,
+        range: Option<Range<Position>>,
+        version: u64,
+    ) -> PreparedView {
+        let mut view = Self::prepare_view(document, range);
+        view.version = version;
+        view
+    }
+
+    /// Move worker allocations into a session; no tokenization or whole-file layout.
+    pub fn from_prepared(
+        document: CodeDocument,
+        prepared: PreparedView,
+    ) -> Result<Self, PreparedViewError> {
+        if prepared.schema != 1
+            || prepared.version != document.version()
+            || prepared.digest != document.digest()
+        {
+            return Err(PreparedViewError::Stale);
+        }
+        if let Some(range) = &prepared.range {
+            if range.start > range.end
+                || !valid_position(&document.as_text(), range.start)
+                || !valid_position(&document.as_text(), range.end)
+            {
+                return Err(PreparedViewError::InvalidRange);
+            }
+        }
+        let session = Self::attach(document, prepared.layout);
+        if let Some(range) = prepared.range {
+            let anchors = AnchorRange {
+                start: session.document.create_anchor(range.start, Drift::Before),
+                end: session.document.create_anchor(range.end, Drift::After),
+            };
+            session.view_range.set(Some(anchors));
+            session.owned_view_anchors.set(Some(anchors));
+            // Initial selection without delimiter scanning on the attaching thread.
+            session
+                .selection_state
+                .borrow_mut()
+                .selections
+                .set_selection(Selection::from(Cursor {
+                    position: range.start,
+                    affinity: Affinity::After,
+                    preferred_column_index: None,
+                }));
+        }
+        Ok(session)
+    }
+
+    fn attach(document: CodeDocument, layout: SessionLayout) -> Self {
+        let (edit_sender, edit_receiver) = mpsc::channel();
         let mut session = Self {
-            id: SessionId(ID.fetch_add(1, atomic::Ordering::AcqRel)),
+            id: SessionId::new(),
             settings: Rc::new(Settings::default()),
             document,
-            layout: RefCell::new(SessionLayout {
-                y: Vec::new(),
-                column_count: (0..line_count).map(|_| None).collect(),
-                fold_column: (0..line_count).map(|_| 0).collect(),
-                scale: (0..line_count).map(|_| 1.0).collect(),
-                wrap_data: (0..line_count).map(|_| None).collect(),
-            }),
+            layout: RefCell::new(layout),
             selection_state: RefCell::new(SelectionState {
                 mode: SelectionMode::Simple,
                 selections: SelectionSet::new(),
@@ -63,14 +156,59 @@ impl CodeSession {
                 folded_lines: HashSet::new(),
                 unfolding_lines: HashSet::new(),
             }),
+            view_range: Cell::new(None),
+            owned_view_anchors: Cell::new(None),
             edit_receiver,
         };
-        for line in 0..line_count {
-            session.update_wrap_data(line);
-        }
-        session.update_y();
         session.document.add_session(session.id, edit_sender);
         session
+    }
+
+    /// Present only this half-open range while retaining original columns and line numbers.
+    /// Foreign or released anchors are rejected (the previous range is retained).
+    pub fn set_view_range(&mut self, range: Option<AnchorRange>) {
+        self.handle_changes();
+        if let Some(range) = range {
+            let (Some(start), Some(end)) = (
+                self.document.resolve_anchor(range.start),
+                self.document.resolve_anchor(range.end),
+            ) else {
+                return;
+            };
+            if start > end {
+                return;
+            }
+        }
+        if let Some(owned) = self.owned_view_anchors.take() {
+            if Some(owned) != range {
+                self.document.remove_anchor(owned.start);
+                self.document.remove_anchor(owned.end);
+            } else {
+                self.owned_view_anchors.set(Some(owned));
+            }
+        }
+        self.view_range.set(range);
+        self.constrain_selections();
+    }
+
+    pub fn view_range(&self) -> Option<Range<Position>> {
+        let range = self.view_range.get()?;
+        let start = self.document.resolve_anchor(range.start)?;
+        let end = self.document.resolve_anchor(range.end)?;
+        Some(start.min(end)..start.max(end))
+    }
+
+    fn constrain_selections(&self) {
+        let mut state = self.selection_state.borrow_mut();
+        let last = state.last_added_selection_index;
+        state.last_added_selection_index =
+            state
+                .selections
+                .update_all_selections(last, |mut selection| {
+                    selection.anchor = self.clamp_position(selection.anchor);
+                    selection.cursor.position = self.clamp_position(selection.cursor.position);
+                    selection
+                });
     }
 
     pub fn id(&self) -> SessionId {
@@ -81,8 +219,56 @@ impl CodeSession {
         &self.settings
     }
 
+    /// Indent width in columns (the design tweaker's shader view uses 2).
+    pub fn set_tab_column_count(&mut self, tab_column_count: usize) {
+        let tab_column_count = tab_column_count.max(1);
+        if self.settings.tab_column_count != tab_column_count {
+            let mut settings = (*self.settings).clone();
+            settings.tab_column_count = tab_column_count;
+            self.settings = Rc::new(settings);
+            let line_count = self.document.as_text().as_lines().len();
+            {
+                let mut layout = self.layout.borrow_mut();
+                for i in 0..line_count {
+                    layout.column_count[i] = None;
+                    layout.wrap_data[i] = None;
+                }
+                layout.y.clear();
+            }
+            for line in 0..line_count {
+                self.update_wrap_data(line);
+            }
+            self.update_y();
+        }
+    }
+
+    /// Re-measure every line, after the document's inline inlays changed
+    /// ([`CodeDocument::set_inline_inlays`]): widths, wraps and positions.
+    pub fn relayout_inline(&self) {
+        let line_count = self.document.as_text().as_lines().len();
+        {
+            let mut layout = self.layout.borrow_mut();
+            for i in 0..line_count {
+                layout.column_count[i] = None;
+                layout.wrap_data[i] = None;
+            }
+            layout.y.clear();
+        }
+        for line in 0..line_count {
+            self.update_wrap_data(line);
+        }
+        self.update_y();
+    }
+
     pub fn document(&self) -> &CodeDocument {
         &self.document
+    }
+
+    /// Recompute every line's position, after the document's block inlays
+    /// changed ([`CodeDocument::set_block_inlays`]).
+    pub fn relayout(&self) {
+        self.layout.borrow_mut().y.clear();
+        self.update_y();
     }
 
     pub fn layout(&self) -> Layout<'_> {
@@ -90,6 +276,8 @@ impl CodeSession {
             text: self.document.as_text(),
             document_layout: self.document.layout(),
             session_layout: self.layout.borrow(),
+            view_range: self.view_range(),
+            tab_column_count: self.settings.tab_column_count,
         }
     }
 
@@ -142,6 +330,92 @@ impl CodeSession {
                 fold_state.folding_lines.insert(line_index);
             }
         }
+    }
+
+    /// Fold exactly `lines` (animated, like `fold`): each keeps its first
+    /// `column` columns at full size and shrinks the rest (0: the whole
+    /// line shrinks). Lines already folded stay folded.
+    pub fn fold_lines(&self, lines: &[usize], column: usize) {
+        let mut fold_state = self.fold_state.borrow_mut();
+        let line_count = self.document().as_text().as_lines().len();
+        for &line_index in lines.iter().filter(|line| **line < line_count) {
+            if fold_state.folded_lines.contains(&line_index) || fold_state.folding_lines.contains(&line_index) {
+                continue;
+            }
+            self.layout.borrow_mut().fold_column[line_index] = column;
+            fold_state.unfolding_lines.remove(&line_index);
+            fold_state.folding_lines.insert(line_index);
+        }
+    }
+
+    /// Unfold exactly `lines` (animated).
+    pub fn unfold_lines(&self, lines: &[usize]) {
+        let fold_state = &mut *self.fold_state.borrow_mut();
+        for line in lines {
+            if fold_state.folding_lines.remove(line) | fold_state.folded_lines.remove(line) {
+                fold_state.unfolding_lines.insert(*line);
+            }
+        }
+    }
+
+    /// Fold `fold` and unfold `unfold` at once, without animating (a host
+    /// jumping to a line it opened: the line is where it will stay).
+    pub fn set_folds_now(&self, fold: &[usize], unfold: &[usize]) {
+        let line_count = self.document().as_text().as_lines().len();
+        {
+            let fold_state = &mut *self.fold_state.borrow_mut();
+            let mut layout = self.layout.borrow_mut();
+            let mut first = usize::MAX;
+            // Folds still moving land now too.
+            for line in fold_state.folding_lines.drain().collect::<Vec<_>>() {
+                if let Some(scale) = layout.scale.get_mut(line) {
+                    *scale = 0.1;
+                }
+                fold_state.folded_lines.insert(line);
+                first = first.min(line);
+            }
+            for line in fold_state.unfolding_lines.drain().collect::<Vec<_>>() {
+                if let Some(scale) = layout.scale.get_mut(line) {
+                    *scale = 1.0;
+                }
+                first = first.min(line);
+            }
+            for &line in fold.iter().filter(|l| **l < line_count) {
+                fold_state.unfolding_lines.remove(&line);
+                fold_state.folding_lines.remove(&line);
+                fold_state.folded_lines.insert(line);
+                layout.fold_column[line] = 0;
+                if let Some(scale) = layout.scale.get_mut(line) {
+                    *scale = 0.1;
+                }
+                first = first.min(line);
+            }
+            for &line in unfold.iter().filter(|l| **l < line_count) {
+                fold_state.unfolding_lines.remove(&line);
+                fold_state.folding_lines.remove(&line);
+                fold_state.folded_lines.remove(&line);
+                if let Some(scale) = layout.scale.get_mut(line) {
+                    *scale = 1.0;
+                }
+                first = first.min(line);
+            }
+            if first != usize::MAX {
+                layout.y.truncate(first + 1);
+            }
+        }
+        self.update_y();
+    }
+
+    /// Whether a fold or unfold is still animating.
+    pub fn folds_animating(&self) -> bool {
+        let fold_state = self.fold_state.borrow();
+        !fold_state.folding_lines.is_empty() || !fold_state.unfolding_lines.is_empty()
+    }
+
+    /// Whether `line` is folded or folding.
+    pub fn is_folded(&self, line: usize) -> bool {
+        let fold_state = self.fold_state.borrow();
+        fold_state.folded_lines.contains(&line) || fold_state.folding_lines.contains(&line)
     }
 
     pub fn unfold(&self) {
@@ -218,6 +492,7 @@ impl CodeSession {
         selection_state.last_added_selection_index = Some(0);
         selection_state.injected_char_stack.clear();
         drop(selection_state);
+        self.constrain_selections();
         self.update_highlighted_delimiter_positions();
         if let NewGroup::Yes = new_group {
             self.document().force_new_group();
@@ -236,6 +511,8 @@ impl CodeSession {
                 position.byte_index = line_len;
             }
         }
+        while !lines[position.line_index].is_char_boundary(position.byte_index) { position.byte_index -= 1; }
+        if let Some(range) = self.view_range() { position = position.max(range.start).min(range.end); }
         position
     }
 
@@ -256,6 +533,7 @@ impl CodeSession {
             Some(selection_state.selections.add_selection(selection));
         selection_state.injected_char_stack.clear();
         drop(selection_state);
+        self.constrain_selections();
         self.update_highlighted_delimiter_positions();
         self.document().force_new_group();
     }
@@ -282,6 +560,7 @@ impl CodeSession {
         );
         selection_state.injected_char_stack.clear();
         drop(selection_state);
+        self.constrain_selections();
         self.update_highlighted_delimiter_positions();
         if let NewGroup::Yes = new_group {
             self.document().force_new_group();
@@ -325,6 +604,7 @@ impl CodeSession {
     }
 
     pub fn insert(&self, text: Text) {
+        if self.document.is_read_only() { return; }
         let mut edit_kind = EditKind::Insert;
         let mut inject_char = None;
         let mut uninject_char = None;
@@ -428,6 +708,7 @@ impl CodeSession {
     }
 
     pub fn paste(&self, text: Text) {
+        if self.document.is_read_only() { return; }
         self.document.edit_selections(
             self.id,
             EditKind::Other,
@@ -447,6 +728,7 @@ impl CodeSession {
     }
 
     pub fn paste_grouped(&self, text: Text, group: u64) {
+        if self.document.is_read_only() { return; }
         self.document.edit_selections(
             self.id,
             EditKind::Group(group),
@@ -466,6 +748,7 @@ impl CodeSession {
     }
 
     pub fn enter(&self) {
+        if self.document.is_read_only() { return; }
         self.selection_state
             .borrow_mut()
             .injected_char_stack
@@ -544,6 +827,7 @@ impl CodeSession {
     }
 
     pub fn delete(&self) {
+        if self.document.is_read_only() { return; }
         self.selection_state
             .borrow_mut()
             .injected_char_stack
@@ -625,6 +909,7 @@ impl CodeSession {
     }
 
     pub fn backspace(&self) {
+        if self.document.is_read_only() { return; }
         self.selection_state
             .borrow_mut()
             .injected_char_stack
@@ -736,6 +1021,7 @@ impl CodeSession {
     }
 
     pub fn indent(&self) {
+        if self.document.is_read_only() { return; }
         self.document.edit_linewise(
             self.id,
             EditKind::Other,
@@ -762,6 +1048,7 @@ impl CodeSession {
     }
 
     pub fn outdent(&self) {
+        if self.document.is_read_only() { return; }
         self.document.edit_linewise(
             self.id,
             EditKind::Other,
@@ -809,6 +1096,7 @@ impl CodeSession {
     }
 
     pub fn undo(&self) -> bool {
+        if self.document.is_read_only() { return false; }
         self.selection_state
             .borrow_mut()
             .injected_char_stack
@@ -818,6 +1106,7 @@ impl CodeSession {
     }
 
     pub fn redo(&self) -> bool {
+        if self.document.is_read_only() { return false; }
         self.selection_state
             .borrow_mut()
             .injected_char_stack
@@ -855,9 +1144,16 @@ impl CodeSession {
     }
 
     pub fn handle_changes(&mut self) {
-        while let Ok((selections, edits)) = self.edit_receiver.try_recv() {
-            self.update_after_edit(selections, &edits);
+        let mut edits = Vec::new();
+        let mut restored: Option<SelectionSet> = None;
+        while let Ok((selections, batch)) = self.edit_receiver.try_recv() {
+            if let Some(selections) = selections { restored = Some(selections); }
+            else if let Some(selections) = &mut restored {
+                for edit in &batch { selections.apply_edit(edit, None); }
+            }
+            edits.extend(batch);
         }
+        if restored.is_some() || !edits.is_empty() { self.update_after_edit(restored, &edits); }
     }
 
     fn modify_selections(
@@ -869,6 +1165,8 @@ impl CodeSession {
             text: self.document.as_text(),
             document_layout: self.document.layout(),
             session_layout: self.layout.borrow(),
+            view_range: self.view_range(),
+            tab_column_count: self.settings.tab_column_count,
         };
         let mut selection_state = self.selection_state.borrow_mut();
         let last_added_selection_index = selection_state.last_added_selection_index;
@@ -884,6 +1182,7 @@ impl CodeSession {
         selection_state.injected_char_stack.clear();
         drop(selection_state);
         drop(layout);
+        self.constrain_selections();
         self.update_highlighted_delimiter_positions();
         self.document().force_new_group();
     }
@@ -950,6 +1249,7 @@ impl CodeSession {
         self.update_y();
         let mut selection_state = self.selection_state.borrow_mut();
         if let Some(selections) = selections {
+            selection_state.last_added_selection_index = Some(selection_state.last_added_selection_index.unwrap_or(0).min(selections.as_selections().len().saturating_sub(1)));
             selection_state.selections = selections;
         } else {
             for edit in edits {
@@ -960,6 +1260,7 @@ impl CodeSession {
             }
         }
         drop(selection_state);
+        self.constrain_selections();
         self.update_highlighted_delimiter_positions();
     }
 
@@ -972,12 +1273,15 @@ impl CodeSession {
         let mut y = if start == 0 {
             0.0
         } else {
-            let layout = self.layout();
+            let mut layout = self.layout();
+            layout.view_range = None;
             let line = layout.line(start - 1);
-            line.y() + line.height()
+            self.layout.borrow().y[start - 1] + line.height()
         };
         let mut ys = mem::take(&mut self.layout.borrow_mut().y);
-        for block in self.layout().block_elements(start, end) {
+        let mut layout = self.layout();
+        layout.view_range = None;
+        for block in layout.block_elements(start, end) {
             match block {
                 BlockElement::Line { is_inlay, line } => {
                     if !is_inlay {
@@ -991,18 +1295,20 @@ impl CodeSession {
             }
         }
         ys.push(y);
+        drop(layout);
         self.layout.borrow_mut().y = ys;
     }
 
     fn update_column_count(&self, index: usize) {
         let mut column_count = 0;
         let mut column = 0;
-        let layout = self.layout();
+        let mut layout = self.layout();
+            layout.view_range = None;
         let line = layout.line(index);
         for wrapped in line.wrapped_elements() {
             match wrapped {
                 WrappedElement::Text { text, .. } => {
-                    column += text.column_count();
+                    column += text.column_count_at(column, line.tab_column_count);
                 }
                 WrappedElement::Widget(widget) => {
                     column += widget.column_count;
@@ -1020,7 +1326,8 @@ impl CodeSession {
     fn update_wrap_data(&self, line: usize) {
         let wrap_data = match self.wrap_column.get() {
             Some(wrap_column) => {
-                let layout = self.layout();
+                let mut layout = self.layout();
+            layout.view_range = None;
                 let line = layout.line(line);
                 wrap::compute_wrap_data(line, wrap_column)
             }
@@ -1083,6 +1390,10 @@ impl CodeSession {
 
 impl Drop for CodeSession {
     fn drop(&mut self) {
+        if let Some(range) = self.owned_view_anchors.take() {
+            self.document.remove_anchor(range.start);
+            self.document.remove_anchor(range.end);
+        }
         self.document.remove_session(self.id);
     }
 }
@@ -1090,7 +1401,16 @@ impl Drop for CodeSession {
 #[derive(Clone, Copy, Debug, Eq, Hash, Default, PartialEq)]
 pub struct SessionId(usize);
 
-#[derive(Debug)]
+impl SessionId {
+    /// A fresh id, for a view that joins a document's edit broadcast
+    /// (`CodeDocument::add_session`) without being a `CodeSession`.
+    pub fn new() -> Self {
+        static ID: AtomicUsize = AtomicUsize::new(0);
+        Self(ID.fetch_add(1, atomic::Ordering::AcqRel))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SessionLayout {
     pub y: Vec<f64>,
     pub column_count: Vec<Option<usize>>,
@@ -1125,7 +1445,8 @@ struct FoldState {
 
 pub fn reindent(string: &str, f: impl FnOnce(usize) -> usize) -> (usize, usize, String) {
     let indentation = string.indent().unwrap_or("");
-    let indentation_column_count = indentation.column_count();
+    let indentation_column_count =
+        indentation.column_count_at(0, Settings::default().tab_column_count);
     let new_indentation_column_count = f(indentation_column_count);
     let new_indentation = new_indentation(new_indentation_column_count);
     let len = indentation.longest_common_prefix(&new_indentation).len();
@@ -1399,3 +1720,34 @@ fn find_closing_delimiter(
         position.byte_index = 0;
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct PreparedView {
+    digest: u64,
+    version: u64,
+    schema: u32,
+    range: Option<Range<Position>>,
+    layout: SessionLayout,
+}
+impl PreparedView {
+    pub fn digest(&self) -> u64 {
+        self.digest
+    }
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedViewError {
+    Stale,
+    InvalidRange,
+}
+impl std::fmt::Display for PreparedViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stale => "prepared view does not match document",
+            Self::InvalidRange => "invalid prepared view range",
+        })
+    }
+}
+impl std::error::Error for PreparedViewError {}

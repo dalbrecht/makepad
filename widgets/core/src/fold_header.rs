@@ -1,0 +1,359 @@
+use crate::{
+    animator::{Animate, Animator, AnimatorImpl},
+    fold_button::FoldButtonAction,
+    makepad_derive_widget::*,
+    makepad_draw::*,
+    widget::*,
+};
+
+script_mod! {
+    use mod.prelude.widgets_internal.*
+    use mod.widgets.*
+
+    mod.widgets.FoldHeaderBase = #(FoldHeader::register_widget(vm))
+
+    mod.widgets.FoldHeader = set_type_default() do mod.widgets.FoldHeaderBase{
+        width: Fill
+        height: Fit
+        body_walk: Walk{width: Fill, height: Fit}
+
+        flow: Down
+
+        animator: Animator{
+            active: {
+                default: @on
+                off: AnimatorState{
+                    from: {all: Forward {duration: 0.2}}
+                    ease: ExpDecay {d1: 0.96, d2: 0.97}
+                    redraw: true
+                    apply: {
+                        opened: 0.0
+                    }
+                }
+                on: AnimatorState{
+                    from: {all: Forward {duration: 0.2}}
+                    ease: ExpDecay {d1: 0.98, d2: 0.95}
+                    redraw: true
+                    apply: {
+                        opened: 1.0
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum DrawState {
+    DrawHeader,
+    DrawBody,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum FoldHeaderAction {
+    Opening,
+    Closing,
+    #[default]
+    None,
+}
+
+#[derive(Script, ScriptHook, Widget, Animator)]
+pub struct FoldHeader {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+
+    #[rust]
+    draw_state: DrawStateWrap<DrawState>,
+    #[rust]
+    rect_size: f64,
+    /// Set by the header step when the body is drawn unconstrained (fully
+    /// open or first draw), so its measured height may shrink the remembered size.
+    #[rust]
+    measure_body: bool,
+    /// The fold's full outer rect (header + body), captured when the outer
+    /// turtle ends. Marked `#[area]` so `Widget::area()` reports the whole
+    /// fold, not the first `#[redraw]` child (the header strip) — rect-driven
+    /// tools (snap, the tweaker's pick) need the real extent.
+    #[redraw]
+    #[area]
+    area: Area,
+    #[find]
+    #[redraw]
+    #[live]
+    header: WidgetRef,
+    #[find]
+    #[redraw]
+    #[live]
+    body: WidgetRef,
+    #[apply_default]
+    animator: Animator,
+
+    #[live]
+    opened: f64,
+    #[layout]
+    layout: Layout,
+    #[walk]
+    walk: Walk,
+    #[live]
+    body_walk: Walk,
+}
+
+impl Widget for FoldHeader {
+    fn handle_action(
+        &mut self,
+        cx: &mut Cx,
+        request: &a11y_tree::ActionRequest,
+        scope: &mut Scope,
+    ) -> a11y_tree::ActionResult {
+        let open = match request.action {
+            a11y_tree::Actions::EXPAND => true,
+            a11y_tree::Actions::COLLAPSE => false,
+            _ => return a11y_tree::ActionResult::Unhandled,
+        };
+        if let Some(mut button) = self
+            .header
+            .widget(cx, ids!(fold_button))
+            .borrow_mut::<crate::fold_button::FoldButton>()
+        {
+            button.handle_action(cx, request, scope);
+        }
+        self.set_is_open(cx, open, Animate::Yes);
+        a11y_tree::ActionResult::Handled
+    }
+
+    fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
+        let _ = cx;
+        node.role = a11y_tree::Role::DisclosureButton;
+        makepad_platform::a11y::set_string(&mut node.name, &self.text());
+        node.states = a11y_tree::States::FOCUSABLE;
+        node.states
+            .set(a11y_tree::States::DISABLED, self.disabled(cx));
+        node.actions = a11y_tree::Actions::FOCUS | a11y_tree::Actions::EXPAND;
+        node.states
+            .set(a11y_tree::States::EXPANDED, self.is_open(cx));
+        node.states
+            .set(a11y_tree::States::COLLAPSED, !self.is_open(cx));
+        node.actions.insert(a11y_tree::Actions::COLLAPSE);
+    }
+
+    fn visit_cancel(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) -> bool {
+        if !self.visible() {
+            return false;
+        }
+        visit(id!(header), self.header.clone());
+        if self.body_is_active() {
+            visit(id!(body), self.body.clone());
+        }
+        true
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if self.animator_handle_event(cx, event).must_redraw() {
+            self.area.redraw(cx);
+        }
+
+        self.header.handle_event(cx, event, scope);
+        let cancel = matches!(event, Event::BackPressed { .. })
+            || matches!(event, Event::KeyDown(key) | Event::KeyUp(key) if key.key_code == KeyCode::Escape);
+        if !cancel || self.body_is_active() {
+            self.body.handle_event(cx, event, scope);
+        }
+
+        if let Event::Actions(actions) = event {
+            let button = self.header.widget(cx, ids!(fold_button));
+            if button.is_empty() {
+                return;
+            }
+            match actions
+                .find_widget_action(button.widget_uid())
+                .map(|action| action.cast::<FoldButtonAction>())
+            {
+                Some(FoldButtonAction::Opening) => {
+                    self.animator_play(cx, ids!(active.on));
+                }
+                Some(FoldButtonAction::Closing) => {
+                    self.animator_play(cx, ids!(active.off));
+                }
+                _ => (),
+            }
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        if self.draw_state.begin(cx, DrawState::DrawHeader) {
+            cx.begin_turtle(walk, self.layout);
+        }
+        if let Some(DrawState::DrawHeader) = self.draw_state.get() {
+            let walk = self.header.walk(cx);
+            self.header.draw_walk(cx, scope, walk)?;
+
+            // Fully open (or never measured): draw the body with its own walk,
+            // so a Fill body keeps tracking the window and we can measure its
+            // unconstrained height. While folding/unfolding, clamp the body to
+            // `opened * rect_size` and scroll the hidden part away.
+            // The eased `opened` scalar is only meaningful while its animation
+            // is actually running. Settled, the animator STATE is the truth:
+            // an ExpDecay ease can end shy of its keyframe, a deferred cut
+            // applies with no redraw, and a redraw lost mid-animation freezes
+            // whatever fraction was painted last — every one of those left the
+            // body permanently clamped and the pane's bottom row clipped under
+            // its edge. Snapping a settled fold to its state's endpoint makes
+            // any such frame heal itself on the next draw, whatever caused it.
+            if !self.animator.is_track_animating(live_id!(active))
+                && self.animator.groups.get(&live_id!(active)).is_some()
+            {
+                self.opened = if self.animator_in_state(cx, ids!(active.on)) {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
+            let unconstrained = self.rect_size == 0.0 || self.opened >= 1.0;
+            let (body_walk, scroll_y) = if unconstrained {
+                (self.body_walk, 0.0)
+            } else {
+                // `rect_size` was measured at the last unconstrained draw; the
+                // pane may have shrunk since (splitter drag, status bar, a
+                // window resize). Never let the clamped body paint past the
+                // space the pane actually has left, or its bottom rows sit
+                // under the pane's edge for as long as the stale state lasts.
+                let mut height = self.rect_size * self.opened;
+                let avail = cx.turtle().unused_inner_height();
+                if avail.is_finite() {
+                    height = height.min(avail.max(0.0));
+                }
+                let body_walk = Walk {
+                    height: Size::Fixed(height),
+                    ..self.body_walk
+                };
+                let scroll_y = self.rect_size * (1.0 - self.opened);
+                (body_walk, scroll_y)
+            };
+
+            cx.begin_turtle(
+                body_walk,
+                Layout::flow_down().with_scroll(dvec2(0.0, scroll_y)),
+            );
+            self.draw_state.set(DrawState::DrawBody);
+            self.measure_body = unconstrained;
+        }
+        if let Some(DrawState::DrawBody) = self.draw_state.get() {
+            let walk = self.body.walk(cx);
+            self.body.draw_walk(cx, scope, walk)?;
+            // An unconstrained draw sets the remembered height. A folded or
+            // animating draw may only grow it: a Fit body lays out at its full
+            // height in the shorter turtle too, so rows a panel makes when the
+            // fold opens set the animation's target on its first frame (it ran
+            // to the empty body's height and then jumped open). A Fill body
+            // measures at most the clamped height there; shrinking to that
+            // collapsed it to its Fit children while closed (the chat text box
+            // never came back on re-opening).
+            let used_y = cx.turtle().used().y;
+            if self.measure_body {
+                if used_y > 0.0 {
+                    self.rect_size = used_y;
+                }
+            } else if used_y > self.rect_size {
+                self.rect_size = used_y;
+            }
+            cx.end_turtle();
+            cx.end_turtle_with_area(&mut self.area);
+            self.draw_state.end();
+        }
+        DrawStep::done()
+    }
+}
+
+impl FoldHeader {
+    fn body_is_active(&self) -> bool {
+        if self.animator.groups.contains_key(&id!(active)) {
+            self.animator.in_state_id(ids!(active.on))
+        } else {
+            self.opened > 0.0
+        }
+    }
+
+    pub fn set_is_open(&mut self, cx: &mut Cx, is_open: bool, animate: Animate) {
+        self.animator_toggle(cx, is_open, animate, ids!(active.on), ids!(active.off));
+        // Also toggle the fold button if it exists
+        if let Some(mut fold_button) = self
+            .header
+            .widget(cx, ids!(fold_button))
+            .borrow_mut::<crate::fold_button::FoldButton>()
+        {
+            fold_button.set_is_open(cx, is_open, animate);
+        }
+    }
+
+    pub fn is_open(&self, cx: &Cx) -> bool {
+        self.animator_in_state(cx, ids!(active.on))
+    }
+
+    pub fn opened(&self) -> f64 {
+        self.opened
+    }
+
+    /// Where the header strip is, as against `area()`, which is the whole
+    /// fold. A panel coordinating several folds needs the strip: the fold's
+    /// own rect grows to include the body, so a pointer anywhere in an open
+    /// section's text would otherwise read as a pointer on its heading.
+    pub fn header_rect(&self, cx: &Cx) -> Rect {
+        self.header.area().rect(cx)
+    }
+}
+
+impl FoldHeaderRef {
+    pub fn set_is_open(&self, cx: &mut Cx, is_open: bool, animate: Animate) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_is_open(cx, is_open, animate);
+        }
+    }
+
+    pub fn is_open(&self, cx: &Cx) -> bool {
+        self.borrow().map_or(true, |inner| inner.is_open(cx))
+    }
+
+    pub fn opened(&self) -> f64 {
+        self.borrow().map_or(1.0, |inner| inner.opened())
+    }
+
+    /// Where the header strip is; an empty rect if there is no fold here.
+    pub fn header_rect(&self, cx: &Cx) -> Rect {
+        self.borrow().map(|inner| inner.header_rect(cx)).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod settled_cut_tests {
+    use super::*;
+
+    /// A cut to the state the animator is already in, with nothing on its way, applies
+    /// nothing: a widget that sets its state as it draws re-applies (and redraws) nothing on
+    /// an unchanged draw. A cut to another state, or one while a track runs, still applies.
+    #[test]
+    fn a_cut_to_the_settled_state_applies_nothing_and_another_cut_applies() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fold = cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let value = crate::script_eval!(vm, {use mod.widgets.* FoldHeader{}});
+            FoldHeader::script_from_value(vm, value)
+        });
+        fold.set_is_open(&mut cx, false, Animate::No);
+        assert_eq!(fold.opened(), 0.0, "the first cut applies its state");
+        // A value the animator did not write: an applied cut would put it back to 0.
+        fold.opened = 0.5;
+        fold.set_is_open(&mut cx, false, Animate::No);
+        assert_eq!(fold.opened(), 0.5, "a cut to the settled state applied");
+        fold.set_is_open(&mut cx, true, Animate::No);
+        assert_eq!(fold.opened(), 1.0, "a cut to another state did not apply");
+        // Settled in `off`, on its way to `on`: a cut back to `off` stops the track.
+        fold.set_is_open(&mut cx, false, Animate::No);
+        fold.set_is_open(&mut cx, true, Animate::Yes);
+        assert!(fold.animator.is_animating(), "no track to `on`");
+        fold.set_is_open(&mut cx, false, Animate::No);
+        assert!(!fold.animator.is_animating(), "a cut under a running track left it running");
+        assert_eq!(fold.opened(), 0.0);
+    }
+}

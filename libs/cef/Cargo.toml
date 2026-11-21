@@ -2,11 +2,20 @@
 name = "makepad-cef"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 libloading = { path = "../vulkan/libloading", version = "0.8.9" }
+makepad-error-log = { path = "../error_log", version = "1.0.0" }
+makepad-alloc-epoch = { path = "../alloc_epoch", version = "1.0.0" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 makepad-objc-sys = { path = "../objc-sys", version = "1.0.0" }
+makepad-hal = { path = "../../platform/hal", version = "1.0.0" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+makepad-hal = { path = "../../platform/hal", version = "1.0.0" }
+
+[target.'cfg(windows)'.dependencies]
+makepad-hal = { path = "../../platform/hal", version = "1.0.0" }
+makepad-windows-sys = { path = "../windows/sys" }

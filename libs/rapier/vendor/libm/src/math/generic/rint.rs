@@ -14,7 +14,7 @@ pub fn rint_round<F: Float>(x: F, _round: Round) -> FpResult<F> {
     // On i386 `force_eval!` must be used to force rounding via storage to memory. Otherwise,
     // the excess precission from x87 would cause an incorrect final result.
     let force = |x| {
-        if cfg!(x86_no_sse) && (F::BITS == 32 || F::BITS == 64) {
+        if cfg!(all(target_arch = "x86", not(target_feature = "sse"))) && (F::BITS == 32 || F::BITS == 64) {
             force_eval!(x)
         } else {
             x
@@ -73,13 +73,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(f16_enabled)]
-    fn spec_tests_f16() {
-        let cases = [];
-        spec_test::<f16>(&cases);
-    }
-
-    #[test]
     fn spec_tests_f32() {
         let cases = [
             (0.1, 0.0, Status::OK),
@@ -121,10 +114,4 @@ mod tests {
         spec_test::<f64>(&cases);
     }
 
-    #[test]
-    #[cfg(f128_enabled)]
-    fn spec_tests_f128() {
-        let cases = [];
-        spec_test::<f128>(&cases);
-    }
 }

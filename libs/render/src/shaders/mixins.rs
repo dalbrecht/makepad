@@ -1,0 +1,122 @@
+//! Shared scene-shader mixins: fur shells, colour adjustment, output dither
+//! and the world wind.
+
+use super::*;
+
+script_mod! {
+    use mod.prelude.widgets_internal.*
+    use mod.widgets.*
+    use mod.geom
+
+    mod.draw.SceneOutputDither = {
+        // Physical target size; z enables dither only for display UNORM output.
+        output_dither_ctl: uniform(vec3(1.0, 1.0, 0.0))
+        output_dither: fn(color: vec3, wp: vec3) -> vec3 {
+            if self.output_dither_ctl.z < 0.5 { return color }
+            let clip = self.draw_pass.camera_projection * (self.draw_pass.camera_view * vec4(wp, 1.0))
+            let p = floor(vec2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5) * self.output_dither_ctl.xy)
+            let a = fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))))
+            let b = fract(52.9829189 * fract(dot(p + vec2(47.0, 17.0), vec2(0.06711056, 0.00583715))))
+            let noise = (a + b - 1.0) / 255.0
+            return max(color + vec3(noise, noise, noise), vec3(0.0, 0.0, 0.0))
+        }
+    }
+
+    // The same root-space pattern follows both static and skinned surfaces.
+    // Each extra shell reuses the base mesh; strand count never becomes CPU
+    // geometry, skin weights, editable topology or collision primitives.
+    mod.draw.SceneFurSurface = {
+        v_fur_root: varying(vec3)
+        v_fur_normal: varying(vec3)
+        fur_hash: fn(p: vec2) -> float {
+            return fract(sin(dot(p, vec2(127.1, 311.7)) + self.fur.w * 0.123) * 43758.5453)
+        }
+        fur_mask: fn() -> float {
+            if self.fur.x <= 0.0 || self.fur_layer.x <= 0.0 { return 1.0 }
+            let n = abs(self.v_fur_normal)
+            var uv = self.v_fur_root.xy
+            if n.y >= n.x && n.y >= n.z { uv = self.v_fur_root.xz }
+            else if n.x > n.z { uv = self.v_fur_root.yz }
+            let p = uv * self.fur.z
+            let cell = floor(p)
+            let seed = self.fur_hash(cell)
+            if seed > self.fur.y { return 0.0 }
+            let center = vec2(self.fur_hash(cell + vec2(17.0, 3.0)), self.fur_hash(cell + vec2(7.0, 29.0))) * 0.5 + vec2(0.25, 0.25)
+            let radius = 0.43 * (1.0 - self.fur_layer.x * 0.8)
+            let delta = fract(p) - center
+            return step(dot(delta, delta), radius * radius)
+        }
+        fur_shade: fn(lit: vec3, n: vec3, view: vec3) -> vec3 {
+            if self.fur.x <= 0.0 { return lit }
+            let rim = 1.0 - abs(dot(normalize(n), normalize(view)))
+            return lit * (0.72 + 0.28 * self.fur_layer.x + 0.18 * rim * rim)
+        }
+    }
+
+    // One appearance law for every asset family. Hue is a rotation around
+    // the neutral-grey axis, so textured/multi-colour assets keep their
+    // shading while changing family; saturation and value are optional
+    // scalars in the same vec4 lane. Tint is deliberately last.
+    mod.draw.SceneColorAdjust = {
+        color_adjust: fn(albedo: vec3, tint: vec4, adjust: vec4) -> vec3 {
+            let angle = adjust.x * 0.01745329252
+            let axis = vec3(0.57735026919, 0.57735026919, 0.57735026919)
+            let rotated = albedo * cos(angle)
+                + cross(axis, albedo) * sin(angle)
+                + axis * dot(axis, albedo) * (1.0 - cos(angle))
+            let luma = dot(rotated, vec3(0.2126, 0.7152, 0.0722))
+            let saturated = mix(vec3(luma, luma, luma), rotated, max(adjust.y, 0.0))
+            return max(saturated * max(adjust.z, 0.0), vec3(0.0, 0.0, 0.0)) * tint.xyz
+        }
+    }
+
+    // The world wind (makepad-scene wind.rs, whose `wind_at` is this
+    // field's CPU twin): two layers of value noise, 40 m and 9 m cells,
+    // carried downwind; their sum scales the mean speed (gusts and lulls)
+    // and the small one turns it a little. state = (mean velocity x, z in
+    // m/s, gust, oscillator clock / its period); scroll = each layer's
+    // offset (x, z) in cells. The noise repeats every 256 cells and the
+    // scroll wraps there, so the field is continuous in place and time.
+    mod.draw.SceneWind = {
+        wind_hash: fn(p: vec2) -> float {
+            let p3 = fract(vec3(p.x, p.y, p.x) * 0.1031)
+            let q = p3 + dot(p3, vec3(p3.y, p3.z, p3.x) + vec3(33.33, 33.33, 33.33))
+            return fract((q.x + q.y) * q.z)
+        }
+        wind_noise: fn(p: vec2) -> float {
+            let i = floor(p)
+            let f = p - i
+            let u = f * f * (vec2(3.0, 3.0) - f * 2.0)
+            let c0 = i - floor(i / 256.0) * 256.0
+            let c1 = c0 + vec2(1.0, 1.0) - step(vec2(255.0, 255.0), c0) * 256.0
+            let a = self.wind_hash(c0)
+            let b = self.wind_hash(vec2(c1.x, c0.y))
+            let c = self.wind_hash(vec2(c0.x, c1.y))
+            let d = self.wind_hash(c1)
+            return mix(mix(a, b, u.x), mix(c, d, u.x), u.y)
+        }
+        // The wind at ground position p (x, z): velocity x, z in m/s and the
+        // gust level there (0..1, 0.5 on average).
+        scene_wind: fn(p: vec2, state: vec4, scroll: vec4) -> vec3 {
+            let n1 = self.wind_noise(p / 40.0 - scroll.xy)
+            let n2 = self.wind_noise(p / 9.0 - scroll.zw)
+            let g = 0.65 * n1 + 0.35 * n2
+            let m = 1.0 - state.z + state.z * 2.0 * g
+            let turn = (n2 - 0.5) * 0.5
+            let c = cos(turn)
+            let s = sin(turn)
+            return vec3((state.x * c - state.y * s) * m, (state.x * s + state.y * c) * m, g)
+        }
+        // How hard a wind pushes a plant: 1 at 6 m/s, easing off in a gale
+        // so a storm flattens without stretching.
+        wind_push: fn(v: vec2) -> vec2 {
+            let f = v / 6.0
+            return f / sqrt(1.0 + 0.15 * dot(f, f))
+        }
+        // An oscillator of k whole cycles per clock period (state.w), offset
+        // by phase cycles: continuous through the clock's wrap.
+        wind_wave: fn(clock: float, k: float, phase: float) -> float {
+            return sin(6.2831853 * fract(k * clock + phase))
+        }
+    }
+}

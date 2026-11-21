@@ -3,66 +3,407 @@ use crate::{
     token::TokenKind,
     Token,
 };
+use makepad_code_language::{
+    detect_label, fence_info, lexical_provider, provider_for_detection, Detection, LanguageId,
+    LexContinuation, TokenRole, TokenSpan,
+};
+
+thread_local! {
+    /// The lines this thread lexed: those a tokenizer scanned, not those its cache kept.
+    static LINES_LEXED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The lines this thread has lexed so far: a diagnostic, how a test tells tokenising from attaching what a
+/// worker tokenised (counted where a clock would vary with the box's load).
+pub fn lines_lexed() -> u64 {
+    LINES_LEXED.with(|n| n.get())
+}
+
+fn lexed_a_line() {
+    LINES_LEXED.with(|n| n.set(n.get() + 1));
+}
+
+/// One line of provider-owned continuation. Rust keeps its richer editor
+/// lexer in this slot; every other language uses `LexContinuation`.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum LineSlot {
+    Rust((State, usize), (State, usize)),
+    Generic(LexContinuation, LexContinuation),
+    Markdown(MarkdownLine, MarkdownLine),
+}
+
+/// A Markdown line's continuation: the Markdown lexer's, and inside a fenced
+/// block that names a language, that language's lexer's.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+struct MarkdownLine {
+    markdown: LexContinuation,
+    fenced: Option<Fenced>,
+}
+
+/// The lexer of a fenced block's language and where it stands.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum Fenced {
+    Rust((State, usize)),
+    Generic(LanguageId, LexContinuation),
+}
+
+impl Fenced {
+    /// The lexer for the language a fence's opening line names.
+    fn open(line: &str) -> Option<Self> {
+        let detection = detect_label(fence_info(line)?)?;
+        Some(match detection.language {
+            LanguageId::Rust => Fenced::Rust((State::default(), 0)),
+            language => Fenced::Generic(language, provider_for_detection(detection).1),
+        })
+    }
+
+    fn lex(&mut self, line: &str) -> Vec<Token> {
+        match self {
+            Fenced::Rust(state) => lex_rust_line(line, state),
+            Fenced::Generic(language, state) => {
+                tokens_from_spans(lexical_provider(*language).lex_line(line, state), line.len())
+            }
+        }
+    }
+}
+
+/// A line's tokens in the Rust editor lexer, from `state` (the lexer state
+/// and the depth of an attribute open across lines), which it advances.
+fn lex_rust_line(line: &str, state: &mut (State, usize)) -> Vec<Token> {
+    let (mut lexer, mut attribute_depth) = *state;
+    let mut new_tokens = Vec::new();
+    let mut cursor = Cursor::new(line);
+    loop {
+        let start = cursor.index;
+        let initial = matches!(lexer, State::Initial(_));
+        let (next_state, token) = lexer.next(&mut cursor);
+        lexer = next_state;
+        match token {
+            Some(mut token) => {
+                let source = &line[start..];
+                if initial && attribute_depth == 0 && (source.starts_with("#[") || source.starts_with("#![")) {
+                    attribute_depth = 1;
+                }
+                if attribute_depth > 0 {
+                    // Only lexical delimiters affect nesting: brackets in strings
+                    // and comments cannot terminate a multiline attribute.
+                    if token.kind == TokenKind::Delimiter {
+                        match source.as_bytes()[0] {
+                            b'[' => attribute_depth += 1,
+                            b']' => {
+                                attribute_depth -= 1;
+                                if attribute_depth == 1 {
+                                    attribute_depth = 0;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    token.kind = TokenKind::Attribute;
+                }
+                new_tokens.push(token);
+            }
+            None => break,
+        }
+    }
+    *state = (lexer, attribute_depth);
+    new_tokens
+}
+
+/// A provider's spans of a line as tokens covering the whole line.
+fn tokens_from_spans(spans: Vec<TokenSpan>, line_len: usize) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut prev = 0usize;
+    for span in spans {
+        let end = span.end as usize;
+        if end > prev {
+            tokens.push(Token { len: end - prev, kind: token_kind_from_role(span.role) });
+            prev = end;
+        }
+    }
+    if prev < line_len {
+        tokens.push(Token { len: line_len - prev, kind: TokenKind::Unknown });
+    }
+    tokens
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Tokenizer {
-    state: Vec<Option<(State, State)>>,
+    language: LanguageId,
+    initial: LexContinuation,
+    lines: Vec<Option<LineSlot>>,
 }
 
 impl Tokenizer {
     pub fn new(line_count: usize) -> Self {
+        Self::for_language(LanguageId::Rust, line_count)
+    }
+
+    pub fn for_language(language: LanguageId, line_count: usize) -> Self {
         Self {
-            state: (0..line_count).map(|_| None).collect(),
+            language,
+            initial: lexical_provider(language).initial(),
+            lines: (0..line_count).map(|_| None).collect(),
+        }
+    }
+
+    /// Dialect-aware initial continuation from a finished path detection.
+    pub fn for_detection(detection: Detection, line_count: usize) -> Self {
+        let (_provider, initial) = provider_for_detection(detection);
+        Self {
+            language: detection.language,
+            initial,
+            lines: (0..line_count).map(|_| None).collect(),
+        }
+    }
+
+    pub fn language(&self) -> LanguageId {
+        self.language
+    }
+
+    /// Changing language invalidates every line; same bytes in another language
+    /// must not keep the previous classification. Dialect is reset to the
+    /// language default.
+    pub fn set_language(&mut self, language: LanguageId) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        self.initial = lexical_provider(language).initial();
+        for slot in &mut self.lines {
+            *slot = None;
         }
     }
 
     pub fn apply_change(&mut self, change: &Change) {
         match *change {
             Change::Insert(point, ref text) => {
-                self.state[point.line_index] = None;
+                self.lines[point.line_index] = None;
                 let line_count = text.length().line_count;
                 if line_count > 0 {
                     let line = point.line_index + 1;
-                    self.state.splice(line..line, (0..line_count).map(|_| None));
+                    self.lines.splice(line..line, (0..line_count).map(|_| None));
                 }
             }
             Change::Delete(start, length) => {
-                self.state[start.line_index] = None;
+                self.lines[start.line_index] = None;
                 let line_count = length.line_count;
                 if line_count > 0 {
                     let start_line = start.line_index + 1;
                     let end_line = start_line + line_count;
-                    self.state.drain(start_line..end_line);
+                    self.lines.drain(start_line..end_line);
                 }
             }
         }
     }
 
     pub fn update(&mut self, text: &Text, tokens: &mut [Vec<Token>]) {
+        self.update_cancellable(text, tokens, &|| false)
+            .expect("non-cancellable tokenizer");
+    }
+
+    /// The editor lexer as a library. Cancellation leaves completed line states
+    /// valid; calling this again resumes through the same incremental cache.
+    /// Multiline lexical state is preserved across every batch boundary.
+    pub fn update_cancellable(
+        &mut self,
+        text: &Text,
+        tokens: &mut [Vec<Token>],
+        cancel: &impl Fn() -> bool,
+    ) -> Result<(), TokenizeCancelled> {
+        if self.language == LanguageId::Rust {
+            return self.update_rust(text, tokens, cancel);
+        }
+        if self.language == LanguageId::Markdown {
+            return self.update_markdown(text, tokens, cancel);
+        }
+        self.update_provider(text, tokens, cancel)
+    }
+
+    fn update_rust(
+        &mut self,
+        text: &Text,
+        tokens: &mut [Vec<Token>],
+        cancel: &impl Fn() -> bool,
+    ) -> Result<(), TokenizeCancelled> {
         let mut state = State::default();
+        let mut attribute_depth = 0;
         for line in 0..text.as_lines().len() {
-            match self.state[line] {
-                Some((start_state, end_state)) if state == start_state => {
-                    state = end_state;
+            if line % TOKENIZE_BATCH_LINES == 0 && cancel() {
+                return Err(TokenizeCancelled);
+            }
+            match &self.lines[line] {
+                Some(LineSlot::Rust(start_state, end_state))
+                    if (state, attribute_depth) == *start_state =>
+                {
+                    (state, attribute_depth) = *end_state;
                 }
                 _ => {
-                    let start_state = state;
-                    let mut new_tokens = Vec::new();
-                    let mut cursor = Cursor::new(&text.as_lines()[line]);
-                    loop {
-                        let (next_state, token) = state.next(&mut cursor);
-                        state = next_state;
-                        match token {
-                            Some(token) => new_tokens.push(token),
-                            None => break,
-                        }
-                    }
-                    self.state[line] = Some((start_state, state));
-                    tokens[line] = new_tokens;
+                    lexed_a_line();
+                    let start_state = (state, attribute_depth);
+                    let mut end_state = start_state;
+                    tokens[line] = lex_rust_line(&text.as_lines()[line], &mut end_state);
+                    (state, attribute_depth) = end_state;
+                    self.lines[line] = Some(LineSlot::Rust(start_state, end_state));
                 }
             }
         }
+        if cancel() {
+            return Err(TokenizeCancelled);
+        }
+        Ok(())
     }
+
+    fn update_provider(
+        &mut self,
+        text: &Text,
+        tokens: &mut [Vec<Token>],
+        cancel: &impl Fn() -> bool,
+    ) -> Result<(), TokenizeCancelled> {
+        let provider = lexical_provider(self.language);
+        let mut state = self.initial.clone();
+        for line in 0..text.as_lines().len() {
+            if line % TOKENIZE_BATCH_LINES == 0 && cancel() {
+                return Err(TokenizeCancelled);
+            }
+            match &self.lines[line] {
+                Some(LineSlot::Generic(start, end)) if *start == state => {
+                    state = end.clone();
+                }
+                _ => {
+                    lexed_a_line();
+                    let start = state.clone();
+                    let source = &text.as_lines()[line];
+                    let spans = provider.lex_line(source, &mut state);
+                    self.lines[line] = Some(LineSlot::Generic(start, state.clone()));
+                    tokens[line] = tokens_from_spans(spans, source.len());
+                }
+            }
+        }
+        if cancel() {
+            return Err(TokenizeCancelled);
+        }
+        Ok(())
+    }
+}
+
+/// Markdown, each fenced block that names a language lexed in that
+/// language (its fences and a block naming none stay Markdown).
+impl Tokenizer {
+    fn update_markdown(
+        &mut self,
+        text: &Text,
+        tokens: &mut [Vec<Token>],
+        cancel: &impl Fn() -> bool,
+    ) -> Result<(), TokenizeCancelled> {
+        let provider = lexical_provider(LanguageId::Markdown);
+        let mut state = MarkdownLine { markdown: self.initial.clone(), fenced: None };
+        for line in 0..text.as_lines().len() {
+            if line % TOKENIZE_BATCH_LINES == 0 && cancel() {
+                return Err(TokenizeCancelled);
+            }
+            match &self.lines[line] {
+                Some(LineSlot::Markdown(start, end)) if *start == state => {
+                    state = end.clone();
+                }
+                _ => {
+                    lexed_a_line();
+                    let start = state.clone();
+                    let source = &text.as_lines()[line];
+                    let was_fenced = in_fence(&state.markdown);
+                    let spans = provider.lex_line(source, &mut state.markdown);
+                    let fenced = in_fence(&state.markdown);
+                    tokens[line] = match &mut state.fenced {
+                        Some(lexer) if was_fenced && fenced => lexer.lex(source),
+                        _ => tokens_from_spans(spans, source.len()),
+                    };
+                    if !was_fenced && fenced {
+                        state.fenced = Fenced::open(source);
+                    } else if !fenced {
+                        state.fenced = None;
+                    }
+                    self.lines[line] = Some(LineSlot::Markdown(start, state.clone()));
+                }
+            }
+        }
+        if cancel() {
+            return Err(TokenizeCancelled);
+        }
+        Ok(())
+    }
+}
+
+fn in_fence(state: &LexContinuation) -> bool {
+    matches!(state, LexContinuation::Markdown(markdown) if markdown.in_fence())
+}
+
+fn token_kind_from_role(role: TokenRole) -> TokenKind {
+    match role {
+        TokenRole::Unknown => TokenKind::Unknown,
+        TokenRole::Whitespace => TokenKind::Whitespace,
+        TokenRole::Comment => TokenKind::Comment,
+        TokenRole::Identifier => TokenKind::Identifier,
+        TokenRole::Keyword => TokenKind::OtherKeyword,
+        TokenRole::BranchKeyword => TokenKind::BranchKeyword,
+        TokenRole::LoopKeyword => TokenKind::LoopKeyword,
+        TokenRole::Typename => TokenKind::Typename,
+        TokenRole::Function => TokenKind::Function,
+        TokenRole::Macro => TokenKind::Macro,
+        TokenRole::Number => TokenKind::Number,
+        TokenRole::String => TokenKind::String,
+        TokenRole::Char => TokenKind::Constant,
+        TokenRole::Punctuator => TokenKind::Punctuator,
+        TokenRole::Delimiter => TokenKind::Delimiter,
+        TokenRole::Preprocessor => TokenKind::Attribute,
+        TokenRole::Constant => TokenKind::Constant,
+    }
+}
+
+pub const TOKENIZE_BATCH_LINES: usize = 32;
+
+/// Same canonical FNV-1a UTF-8 identity as PreparedDocument (including display
+/// row separators). Workers validate a request before publishing its geometry.
+pub fn code_source_digest(
+    text: &Text,
+    cancel: &impl Fn() -> bool,
+) -> Result<u64, TokenizeCancelled> {
+    let mut hash = 0xcbf29ce484222325u64;
+    for (index, line) in text.as_lines().iter().enumerate() {
+        if index % TOKENIZE_BATCH_LINES == 0 && cancel() {
+            return Err(TokenizeCancelled);
+        }
+        if index != 0 {
+            hash = (hash ^ 10).wrapping_mul(0x100000001b3);
+        }
+        for byte in line.bytes() {
+            hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok(hash)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TokenizeCancelled;
+
+pub fn tokenize_cancellable(
+    text: &Text,
+    cancel: &impl Fn() -> bool,
+) -> Result<Vec<Vec<Token>>, TokenizeCancelled> {
+    tokenize_cancellable_for_language(LanguageId::Rust, text, cancel)
+}
+
+pub fn tokenize_cancellable_for_language(
+    language: LanguageId,
+    text: &Text,
+    cancel: &impl Fn() -> bool,
+) -> Result<Vec<Vec<Token>>, TokenizeCancelled> {
+    if cancel() {
+        return Err(TokenizeCancelled);
+    }
+    let mut tokens = vec![Vec::new(); text.as_lines().len()];
+    Tokenizer::for_language(language, tokens.len())
+        .update_cancellable(text, &mut tokens, cancel)?;
+    Ok(tokens)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -109,7 +450,8 @@ pub struct InitialState;
 impl InitialState {
     fn next(self, cursor: &mut Cursor<'_>) -> (State, TokenKind) {
         match (cursor.peek(0), cursor.peek(1), cursor.peek(2)) {
-            ('r', '#', '"') | ('r', '#', '#') => self.raw_string(cursor),
+            // `r"…"` and `r#"…"#` (any number of `#`): raw strings, no escapes.
+            ('r', '"', _) | ('r', '#', '"') | ('r', '#', '#') => self.raw_string(cursor),
             ('b', 'r', '"') | ('b', 'r', '#') => self.raw_byte_string(cursor),
             ('/', '/', _) => self.line_comment(cursor),
             ('/', '*', _) => self.block_comment(cursor),
@@ -219,6 +561,9 @@ impl InitialState {
         while cursor.skip_if(|char| char.is_identifier_continue()) {}
         let end = cursor.index;
         let string = &cursor.string[start..end];
+        if cursor.peek(0) == '!' {
+            return (State::Initial(InitialState), TokenKind::Macro);
+        }
         (
             State::Initial(InitialState),
             match string {
@@ -558,5 +903,27 @@ impl CharExt for char {
             '0'..='9' | 'A'..='Z' | '_' | 'a'..='z' => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Markdown lexes a fenced block in the language its fence names (the
+    /// Rust editor lexer for Rust); its fences, and a block naming no
+    /// language, stay Markdown code.
+    #[test]
+    fn markdown_fences_lex_in_their_language() {
+        let source = "# T\n```rust\nlet x = 1; // c\n```\n```\nlet y\n```\n~~~toml\na = \"b\"\n~~~\n";
+        let tokens = tokenize_cancellable_for_language(LanguageId::Markdown, &Text::from(source), &|| false)
+            .expect("not cancelled");
+        let kinds = |line: usize| tokens[line].iter().map(|token| token.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(1), [TokenKind::String], "an opening fence is Markdown code");
+        assert!(kinds(2).contains(&TokenKind::Comment), "a Rust comment in a rust block: {:?}", kinds(2));
+        assert!(kinds(2).contains(&TokenKind::Number), "a Rust number in a rust block: {:?}", kinds(2));
+        assert_eq!(kinds(3), [TokenKind::String], "the closing fence is Markdown code");
+        assert_eq!(kinds(5), [TokenKind::String], "a block naming no language is Markdown code");
+        assert!(kinds(8).contains(&TokenKind::String) && kinds(8).len() > 1, "toml in a tilde block: {:?}", kinds(8));
     }
 }

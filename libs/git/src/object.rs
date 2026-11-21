@@ -66,7 +66,7 @@ pub fn read_loose_object(git_dir: &Path, oid: &ObjectId) -> Result<Object, GitEr
         if e.kind() == std::io::ErrorKind::NotFound {
             GitError::ObjectNotFound(oid.to_hex())
         } else {
-            GitError::Io(e)
+            GitError::io_at("read loose object", &path, e)
         }
     })?;
 
@@ -191,67 +191,33 @@ pub fn copy_loose_object(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
-    fn make_test_repo() -> crate::test_support::TempDir {
+    fn make_git_dir() -> (crate::test_support::TempDir, std::path::PathBuf) {
         let dir = crate::test_support::tempdir().unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        fs::write(dir.path().join("hello.txt"), "hello world\n").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(dir.path())
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@test.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@test.com")
-            .output()
-            .unwrap();
-        dir
-    }
-
-    #[test]
-    fn test_read_blob() {
-        let dir = make_test_repo();
         let git_dir = dir.path().join(".git");
-
-        // "hello world\n" as a blob
-        let oid = ObjectId::from_hex("3b18e512dba79e4c8300dd08aeb37f8e728b8dad").unwrap();
-        let obj = read_loose_object(&git_dir, &oid).unwrap();
-        assert_eq!(obj.kind, ObjectKind::Blob);
-        assert_eq!(obj.data, b"hello world\n");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        (dir, git_dir)
     }
 
     #[test]
     fn test_write_and_read_blob() {
-        let dir = make_test_repo();
-        let git_dir = dir.path().join(".git");
-
+        let (_dir, git_dir) = make_git_dir();
         let data = b"test content for writing\n";
         let oid = write_loose_object(&git_dir, ObjectKind::Blob, data).unwrap();
+        // The id git assigns to this content.
+        assert_eq!(oid.to_hex(), "bcd287cc19f0a057c2b776344c6c7b346da838f1");
 
         // Read it back
         let obj = read_loose_object(&git_dir, &oid).unwrap();
         assert_eq!(obj.kind, ObjectKind::Blob);
         assert_eq!(obj.data, data);
 
-        // Verify git can read it too
-        let output = Command::new("git")
-            .args(["cat-file", "-p", &oid.to_hex()])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "test content for writing\n"
-        );
+        // Stored the way git stores it: objects/xx/yyyy... as one zlib stream.
+        let (dir, file) = oid.loose_path_components();
+        let path = git_dir.join("objects").join(dir).join(file);
+        let compressed = fs::read(&path).unwrap();
+        let raw = makepad_fast_inflate::zlib_decompress_vec(&compressed).unwrap();
+        assert!(raw.starts_with(b"blob 25\0"));
+        assert_eq!(&raw[8..], data);
     }
 }

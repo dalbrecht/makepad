@@ -8,7 +8,6 @@ use super::Float;
 use super::support::{FpResult, Round, cold_path};
 
 /// Compute the cube root of the argument.
-#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn cbrt(x: f64) -> f64 {
     cbrt_round(x, Round::Nearest).val
 }
@@ -46,7 +45,7 @@ pub fn cbrt_round(x: f64, round: Round) -> FpResult<f64> {
     if ((e + 1) & f64::EXP_SAT) < 2 {
         cold_path();
 
-        let ix: u64 = hx & !f64::SIGN_MASK;
+        let ix: u64 = hx & !<f64 as Float>::SIGN_MASK;
 
         /* 0, inf, nan: we return x + x instead of simply x,
         to that for x a signaling NaN, it correctly triggers
@@ -208,7 +207,7 @@ mod tests {
 
     #[test]
     fn spot_checks() {
-        if !cfg!(x86_no_sse) {
+        if !cfg!(all(target_arch = "x86", not(target_feature = "sse"))) {
             // Exposes a rounding mode problem. Ignored on i586 because of inaccurate FMA.
             assert_biteq!(
                 cbrt(f64::from_bits(0xf7f792b28f600000)),

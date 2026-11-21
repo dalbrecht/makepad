@@ -6,7 +6,7 @@ use makepad_widgets::event::{XrSyncAnchor, XrSyncAnchorExtrema};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{mpsc::TryRecvError, Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[path = "alignment.rs"]
@@ -457,11 +457,9 @@ impl Widget for XrPeerSync {
         if method == live_id!(set_enabled) {
             let mut enabled = self.enabled;
             if let Some(args_obj) = args.as_object() {
-                let trap = vm.bx.threads.cur().trap.pass();
+                let trap = vm.trap();
                 enabled = vm
-                    .bx
-                    .heap
-                    .cast_to_bool(vm.bx.heap.vec_value(args_obj, 0, trap));
+                    .bx.heap_ref().cast_to_bool(vm.bx.heap_ref().vec_value(args_obj, 0, trap));
             }
             let enabled = vm.with_cx_mut(|cx| self.set_enabled(cx, enabled));
             return ScriptAsyncResult::Return(ScriptValue::from_bool(enabled));
@@ -476,11 +474,9 @@ impl Widget for XrPeerSync {
         if method == live_id!(set_auto_alignment_enabled) || method == live_id!(set_auto_align) {
             let mut enabled = self.auto_alignment_enabled;
             if let Some(args_obj) = args.as_object() {
-                let trap = vm.bx.threads.cur().trap.pass();
+                let trap = vm.trap();
                 enabled = vm
-                    .bx
-                    .heap
-                    .cast_to_bool(vm.bx.heap.vec_value(args_obj, 0, trap));
+                    .bx.heap_ref().cast_to_bool(vm.bx.heap_ref().vec_value(args_obj, 0, trap));
             }
             let enabled = vm.with_cx_mut(|cx| self.set_auto_alignment_enabled(cx, enabled));
             return ScriptAsyncResult::Return(ScriptValue::from_bool(enabled));
@@ -523,6 +519,10 @@ impl Widget for XrPeerSync {
         } else {
             self.node.local_transform()
         };
+        // One batch carries opaque peers and translucent previews (raw-peer
+        // ghosts at 0.42, descriptor cells at 0.16-0.40, anchor fades), so
+        // the batch blends; opaque colours are unchanged under source-over.
+        self.draw_cube.draw_vars.options.alpha_blend = true;
         self.draw_cube.begin_many_instances(cx);
         self.draw_pending_sync_anchor_preview(cx, &world);
         self.draw_recent_anchor_confirmation(cx, &world);

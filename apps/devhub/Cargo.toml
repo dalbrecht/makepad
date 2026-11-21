@@ -1,0 +1,27 @@
+[package]
+name = "makepad-app-devhub"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "devhub: the development hub. Master on the user's Mac (tray: inbox + explorer), node as a WM-supervised tray service on each Linux WM"
+
+[[bin]]
+name = "makepad-app-devhub"
+path = "src/main.rs"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets", default-features = false }
+makepad-shell-kit = { path = "../../libs/shell_kit" }
+makepad-devhub = { path = "../../libs/devhub" }
+makepad-devhub-conf = { path = "../../libs/devhub_conf" }
+makepad-remote = { workspace = true }
+makepad-prof-view = { workspace = true }
+makepad-strict-json = { workspace = true }
+
+[lints.rust]
+# `cfg(relax)`: tests/menu_bar_item.rs runs under the JIT (`makepad test`) only
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(relax)"] }
+
+[package.metadata.makepad.macos-tests]
+"test:menu_bar_item" = "the menu-bar item's helper answers its menu, a replaced one too"

@@ -1,0 +1,1088 @@
+pub use makepad_widgets::desktop_style::DesktopStyle;
+use makepad_widgets::tween::{Easing, QuickTo};
+use makepad_widgets::*;
+
+/// Seconds of a theme switch.
+const STYLE_SECS: f64 = 0.65;
+
+/// Weight 1 on `style`, 0 elsewhere.
+fn one_hot(style: usize) -> [f64; 8] {
+    let mut w = [0.0; 8];
+    if let Some(x) = w.get_mut(style) {
+        *x = 1.0;
+    }
+    w
+}
+
+/// The crossfade between desktop styles: one weight per `DesktopStyle`
+/// (indexed by its discriminant), moved together by one smoothstep tween
+/// (GSAP `quickTo` with a restart on every select).
+#[derive(Clone, Debug)]
+pub struct StyleTween {
+    pub target: DesktopStyle,
+    pub dark: bool,
+    pub weights: [f64; 8],
+    q: QuickTo<[f64; 8]>,
+}
+impl Default for StyleTween {
+    fn default() -> Self {
+        Self {
+            target: DesktopStyle::Macos,
+            dark: false,
+            weights: one_hot(DesktopStyle::Macos as usize),
+            q: QuickTo::at(one_hot(DesktopStyle::Macos as usize)),
+        }
+    }
+}
+impl StyleTween {
+    /// Heads for `style` from the visible mix, over the full duration (even
+    /// when it is the current target: the appearance toggle restarts it).
+    pub fn select(&mut self, style: DesktopStyle) {
+        self.target = style;
+        self.q
+            .restart(one_hot(style as usize), STYLE_SECS, Easing::SmoothStep);
+    }
+    /// Advances by `dt` seconds; `false` once landed (exactly on the target).
+    pub fn step(&mut self, dt: f64) -> bool {
+        let moving = self.q.step(dt);
+        self.weights = self.q.value();
+        moving
+    }
+    pub fn active(&self) -> bool {
+        !self.q.is_settled()
+    }
+    // Desktop-only geometry arrays have no contribution in phone modes.
+    pub fn value<const N: usize>(&self, values: [f64; N]) -> f64 {
+        self.weights.iter().zip(values).map(|(w, v)| w * v).sum()
+    }
+    /// Allocation and layout targets use the destination style. Interpolated
+    /// values are only for presentation; feeding them back into app geometry
+    /// recreates child framebuffers throughout the transition.
+    pub fn target_value<const N: usize>(&self, values: [f64; N]) -> f64 {
+        values.get(self.target as usize).copied().unwrap_or(0.0)
+    }
+    /// The same mix taken at the tween's start.
+    pub fn from_value<const N: usize>(&self, values: [f64; N]) -> f64 {
+        self.q
+            .from_value()
+            .iter()
+            .zip(values)
+            .map(|(w, v)| w * v)
+            .sum()
+    }
+    /// The eased progress of the running tween, 1 once settled: the
+    /// weights move from the start mix to the target along this curve.
+    pub fn progress(&self) -> f64 {
+        Easing::SmoothStep.map(self.q.progress())
+    }
+    pub fn reserved_height(&self) -> f64 {
+        self.target_value([0.0, 0.0, 54.0, 34.0, 0.0])
+    }
+    /// What a maximised window leaves at the bottom for a shelf that floats
+    /// over the desk (the macOS dock and its margin); the taskbars are
+    /// already out of the desk's area (`reserved_height`).
+    pub fn shelf_reserve(&self) -> f64 {
+        self.target_value([0.0, MAC_DOCK_RESERVE, 0.0, 0.0, 0.0])
+    }
+    pub fn title_height(&self) -> f64 {
+        self.value([0.0, 32.0, 34.0, 20.0, 22.0])
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn interrupted_switch_starts_from_the_visible_mix_and_lands_exactly() {
+        let mut t = StyleTween::default();
+        t.select(DesktopStyle::Omarchy);
+        t.step(0.2);
+        let old = t.weights;
+        t.select(DesktopStyle::Windows2000);
+        t.step(0.0);
+        assert_eq!(t.weights, old);
+        t.step(1.0);
+        for (index, weight) in t.weights.iter().enumerate() {
+            let expected = if index == DesktopStyle::Windows2000 as usize { 1.0 } else { 0.0 };
+            assert_eq!(*weight, expected, "style weight at index {index}");
+        }
+    }
+    /// Every desktop style's shelf (the macOS dock, the Windows taskbars)
+    /// stands aside while the main screen shows a fullscreen window and
+    /// returns when it ends; the mobile styles have none either way.
+    /// A pointer pushed against the screen's bottom edge clicks the dock icon
+    /// above it; the gaps between icons go to the nearest icon; nothing
+    /// beside the dock or above it is a dock hit.
+    #[test]
+    fn the_dock_hits_reach_the_bottom_pixel_row() {
+        let screen = rect(0.0, 0.0, 1280.0, 800.0);
+        let bar = rect(400.0, 800.0 - MAC_DOCK_RESERVE, 480.0, MAC_DOCK_HEIGHT);
+        let cell = |i: f64| rect(410.0 + i * 62.0, bar.pos.y + 6.0, 60.0, MAC_DOCK_HEIGHT - 12.0);
+        let hits = vec![
+            (cell(0.0), ShelfHit::Launcher),
+            (cell(1.0), ShelfHit::App("files".into())),
+            (cell(2.0), ShelfHit::App("code".into())),
+        ];
+        let reach = Some((bar, screen.pos.y + screen.size.y));
+        let bottom = screen.size.y; // the last row, at any scale the WM maps it to
+        assert_eq!(shelf_hit(&hits, reach, dvec2(500.0, bottom)), Some(ShelfHit::App("files".into())));
+        assert_eq!(shelf_hit(&hits, reach, dvec2(500.0, bottom - 0.5)), Some(ShelfHit::App("files".into())));
+        // in the margin under the bar and in the bar's padding
+        assert_eq!(shelf_hit(&hits, reach, dvec2(560.0, bar.pos.y + bar.size.y + 1.0)), Some(ShelfHit::App("code".into())));
+        assert_eq!(shelf_hit(&hits, reach, dvec2(420.0, bar.pos.y + 1.0)), Some(ShelfHit::Launcher));
+        // the 2 pt gap between two cells goes to the nearer one
+        assert_eq!(shelf_hit(&hits, reach, dvec2(470.6, bottom)), Some(ShelfHit::Launcher));
+        assert_eq!(shelf_hit(&hits, reach, dvec2(471.6, bottom)), Some(ShelfHit::App("files".into())));
+        // beside the dock and above it: no hit
+        assert_eq!(shelf_hit(&hits, reach, dvec2(300.0, bottom)), None);
+        assert_eq!(shelf_hit(&hits, reach, dvec2(500.0, bar.pos.y - 1.0)), None);
+        // the dock sits low: a few points over the bottom edge
+        assert!(800.0 - (bar.pos.y + bar.size.y) <= 4.0);
+    }
+
+    #[test]
+    fn the_dock_hides_under_a_fullscreen_main_screen() {
+        for style in [DesktopStyle::Macos, DesktopStyle::Windows, DesktopStyle::Windows2000, DesktopStyle::NextStep] {
+            assert!(dock_visible(style, false), "{style:?}");
+            assert!(!dock_visible(style, true), "{style:?}");
+        }
+        for style in [DesktopStyle::Ios, DesktopStyle::Android] {
+            assert!(!dock_visible(style, false), "{style:?}");
+            assert!(!dock_visible(style, true), "{style:?}");
+        }
+    }
+}
+
+use crate::desk::WmState;
+use makepad_app_host::ClientId;
+use crate::shell::{
+    alpha, rgb,
+    ui::{rect, HAlign, Ico, ShellDraw},
+};
+use makepad_widgets::app_icon::AppIconDraw;
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Script, ScriptHook)]
+#[repr(u32)]
+pub enum MacCaption {
+    #[pick]
+    None = 0,
+    Close = 1,
+    Minimize = 2,
+    Maximize = 3,
+}
+
+script_mod! {
+    use mod.prelude.widgets_internal.*
+    use mod.widgets.*
+    let MacCaption = set_type_default() do #(MacCaption::script_api(vm))
+    set_type_default() do #(DrawDesktopChrome::script_shader(vm)) {
+        ..mod.draw.DrawQuad
+        color: #eeeeee
+        radius: 6.0
+        bevel: 0.0
+        pressed: 0.0
+        selected: 0.0
+        top_only: 0.0
+        title_gradient: 0.0
+        title_gradient_end: #a6caf0
+        frame_width: 0.0
+        caption: MacCaption.None
+        caption_ink: #0000
+        pixel: fn() {
+            let p = self.pos * self.rect_size
+            let sdf = Sdf2d.viewport(p)
+            // The content quad has hard, pixel-aligned edges. Extend the
+            // title's SDF by half a device pixel so its straight edges and
+            // bottom junction cover the same pixels without a dark AA seam.
+            let bleed = if self.top_only > 0.5 {0.5 / self.draw_pass.dpi_factor} else {0.0}
+            sdf.box_y(-bleed, -bleed, self.rect_size.x+2.0*bleed, self.rect_size.y+2.0*bleed, self.radius*0.5, self.radius*0.5*(1.0-self.top_only))
+            if self.frame_width > 0.0 {
+                sdf.rect(self.frame_width, self.frame_width, self.rect_size.x - 2.0*self.frame_width, self.rect_size.y - 2.0*self.frame_width)
+                sdf.subtract()
+            }
+            let pixel=floor(p*self.draw_pass.dpi_factor)
+            let checker=modf(pixel.x+pixel.y,2.0)
+            let fill=mix(self.color.rgb,vec3(1.0),self.selected*checker)
+            let base=mix(fill,self.title_gradient_end.rgb,self.pos.x*self.title_gradient)
+            let tl=min(p.x,p.y)
+            let br=min(self.rect_size.x-p.x,self.rect_size.y-p.y)
+            let outer=if tl<br {mix(vec3(0.831,0.816,0.784),vec3(0.502),self.pressed)}else{mix(vec3(0.251),vec3(1.0),self.pressed)}
+            let inner=if tl<br {mix(vec3(1.0),vec3(0.251),self.pressed)}else{mix(vec3(0.502),vec3(0.831,0.816,0.784),self.pressed)}
+            let distance=min(tl,br)
+            let edge=if distance<1.0 {outer}else{inner}
+            let color=mix(base,edge,(1.0-step(2.0,distance))*self.bevel)
+            // Window titles are rectangular content inside the complete
+            // window's compositor mask. A second SDF coverage ramp here
+            // exposes the wallpaper along the join with the app surface.
+            if self.top_only > 0.5 && self.radius == 0.0 {
+                return vec4(color*self.color.w,self.color.w)
+            }
+            sdf.fill(vec4(color,self.color.w))
+            let c = self.rect_size * 0.5
+            match self.caption {
+                MacCaption.Close => {
+                    sdf.move_to(c.x-2.8,c.y-2.8)
+                    sdf.line_to(c.x+2.8,c.y+2.8)
+                    sdf.move_to(c.x-2.8,c.y+2.8)
+                    sdf.line_to(c.x+2.8,c.y-2.8)
+                    sdf.stroke(self.caption_ink,1.35)
+                }
+                MacCaption.Minimize => {
+                    sdf.move_to(c.x-3.25,c.y)
+                    sdf.line_to(c.x+3.25,c.y)
+                    sdf.stroke(self.caption_ink,1.5)
+                }
+                MacCaption.Maximize => {
+                    sdf.move_to(c.x-3.1,c.y-0.9)
+                    sdf.line_to(c.x+0.9,c.y+3.1)
+                    sdf.line_to(c.x-3.1,c.y+3.1)
+                    sdf.close_path()
+                    sdf.fill(self.caption_ink)
+                    sdf.move_to(c.x+3.1,c.y+0.9)
+                    sdf.line_to(c.x-0.9,c.y-3.1)
+                    sdf.line_to(c.x+3.1,c.y-3.1)
+                    sdf.close_path()
+                    sdf.fill(self.caption_ink)
+                }
+                _ => {}
+            }
+            return sdf.result
+        }
+    }
+    mod.widgets.DesktopShelfBase = #(DesktopShelf::register_widget(vm))
+    mod.widgets.DesktopShelf = set_type_default() do mod.widgets.DesktopShelfBase {
+        width: Fill height: Fill
+        d +: {text.text_style: theme.font_regular text_bold.text_style: theme.font_bold}
+        chrome +: {}
+        glass: GlassPanel {
+            width: Fill height: Fill
+            draw_bg +: {
+                blur_level: 4.5
+                corner_radius: 12.0
+                lensing_strength: 0.0
+                diffraction_strength: 0.0
+                tint_color: #dddded
+                tint_alpha: 0.22
+                surface_alpha: 0.88
+                specular_strength: 0.025
+                border_alpha: 0.20
+                border_width: 0.65
+                shadow_radius: 10.0
+                shadow_color: #0005
+            }
+        }
+    }
+}
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawDesktopChrome {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    pub color: Vec4f,
+    #[live]
+    pub radius: f32,
+    #[live]
+    pub bevel: f32,
+    #[live]
+    pub pressed: f32,
+    #[live]
+    pub selected: f32,
+    #[live]
+    pub top_only: f32,
+    #[live]
+    pub title_gradient: f32,
+    #[live]
+    pub title_gradient_end: Vec4f,
+    #[live]
+    pub frame_width: f32,
+    #[live]
+    pub caption: MacCaption,
+    #[live]
+    pub caption_ink: Vec4f,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShelfHit {
+    Launcher,
+    App(String),
+    /// The dock's last slot when apps did not fit: how many apps are drawn
+    /// before it, so the rest are `dock_items()[shown..]`.
+    More(usize),
+    Window(ClientId),
+    ShowDesktop,
+}
+#[derive(Script, ScriptHook, Widget)]
+pub struct DesktopShelf {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+    #[walk]
+    walk: Walk,
+    #[layout]
+    layout: Layout,
+    #[redraw]
+    #[live]
+    chrome: DrawDesktopChrome,
+    #[rust]
+    app_icons: AppIconDraw,
+    #[rust]
+    window_apps: HashMap<ClientId, String>,
+    #[rust]
+    active_window: Option<ClientId>,
+    #[live]
+    d: ShellDraw,
+    #[live]
+    glass: WidgetRef,
+    #[redraw]
+    #[rust]
+    area: Area,
+    #[rust]
+    hits: Vec<(Rect, ShelfHit)>,
+    #[rust]
+    bounds: Rect,
+    /// A bottom shelf's reach: its bar and the screen's bottom edge under it
+    /// (the dock's hits go down to the last pixel row).
+    #[rust]
+    bottom_reach: Option<(Rect, f64)>,
+    /// The area the shelf laid out in at the last draw (the whole window).
+    #[rust]
+    screen: Rect,
+    #[rust]
+    overlay: Option<DrawList2d>,
+    #[rust]
+    hover: Option<ShelfHit>,
+    #[rust]
+    dark: bool,
+    #[rust]
+    hover_mix: Vec<(ShelfHit, f64)>,
+    #[rust]
+    hover_frame: NextFrame,
+    #[rust]
+    hover_time: f64,
+    #[rust]
+    starting: HashMap<String, f64>,
+    #[rust]
+    start_frame: NextFrame,
+    #[rust]
+    bounce: bool,
+    #[rust]
+    start_visible: bool,
+}
+impl DesktopShelf {
+    pub fn hit(&self, p: Vec2d) -> Option<ShelfHit> {
+        shelf_hit(&self.hits, self.bottom_reach, p)
+    }
+    /// The area the shelf last laid out in.
+    pub fn screen_rect(&self) -> Rect {
+        self.screen
+    }
+    pub fn contains(&self, p: Vec2d) -> bool {
+        (self.bounds.contains(p) && self.bounds.size.y > 0.0)
+            || self.bottom_reach.is_some_and(|(bar, bottom)| in_bottom_reach(bar, bottom, p))
+    }
+    pub fn hover_at(&mut self, cx: &mut Cx, p: Vec2d) {
+        let h = self.hit(p);
+        if h != self.hover {
+            self.hover = h;
+            self.hover_time = 0.0;
+            self.hover_frame = cx.new_next_frame();
+            self.redraw(cx);
+        }
+    }
+    fn button(
+        &mut self,
+        cx: &mut Cx2d,
+        r: Rect,
+        hit: ShelfHit,
+        _icon: Ico,
+        label: &str,
+        running: bool,
+        style: DesktopStyle,
+        opacity: f32,
+    ) {
+        let hover = self.hover.as_ref() == Some(&hit);
+        let amount = self
+            .hover_mix
+            .iter()
+            .find(|(h, _)| h == &hit)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0);
+        let mac = style == DesktopStyle::Macos;
+        let classic = style == DesktopStyle::Windows2000;
+        let selected = classic && matches!(&hit, ShelfHit::Window(c) if Some(*c) == self.active_window);
+        let inset = if selected { 1.0 } else { 0.0 };
+        self.chrome.pressed = if selected { 1.0 } else { 0.0 };
+        self.chrome.selected = self.chrome.pressed;
+        let ink = alpha(
+            if style.supports_dark() && self.dark {
+                rgb(240, 240, 245)
+            } else {
+                rgb(28, 30, 36)
+            },
+            opacity,
+        );
+        if !mac && style != DesktopStyle::NextStep && (classic || hover) {
+            self.chrome.radius = if classic { 0.0 } else { 5.0 };
+            self.chrome.bevel = if classic { 1.0 } else { 0.0 };
+            self.chrome.color = alpha(
+                if classic {
+                    rgb(212, 208, 200)
+                } else {
+                    rgb(255, 255, 255)
+                },
+                opacity * if classic { 1.0 } else { 0.4 },
+            );
+            self.chrome.draw_abs(cx, r);
+        }
+        let icon_rect = if classic {
+            rect(r.pos.x + 4.0 + inset, r.pos.y + inset, 22.0, r.size.y)
+        } else {
+            rect(
+                r.pos.x,
+                r.pos.y - if mac { 7.0 * amount } else { 0.0 },
+                r.size.x,
+                if mac { 50.0 } else { r.size.y },
+            )
+        };
+        let app_id = match &hit {
+            ShelfHit::App(app) => app.as_str(),
+            ShelfHit::Window(client) => self
+                .window_apps
+                .get(client)
+                .map(String::as_str)
+                .unwrap_or("app"),
+            ShelfHit::Launcher => "applications",
+            _ => "app",
+        };
+        let size = if style == DesktopStyle::NextStep { r.size.x.min(r.size.y) } else if mac {
+            54.0 + 8.0 * amount
+        } else if classic {
+            16.0
+        } else {
+            26.0 * (r.size.x / CLASSIC_PITCH).min(1.0)
+        };
+        let mut icon_box = if mac {
+            mac_icon_box(r, amount)
+        } else {
+            rect(
+                icon_rect.pos.x + (icon_rect.size.x - size) * 0.5,
+                icon_rect.pos.y + (icon_rect.size.y - size) * 0.5,
+                size,
+                size,
+            )
+        };
+        if self.bounce {
+            if let Some(since) = self.starting.get(app_id) {
+                self.start_visible = true;
+                // A soft hop, then a rest. Move only the picture: its hit target and
+                // running indicator stay still, including while the pointer hovers it.
+                let phase = ((crate::host::now() - since) / 0.95).fract();
+                let hop = if phase < 0.65 { (std::f64::consts::PI * phase / 0.65).sin().powi(2) } else { 0.0 };
+                let distance = icon_box.size.y * 0.24 * hop;
+                if style == DesktopStyle::NextStep { icon_box.pos.x -= distance; }
+                else { icon_box.pos.y -= distance; }
+            }
+        }
+        if matches!(hit, ShelfHit::More(_)) {
+            // The apps that did not fit: a tile of the weight of an app icon
+            // (opaque, the icons' corner radius, white count), not a wash of
+            // the ink over the shelf glass, which vanished on it.
+            self.chrome.radius = if classic { 0.0 } else { (icon_box.size.x * 0.22) as f32 };
+            self.chrome.bevel = 0.0;
+            self.chrome.color = alpha(rgb(92, 95, 108), opacity);
+            self.chrome.draw_abs(cx, icon_box);
+            let count = label.split(' ').next().unwrap_or("");
+            self.d.label(cx, icon_box, true, (icon_box.size.x * 0.36).max(9.0), alpha(rgb(255, 255, 255), opacity), HAlign::Center, &format!("+{count}"));
+        } else if !crate::wayland_view::draw_foreign_icon(cx, app_id, icon_box, opacity) {
+            self.app_icons
+                .draw(cx, app_id, style, icon_box, opacity, ink);
+        }
+        if classic {
+            self.d.label_elided(
+                cx,
+                rect(
+                    r.pos.x + 28.0 + inset,
+                    r.pos.y + inset,
+                    (r.size.x - 32.0).max(1.0),
+                    r.size.y,
+                ),
+                selected,
+                12.0,
+                ink,
+                HAlign::Left,
+                label,
+            );
+        }
+        if running && !classic && style != DesktopStyle::NextStep {
+            self.chrome.radius = 2.0;
+            self.chrome.bevel = 0.0;
+            self.chrome.color = if mac {
+                alpha(rgb(220, 220, 230), opacity * 0.82)
+            } else {
+                ink
+            };
+            self.chrome.draw_abs(
+                cx,
+                rect(
+                    r.pos.x + r.size.x * 0.5 - 1.8,
+                    if mac { mac_icon_box(r, 0.0).pos.y + 59.0 * slot_scale(r) } else { r.pos.y + r.size.y - 4.0 },
+                    3.6,
+                    3.6,
+                ),
+            );
+        }
+        if hover && !classic && style != DesktopStyle::NextStep {
+            let width = (label.len() as f64 * 7.0 + 22.0).max(60.0);
+            let tip = rect(
+                r.pos.x + (r.size.x - width) * 0.5,
+                r.pos.y - 35.0,
+                width,
+                25.0,
+            );
+            self.chrome.color = alpha(
+                if style.supports_dark() && self.dark {
+                    rgb(48, 48, 52)
+                } else {
+                    rgb(240, 240, 244)
+                },
+                opacity,
+            );
+            self.chrome.radius = 6.0;
+            self.chrome.bevel = 0.0;
+            self.chrome.draw_abs(cx, tip);
+            self.d
+                .label(cx, tip, false, 12.0, ink, HAlign::Center, label);
+        }
+        self.hits.push((r, hit));
+    }
+}
+pub fn app_icon(id: &str) -> Ico {
+    match id {
+        "browser" => Ico::Globe,
+        "photos" | "image" | "camera" => Ico::Photo,
+        "terminal" => Ico::Keyboard,
+        "files" => Ico::Menu,
+        "sheets" => Ico::Calendar,
+        "task" => Ico::Pulse,
+        "video" => Ico::Play,
+        "pdf" => Ico::Check,
+        "mixer" => Ico::Speaker,
+        "amp" => Ico::Play,
+        "code" => Ico::Prompt,
+        "score" => Ico::Bell,
+        "route" => Ico::Globe,
+        "fabric" => Ico::Shirt,
+        "fab" => Ico::Refresh,
+        _ => Ico::Monitor,
+    }
+}
+/// The shelf rect for one mix of the per-style geometries.
+fn shelf_rect(screen: Rect, mix: impl Fn([f64; 5]) -> f64, app_count: usize) -> Rect {
+    let mac = shelf_plan(DesktopStyle::Macos, screen, app_count);
+    let next = shelf_plan(DesktopStyle::NextStep, screen, app_count);
+    let dock_width = mac.slots() as f64 * mac.pitch + 20.0;
+    let next_height = next.slots() as f64 * next.pitch;
+    rect(
+        screen.pos.x + mix([8.0, (screen.size.x - dock_width) * 0.5, 0.0, 0.0, screen.size.x - 64.0]),
+        screen.pos.y + mix([0.0, screen.size.y - MAC_DOCK_RESERVE, screen.size.y - 54.0, screen.size.y - 34.0, 40.0]),
+        mix([32.0, dock_width, screen.size.x, screen.size.x, 56.0]),
+        mix([0.0, MAC_DOCK_HEIGHT, 54.0, 34.0, next_height]),
+    )
+}
+fn shelf_geometry(screen: Rect, style: &StyleTween, app_count: usize) -> Rect {
+    shelf_rect(screen, |values| style.value(values), app_count)
+}
+
+/// Where the shelf paints this frame. The NeXT dock stands at the right
+/// edge while every other shelf lies along the bottom; a tween between
+/// those orientations does not morph one rect (lerping width and height
+/// sweeps a screen-sized box across the desktop) but crossfades the two
+/// shelves in place: `bar` is the bottom shelf, `next` the dock, `mix` the
+/// dock's share. Same-orientation tweens keep morphing the single rect.
+struct ShelfLayout {
+    bar: Rect,
+    next: Option<Rect>,
+    mix: f64,
+}
+fn shelf_layout(screen: Rect, style: &StyleTween, app_count: usize, drop: f64) -> ShelfLayout {
+    let mut layout = shelf_resting_layout(screen, style, app_count);
+    layout.bar.pos.y += drop;
+    layout
+}
+fn shelf_resting_layout(screen: Rect, style: &StyleTween, app_count: usize) -> ShelfLayout {
+    let to_next = style.target == DesktopStyle::NextStep;
+    let from_next = style.from_value([0.0, 0.0, 0.0, 0.0, 1.0]) > 0.5;
+    if style.active() && to_next != from_next {
+        let from = shelf_rect(screen, |values| style.from_value(values), app_count);
+        let to = shelf_rect(screen, |values| style.target_value(values), app_count);
+        let mix = style.weights[4];
+        if to_next {
+            ShelfLayout { bar: from, next: Some(to), mix }
+        } else {
+            ShelfLayout { bar: to, next: Some(from), mix }
+        }
+    } else {
+        ShelfLayout { bar: shelf_geometry(screen, style, app_count), next: None, mix: 0.0 }
+    }
+}
+
+fn union_rect(a: Rect, b: Rect) -> Rect {
+    let pos = dvec2(a.pos.x.min(b.pos.x), a.pos.y.min(b.pos.y));
+    let far = dvec2((a.pos.x + a.size.x).max(b.pos.x + b.size.x), (a.pos.y + a.size.y).max(b.pos.y + b.size.y));
+    Rect { pos, size: far - pos }
+}
+
+/// The theme's dock slot length and icon size; a slot shorter than this
+/// draws everything smaller by the same share (`dock_layout`).
+const MAC_PITCH: f64 = 62.0;
+/// The macOS dock sits low: 70 pt high (icon, running dot, a few points of
+/// glass under it), 4 pt above the screen's bottom edge.
+const MAC_DOCK_HEIGHT: f64 = 70.0;
+const MAC_DOCK_MARGIN: f64 = 4.0;
+const MAC_DOCK_RESERVE: f64 = MAC_DOCK_HEIGHT + MAC_DOCK_MARGIN;
+
+/// The shelf item at `p`: the item drawn there, or, for a bottom shelf, the
+/// item whose column is nearest anywhere from the bar's top down to the
+/// screen's last row (a pointer pushed against the bottom edge hits the icon
+/// above it; gaps between icons go to the nearest one).
+fn shelf_hit(hits: &[(Rect, ShelfHit)], bottom_reach: Option<(Rect, f64)>, p: Vec2d) -> Option<ShelfHit> {
+    if let Some((_, h)) = hits.iter().find(|(r, _)| r.contains(p)) {
+        return Some(h.clone());
+    }
+    let (bar, bottom) = bottom_reach?;
+    if !in_bottom_reach(bar, bottom, p) {
+        return None;
+    }
+    let distance = |r: &Rect| if p.x < r.pos.x { r.pos.x - p.x } else if p.x > r.pos.x + r.size.x { p.x - r.pos.x - r.size.x } else { 0.0 };
+    hits.iter()
+        .filter(|(r, _)| r.pos.y + r.size.y > bar.pos.y)
+        .min_by(|(a, _), (b, _)| distance(a).total_cmp(&distance(b)))
+        .map(|(_, h)| h.clone())
+}
+/// From the bar's top to the screen's bottom edge, across the bar's width.
+fn in_bottom_reach(bar: Rect, bottom: f64, p: Vec2d) -> bool {
+    bar.size.y > 0.0 && p.x >= bar.pos.x && p.x < bar.pos.x + bar.size.x && p.y >= bar.pos.y && p.y <= bottom
+}
+const NEXT_PITCH: f64 = 56.0;
+const CLASSIC_PITCH: f64 = 48.0;
+fn slot_scale(cell: Rect) -> f64 {
+    (cell.size.x / MAC_PITCH).min(1.0)
+}
+
+/// Center the icon and its running indicator as one group inside each dock cell.
+/// The icon and the magnification grow with the cell's scale and never past it.
+fn mac_icon_box(cell: Rect, hover: f64) -> Rect {
+    let k = slot_scale(cell);
+    let size = (54.0 + 8.0 * hover) * k;
+    let top = cell.pos.y + (cell.size.y - 63.0 * k) * 0.5;
+    rect(cell.pos.x + (cell.size.x-size)*0.5, top - 8.0*hover*k, size, size)
+}
+
+/// The compositor samples exactly the shelf it will paint this frame, including
+/// an interrupted style tween. Glass outside the dock cannot add a blur stack.
+pub(crate) fn dock_items(state: &WmState) -> Vec<crate::shell::menu::MenuItem> {
+    // A supervised service (the AI Hub) is in the launcher, not the dock.
+    let service = format!("apps.{}", crate::clients::HUB_SERVICE_APP);
+    let mut apps: Vec<_> = crate::shell::launcher::apps(&state.launchable)
+        .into_iter().filter(|app| !app.disabled && app.id != service).collect();
+    for client in state.dock_clients() {
+        if let Some(client) = state.clients.get(&client) {
+            let id = format!("apps.{}", client.app);
+            if !apps.iter().any(|item| item.id == id) {
+                apps.push(crate::shell::menu::MenuItem {
+                    id,
+                    label: client.display_title().to_string(),
+                    icon: Some(app_icon(&client.app)),
+                    kind: crate::shell::menu::MenuKind::App,
+                    checked: false,
+                    divider: false,
+                    disabled: false,
+                    description: String::new(),
+                    aliases: vec![client.app.clone()],
+                });
+            }
+        }
+    }
+    apps
+}
+/// The slots each shelf style fits along its axis. `screen` is the rect the
+/// shelf lays out in.
+fn shelf_plan(style: DesktopStyle, screen: Rect, app_count: usize) -> crate::dock_layout::DockPlan {
+    match style {
+        DesktopStyle::NextStep => crate::dock_layout::plan((screen.size.y - 48.0).max(1.0), app_count, NEXT_PITCH),
+        DesktopStyle::Macos => crate::dock_layout::plan((screen.size.x - 24.0 - 20.0).max(1.0), app_count, MAC_PITCH),
+        _ => crate::dock_layout::plan((screen.size.x - 36.0).max(1.0), app_count, CLASSIC_PITCH),
+    }
+}
+/// The rect the dock lays out in: the main screen's on a multi-screen
+/// desktop (where the desk reserves its height), else `full`, the whole
+/// window as before. The shelf's drawing, hits and magnification, the
+/// compositor's blur footprint and the minimize warp's target all go
+/// through here, so they agree.
+fn dock_screen(state: &WmState, full: Rect) -> Rect {
+    match state.screens.main_rect() {
+        Some(r) if !state.style.target.mobile() => rect(r.x, r.y, r.w, r.h),
+        _ => full,
+    }
+}
+/// Whether the shelf (the macOS dock, the Windows and Windows 2000
+/// taskbars, the NeXT dock: one widget for every desktop style) is drawn,
+/// takes hits and is sampled by the compositor: a desktop (not mobile)
+/// style, unless the main screen, where it sits, shows a fullscreen
+/// window, whose own bottom edge it would otherwise cover. It comes back
+/// when the fullscreen ends; a maximized window keeps it.
+pub fn dock_visible(style: DesktopStyle, main_fullscreen: bool) -> bool {
+    !style.mobile() && !main_fullscreen
+}
+/// `dock_visible` for the WM's current style and screens.
+pub fn dock_shown(state: &WmState) -> bool {
+    dock_visible(state.style.target, state.screens.main_fullscreen())
+        && (!state.dock_autohides() || state.dock_autohide.drawn())
+}
+/// How far the auto-hiding dock is slid down off its resting place (px).
+fn dock_drop(state: &WmState) -> f64 {
+    if state.dock_autohides() { (1.0 - state.dock_autohide.out_fraction()) * DOCK_SLIDE_TRAVEL } else { 0.0 }
+}
+/// The dock's resting place at its full height plus its margin below the
+/// screen edge: sliding this far hides all of it.
+const DOCK_SLIDE_TRAVEL: f64 = 96.0;
+pub fn dock_bounds(state: &WmState, size: Vec2d) -> Rect {
+    shelf_layout(dock_screen(state, rect(0.0,0.0,size.x,size.y)), &state.style, dock_items(state).len(), dock_drop(state)).bar
+}
+/// Where the pointer calls or keeps the auto-hiding dock: the main
+/// display's bottom edge and the dock's resting footprint.
+pub fn dock_zone(state: &WmState, full: Rect) -> crate::dock_autohide::Zone {
+    let screen = dock_screen(state, full);
+    let rest = shelf_layout(screen, &state.style, dock_items(state).len(), 0.0).bar;
+    crate::dock_autohide::Zone {
+        left: screen.pos.x,
+        right: screen.pos.x + screen.size.x,
+        bottom: screen.pos.y + screen.size.y,
+        dock_left: rest.pos.x,
+        dock_right: rest.pos.x + rest.size.x,
+        dock_top: rest.pos.y,
+    }
+}
+pub fn dock_icon_bounds(state: &WmState, size: Vec2d, app: &str) -> Rect {
+    let apps=dock_items(state);
+    let screen=dock_screen(state, rect(0.0,0.0,size.x,size.y));
+    let dock=shelf_layout(screen, &state.style, apps.len(), dock_drop(state)).bar;
+    let plan=shelf_plan(DesktopStyle::Macos, screen, apps.len());
+    let slot=apps.iter().position(|item| item.id==format!("apps.{app}")).map(|i|plan.slot_of_app(i)).unwrap_or(0);
+    let cell=(dock.size.x-20.0)/plan.slots() as f64;
+    mac_icon_box(rect(dock.pos.x+10.0+slot as f64*cell,dock.pos.y+6.0,cell,dock.size.y-12.0), 0.0)
+}
+
+impl Widget for DesktopShelf {
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        cx.begin_turtle(walk, self.layout);
+        let screen = cx.turtle().rect();
+        self.hits.clear();
+        self.bounds = Rect::default();
+        self.bottom_reach = None;
+        self.screen = screen;
+        self.start_visible = false;
+        if let Some(state) = scope.data.get_mut::<WmState>() {
+            let pending: std::collections::HashSet<String> = state.clients.values()
+                .filter(|s| s.starting && !s.warm && !s.pane && !s.service && s.closing.is_none() && s.is_dock_instance())
+                .map(|s| s.app.clone()).chain(crate::wayland_host::starting_apps()).collect();
+            self.starting.retain(|app, _| pending.contains(app));
+            let now = crate::host::now();
+            for app in pending { self.starting.entry(app).or_insert(now); }
+            self.bounce = !state.accessibility.reduce_motion && dock_shown(state) && !self.starting.is_empty();
+            self.active_window = state.layout().focused_client()
+                .filter(|c| !state.layout().desktop.minimized(*c));
+            self.window_apps = state
+                .clients
+                .iter()
+                .map(|(c, s)| (*c, s.app.clone()))
+                .collect();
+            let t = &state.style;
+            let style = t.target;
+            let dark = style.supports_dark() && t.dark;
+            if self.dark != dark {
+                self.dark = dark;
+                let tint = if dark {
+                    rgb(24, 24, 28)
+                } else {
+                    rgb(221, 221, 237)
+                };
+                let tint_alpha = if dark { 0.32 } else { 0.20 };
+                script_apply_eval!(cx,self.glass,{draw_bg +: {tint_color: #(tint) tint_alpha: #(tint_alpha)}});
+            }
+            let opacity = (1.0 - t.weights[0]) as f32;
+            if opacity > 0.001 && dock_shown(state) {
+                let apps = dock_items(state);
+                let clients: Vec<_> = state
+                    .dock_clients()
+                    .into_iter()
+                    .filter_map(|c| {
+                        state
+                            .clients
+                            .get(&c)
+                            .map(|s| (c, s.app.clone(), s.display_title().to_string()))
+                    })
+                    .collect();
+                let dock_area = dock_screen(state, screen);
+                let layout = shelf_layout(dock_area, t, apps.len(), dock_drop(state));
+                let r = layout.bar;
+                self.bounds = layout.next.map_or(r, |next| union_rect(r, next));
+                if style != DesktopStyle::NextStep && layout.next.is_none() {
+                    self.bottom_reach = Some((r, dock_area.pos.y + dock_area.size.y));
+                }
+                // Window-backed Gaussian blur, sampled from the live desktop.
+                if t.weights[1] > 0.01 {
+                    if let Some(mut glass) = self.glass.borrow_mut::<gauss_view::GaussRoundedView>()
+                    {
+                        glass.draw_surface_with_backdrop(
+                            cx,
+                            r,
+                            state.dock_backdrop.clone(),
+                            t.weights[1] as f32,
+                        );
+                    }
+                }
+                // Glass redirects drawing through its backdrop pass; keep its
+                // foreground in a separate list. Opaque shelves stay in the
+                // scene's recording so closing a child cannot detach them.
+                let glass_foreground = t.weights[1] > 0.001;
+                if glass_foreground {
+                    if self.overlay.is_none() {
+                        self.overlay = Some(DrawList2d::new(cx));
+                    }
+                    self.overlay.as_mut().unwrap().begin_always(cx);
+                }
+                self.chrome.new_draw_call(cx);
+                self.chrome.pressed = 0.0;
+                self.chrome.selected = 0.0;
+                let color = if style == DesktopStyle::Windows2000 {
+                    rgb(212, 208, 200)
+                } else if dark {
+                    rgb(32, 32, 32)
+                } else {
+                    rgb(234, 238, 245)
+                };
+                let bar_share = if layout.next.is_some() { 1.0 - layout.mix } else { 1.0 };
+                self.chrome.color = alpha(color, (opacity as f64 * (1.0 - t.weights[1]) * bar_share) as f32);
+                self.chrome.radius = t.value([0.0, 18.0, 0.0, 0.0, 0.0]) as f32;
+                self.chrome.bevel = t.weights[3] as f32;
+                self.chrome.draw_abs(cx, r);
+                if let Some(next) = layout.next {
+                    self.chrome.color = alpha(color, (opacity as f64 * layout.mix) as f32);
+                    self.chrome.radius = 0.0;
+                    self.chrome.bevel = 0.0;
+                    self.chrome.draw_abs(cx, next);
+                }
+                for style in [
+                    DesktopStyle::Macos,
+                    DesktopStyle::Windows,
+                    DesktopStyle::Windows2000,
+                    DesktopStyle::NextStep,
+                ] {
+                    let opacity = t.weights[style as usize] as f32;
+                    if opacity < 0.001 {
+                        continue;
+                    }
+                    let hit_start = self.hits.len();
+                    // Each shelf lays out in its own rect while two crossfade.
+                    let place = if style == DesktopStyle::NextStep { layout.next.unwrap_or(r) } else { r };
+                    let (x, y, w, h) = (place.pos.x, place.pos.y, place.size.x, place.size.y);
+                    if style == DesktopStyle::NextStep {
+                        let plan = shelf_plan(style, dock_area, apps.len());
+                        let cell = h / plan.slots() as f64;
+                        self.button(cx, rect(x,y,w,cell), ShelfHit::Launcher, Ico::Menu, "Workspace", false, style, opacity);
+                        for (i, app) in apps.iter().take(plan.shown).enumerate() {
+                            let id = app.id.trim_start_matches("apps.");
+                            self.button(cx, rect(x,y+(i+1) as f64*cell,w,cell), ShelfHit::App(id.into()), app_icon(id), &app.label, clients.iter().any(|(_,a,_)| a==id), style, opacity);
+                        }
+                        if plan.overflow > 0 {
+                            self.button(cx, rect(x,y+(plan.shown+1) as f64*cell,w,cell), ShelfHit::More(plan.shown), Ico::Menu, &format!("{} more", plan.overflow), false, style, opacity);
+                        }
+                    } else if style == DesktopStyle::Windows2000 {
+                        self.button(
+                            cx,
+                            rect(x + 3.0, y + 3.0, 76.0, (h - 6.0).max(1.0)),
+                            ShelfHit::Launcher,
+                            Ico::Menu,
+                            "Start",
+                            false,
+                            style,
+                            opacity,
+                        );
+                        let available = (w - 126.0).max(1.0);
+                        let cell = (available / clients.len().max(1) as f64).min(180.0);
+                        for (i, (c, app, title)) in clients.iter().enumerate() {
+                            self.button(
+                                cx,
+                                rect(
+                                    x + 86.0 + i as f64 * cell,
+                                    y + 3.0,
+                                    cell - 3.0,
+                                    (h - 6.0).max(1.0),
+                                ),
+                                ShelfHit::Window(*c),
+                                app_icon(app),
+                                title,
+                                !state.layout_of(*c).desktop.minimized(*c),
+                                style,
+                                opacity,
+                            );
+                        }
+                    } else {
+                        let plan = shelf_plan(style, dock_area, apps.len());
+                        let n = plan.slots() as f64;
+                        let cell = if style == DesktopStyle::Macos {
+                            (w - 20.0) / n
+                        } else {
+                            plan.pitch.min((w - 36.0) / n)
+                        };
+                        let start = if style == DesktopStyle::Macos {
+                            x + 10.0
+                        } else {
+                            x + (w - cell * n) * 0.5
+                        };
+                        self.button(
+                            cx,
+                            rect(start, y + 6.0, cell, (h - 12.0).max(1.0)),
+                            ShelfHit::Launcher,
+                            Ico::Menu,
+                            if style == DesktopStyle::Macos {
+                                "Applications"
+                            } else {
+                                "Start"
+                            },
+                            false,
+                            style,
+                            opacity,
+                        );
+                        for (i, app) in apps.iter().take(plan.shown).enumerate() {
+                            let id = app.id.trim_start_matches("apps.");
+                            self.button(
+                                cx,
+                                rect(
+                                    start + (i + 1) as f64 * cell,
+                                    y + 6.0,
+                                    cell,
+                                    (h - 12.0).max(1.0),
+                                ),
+                                ShelfHit::App(id.into()),
+                                app_icon(id),
+                                &app.label,
+                                clients.iter().any(|(_, a, _)| a == id),
+                                style,
+                                opacity,
+                            );
+                        }
+                        if plan.overflow > 0 {
+                            self.button(
+                                cx,
+                                rect(start + (plan.shown + 1) as f64 * cell, y + 6.0, cell, (h - 12.0).max(1.0)),
+                                ShelfHit::More(plan.shown),
+                                Ico::Menu,
+                                &format!("{} more", plan.overflow),
+                                false,
+                                style,
+                                opacity,
+                            );
+                        }
+                    }
+                    if style != DesktopStyle::Macos && style != DesktopStyle::NextStep {
+                        let button = rect(x + w - 22.0, y + 3.0, 19.0, (h - 6.0).max(1.0));
+                        self.hits.push((button, ShelfHit::ShowDesktop));
+                        self.d.solid(
+                            cx,
+                            rect(button.pos.x, button.pos.y, 1.0, button.size.y),
+                            alpha(rgb(128, 128, 128), opacity),
+                        );
+                    }
+                    if style != t.target {
+                        self.hits.truncate(hit_start);
+                    }
+                }
+                if glass_foreground { self.overlay.as_mut().unwrap().end(cx); }
+            }
+        }
+        cx.end_turtle_with_area(&mut self.area);
+        if self.start_visible { self.start_frame = cx.new_next_frame(); }
+        DrawStep::done()
+    }
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        if self.start_frame.is_event(event).is_some() && self.start_visible { self.redraw(cx); }
+        if let Some(ne) = self.hover_frame.is_event(event) {
+            if let Some(hit) = &self.hover {
+                if !self.hover_mix.iter().any(|(h, _)| h == hit) {
+                    self.hover_mix.push((hit.clone(), 0.0));
+                }
+            }
+            let dt = if self.hover_time == 0.0 {
+                1.0 / 60.0
+            } else {
+                (ne.time - self.hover_time).min(0.05)
+            };
+            self.hover_time = ne.time;
+            let mut active = false;
+            for (hit, value) in &mut self.hover_mix {
+                let target = if Some(&*hit) == self.hover.as_ref() {
+                    1.0
+                } else {
+                    0.0
+                };
+                *value += (target - *value) * (1.0 - (-dt * 20.0).exp());
+                active |= (target - *value).abs() > 0.001;
+            }
+            self.hover_mix
+                .retain(|(hit, value)| *value > 0.001 || Some(hit) == self.hover.as_ref());
+            if active {
+                self.hover_frame = cx.new_next_frame();
+            }
+            self.redraw(cx);
+        }
+    }
+}
+
+/// The person's accessibility choices for the phone's glass and motion,
+/// read from `~/.makepad/wm/accessibility.splash` — a settings file, never
+/// an environment variable — in the same shape as `apps.splash`:
+/// `reduce_transparency: true` / `reduce_motion: true`, one per line.
+/// Reduce Transparency draws every glass surface opaque with a hairline;
+/// Reduce Motion makes presses and presents instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Accessibility {
+    pub reduce_transparency: bool,
+    pub reduce_motion: bool,
+}
+
+impl Accessibility {
+    pub fn load(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path).map(|text| Self::parse(&text)).unwrap_or_default()
+    }
+
+    pub fn parse(text: &str) -> Self {
+        let mut out = Accessibility::default();
+        for raw in text.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim().trim_matches(|c| c == '{' || c == '}' || c == ',').trim();
+            let Some((key, value)) = line.split_once(':') else { continue };
+            let on = matches!(value.trim().trim_matches(',').trim().to_lowercase().as_str(), "true" | "on" | "1" | "yes");
+            match key.trim().to_lowercase().as_str() {
+                "reduce_transparency" => out.reduce_transparency = on,
+                "reduce_motion" => out.reduce_motion = on,
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::Accessibility;
+
+    #[test]
+    fn the_settings_file_reads_like_the_other_wm_files_and_defaults_off() {
+        let text = "// glass and motion\n{\n  reduce_transparency: true,\n  Reduce_Motion: on\n  nonsense\n}\n";
+        assert_eq!(Accessibility::parse(text), Accessibility { reduce_transparency: true, reduce_motion: true });
+        assert_eq!(Accessibility::parse("reduce_motion: false"), Accessibility::default());
+        assert_eq!(Accessibility::load(std::path::Path::new("/nonexistent/accessibility.splash")), Accessibility::default());
+    }
+}

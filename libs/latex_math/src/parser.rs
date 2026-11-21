@@ -9,6 +9,9 @@ pub enum MathNode {
     Symbol(Symbol),
     /// Fraction: \frac{numerator}{denominator}
     Frac(Vec<MathNode>, Vec<MathNode>),
+    /// One part over the other with no rule between, set as a fraction's
+    /// parts are: the inside of `\binom{n}{k}`.
+    Stack(Vec<MathNode>, Vec<MathNode>),
     /// Square root or nth root: \sqrt{content} or \sqrt[n]{content}
     Sqrt(Option<Vec<MathNode>>, Vec<MathNode>),
     /// Superscript: base^{exponent} (base is previous node, stored separately)
@@ -37,6 +40,16 @@ pub enum MathNode {
     /// \overbrace{...} / \underbrace{...}
     Overbrace(Vec<MathNode>),
     Underbrace(Vec<MathNode>),
+    /// `\overset{over}{base}` / `\underset{under}{base}`: the base with a
+    /// script-size part centered above or below it, as an operator's limits.
+    /// The pair spaces as its base does (`\overset{!}{=}` is a relation).
+    Overset(Vec<MathNode>, Vec<MathNode>),
+    Underset(Vec<MathNode>, Vec<MathNode>),
+    /// `\xrightarrow[under]{over}`, `\xleftarrow[under]{over}`: the arrow
+    /// grown to its labels, which sit above and below it; a relation.
+    ExtensibleArrow(Symbol, Vec<MathNode>, Vec<MathNode>),
+    /// `\boxed{...}`: the content in display style inside a ruled frame.
+    Boxed(Vec<MathNode>),
     /// \mathbf{...}, \mathit{...}, etc.
     MathVariant(MathVariant, Vec<MathNode>),
     /// \sum, \prod, \int with limits — encoded as the symbol followed by Sub/Superscript
@@ -44,6 +57,27 @@ pub enum MathNode {
 
     /// \color{red}{content} or \textcolor{red}{content}
     Color(String, Vec<MathNode>),
+
+    /// `\id{name}{content}`: names the content as a part of the formula. It
+    /// is laid out exactly as the content alone would be; only the output
+    /// carries the name, so an animation can address the part.
+    Id(String, Vec<MathNode>),
+
+    /// `\limits` / `\nolimits` after an operator: its scripts go above and
+    /// below it (true) or beside it (false), in any style.
+    Limits(bool, Vec<MathNode>),
+
+    /// `\displaystyle`, `\textstyle`, `\scriptstyle`, `\scriptscriptstyle`:
+    /// the rest of the group is laid out in that style.
+    Style(StyleSwitch),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StyleSwitch {
+    Display,
+    Text,
+    Script,
+    ScriptScript,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +158,10 @@ pub enum Symbol {
     Ddagger,
     Setminus,
     Wr,
+    Cap,
+    Cup,
+    Wedge,
+    Vee,
     // Relations
     Eq,
     Neq,
@@ -260,6 +298,8 @@ pub enum MatrixKind {
     Vert,       // vmatrix
     DoubleVert, // Vmatrix
     Cases,      // cases
+    Aligned,    // aligned, align: columns alternate right and left aligned
+    Substack,   // \substack{a \\ b}: one centered column of tight script rows
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,11 +330,13 @@ pub enum MathVariant {
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    /// Commands this subset does not know, in the order met.
+    unknown: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self { input, pos: 0, unknown: Vec::new() }
     }
 
     fn peek(&self) -> Option<char> {
@@ -458,10 +500,17 @@ impl<'a> Parser<'a> {
             if stop(self) || self.peek().is_none() {
                 break;
             }
+            let pos_before = self.pos;
             if let Some(node) = self.parse_one() {
                 // Check for sub/superscript attachment
                 let node = self.maybe_attach_scripts(node);
                 nodes.push(node);
+            }
+            // parse_one leaves a stray `}` or `]` for its caller; when this
+            // loop's stop condition does not take it, consume it so
+            // malformed input cannot spin here forever.
+            if self.pos == pos_before {
+                self.advance();
             }
         }
         nodes
@@ -469,6 +518,16 @@ impl<'a> Parser<'a> {
 
     fn maybe_attach_scripts(&mut self, base: MathNode) -> MathNode {
         self.skip_whitespace();
+        // `\limits` / `\nolimits` belong to the operator before them.
+        let base = match self.peek_command() {
+            Some(word @ ("limits" | "nolimits")) => {
+                let limits = word == "limits";
+                self.pos += 1 + word.len();
+                self.skip_whitespace();
+                MathNode::Limits(limits, vec![base])
+            }
+            _ => base,
+        };
         match self.peek() {
             Some('^') => {
                 self.advance();
@@ -499,6 +558,13 @@ impl<'a> Parser<'a> {
             }
             _ => base,
         }
+    }
+
+    /// The name of the command at the cursor (`\name`), without consuming it.
+    fn peek_command(&self) -> Option<&'static str> {
+        let rest = self.input.get(self.pos..)?.strip_prefix('\\')?;
+        let len = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
+        ["limits", "nolimits"].into_iter().find(|w| *w == &rest[..len])
     }
 
     fn parse_one(&mut self) -> Option<MathNode> {
@@ -545,8 +611,13 @@ impl<'a> Parser<'a> {
                 Some(MathNode::Char('&')) // Column separator in matrices
             }
             '\'' => {
-                self.advance();
-                Some(MathNode::Symbol(Symbol::DoubleVert)) // prime — will fix in layout
+                // Primes: the font's raised prime glyphs (one, two or three).
+                let mut count = 0;
+                while self.peek() == Some('\'') {
+                    self.advance();
+                    count += 1;
+                }
+                Some(MathNode::Char(match count { 1 => '\u{2032}', 2 => '\u{2033}', _ => '\u{2034}' }))
             }
             _ if is_math_char(c) => {
                 self.advance();
@@ -566,6 +637,37 @@ impl<'a> Parser<'a> {
                 let num = self.parse_brace_group();
                 let den = self.parse_brace_group();
                 return Some(MathNode::Frac(num, den));
+            }
+            "binom" | "dbinom" | "tbinom" => {
+                let n = self.parse_brace_group();
+                let k = self.parse_brace_group();
+                return Some(MathNode::LeftRight(
+                    Delimiter::Paren,
+                    vec![MathNode::Stack(n, k)],
+                    Delimiter::Paren,
+                ));
+            }
+            "overset" | "underset" => {
+                let script = self.parse_brace_group();
+                let base = self.parse_brace_group();
+                return Some(if name == "overset" {
+                    MathNode::Overset(script, base)
+                } else {
+                    MathNode::Underset(script, base)
+                });
+            }
+            "xrightarrow" | "xleftarrow" => {
+                let under = self.parse_bracket_group().unwrap_or_default();
+                let over = self.parse_brace_group();
+                let arrow = if name == "xrightarrow" { Symbol::RightArrow } else { Symbol::LeftArrow };
+                return Some(MathNode::ExtensibleArrow(arrow, over, under));
+            }
+            "boxed" => {
+                let c = self.parse_brace_group();
+                return Some(MathNode::Boxed(c));
+            }
+            "substack" => {
+                return Some(self.parse_substack());
             }
             "sqrt" => {
                 let index = self.parse_bracket_group();
@@ -685,6 +787,11 @@ impl<'a> Parser<'a> {
                 let content = self.parse_brace_group();
                 return Some(MathNode::Color(color, content));
             }
+            "id" => {
+                let name = self.parse_brace_text();
+                let content = self.parse_brace_group();
+                return Some(MathNode::Id(name.trim().to_string(), content));
+            }
             "left" => {
                 return self.parse_left_right();
             }
@@ -692,6 +799,12 @@ impl<'a> Parser<'a> {
                 let env_name = self.parse_brace_text();
                 return self.parse_environment(&env_name);
             }
+            "displaystyle" => return Some(MathNode::Style(StyleSwitch::Display)),
+            "textstyle" => return Some(MathNode::Style(StyleSwitch::Text)),
+            "scriptstyle" => return Some(MathNode::Style(StyleSwitch::Script)),
+            "scriptscriptstyle" => return Some(MathNode::Style(StyleSwitch::ScriptScript)),
+            // Only meaningful right after an operator (taken there); elsewhere nothing.
+            "limits" | "nolimits" => return Some(MathNode::Group(Vec::new())),
             "quad" => return Some(MathNode::Space(SpaceWidth::Quad)),
             "qquad" => return Some(MathNode::Space(SpaceWidth::QQuad)),
             _ => {}
@@ -707,7 +820,8 @@ impl<'a> Parser<'a> {
             return Some(MathNode::Symbol(sym));
         }
 
-        // Unknown command — try to render as text
+        // Unknown command: shown as its text, and reported (parse_checked).
+        self.unknown.push(name.to_string());
         Some(MathNode::Text(format!("\\{}", name)))
     }
 
@@ -818,6 +932,32 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `\substack{a \\ b}`'s argument: one cell per `\\`-separated row. A
+    /// trailing `\\` starts no row, as at the end of an environment.
+    fn parse_substack(&mut self) -> MathNode {
+        self.skip_whitespace();
+        if self.peek() != Some('{') {
+            return MathNode::Matrix(MatrixKind::Substack, vec![vec![self.parse_brace_group()]]);
+        }
+        self.advance();
+        let mut rows = Vec::new();
+        loop {
+            let cell = self.parse_until(|p| p.peek() == Some('}') || p.remaining().starts_with("\\\\"));
+            if self.remaining().starts_with("\\\\") {
+                self.pos += 2;
+                rows.push(vec![cell]);
+                continue;
+            }
+            if self.peek() == Some('}') {
+                self.advance();
+            }
+            if !cell.is_empty() || rows.is_empty() {
+                rows.push(vec![cell]);
+            }
+            return MathNode::Matrix(MatrixKind::Substack, rows);
+        }
+    }
+
     fn parse_environment(&mut self, name: &str) -> Option<MathNode> {
         let kind = match name {
             "matrix" => MatrixKind::Plain,
@@ -827,6 +967,7 @@ impl<'a> Parser<'a> {
             "vmatrix" => MatrixKind::Vert,
             "Vmatrix" => MatrixKind::DoubleVert,
             "cases" => MatrixKind::Cases,
+            "aligned" | "align" | "align*" | "split" => MatrixKind::Aligned,
             _ => MatrixKind::Plain,
         };
 
@@ -837,6 +978,7 @@ impl<'a> Parser<'a> {
         let end_marker = format!("\\end{{{}}}", name);
 
         loop {
+            self.skip_whitespace();
             if self.remaining().starts_with(&end_marker) {
                 self.pos += end_marker.len();
                 break;
@@ -1017,6 +1159,10 @@ fn symbol_from_name(name: &str) -> Option<Symbol> {
         "ddagger" => Symbol::Ddagger,
         "setminus" => Symbol::Setminus,
         "wr" => Symbol::Wr,
+        "cap" => Symbol::Cap,
+        "cup" => Symbol::Cup,
+        "wedge" | "land" => Symbol::Wedge,
+        "vee" | "lor" => Symbol::Vee,
         // Relations
         "neq" | "ne" => Symbol::Neq,
         "leq" | "le" => Symbol::Leq,
@@ -1187,6 +1333,10 @@ pub fn symbol_to_char(sym: Symbol) -> char {
         Symbol::Ddagger => '\u{2021}',
         Symbol::Setminus => '\u{2216}',
         Symbol::Wr => '\u{2240}',
+        Symbol::Cap => '\u{2229}',
+        Symbol::Cup => '\u{222A}',
+        Symbol::Wedge => '\u{2227}',
+        Symbol::Vee => '\u{2228}',
         // Relations
         Symbol::Eq => '=',
         Symbol::Neq => '\u{2260}',
@@ -1287,9 +1437,17 @@ pub fn symbol_to_char(sym: Symbol) -> char {
 /// Parse a LaTeX math string into an AST.
 /// The input should be the content between $ ... $ (without the dollar signs).
 pub fn parse(input: &str) -> Vec<MathNode> {
-    let mut parser = Parser::new(input);
-    parser.parse_until(|p| p.peek().is_none())
+    parse_checked(input).0
 }
+
+/// The formula and the commands in it this subset does not know (each
+/// shown as its own text in the formula).
+pub fn parse_checked(input: &str) -> (Vec<MathNode>, Vec<String>) {
+    let mut parser = Parser::new(input);
+    let nodes = parser.parse_until(|p| p.peek().is_none());
+    (nodes, parser.unknown)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1318,6 +1476,18 @@ mod tests {
                 vec![MathNode::Char('b')],
             ),]
         );
+    }
+
+    #[test]
+    fn unknown_commands_are_reported() {
+        let (_, unknown) = parse_checked(r"A \cap B \capx \foo{y}");
+        assert_eq!(unknown, ["capx", "foo"]);
+    }
+
+    #[test]
+    fn primes_are_prime_glyphs() {
+        assert_eq!(parse("f'(x)")[..2], [MathNode::Char('f'), MathNode::Char('\u{2032}')]);
+        assert_eq!(parse("f''")[1], MathNode::Char('\u{2033}'));
     }
 
     #[test]

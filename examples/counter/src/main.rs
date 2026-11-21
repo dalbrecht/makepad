@@ -6,10 +6,7 @@ app_main!(App);
 
 script_mod! {
     use mod.prelude.widgets.*
-    let state = {
-        counter: 0
-    }
-    mod.state = state
+    let state = mod.state
     startup() do #(App::script_component(vm)){
         ui: Root{
             on_startup:||{ // right now render isnt called automatically yet
@@ -18,6 +15,8 @@ script_mod! {
             main_window := Window{
                 window.inner_size: vec2(420, 220)
                 body +: {
+                    // the system bars sit over the window's edges: stay inside the safe area
+                    padding: Inset{top: mod.widgets.SAFE_INSET_PAD_TOP right: mod.widgets.SAFE_INSET_PAD_RIGHT bottom: mod.widgets.SAFE_INSET_PAD_BOTTOM left: mod.widgets.SAFE_INSET_PAD_LEFT}
                     main_view := View{
                         width: Fill
                         height: Fill
@@ -25,6 +24,7 @@ script_mod! {
                         spacing: 12
                         align: Center
                         on_render: ||{
+                            app_icon := AppIcon{name: "counter" width: 48 height: 48}
                             counter_label := Label{
                                 text: "Count: " + state.counter
                                 draw_text.text_style.font_size: 24
@@ -59,7 +59,14 @@ impl MatchEvent for App {
 
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+        #[cfg(feature = "tweaker")]
+        makepad_widgets_tweaker::link(vm);
         crate::makepad_widgets::script_mod(vm);
+        // Application data survives Splash/style reloads; the UI definitions
+        // below are re-evaluated against this same state object.
+        if !vm.is_reload() {
+            script_eval!(vm, {mod.state = {counter: 0} true});
+        }
         self::script_mod(vm)
     }
 

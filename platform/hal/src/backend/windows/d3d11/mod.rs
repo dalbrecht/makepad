@@ -1,0 +1,833 @@
+//! The D3D11 HAL backend (Windows). Commands, generations, font jobs and lending use the shared
+//! executor; the device work is here: resources keyed by (session, index) with generations,
+//! HLSL pipelines compiled off the HAL's thread, frame packets encoded on the immediate context,
+//! completion and readbacks on the completion thread, swapchains for the Win32 shell's windows.
+//! Offscreen windows (`OPEN_FLAGS::OFFSCREEN_WINDOWS`, hidden runs) render into retained images
+//! with no window system at all.
+
+mod chain;
+mod complete;
+pub(crate) mod dcomp;
+pub(crate) mod device;
+mod frame;
+mod pipeline;
+mod compute;
+mod leases;
+mod readback;
+pub(crate) mod resources;
+pub mod share_copy;
+
+use super::super::exec::{self, Gpu, PipeStatus};
+use super::super::{Backend, Pixels};
+use super::win32;
+use crate::buffers::{CmdView, PipelineBlob};
+use crate::hlsl::HlslPipeline;
+use crate::ledger::{Kind, LedgerEntry};
+use crate::session::*;
+use crate::types::*;
+use complete::{Completion, Event, Mailbox, Token};
+use device::{CompilePool, Device};
+use pipeline::{PipeSrc, PipeState};
+use resources::{Arena, Buffer, Texture};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
+
+pub(crate) struct Tex {
+    pub(crate) gen: u32,
+    pub(crate) tex: Arc<Texture>,
+}
+struct Buf {
+    gen: u32,
+    buf: Arc<Buffer>,
+    evictable: bool,
+}
+struct Pipe {
+    gen: u32,
+    state: Arc<PipeState>,
+    epoch: u64,
+    announced: bool,
+}
+/// A program that ran out of memory on a live device. Its pipelines keep the failure until a
+/// build made again in the background fits, then they move to that build.
+struct Starved {
+    failed: Arc<PipeState>,
+    next: Option<Arc<PipeState>>,
+    /// when `next` starts, if it isn't running (HAL clock ns)
+    retry_ns: u64,
+}
+/// How long a program that ran out of memory waits to be built again, as on Vulkan.
+const STARVED_RETRY_NS: u64 = 16_000_000;
+
+/// How often the device's memory count is read.
+const COUNT_NS: u64 = 250_000_000;
+
+pub struct D3d11 {
+    shell: Option<&'static win32::Shared>,
+    a11y_update: Option<win32::a11y::Update>,
+    leases: Arc<leases::Pool>,
+    dev: Arc<Device>,
+    info: HalInfo,
+    tex: HashMap<(u32, u32), Tex>,
+    buf: HashMap<(u32, u32), Buf>,
+    pipe: HashMap<(u32, u32), Pipe>,
+    compute: HashMap<(u32, u32), compute::Pipe>,
+    /// compiled pipelines shared by identical sources and layouts (by `PipeSrc::hash_key`)
+    programs: HashMap<u64, Vec<Weak<PipeState>>>,
+    starved: Vec<Starved>,
+    /// windows' retained images, by (owner, index)
+    win: HashMap<(u32, u32), Tex>,
+    /// session 0's windows with a badge layer (by index), and the image each last presented: its
+    /// retained image with the layer drawn over (what a snapshot of the window reads)
+    badged: HashMap<u32, Option<Tex>>,
+    /// the composed image the badge frame being encoded draws into
+    compose: Option<Arc<Texture>>,
+    aliases: HashMap<(u32, Id), Id>,
+    /// Pick targets whose latest replay skipped a draw.
+    pick_pending: std::collections::HashSet<(u32, Id)>,
+    /// window capture textures (recording), reused once no sink holds them
+    captures: Vec<([u32; 2], makepad_windows_sys::Win32::Graphics::Direct3D11::ID3D11Texture2D, crate::ledger::Charge)>,
+    /// cross-process images this pass holds (keyed mutex), given back when it is encoded
+    acquired: Vec<Arc<Texture>>,
+    fallback: HashMap<u32, Arc<Texture>>,
+    chains: chain::Chains,
+    /// the image of each upper segment of a window with native layers, by (owner, index, gap)
+    segments: HashMap<(u32, u32, usize), Arc<Texture>>,
+    /// their depth targets, for passes with depth
+    segment_depths: HashMap<(u32, u32, usize), Arc<Texture>>,
+    /// the upper segment the pass being encoded renders into
+    segment: Option<frame::SegTarget>,
+    /// native layers past the composited budget, told unsupported once
+    over_budget: std::collections::HashSet<(u32, Id)>,
+    /// windows whose native layers draw nothing (logged once)
+    native_fallback: std::collections::HashSet<(u32, Id)>,
+    /// the composition device was lost: the device reset in progress makes it again too
+    dcomp_reset: bool,
+    batch: complete::Batch,
+    cb_arena: Arena,
+    word_arena: Arena,
+    /// the device's count of this process's video memory (`Device::usage`), read every
+    /// `COUNT_NS` (when idle staging is trimmed too)
+    device_bytes: Option<u64>,
+    counted_at: u64,
+    /// one pass's draw lists, reused pass after pass
+    scratch: frame::PassScratch,
+    /// the pass being encoded of a frame the GPU profiler records: its draws and attachments
+    prof: Option<frame::ProfRecords>,
+    mailbox: Mailbox,
+    complete: Completion,
+    /// HLSL compiles in parallel (FXC is single-threaded per call; a cold start compiles dozens)
+    compilers: CompilePool,
+    /// video, audio, MIDI, camera, game input (`backend/windows/media`)
+    media: super::media::Media,
+    /// the sessions heard `DeviceLost` and the replacement device is not made yet
+    lost_posted: bool,
+    /// when the next attempt to make a replacement device may run (HAL clock ns)
+    retry_ns: u64,
+    /// `simulate_device_loss` asked for a loss: the next step treats the device as removed
+    simulate: bool,
+    /// `MAKEPAD_HAL_SIMULATE_DEVICE_LOSS_MS`: a loss is simulated this long after the device was
+    /// made (app-level checks of the reset path, e.g. a grab before and after)
+    simulate_at_ns: Option<u64>,
+}
+
+impl D3d11 {
+    pub fn new(flags: u32, wake: Arc<dyn Fn() + Send + Sync>, notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+        let dev = Device::new()?;
+        let shell = if flags & open_flags::OFFSCREEN_WINDOWS == 0 {
+            let shell = win32::Shared::global();
+            shell.start(flags, notify)?;
+            Some(shell)
+        } else {
+            None
+        };
+        let budget = dev.budget().map_or(0, |b| b.0);
+        let mut info = HalInfo {
+            backend: backend_id::D3D11,
+            dialect: dialect::HLSL,
+            formats: dev.formats,
+            msaa: 1,
+            dpi: shell.map_or_else(win32::system_dpi, |s| s.dpi()),
+            // offscreen too: a badge layer is composed into the retained image's copy either way
+            flags: info_flags::GPU_TIMESTAMPS | info_flags::WINDOW_BADGES | info_flags::WINDOW_LAYERS | info_flags::COMPUTE | info_flags::DRAW_STORAGE_BUFFERS | info_flags::DEVICE_RESET,
+            max_workgroup_size: [1024, 1024, 64],
+            max_workgroup_invocations: 1024,
+            storage_formats: (0..format::COUNT).filter(|f| device::dxgi(*f).is_some_and(|fmt| unsafe { dev.device.CheckFormatSupport(fmt.resource) }.unwrap_or(0) & 0x02000000 != 0)).fold(0, |bits, f| bits | (1u64 << f)),
+            max_texture: 16384,
+            max_window: [16384, 16384],
+            max_buffer: (u32::MAX as u64) & !15,
+            working_set: budget,
+            ..Default::default()
+        };
+        if shell.is_some() {
+            // apps draw their own captions on Windows
+            info.flags |= info_flags::DISPLAY_CLOCK | info_flags::CLIENT_CHROME;
+        }
+        crate::gpu_limits::set_max_gpu_buffer_bytes(info.max_buffer);
+        crate::gpu_limits::set_gpu_working_set_bytes(info.working_set);
+        let mailbox = Mailbox::new(wake.clone());
+        let complete = Completion::new(dev.clone(), mailbox.clone())?;
+        crate::gpu_prof::set_device(crate::gpu_prof::DeviceInfo {
+            name: dev.adapter_name.clone(),
+            counter_sets: vec!["timestamp (D3D11 timestamp queries inside a disjoint query per frame)".into()],
+            sampling: vec!["pass boundary".into(), "completion-time clock anchor".into()],
+            notes: vec![
+                "render passes are timed whole with timestamp queries (no vertex / fragment lanes, no per-shader split)".into(),
+                "GPU times are placed on the host clock where each frame's completion event was seen (late by the completion thread's wake-up)".into(),
+            ],
+        });
+        if win32::log_enabled() {
+            eprintln!("[hal-d3d11] device on \"{}\": formats {:#x} renderable {:#x} offscreen={}", dev.adapter_name, dev.formats, dev.renderable, shell.is_none());
+        }
+        Ok(Self {
+            leases: leases::Pool::new(dev.clone(), wake.clone()),
+            shell,
+            a11y_update: None,
+            cb_arena: Arena::new(&dev, 256 * 1024, true)?,
+            word_arena: Arena::new(&dev, 256 * 1024, false)?,
+            device_bytes: None,
+            counted_at: 0,
+            scratch: Default::default(),
+            prof: None,
+            dev,
+            info,
+            tex: HashMap::new(),
+            buf: HashMap::new(),
+            pipe: HashMap::new(),
+            compute: HashMap::new(),
+            programs: HashMap::new(),
+            starved: Vec::new(),
+            win: HashMap::new(),
+            badged: HashMap::new(),
+            compose: None,
+            aliases: HashMap::new(),
+            pick_pending: Default::default(),
+            acquired: Vec::new(),
+            captures: Vec::new(),
+            fallback: HashMap::new(),
+            chains: chain::Chains::default(),
+            segments: HashMap::new(),
+            segment_depths: HashMap::new(),
+            segment: None,
+            over_budget: Default::default(),
+            native_fallback: Default::default(),
+            dcomp_reset: false,
+            batch: complete::Batch::default(),
+            mailbox,
+            complete,
+            compilers: CompilePool::new("makepad-d3d11-compile", std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(1, 8)))?,
+            media: super::media::Media::new(),
+            lost_posted: false,
+            retry_ns: 0,
+            simulate: false,
+            simulate_at_ns: super::super::simulated_loss_at(),
+        })
+    }
+
+    /// Queues the compile of `state`'s program on the compile threads; it wakes the HAL when done.
+    fn compile(&mut self, state: &Arc<PipeState>) {
+        let job = state.clone();
+        let dev = self.dev.clone();
+        let wake = self.mailbox.wake.clone();
+        self.compilers.push(Arc::as_ptr(state) as usize, move || {
+            let t0 = std::time::Instant::now();
+            let src = &job.src;
+            if win32::log_enabled() {
+                eprintln!("[hal-d3d11] compiling `{}` ({} bytes of HLSL)", src.name, src.code.source.len());
+            }
+            let program = pipeline::build(&dev, &src.code, src.desc, src.bindings.clone(), src.layout.clone(), src.storage.clone(), &src.name);
+            if win32::log_enabled() || t0.elapsed() > std::time::Duration::from_secs(2) {
+                eprintln!("[hal-d3d11] compiled `{}` in {:.0} ms", src.name, t0.elapsed().as_secs_f64() * 1e3);
+            }
+            let _ = job.program.set(program);
+            job.epoch.fetch_add(1, Ordering::Release);
+            wake();
+        });
+    }
+
+    fn token(s: &Session) -> Token {
+        Token { sid: s.id, incarnation: s.font_frames.clone() }
+    }
+
+    fn window_key(&self, sid: u32, id: Id) -> (u32, Id) {
+        self.aliases.get(&(sid, id)).map_or((sid, id), |host| (HOST, *host))
+    }
+
+    /// Presents a window's image on its swapchain; an offscreen window's frame is done as rendered.
+    fn present(&mut self, key: (u32, Id), image: &Arc<Texture>, layered: Option<chain::Layered>) -> bool {
+        match self.shell {
+            Some(shell) => self.chains.present(&self.dev, shell, key, image, layered),
+            None => true,
+        }
+    }
+
+    /// A lost device (removed, reset, or a simulated loss) is replaced here: the sessions hear
+    /// `DeviceLost` once, then `exec::device_reset` runs until a device can be made.
+    fn recover(&mut self, world: &mut World) {
+        // a lost composition device takes every window's content with it: the device reset
+        // makes the swapchains, trees and native layer visuals again, and the apps repaint
+        if self.shell.is_some() && !self.dcomp_reset && dcomp::lost() {
+            self.dcomp_reset = true;
+            self.simulate = true;
+        }
+        if self.simulate_at_ns.is_some_and(|t| crate::clock_ns() >= t) {
+            self.simulate_at_ns = None;
+            self.simulate = true;
+            // the composition device goes too: the whole recovery runs
+            if self.shell.is_some() {
+                dcomp::simulate_loss();
+                self.dcomp_reset = true;
+            }
+        }
+        if self.simulate {
+            self.simulate = false;
+            self.dev.lost.store(true, Ordering::Release);
+        }
+        if !self.dev.check_lost() {
+            return;
+        }
+        if !self.lost_posted {
+            let generation = exec::device_lost(world);
+            eprintln!("[hal-d3d11] device generation {generation} lost; making a new one");
+            self.lost_posted = true;
+            self.retry_ns = 0;
+        }
+        let now = crate::clock_ns();
+        if now < self.retry_ns {
+            return;
+        }
+        if exec::device_reset(self, world) {
+            self.lost_posted = false;
+            eprintln!("[hal-d3d11] device generation {} on \"{}\"", world.device_generation, self.dev.adapter_name);
+        } else {
+            self.retry_ns = now + 500_000_000;
+        }
+    }
+
+    fn drain(&mut self, world: &mut World) {
+        leases::drain();
+        for done in self.mailbox.take() {
+            let sid = done.token.sid;
+            if !world.session(sid).is_some_and(|s| Arc::ptr_eq(&s.font_frames, &done.token.incarnation)) {
+                continue;
+            }
+            match done.event {
+                Event::DispatchTime { name, gpu_ns } => world.to_session(sid, |q| q.dispatch_time(name.as_bytes(), gpu_ns)),
+                Event::Frame { target, kind, frame, window, gpu_ns, gpu_span } => {
+                    if let Some(s) = world.session_mut(sid) {
+                        s.stats.frames += 1;
+                        if gpu_ns > 0 {
+                            s.stats.gpu_frames += 1;
+                            s.stats.gpu_ns_total += gpu_ns;
+                            s.stats.gpu_ns_max = s.stats.gpu_ns_max.max(gpu_ns);
+                        }
+                    }
+                    if window {
+                        world.window_presented(sid, target, frame, gpu_ns, done.time);
+                    }
+                    world.frame_done(sid, target, kind, frame, gpu_ns, done.time, gpu_span);
+                }
+                Event::BufferLeases { req, status, leases } => world.to_session(sid, |q| q.buffer_leases(req, status, leases)),
+                Event::Readback { req, status, rect, lease } => world.to_session(sid, |q| q.readback(req, status, rect, lease)),
+            }
+        }
+        for ((sid, index), pipe) in &mut self.pipe {
+            let epoch = pipe.state.epoch.load(Ordering::Acquire);
+            if epoch == pipe.epoch {
+                continue;
+            }
+            pipe.epoch = epoch;
+            let id = Id::new(*index, pipe.gen);
+            let Some(s) = world.session_mut(*sid) else { continue };
+            if !pipe.announced {
+                pipe.announced = true;
+                s.pipelines_pending = s.pipelines_pending.saturating_sub(1);
+            }
+            if let Some(e) = pipe.state.failure() {
+                eprintln!("[hal-d3d11] pipeline {id:?} failed: {}", e.lines().next().unwrap_or(""));
+                // D3D11 can't ask the apps for room, so `step` builds it again until some frees up
+                if pipe.state.out_of_memory() && !self.dev.check_lost() && !self.starved.iter().any(|st| Arc::ptr_eq(&st.failed, &pipe.state)) {
+                    eprintln!("[hal-d3d11] `{}` ran out of memory; building it again until it fits", pipe.state.src.name);
+                    self.starved.push(Starved { failed: pipe.state.clone(), next: None, retry_ns: crate::clock_ns() + STARVED_RETRY_NS });
+                }
+                let log = e.to_owned();
+                world.to_session(*sid, |q| q.pipeline_failed(id, log.as_bytes()));
+            } else if pipe.state.ready().is_some() {
+                world.to_session(*sid, |q| q.pipeline_ready(id));
+            }
+        }
+        self.announce_compute(world);
+        let now = crate::clock_ns();
+        if now >= self.counted_at {
+            self.counted_at = now + COUNT_NS;
+            self.leases.trim(now);
+            self.device_bytes = self.dev.usage();
+        }
+        let device = self.device_bytes;
+        if let Some(host) = world.session_mut(HOST) {
+            let frame = host.frame;
+            host.ledger.set_pools(&self.dev.pools, frame, now);
+        }
+        // a window's row: its retained image and its swapchain's back buffers
+        for ((sid, index), t) in &self.win {
+            let id = Id::new(*index, t.gen);
+            let back = self.chains.back_buffers((*sid, id));
+            if *sid != HOST && back.is_none() { continue; }
+            let Some(owner) = world.session_mut(*sid) else { continue };
+            let (back_bytes, back_count) = back.unwrap_or_default();
+            let (bytes, objects) = (t.tex.bytes + back_bytes, 1 + back_count as u64);
+            if owner.ledger.get(Kind::Window, *index).is_none_or(|r| r.gen != t.gen || r.bytes != bytes || r.objects != objects
+                || r.width != t.tex.desc.w || r.height != t.tex.desc.h) {
+                let mut row = window_row(id, &t.tex, now, owner.frame);
+                row.bytes = bytes;
+                row.objects = objects;
+                owner.ledger.add(row);
+            }
+        }
+        for sid in world.session_ids() {
+            if let Some(s) = world.session_mut(sid) {
+                s.ledger.device_allocated = device;
+            }
+        }
+    }
+}
+
+impl Backend for D3d11 {
+    /// Complete once submitted: a shared texture's keyed mutex, released at the end of the pass
+    /// that drew it, orders the reader's GPU use after it.
+    fn frame_completion(&mut self, _session: u32, _notify: std::sync::Arc<dyn Fn() + Send + Sync>) -> Result<crate::completion::Completion, String> {
+        Ok(crate::completion::Completion::done())
+    }
+    fn info(&self) -> HalInfo {
+        self.info
+    }
+    /// The process ends next: the open batch is handed on, the HLSL compilers and the
+    /// completion thread (GPU event waits, readback maps) run out and are joined.
+    fn before_exit(&mut self) {
+        let batch = std::mem::take(&mut self.batch);
+        self.complete.submit(batch);
+        self.compilers.stop();
+        self.complete.stop();
+        // No receiver remains: dropping completion guards queues their unmaps here.
+        drop(self.mailbox.take());
+        leases::drain();
+    }
+    fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) {
+        self.recover(world);
+        self.drain(world);
+        exec::submit(self, world, sid, view);
+    }
+    fn host_gpu(&mut self) -> Option<&mut dyn Gpu> {
+        Some(self)
+    }
+    fn step(&mut self, world: &mut World, sid: u32) {
+        self.recover(world);
+        // A program that ran out of memory is built again until a build fits. Its pipelines move
+        // to that build, and the `drain` below tells them how it went.
+        if !self.starved.is_empty() && !self.dev.check_lost() {
+            let now = crate::clock_ns();
+            for mut st in std::mem::take(&mut self.starved) {
+                // no pipeline uses it anymore
+                if Arc::strong_count(&st.failed) == 1 {
+                    continue;
+                }
+                match st.next.take() {
+                    None if now < st.retry_ns => {}
+                    None => {
+                        let next = PipeState::new(st.failed.src.clone());
+                        self.compile(&next);
+                        st.next = Some(next);
+                    }
+                    Some(next) => match next.program.get() {
+                        None => st.next = Some(next),
+                        Some(_) if next.out_of_memory() => st.retry_ns = now + STARVED_RETRY_NS,
+                        Some(_) => {
+                            for pipe in self.pipe.values_mut().filter(|p| Arc::ptr_eq(&p.state, &st.failed)) {
+                                pipe.state = next.clone();
+                                pipe.epoch = 0;
+                            }
+                            self.programs.entry(next.src.hash_key()).or_default().push(Arc::downgrade(&next));
+                            continue;
+                        }
+                    },
+                }
+                self.starved.push(st);
+            }
+        }
+        self.drain(world);
+        if let Some(shell) = self.shell {
+            for (owner, id) in shell.drain_events(sid, world) {
+                let host = self.aliases.get(&(owner, id)).copied();
+                let key = self.window_key(owner, id);
+                self.window_closed(key.0, key.1);
+                let _ = world.release_window(owner, id);
+                if let Some(host) = host {
+                    self.aliases.retain(|_, parent| *parent != host);
+                    let _ = world.release_window(HOST, host);
+                    world.to_session(HOST, |q| q.closed(host));
+                }
+            }
+        }
+        if let Some(s) = world.session_mut(sid) {
+            self.media.step(&mut super::media::Sink { dev: &self.dev, tex: &mut self.tex, now: crate::clock_ns() }, s);
+        }
+        exec::step_timers(world, sid);
+    }
+    fn next_due(&self, world: &World, sid: u32) -> Option<u64> {
+        // timers, and the next build of a program that ran out of memory
+        let retry = self.starved.iter().filter(|st| st.next.is_none()).map(|st| st.retry_ns).min();
+        exec::next_timer(world, sid).into_iter().chain(retry).min()
+    }
+    fn session_closed(&mut self, world: &mut World, sid: u32) {
+        if let Some(shell) = self.shell {
+            self.chains.close_session(shell, sid);
+        }
+        self.media.session_closed(sid);
+        self.tex.retain(|k, _| k.0 != sid);
+        self.buf.retain(|k, _| k.0 != sid);
+        self.pipe.retain(|k, _| k.0 != sid); self.compute.retain(|k, _| k.0 != sid);
+        self.win.retain(|k, _| k.0 != sid);
+        self.segments.retain(|k, _| k.0 != sid);
+        self.segment_depths.retain(|k, _| k.0 != sid);
+        self.over_budget.retain(|k| k.0 != sid);
+        self.native_fallback.retain(|k| k.0 != sid);
+        if sid == HOST { self.badged.clear(); }
+        self.aliases.retain(|k, _| k.0 != sid);
+        self.pick_pending.retain(|k| k.0 != sid);
+        self.programs.retain(|_, list| {
+            list.retain(|w| w.strong_count() > 0);
+            !list.is_empty()
+        });
+        exec::free_session(world, sid);
+        if let Some(shell) = self.shell {
+            shell.session_closed(sid);
+        }
+    }
+    fn window_pixels(&mut self, world: &mut World, sid: u32, window: Option<Id>) -> Option<Pixels> {
+        self.host_window_pixels(world, sid, window)
+    }
+    fn simulate_device_loss(&mut self) {
+        self.simulate = true;
+    }
+}
+
+impl exec::DeviceReset for D3d11 {
+    fn replace_device(&mut self, world: &mut World) -> Result<(), String> {
+        let dev = Device::new()?;
+        let cb_arena = Arena::new(&dev, 256 * 1024, true)?;
+        let word_arena = Arena::new(&dev, 256 * 1024, false)?;
+        let complete = Completion::new(dev.clone(), self.mailbox.clone())?;
+        // the old device's work: its completion thread answers what was submitted (readbacks and
+        // picks as failed, frames as finished) and ends; then those answers are delivered
+        self.dev.lost.store(true, Ordering::Release);
+        let batch = std::mem::take(&mut self.batch);
+        self.complete.submit(batch);
+        drop(std::mem::replace(&mut self.complete, complete));
+        self.drain(world);
+        if let Some(shell) = self.shell {
+            self.chains.clear(shell);
+            if std::mem::take(&mut self.dcomp_reset) {
+                for (key, visual) in dcomp::replace_device() {
+                    shell.web_view_retarget(key, visual);
+                }
+            }
+        }
+        self.tex.clear();
+        self.buf.clear();
+        self.win.clear();
+        self.segments.clear();
+        self.segment_depths.clear();
+        for composed in self.badged.values_mut() { *composed = None; }
+        self.pick_pending.clear();
+        self.captures.clear();
+        self.acquired.clear();
+        self.fallback.clear();
+        self.media.device_reset(world);
+        self.cb_arena = cb_arena;
+        self.word_arena = word_arena;
+        self.leases = leases::Pool::new(dev.clone(), self.mailbox.wake.clone());
+        self.dev = dev;
+        self.info.working_set = self.dev.budget().map_or(0, |b| b.0);
+        crate::gpu_limits::set_gpu_working_set_bytes(self.info.working_set);
+        Ok(())
+    }
+
+    fn rebuild_pipelines(&mut self, world: &mut World) {
+        let kernels: Vec<_> = self.compute.iter().map(|(key, pipe)| (*key, pipe.gen, pipe.announced)).collect();
+        self.compute.clear();
+        for ((sid, index), gen, announced) in kernels {
+            let Some(s) = world.session_mut(sid) else { continue; };
+            let id = Id::new(index, gen);
+            let Ok(entry) = s.pipelines.get(sid, id) else { continue; };
+            let bytes = entry.val.blob.clone();
+            let Some(blob) = PipelineBlob::parse(&bytes) else { continue; };
+            if announced { s.pipelines_pending += 1; }
+            if let PipeStatus::Failed(error) = self.create_compute(s, id, &blob) {
+                s.pipelines_pending = s.pipelines_pending.saturating_sub(1);
+                s.events.pipeline_failed(id, error.as_bytes());
+            }
+        }
+        self.programs.clear();
+        // every program is built again below, the ones that ran out of memory too
+        self.starved.clear();
+        let mut rebuilt: HashMap<*const PipeState, Arc<PipeState>> = HashMap::new();
+        let keys: Vec<(u32, u32)> = self.pipe.keys().copied().collect();
+        for key in keys {
+            let old = self.pipe[&key].state.clone();
+            let state = match rebuilt.get(&Arc::as_ptr(&old)) {
+                Some(st) => st.clone(),
+                None => {
+                    let st = PipeState::new(old.src.clone());
+                    self.compile(&st);
+                    self.programs.entry(st.src.hash_key()).or_default().push(Arc::downgrade(&st));
+                    rebuilt.insert(Arc::as_ptr(&old), st.clone());
+                    st
+                }
+            };
+            let pipe = self.pipe.get_mut(&key).expect("listed above");
+            pipe.state = state;
+            pipe.epoch = 0;
+            // pending again until the new program answers
+            if std::mem::replace(&mut pipe.announced, false) {
+                if let Some(s) = world.session_mut(key.0) {
+                    s.pipelines_pending += 1;
+                }
+            }
+        }
+    }
+}
+
+impl Gpu for D3d11 {
+    /// Web layers are system web views hosted in composition mode on the shell thread: their
+    /// visuals are made here (the window tree places them per frame), their content there.
+    fn native_layer(&mut self, _world: &mut World, sid: u32, command: &crate::cmds::HalCmd) -> bool {
+        use crate::cmds::HalCmd;
+        use crate::native_layer::{kind, mode, state};
+        let Some(shell) = self.shell else { return false };
+        match *command {
+            HalCmd::NativeLayerCreate { id, kind: kind::WEB, params } => {
+                match dcomp::native_create((sid, id)) {
+                    Ok(visual) => shell.web_view_create((sid, id), params.to_vec(), visual),
+                    Err(e) => {
+                        eprintln!("[hal-d3d11] web layer {id:?}: REALIZED UNSUPPORTED: {e}");
+                        shell.push((sid, id), |q, id| q.native_layer_state(id, state::REALIZED, mode::UNSUPPORTED, 0, e.as_bytes()));
+                    }
+                }
+                true
+            }
+            HalCmd::NativeLayerOp { id, op, arg, data } if dcomp::native_known((sid, id)) => {
+                shell.web_view_op((sid, id), op, arg, data.to_vec());
+                true
+            }
+            HalCmd::NativeLayerDestroy { id } => {
+                if dcomp::native_known((sid, id)) {
+                    self.chains.native_destroyed((sid, id));
+                    shell.web_view_destroy((sid, id));
+                }
+                self.over_budget.remove(&(sid, id));
+                // the executor answers CLOSED for every native content kind
+                false
+            }
+            _ => false,
+        }
+    }
+    fn a11y_prepare(&mut self, window: u64, update: &makepad_a11y::TreeUpdate) {
+        if self.shell.is_some() { self.a11y_update = Some(win32::a11y::prepare(window, update)); }
+    }
+    fn a11y_notify(&mut self, window: u64, notifications: &[makepad_a11y::Notification]) {
+        if let (Some(shell), Some(update)) = (self.shell, self.a11y_update.take()) { win32::a11y::queue(shell, window, update, notifications); }
+    }
+
+    fn media(&mut self, s: &mut Session, c: &crate::cmds::HalCmd) -> bool {
+        self.media.command(&mut super::media::Sink { dev: &self.dev, tex: &mut self.tex, now: crate::clock_ns() }, s, c)
+    }
+    fn gpu_budget(&self) -> Option<(u64, u64)> {
+        self.dev.budget()
+    }
+
+    fn badges(&self) -> bool { true }
+    fn layer_copy(&mut self, s: &mut Session, window: Id, layer: Id, _now: u64) -> bool { self.copy_into_layer(s, window, layer) }
+    fn badge_layer(&mut self, window: Id, on: bool) {
+        if on { self.badged.entry(window.index).or_insert(None); } else { self.badged.remove(&window.index); }
+    }
+
+    fn os(&mut self, sid: u32, command: exec::OsCmd) -> bool {
+        match self.shell {
+            Some(shell) => shell.command(sid, command),
+            None => false,
+        }
+    }
+
+    fn texture_create(&mut self, s: &mut Session, id: Id, t: &mut TextureObj) -> Result<(), String> {
+        let tex = Texture::new(self.dev.clone(), t.clone()).map_err(|e| {
+            eprintln!("[hal-d3d11] texture create: {e}");
+            e
+        })?;
+        t.bytes = tex.bytes;
+        self.tex.insert((s.id, id.index), Tex { gen: id.gen, tex });
+        Ok(())
+    }
+    fn texture_update(&mut self, s: &mut Session, id: Id, _t: &TextureObj, mip: u16, rect: [u32; 4], layer: u32, data: &[u8]) {
+        if let Err(e) = self.upload(s, id, mip, rect, layer, data) {
+            eprintln!("[hal-d3d11] texture upload: {e}");
+            s.bad();
+        }
+    }
+    fn texture_destroy(&mut self, sid: u32, id: Id) {
+        if self.tex.get(&(sid, id.index)).is_some_and(|t| t.gen <= id.gen) {
+            self.tex.remove(&(sid, id.index));
+        }
+        self.pick_pending.remove(&(sid, id));
+    }
+    fn texture_readback(&mut self, s: &mut Session, id: Id, req: u32, rect: [u32; 4]) {
+        if self.pick_pending.contains(&(s.id, id)) {
+            s.events.readback(req, crate::types::readback::INCOMPLETE, rect, None);
+            return;
+        }
+        let t = self.resolve(s, id);
+        self.read(s, t, req, rect);
+    }
+    fn texture_share(&mut self, s: &mut Session, id: Id) {
+        let key = self.tex.get(&(s.id, id.index)).filter(|t| t.gen == id.gen).and_then(|t| t.tex.shared.as_ref()).map_or(0, |sh| sh.key);
+        s.events.texture_shared(id, key);
+    }
+    fn texture_import(&mut self, s: &mut Session, id: Id, handle: u64, kind: u32) -> Option<TextureObj> {
+        if kind != texture_handle::NATIVE || handle == 0 {
+            return None;
+        }
+        let tex = Texture::import(self.dev.clone(), handle).map_err(|e| eprintln!("[hal-d3d11] import: {e}")).ok()?;
+        let desc = tex.desc.clone();
+        self.tex.insert((s.id, id.index), Tex { gen: id.gen, tex });
+        Some(desc)
+    }
+    fn buffer_create(&mut self, s: &mut Session, id: Id, b: &mut BufferObj) -> Result<(), String> {
+        let buf = Buffer::new(self.dev.clone(), b.kind, b.size)?;
+        // A retained buffer reads as zero where nothing wrote it, as on Vulkan and Metal. D3D11
+        // leaves a new buffer's bytes undefined (the driver hands out memory the process freed),
+        // so a storage buffer is cleared on the GPU here; the other kinds are read only where
+        // uploaded (a uniform buffer is written whole).
+        if let Some(uav) = &buf.uav { unsafe { self.dev.ctx.ClearUnorderedAccessViewUint(uav, &[0; 4]) } }
+        b.bytes = buf.bytes;
+        self.buf.insert((s.id, id.index), Buf { gen: id.gen, buf, evictable: b.evictable });
+        Ok(())
+    }
+    fn buffer_update(&mut self, s: &mut Session, id: Id, b: &mut BufferObj, off: u64, data: &[u8]) {
+        match self.buf.get(&(s.id, id.index)).filter(|r| r.gen == id.gen) {
+            Some(r) => {
+                r.buf.write(off, data);
+                b.bytes = r.buf.bytes;
+            }
+            None => {
+                eprintln!("[hal-d3d11] buffer update: missing buffer {id:?}");
+                s.bad();
+            }
+        }
+    }
+    fn buffer_readbacks(&mut self, s: &mut Session, req: u32, ranges: &[BufferReadRange]) { self.read_compute_buffers(s, req, ranges); }
+    fn buffer_destroy(&mut self, sid: u32, id: Id) {
+        if self.buf.get(&(sid, id.index)).is_some_and(|b| b.gen <= id.gen) {
+            self.buf.remove(&(sid, id.index));
+        }
+    }
+    fn buffer_evictable(&mut self, sid: u32, id: Id) {
+        if let Some(b) = self.buf.get_mut(&(sid, id.index)).filter(|b| b.gen == id.gen) {
+            b.evictable = true;
+        }
+    }
+    fn pipeline_create(&mut self, s: &mut Session, id: Id, dialect: u32, blob: &PipelineBlob, _: Attr) -> PipeStatus {
+        if dialect != self::dialect::HLSL {
+            return PipeStatus::Failed("D3D11 takes the HLSL payload".into());
+        }
+        if blob.desc.compute.len != 0 { return self.create_compute(s, id, blob); }
+        let code = match HlslPipeline::decode(blob.code) {
+            Ok(c) => c,
+            Err(e) => return PipeStatus::Failed(e),
+        };
+        let src = PipeSrc {
+            code,
+            desc: blob.desc,
+            bindings: blob.bindings.clone(),
+            layout: blob.vertex_layout.clone(),
+            storage: crate::compute::records(blob.raw, blob.desc.storage_buffers).unwrap_or_default(),
+            name: s.string(blob.desc.name).unwrap_or("").to_owned(),
+        };
+        let key = src.hash_key();
+        let shared = self.programs.get(&key).and_then(|v| v.iter().filter_map(Weak::upgrade).find(|p| p.src.same_program(&src)));
+        let state = shared.unwrap_or_else(|| {
+            let state = PipeState::new(Arc::new(src));
+            self.compile(&state);
+            let list = self.programs.entry(key).or_default();
+            list.retain(|w| w.strong_count() > 0);
+            list.push(Arc::downgrade(&state));
+            state
+        });
+        self.pipe.insert((s.id, id.index), Pipe { gen: id.gen, state, epoch: 0, announced: false });
+        PipeStatus::Pending
+    }
+    fn pipeline_wanted(&mut self, sid: u32, id: Id) {
+        if let Some(p) = self.pipe.get(&(sid, id.index)).filter(|p| p.gen == id.gen) {
+            self.compilers.hurry(Arc::as_ptr(&p.state) as usize);
+        } else if let Some(p) = self.compute.get(&(sid, id.index)).filter(|p| p.gen == id.gen) {
+            self.compilers.hurry(p.compile_key());
+        }
+    }
+    fn pipeline_destroy(&mut self, sid: u32, id: Id) -> bool {
+        if self.compute.get(&(sid, id.index)).is_some_and(|p| p.gen <= id.gen) { return self.compute.remove(&(sid, id.index)).is_some_and(|p| !p.announced); }
+        if self.pipe.get(&(sid, id.index)).is_some_and(|p| p.gen <= id.gen) {
+            return self.pipe.remove(&(sid, id.index)).is_some_and(|p| !p.announced);
+        }
+        false
+    }
+    fn frame(&mut self, s: &mut Session, sid: u32, target: Id, kind: u32, packet: u32, view: &CmdView, now: u64) -> Option<exec::SubmittedFrame> {
+        self.encode_frame(s, sid, target, kind, packet, view, now)
+    }
+    fn snapshot(&mut self, s: &mut Session, window: Id, req: u32) {
+        let t = self.window_image(s, window);
+        let rect = t.as_ref().map_or([0; 4], |t| [0, 0, t.desc.w, t.desc.h]);
+        self.read(s, t, req, rect);
+    }
+    fn window_copy(&mut self, s: &mut Session, window: Id, texture: Id, req: u32) {
+        self.copy_window(s, window, texture, req);
+    }
+    fn window_closed(&mut self, sid: u32, id: Id) {
+        self.win.remove(&(sid, id.index));
+        self.segments.retain(|k, _| (k.0, k.1) != (sid, id.index));
+        self.segment_depths.retain(|k, _| (k.0, k.1) != (sid, id.index));
+        self.native_fallback.remove(&(sid, id));
+        if sid == HOST { self.badged.remove(&id.index); }
+        if let Some(shell) = self.shell {
+            self.chains.remove(shell, (sid, id));
+        }
+    }
+    fn window_lent(&mut self, sid: u32, id: Id, host: Id, attach: bool) {
+        if let Some(shell) = self.shell {
+            shell.lend(host, if attach { sid } else { HOST }, if attach { id } else { host });
+        }
+        if attach {
+            self.aliases.insert((sid, id), host);
+        } else {
+            self.aliases.remove(&(sid, id));
+        }
+    }
+}
+
+fn window_row(id: Id, t: &Texture, now: u64, frame: u64) -> LedgerEntry {
+    LedgerEntry {
+        kind: Kind::Window,
+        detail: "window surface",
+        index: id.index,
+        gen: id.gen,
+        bytes: t.bytes,
+        format: t.desc.format,
+        width: t.desc.w,
+        height: t.desc.h,
+        mips: 1,
+        attr: Attr::default(),
+        created_ns: now,
+        created_frame: frame,
+        last_used_frame: frame,
+        last_used_ns: now,
+        objects: 1,
+        note: "",
+    }
+}

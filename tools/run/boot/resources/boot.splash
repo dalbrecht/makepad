@@ -1,0 +1,637 @@
+// Phone-first session-0 document. All dimensions are logical points: Android
+// dp = pixels / (densityDpi / 160), desktop points = pixels / backing scale.
+// The host supplies real work, measured phase durations and the shell environment.
+use mod.pod.*
+use mod.math.*
+use mod.shader.*
+
+let rounded = fn(p: vec2, size: vec2, radius: float) -> float {
+    let q = abs(p - size * 0.5) - size * 0.5 + vec2(radius)
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius
+}
+// A triangular dither of +-1 step of an 8-bit target (two taps of interleaved gradient noise at
+// pixel `px`), added to every smooth gradient before the target quantises it: no bands at 8 bpp.
+let dither = fn(px: vec2) -> float {
+    let k = vec2(0.06711056, 0.00583715)
+    let a = fract(52.9829189 * fract(dot(px, k)))
+    let b = fract(52.9829189 * fract(dot(px.yx + vec2(47.0, 19.0), k)))
+    return (a + b - 1.0) / 255.0
+}
+// ---- the Ignition Field: every star, dust grain and flare is one instance of one pipeline.
+// Instance: rect = (angle, radius, size, born), info = (kind, 0, glint + 1, seed); a dust grain:
+// rect = (angle, radius, size, the radius it warps to), info = (kind, its warp's start, the turn
+// to its place on an arm, seed).
+// kinds: 0 star, 1 dust, 2 O3 star, 3 the disk (core, arm glow, dust lanes, the source ring's
+// haze), 4 swap ring, 5 corner brackets (halted only), 6 backdrop, 7 warm-up arc. Angles are
+// before the turn, radii in disk radii; view = (centre x, centre y, radius in points, the disk's
+// reach). One radius for both axes: the galaxy is round at any window size and dpi. The spiral
+// is field.rs's: an arm at base angle b runs along a = b - 2.3 ln(r / 0.08). Light is added
+// (alpha 0 over the premultiplied target). The field opens on scattered dust that warps in place
+// into the spiral over about 1.5 s (each grain eases along a short curve to its arm while the disk
+// starts turning). A star arrives with a brief brighter twinkle; a compile glints its star (info.z:
+// that moment + 1, 0: never); `glitter` (field_fall.z, 0..1: the install rate) adds a capped
+// shimmer while the compile is busy. Colours: a warm core, white to blue arms on the deep field bg #08060f; O3 gold
+// #ffcf6a; failure ember #ff7a5c. A halted field (`fault` 1: compile errors, a parked panic)
+// stops turning, its stars cool to dim and the core glows ember.
+let hash21 = fn(p: vec2) -> float {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453)
+}
+let vnoise = fn(p: vec2) -> float {
+    let i = floor(p)
+    let f = fract(p)
+    let u = f * f * (vec2(3.0) - 2.0 * f)
+    let a = hash21(i)
+    let b = hash21(i + vec2(1.0, 0.0))
+    let c = hash21(i + vec2(0.0, 1.0))
+    let e = hash21(i + vec2(1.0, 1.0))
+    return mix(mix(a, b, u.x), mix(c, e, u.x), u.y)
+}
+// the turn at radius r: the inner disk turns faster (2.3x at the core), the arms nearly as one
+let turn = fn(r: float, spin: float) -> float {
+    return spin * (1.0 + 1.3 * exp(-5.0 * r))
+}
+// where (a, r) (before the turn) lies across the arms: 0 and pi on the main arms' ridges
+let arm_phase = fn(a: float, r: float) -> float {
+    return a + 2.3 * log(max(r, 0.02) / 0.08)
+}
+// a dust lane along the inner edge of each main arm, in the disk's middle
+let lane = fn(psi: float, r: float) -> float {
+    let l = pow(0.5 + 0.5 * cos(2.0 * (psi + 0.38)), 7.0)
+    return l * smoothstep(0.06, 0.2, r) * (1.0 - smoothstep(0.5, 0.95, r))
+}
+let project = fn(a: float, r: float, view: vec4, spin: float) -> vec2 {
+    let t = a + turn(r, spin)
+    return view.xy + vec2(cos(t), sin(t)) * r * view.z
+}
+// a soft round dot of sigma s points: below about a pixel it shrinks in brightness, not width,
+// so small stars stay smooth instead of aliasing
+let dot_px = fn(d: vec2, s: float, dp: float) -> float {
+    let sp = max(s * dp, 0.7)
+    let k = s * dp / sp
+    let q = length(d) * dp / sp
+    return exp(-0.5 * q * q) * k * k
+}
+// four soft rays of length l points
+let rays = fn(d: vec2, l: float, dp: float) -> float {
+    let x = exp(-abs(d.y) * dp * 1.5) * max(0.0, 1.0 - abs(d.x) / max(l, 0.01))
+    let y = exp(-abs(d.x) * dp * 1.5) * max(0.0, 1.0 - abs(d.y) / max(l, 0.01))
+    return x + y
+}
+let star_px = fn(d: vec2, size: float, r: float, seed: float, age: float, twinkle: float, time: float, calm: float, shade: float, scale: float, dp: float, fault: float, glitter: float) -> vec4 {
+    let h1 = fract(seed * 7.31 + 0.13)
+    let h2 = fract(seed * 13.7 + 0.41)
+    let h3 = fract(seed * 29.3 + 0.77)
+    let s = size * scale * 0.42
+    // the few large stars: a faint halo and four short rays
+    let big = smoothstep(1.5, 2.6, size)
+    // a gentle twinkle, each star at its own pace, a little deeper while the compile is busy
+    let tw = 1.0 - calm * (0.22 + 0.14 * glitter) * (0.5 + 0.5 * sin(time * (0.9 + 1.8 * h2) + h3 * 6.2831853))
+    // the busy shimmer: now and then a star sparks for a tenth of a second, each at its own slow
+    // pace (under one a second), so the galaxy glitters without ever flashing as one
+    let spark = pow(0.5 + 0.5 * sin(time * (2.2 + 3.0 * h1) + h2 * 40.0), 24.0) * glitter * calm * 0.8
+    // arrival: fades in over 0.3 s into a brief brighter twinkle that settles over about a
+    // second; softer when thousands arrive at once, so a burst never flashes the disk
+    let x = max(age, 0.0) / 0.3
+    let arrive = x * exp(1.0 - x) * (0.85 - 0.4 * glitter) * (1.0 - fault)
+    let birth = smoothstep(0.0, 0.3, age) + arrive
+    let light = dot_px(d, s, dp) + big * (rays(d, s * 9.0, dp) * 0.14 + exp(-length(d) / max(s * 3.5, 0.5)) * 0.08) + rays(d, s * 6.0, dp) * 0.1 * (arrive + spark)
+    // a compile's glint: a brief brightening towards white
+    let g = clamp(1.0 - twinkle / 0.5, 0.0, 1.0) * step(0.0, twinkle) * (1.0 - fault)
+    let lum = (0.3 + 0.7 * h1 * h1) * tw * birth * shade * (1.0 + 2.2 * g * g) * (1.0 + spark)
+    // warm in the bulge, white to blue outward, a few young blue giants and pink knots on the arms
+    let warm = mix(#ffd2a1, #fff2e3, smoothstep(0.04, 0.3, r))
+    let cool = mix(#fff2e3, #9db8ff, smoothstep(0.12, 0.6, r) * (0.6 + 0.4 * h2))
+    var c = mix(warm, cool, smoothstep(0.12, 0.4, r)).rgb
+    c = mix(c, #8fb0ff.rgb, step(0.9, h3) * smoothstep(0.25, 0.5, r))
+    c = mix(c, #ff9ccf.rgb, step(0.975, h2) * smoothstep(0.3, 0.5, r))
+    c = mix(c, #ffffff.rgb, max(g, 0.4 * max(arrive, spark)))
+    c = mix(c, #8a7fb8.rgb * 0.6, fault)
+    return vec4(c * light * lum, 0.0)
+}
+// a grain of source dust: faint and cool where it starts, taking the disk's colours as it warps
+// onto its arm (u: 0 scattered, 1 in place) at the same light, the dust lanes dimming it there
+let dust_px = fn(d: vec2, size: float, u: float, r: float, seed: float, time: float, fade: float, shade: float, scale: float, dp: float) -> vec4 {
+    let light = dot_px(d, 0.5 * size * scale, dp)
+    let a = 1.1 * fade * smoothstep(0.0, 0.35, time) * (0.85 + 0.15 * sin(time * 1.3 + seed * 40.0)) * mix(1.0, shade, u)
+    let place = mix(#ffd2a1, #a9bfff, smoothstep(0.1, 0.7, r))
+    let c = mix(#9890e0, place, u)
+    return vec4(c.rgb * light * a, 0.0)
+}
+let o3_px = fn(d: vec2, age: float, scale: float, dp: float, fault: float) -> vec4 {
+    let f = clamp(1.0 - age / 0.8, 0.0, 1.0) * (1.0 - fault)
+    let core = dot_px(d, 0.55 * scale, dp)
+    let ray = rays(d, (5.0 * f + 2.0) * scale, dp) * (0.15 + 0.45 * f)
+    let halo = exp(-length(d) / (2.5 * scale)) * 0.25 * f
+    let c = #ffcf6a * (core * 0.9 + ray + halo) * (1.0 - 0.6 * fault)
+    return vec4(c.rgb, 0.0)
+}
+// the disk: the core's glow (lit by the dust the parse brings in, swelling when main() starts),
+// the arms' diffuse light out to the reach with dust lanes along them; a halted field glows ember
+// at its core
+let disk_px = fn(d: vec2, view: vec4, spin: float, parsed: float, main_age: float, fault: float, px: vec2) -> vec4 {
+    let p = d / max(view.z, 1.0)
+    let r = length(p)
+    let a = atan2(p.y, p.x) - turn(r, spin)
+    let psi = arm_phase(a, r)
+    let arms = max(pow(0.5 + 0.5 * cos(2.0 * psi), 3.0), pow(0.5 + 0.5 * cos(2.0 * psi - 3.1415927), 6.0) * 0.45)
+    // turbulence that turns with the disk
+    let q = vec2(cos(a), sin(a)) * r
+    let n = vnoise(q * 7.0) * 0.6 + vnoise(q * 19.0 + vec2(5.2, 1.3)) * 0.4
+    let reach = view.w
+    let inside = 1.0 - smoothstep(reach - 0.25, reach + 0.05, r)
+    let grown = clamp((reach - 0.18) / 0.8, 0.0, 1.0)
+    let dust = lane(psi, r) * (0.55 + 0.45 * n) * inside
+    let glow = exp(-r / 0.45) * (0.18 + 0.82 * arms) * (0.45 + 0.55 * n) * inside * (0.25 + 0.75 * grown)
+    let disk_c = mix(#ffc890, #5f7fff, smoothstep(0.05, 0.55, r)) * glow * 0.6
+    let parse = clamp(parsed, 0.0, 1.0)
+    let swell = step(0.0, main_age) * 0.6 * exp(-2.0 * max(main_age, 0.0))
+    let rc = r / 0.045
+    let core = (exp(-rc * rc) + 0.25 * exp(-r / 0.09)) * (0.12 + 0.88 * parse + swell)
+    let core_c = mix(#fff4e2, #ffbe78, smoothstep(0.0, 0.16, r)) * core
+    var c = (disk_c.rgb + core_c.rgb) * (1.0 - 0.75 * dust)
+    let e = exp(-r / 0.25)
+    c = mix(c, c * 0.35 + mix(#ff7a5c, #ffd2c4, e * e).rgb * e * 0.6, fault)
+    // nothing at the quad's edge
+    c = c * (1.0 - smoothstep(1.15, 1.38, r))
+    return vec4(c + vec3(dither(px) * step(0.0005, c.r + c.g + c.b)), 0.0)
+}
+let ring_px = fn(d: vec2, swap_age: float, view: vec4, px: vec2) -> vec4 {
+    let f = clamp(swap_age, 0.0, 1.0)
+    let rr = view.z * (0.9 + f * 0.6)
+    let dist = abs(length(d) - rr)
+    let a = clamp(1.0 - (dist - 0.75) / 0.75, 0.0, 1.0) * (1.0 - f) * 0.5 * step(0.0, swap_age)
+    let c = #ece6ff * a
+    return vec4(c.rgb + vec3(dither(px) * step(0.0001, a)), 0.0)
+}
+// the warm-up arc around the galaxy: the share of the functions queued to build ahead after the
+// first present that are built, from the top clockwise over a faint track; at `resolve` >= 0 (s
+// since the app is ready) it closes, flares and widens away
+let arc_px = fn(d: vec2, view: vec4, progress: float, resolve: float, dp: float, px: vec2) -> vec4 {
+    let r = clamp(resolve, 0.0, 1.0) * step(0.0, resolve)
+    let rr = view.z * (1.16 + 0.10 * r * r)
+    let dist = abs(length(d) - rr)
+    let line = clamp(1.0 - (dist * dp - 0.6) / 1.2, 0.0, 1.0)
+    let soft = clamp(1.0 - dist / 7.0, 0.0, 1.0)
+    let f = fract(atan2(d.x, 0.0 - d.y) / 6.2831853 + 1.0)
+    let p = max(progress, r * 4.0)
+    let done = clamp((p - f) * 400.0, 0.0, 1.0)
+    let head = clamp(1.0 - abs(f - p) * 30.0, 0.0, 1.0) * (1.0 - step(1.0, p))
+    let flare = (1.0 - r) * step(0.0, resolve)
+    let a = (line * (0.10 + 0.62 * done + 0.28 * head) + soft * soft * (0.10 * head + 0.35 * flare * done)) * (1.0 - r * r) * step(0.0, progress)
+    let c = mix(#9d8cff, #ece6ff, max(head, flare)) * a
+    return vec4(c.rgb + vec3(dither(px) * step(0.0001, a)), 0.0)
+}
+// corner brackets of the halted view's frame (half size `half`), ember
+let brackets_px = fn(d: vec2, half: vec2, dp: float, fault: float) -> vec4 {
+    let e = half - vec2(10.0) - abs(d)
+    let l = 16.0
+    let ex = length(vec2(e.x - clamp(e.x, 0.0, l), e.y))
+    let ey = length(vec2(e.x, e.y - clamp(e.y, 0.0, l)))
+    let a = clamp((0.5 - min(ex, ey)) * dp + 0.5, 0.0, 1.0) * 0.8 * fault
+    let c = #ff7a5c * a
+    return vec4(c.rgb, 0.0)
+}
+// the deep field behind everything: a faint haze around the galaxy (ember when halted), rounded
+// to `corner` points (0: the halted view takes the whole window, over the app too); dithered, it
+// is the one large gradient of the window
+let backdrop_px = fn(d: vec2, half: vec2, rel: vec2, view: vec4, fault: float, corner: float, dp: float, px: vec2) -> vec4 {
+    let q = length(rel) / max(view.z * 1.7, 1.0)
+    let h = exp(-2.4 * q * q)
+    let haze = mix(#150f2c, #2a0d12, fault) * h
+    let c = #08060f + haze
+    let cover = clamp(0.5 - rounded(d + half, half * 2.0, corner) * dp, 0.0, 1.0)
+    return vec4((c.rgb + vec3(dither(px))) * cover, cover)
+}
+// coverage of an axis-aligned square of half-size h (points) around the origin, anti-aliased at pixel scale
+let box_cov = fn(d: vec2, h: float, dp: float) -> float {
+    let q = vec2(h * dp + 0.5) - abs(d) * dp
+    return clamp(q.x, 0.0, 1.0) * clamp(q.y, 0.0, 1.0)
+}
+// coverage of a one-pixel stroke along a segment of the x axis [-l, l]
+let bar = fn(d: vec2, l: float, dp: float) -> float {
+    let e = length(vec2(d.x - clamp(d.x, -l, l), d.y))
+    return clamp((0.5 - e) * dp + 0.5, 0.0, 1.0)
+}
+// a window button of the caption, drawn as the stock caption's (widgets' DesktopButton): the
+// glyph a one-pixel line in a 9-point square, the face lit on hover and press; close lights red.
+// glyph: 0 minimise, 1 maximise / restore, 2 close
+// stock: 1 on the app's caption ground (under a makepad WM): drawn as the app's own stock
+// buttons there (widgets' window.rs `windows_buttons`): glyph in `tint` at rest, hover face
+// #e9e9e9 (pressed #cccccc) with a black glyph, close #e81123 (pressed #f1707a) with a white one.
+let caption_button_px = fn(p: vec2, s: vec2, glyph: float, hover: float, down: float, stock: float, tint: vec4, dp: float, px: vec2) -> vec4 {
+    let d = p - s * 0.5
+    let h = 4.5
+    let minimise = bar(d, h, dp)
+    let q = abs(d)
+    let outline = clamp((0.5 - abs(max(q.x, q.y) - h)) * dp + 0.5, 0.0, 1.0) * box_cov(d, h + 1.0, dp)
+    let r = vec2(d.x + d.y, d.x - d.y) * 0.70710678
+    let cross = max(bar(r, h * 1.41421356, dp), bar(vec2(r.y, r.x), h * 1.41421356, dp))
+    let close = step(1.5, glyph)
+    let g = mix(mix(minimise, outline, step(0.5, glyph)), cross, close)
+    let lit = max(hover, down)
+    let field_a = mix(mix(0.0, 0.10, hover), 0.18, down) * (1.0 - close) + mix(mix(0.0, 1.0, hover), 0.75, down) * close
+    let face_a = mix(field_a, lit, stock)
+    let face = mix(mix(#ece6ff, mix(#e9e9e9, #cccccc, down), stock), mix(#e81123, #f1707a, down), close)
+    let field_ink = mix(#ece6ff * 0.85, #ffffff, close * lit)
+    let stock_ink = mix(tint, mix(#000000, #ffffff, close), lit)
+    let ink = mix(field_ink, stock_ink, stock)
+    var col = face.rgb * face_a
+    var alpha = face_a
+    col = col * (1.0 - g) + ink.rgb * g
+    alpha = alpha * (1.0 - g) + g
+    return vec4(col + vec3(dither(px) * step(0.001, alpha)), alpha)
+}
+// a traffic light of the caption under a macOS-like window manager, drawn as the app's own
+// caption draws it there (widgets' DesktopButton MacClose / MacMin / MacMax in a 20-point
+// square): a disc of radius 6 in its colour, darker pressed, grey in a window without focus
+// unless hovered; its glyph (1.1-point strokes) shows on hover. glyph: 3 close, 4 minimise,
+// 5 maximise. focus: the window has focus. Premultiplied.
+let caption_light_px = fn(p: vec2, s: vec2, glyph: float, hover: float, down: float, focus: float, dp: float) -> vec4 {
+    let d = p - s * 0.5
+    // the soft edge of Sdf2d with `aa * 3` (widgets' DesktopButton)
+    let aa = dp * 2.12132034
+    let disc = clamp((6.0 - length(d)) * aa, 0.0, 1.0)
+    let close = 1.0 - step(3.5, glyph)
+    let maxi = step(4.5, glyph)
+    let mini = 1.0 - close - maxi
+    let lit = mix(#ff5f57, #e0443e, down) * close + mix(#febc2e, #d9a020, down) * mini + mix(#28c840, #1fa733, down) * maxi
+    let face = mix(#b5b5b5, lit, max(focus, hover))
+    let ink = #4d0000 * close + #985700 * mini + #006500 * maxi
+    let r = vec2(d.x + d.y, d.x - d.y) * 0.70710678
+    let l = 2.6 * 1.41421356
+    let cross = min(length(vec2(r.x - clamp(r.x, -l, l), r.y)), length(vec2(r.y - clamp(r.y, -l, l), r.x)))
+    let dash = length(vec2(d.x - clamp(d.x, -3.2, 3.2), d.y))
+    let plus = min(length(vec2(d.x - clamp(d.x, -3.0, 3.0), d.y)), length(vec2(d.y - clamp(d.y, -3.0, 3.0), d.x)))
+    let e = cross * close + dash * mini + plus * maxi
+    let g = clamp((1.1 - e) * aa, 0.0, 1.0) * hover
+    let col = ink.rgb * g + face.rgb * disc * (1.0 - g)
+    return vec4(col, g + disc * (1.0 - g))
+}
+// the JIT ring in the running app's caption (makepad run; ring.rs), in its 24 pt badge: a ring
+// 14 pt across that moves whenever the JIT builds. A head with a fading tail turns around it
+// (spin: its turn so far) over a faint track; under it a progress arc from the top covers `fill`
+// of the ring (0: none). mode 0: work the program waits for -- bright, a 2 pt stroke; 1:
+// background tier-up -- the same motion, dimmer and 1.6 pt (0..1 blends them); 2 / 3: the program
+// is stopped on invalidated code / a panic -- a solid amber / red dot. hover 0..1 lifts it on a
+// faint disc. ink 1: on a dark caption, 0: on a light one. a: opacity. Premultiplied. GPU-only.
+let jit_ring_px = fn(p: vec2, s: vec2, fill: float, mode: float, a: float, spin: float, hover: float, ink: float, dp: float, px: vec2) -> vec4 {
+    let d = p - s * 0.5
+    let r = length(d)
+    let dot = step(1.5, mode)
+    let back = clamp(mode, 0.0, 1.0) * (1.0 - dot)
+    // the ring's centre line and stroke
+    let rad = 6.0
+    let w = mix(2.0, 1.6, back)
+    let band = clamp((w * 0.5 - abs(r - rad)) * dp + 0.5, 0.0, 1.0)
+    // where this pixel is on the ring: turns clockwise from the top
+    let t = fract(atan2(d.x, 0.0 - d.y) / 6.2831853 + 1.0)
+    let arc_px = 6.2831853 * rad * dp
+    // the progress arc: from the top to `fill` (quiet: the head is what says busy)
+    let f = clamp(fill, 0.0, 1.0)
+    let on_fill = clamp((f - t) * arc_px + 0.5, 0.0, 1.0) * step(0.004, f)
+    // the head and its tail: full at the head, fading over `tail` turns behind it, a little
+    // wider than the stroke
+    let tail = 0.35
+    let behind = fract(fract(spin) - t + 1.0)
+    let head_in = clamp(behind * arc_px + 0.5, 0.0, 1.0)
+    let fade = clamp(1.0 - behind / tail, 0.0, 1.0)
+    let head = head_in * fade * fade
+    let head_band = clamp(((w + 0.8) * 0.5 - abs(r - rad)) * dp + 0.5, 0.0, 1.0)
+    let ink_c = mix(#2a2638, #ece6ff, ink)
+    let arc_c = mix(#5b4fd0, #b8acff, ink)
+    let head_c = mix(#4433d6, #d4ccff, ink)
+    let track_a = mix(0.10, 0.13, ink)
+    let fill_a = mix(mix(0.26, 0.3, ink), mix(0.18, 0.22, ink), back)
+    let head_a = mix(1.0, 0.8, back)
+    var col = ink_c.rgb * track_a * band
+    var alpha = track_a * band
+    let fa = band * on_fill * fill_a
+    col = col * (1.0 - fa) + arc_c.rgb * fa
+    alpha = alpha * (1.0 - fa) + fa
+    let ha = head_band * head * head_a
+    col = col * (1.0 - ha) + head_c.rgb * ha
+    alpha = alpha * (1.0 - ha) + ha
+    // the dot (replaces the ring)
+    col = col * (1.0 - dot)
+    alpha = alpha * (1.0 - dot)
+    let dot_c = mix(#f5a524, #e5484d, step(2.5, mode))
+    let disc = clamp((5.0 - r) * dp + 0.5, 0.0, 1.0) * dot
+    let rim = clamp((0.6 - abs(r - 4.6)) * dp, 0.0, 1.0) * dot * (1.0 - ink) * 0.35
+    col = col + dot_c.rgb * (1.0 - rim) * disc
+    alpha = alpha + disc
+    // the hover disc under it all
+    let lift = clamp((10.5 - r) * dp + 0.5, 0.0, 1.0) * hover * mix(0.09, 0.14, ink)
+    col = col + ink_c.rgb * lift * (1.0 - alpha)
+    alpha = alpha + lift * (1.0 - alpha)
+    return vec4(col * a, alpha * a)
+}
+// the JIT ring's tooltip plate (its line is drawn over it): a rounded plate with a hairline.
+let jit_tip_px = fn(p: vec2, s: vec2, a: float, ink: float, dp: float) -> vec4 {
+    let e = rounded(p, s, 5.0)
+    let inside = clamp(0.5 - e * dp, 0.0, 1.0)
+    let hair = clamp(1.0 - abs(e + 0.5) * dp, 0.0, 1.0)
+    let plate = mix(#ffffff, #1f1b2e, ink)
+    let line = mix(vec4(0.0, 0.0, 0.0, 0.16), vec4(1.0, 1.0, 1.0, 0.14), ink)
+    let pa = inside * mix(0.97, 0.95, ink)
+    var col = plate.rgb * pa
+    var alpha = pa
+    let h = hair * line.w
+    col = col * (1.0 - h) + line.rgb * h
+    alpha = alpha * (1.0 - h) + h
+    return vec4(col * a, alpha * a)
+}
+let Quad = {
+    geom: vertex_buffer(vec2f)
+    rect: instance(vec4(0.0))
+    clip_rect: instance(vec4(0.0))
+    viewport: uniform(vec2(1.0))
+    dpi: uniform(1.0)
+    pos: varying(vec2f)
+    vertex_pos: vertex_position(vec4f)
+    fb0: fragment_output(0, vec4f)
+    vertex: fn() {
+        self.pos = self.geom
+        let p = self.rect.xy + self.geom * self.rect.zw
+        self.vertex_pos = vec4(p.x / self.viewport.x * 2.0 - 1.0, 1.0 - p.y / self.viewport.y * 2.0, 0.0, 1.0)
+    }
+    fragment: fn() {
+        let p = self.rect.xy + self.pos * self.rect.zw
+        let clip = if self.clip_rect.z > 0.0 { self.clip_rect } else { vec4(0.0, 0.0, self.viewport.x, self.viewport.y) }
+        let inside = step(clip.x, p.x) * step(clip.y, p.y)
+            * step(p.x, clip.x + clip.z) * step(p.y, clip.y + clip.w)
+        self.fb0 = self.pixel() * inside
+    }
+}
+{
+    // the halted view's card sizes, in the boot window and over the app (Overlay: the halted
+    // view takes the whole window too); margin / max_width / max_height / corner are not read
+    boot: {margin: 22 max_width: 0 max_height: 0 corner: 0 card_padding: 12 action_height: 48 action_width: 152 action_gap: 8}
+    overlay: {margin: 16 max_width: 900 max_height: 560 corner: 14 card_padding: 12 action_height: 48 action_width: 152 action_gap: 8}
+    lines: [
+        {role: @app size: 10 height: 14 gap: 0 color: #6e6593}
+        {role: @status size: 10 height: 14 gap: 6 color: #ff7a5c}
+        {role: @current size: 13 height: 18 gap: 0 color: #ece6ff}
+        {role: @domain size: 22 height: 28 gap: 4 color: #ece6ff}
+        {role: @location size: 11 height: 16 gap: 4 color: #9d8cff}
+        {role: @errors size: 14 height: 20 gap: 4 color: #ece6ff}
+        {role: @panic size: 15 height: 21 gap: 4 color: #ffd2c4}
+        {role: @hints size: 10 height: 15 gap: 0 color: #8a80b4}
+    ]
+    hints: {
+        tap_restart: "Restart"
+        tap_copy: "Copy"
+        tap_open: "Open on dev machine"
+        tap_dismiss: "Dismiss"
+        tap_submit: "Submit"
+        tap_cancel: "Cancel"
+        tap_resume: "Resume"
+        input_label: "Return value"
+        paused: "Paused after a panic"
+        halted: "Compile halted"
+        follow_on: "follow-on"
+        root_cause: "root cause"
+        resolve: "Resolving dependencies"
+        parse: "Parsing"
+        typecheck: "Checking"
+        codegen: "JIT compiling"
+        link: "Linking"
+        first_frame: "JIT compiling"
+        restart: "R restart"
+        retry: "R retry compile"
+        copy: "C copy error"
+        open: "E open in editor"
+        dismiss: "Esc dismiss"
+        errors: "↑/↓ select error"
+        scroll: "PgUp/PgDn scroll"
+        return_value: "Return value: "
+        submit: "Enter submit · Esc cancel"
+    }
+    // a card of the halted view, a row of a collapsed group, a touch button, or a window button
+    // of the caption. accent: 0 follow-on card, 1 root cause / panic card, 2 member row, 3 button,
+    // 4 caption window button (action: its glyph, 3..5 a traffic light; selected: hover;
+    // block: the window has focus), 7 the caption's ground (tint), 5 the JIT ring (selected:
+    // its fill, block: its mode, pressed: opacity, action: its spin, beat: hover, ink: on a dark
+    // caption), 6 the ring's tooltip plate (pressed: opacity, ink)
+    error_band: Quad{
+        time: uniform(0.0)
+        reduce_motion: uniform(0.0)
+        selected: instance(0.0)
+        action: instance(0.0)
+        pressed: instance(0.0)
+        accent: instance(0.0)
+        block: instance(0.0)
+        beat: instance(0.0)
+        ink: instance(0.0)
+        tint: instance(vec4(0.0))
+        pixel: fn() {
+            let s = self.rect.zw
+            let p = self.pos * s
+            let dp = max(self.dpi, 1.0)
+            let px = (self.rect.xy + p) * dp
+            if self.accent > 6.5 {
+                // the caption's ground: the app's caption bar colour (`tint`, opaque)
+                return vec4(self.tint.rgb * self.tint.a, self.tint.a)
+            }
+            if self.accent > 5.5 {
+                return jit_tip_px(p, s, self.pressed, self.ink, dp)
+            }
+            if self.accent > 4.5 {
+                return jit_ring_px(p, s, self.selected, self.block, self.pressed, self.action, self.beat, self.ink, dp, px)
+            }
+            if self.accent > 3.5 {
+                if self.action > 2.5 {
+                    return caption_light_px(p, s, self.action, self.selected, self.pressed, self.block, dp)
+                }
+                return caption_button_px(p, s, self.action, self.selected, self.pressed, self.beat, self.tint, dp, px)
+            }
+            let row = step(1.5, self.accent) * (1.0 - step(2.5, self.accent))
+            let button = step(2.5, self.accent)
+            let root = step(0.5, self.accent) * (1.0 - step(1.5, self.accent))
+            let edge = min(min(p.x, s.x - p.x), min(p.y, s.y - p.y))
+            let hair = clamp(1.0 - edge * dp, 0.0, 1.0)
+            let c = min(p, s - p)
+            let tick = clamp(1.6 - edge * dp, 0.0, 1.0) * step(c.x, 9.0) * step(c.y, 9.0)
+            let bar = clamp((2.0 - p.x) * dp, 0.0, 1.0) * (1.0 - button)
+            // fill
+            let fill_a = mix(mix(mix(0.80, 0.90, self.selected), 0.10 * self.selected, row), mix(0.06, 0.24, self.pressed), button)
+            let fill = mix(mix(mix(#0d0a1a, #171030, self.selected), #ece6ff, row), mix(#ece6ff, #9d8cff, self.pressed), button)
+            var col = fill.rgb * fill_a
+            var alpha = fill_a
+            // hairline frame (cards and buttons), corner ticks on the selected card and buttons
+            let line_a = hair * mix(mix(0.10, 0.20, self.selected), 0.0, row) + hair * button * 0.35
+            let tick_a = tick * max(self.selected * (1.0 - row), button)
+            let accent = mix(#6e6593, #ff7a5c, max(root, self.selected * row))
+            col = col * (1.0 - line_a) + #ece6ff.rgb * line_a
+            alpha = alpha * (1.0 - line_a) + line_a
+            col = col * (1.0 - tick_a) + mix(#ece6ff, #ff7a5c, root).rgb * tick_a
+            alpha = alpha * (1.0 - tick_a) + tick_a
+            // the accent bar on the left: ember for a root cause, dim for follow-on, a selected row
+            let bar_a = bar * mix(mix(0.9, 1.0, self.selected), self.selected, row)
+            col = col * (1.0 - bar_a) + accent.rgb * bar_a
+            alpha = alpha * (1.0 - bar_a) + bar_a
+            return vec4(col + vec3(dither(px) * step(0.001, alpha)), alpha)
+        }
+    }
+    ignition: {
+        geom: vertex_buffer(vec2f)
+        rect: instance(vec4(0.0))
+        info: instance(vec4(0.0))
+        viewport: uniform(vec2(1.0))
+        dpi: uniform(1.0)
+        reduce_motion: uniform(0.0)
+        time: uniform(0.0)
+        view: uniform(vec4(0.0))
+        field_params: uniform(vec4(0.0))
+        field_fall: uniform(vec4(0.0))
+        // the frame the backdrop and brackets fill (points; zero: the window) and
+        // (fault, corner radius, caption strip height, 0)
+        field_frame: uniform(vec4(0.0))
+        field_fault: uniform(vec4(0.0))
+        // over a running app (the window layer): (on: 1, galaxy opacity, backdrop opacity, arc
+        // progress or -1); zero: the boot window
+        field_layer: uniform(vec4(0.0))
+        d: varying(vec2f)
+        px: varying(vec2f)
+        // (dust warp, radius, a star's light left by the dust lanes, 0)
+        aux: varying(vec4f)
+        vertex_pos: vertex_position(vec4f)
+        fb0: fragment_output(0, vec4f)
+        vertex: fn() {
+            let k = self.info.x
+            let scale = self.field_params.y
+            // dust warps in place onto its arm: from 0.15 s plus its own start (up to 0.25 s) it
+            // eases (slow in, slow out) over 1.05 s along the curve that turns it and moves its
+            // radius at once, turning with the disk all along (no motion while reduce_motion)
+            let dust = step(0.5, k) * step(k, 1.5)
+            let w0 = clamp((self.time - 0.15 - 0.25 * self.info.y) / 1.05, 0.0, 1.0)
+            let u = max(w0 * w0 * w0 * (w0 * (w0 * 6.0 - 15.0) + 10.0), self.reduce_motion) * dust
+            let r = mix(self.rect.y, self.rect.w, u)
+            let a = self.rect.x + self.info.z * u
+            let at = project(a, r, self.view, self.field_params.x)
+            let vp = self.viewport
+            let frame = if self.field_frame.z > 0.0 { self.field_frame } else { vec4(0.0, 0.0, vp.x, vp.y) }
+            let center = if k < 2.5 { at } else if k < 4.5 { self.view.xy } else if k < 6.5 { frame.xy + frame.zw * 0.5 } else { self.view.xy }
+            // a layer's backdrop it does not draw is empty, the brackets only frame a halted view
+            let gone = step(0.5, self.field_layer.x) * (1.0 - step(0.001, self.field_layer.z))
+            let arc = vec2(self.view.z * 1.45 + 10.0) * step(-0.5, self.field_layer.w) * step(0.5, self.field_layer.x)
+            let big = smoothstep(1.5, 2.6, self.rect.z)
+            let s = self.rect.z * scale * 0.42
+            let extent = if k < 0.5 { vec2(s * (6.2 + 3.2 * big) + 1.0) } else if k < 1.5 { vec2(self.rect.z * scale * 2.1 + 1.0) } else if k < 2.5 { vec2(8.0 * scale + 2.0) } else if k < 3.5 { vec2(self.view.z * mix(1.4, min(1.4, self.view.w + 0.3), step(1.0, self.field_fall.x))) } else if k < 4.5 { vec2(self.view.z * 1.7 + 6.0) } else if k < 5.5 { frame.zw * 0.5 * step(0.5, self.field_fault.x) } else if k < 6.5 { frame.zw * 0.5 * (1.0 - gone) } else { arc }
+            let p = center + (self.geom * 2.0 - vec2(1.0)) * extent
+            self.d = p - center
+            self.px = p * self.dpi
+            self.aux = vec4(u, r, 1.0 - 0.8 * lane(arm_phase(a, r), r), 0.0)
+            self.vertex_pos = vec4(p.x / vp.x * 2.0 - 1.0, 1.0 - p.y / vp.y * 2.0, 0.0, 1.0)
+        }
+        fragment: fn() {
+            let k = self.info.x
+            let dp = max(self.dpi, 1.0)
+            let age = self.time - self.rect.w
+            let scale = self.field_params.y
+            let fault = self.field_fault.x
+            let calm = (1.0 - self.reduce_motion) * (1.0 - fault)
+            let vp = self.viewport
+            let frame = if self.field_frame.z > 0.0 { self.field_frame } else { vec4(0.0, 0.0, vp.x, vp.y) }
+            let half = frame.zw * 0.5
+            let twinkle = if self.info.z > 0.5 { self.time - self.info.z + 1.0 } else { -1.0 }
+            let layer = self.field_layer
+            let on = step(0.5, layer.x)
+            // over the app: the galaxy at its opacity, the backdrop at its own
+            let opacity = if k > 5.5 && k < 6.5 { mix(1.0, layer.z, on) } else { mix(1.0, layer.y, on) }
+            self.fb0 = opacity * if k < 0.5 {
+                star_px(self.d, self.rect.z, self.aux.y, self.info.w, age, twinkle, self.time, calm, self.aux.z, scale, dp, fault, self.field_fall.z)
+            } else if k < 1.5 {
+                dust_px(self.d, self.rect.z, self.aux.x, self.aux.y, self.info.w, self.time, self.field_fall.y, self.aux.z, scale, dp)
+            } else if k < 2.5 {
+                o3_px(self.d, age, scale, dp, fault)
+            } else if k < 3.5 {
+                disk_px(self.d, self.view, self.field_params.x, self.field_fall.x, self.field_params.z, fault, self.px)
+            } else if k < 4.5 {
+                ring_px(self.d, self.field_params.w, self.view, self.px)
+            } else if k < 5.5 {
+                // the frame's brackets start below the caption strip (field_fault.z points)
+                let below = vec2(0.0, self.field_fault.z * 0.5)
+                brackets_px(self.d - below, half - below, dp, fault)
+            } else if k < 6.5 {
+                backdrop_px(self.d, half, frame.xy + half + self.d - self.view.xy, self.view, fault, self.field_fault.y, dp, self.px)
+            } else {
+                arc_px(self.d, self.view, layer.w, self.field_fall.w, dp, self.px)
+            }
+        }
+    }
+    // the running app's frame under the window layer (`image_texture`: the app image, or a blur
+    // stage of it). mode 0: shown at `opacity`, `dim` darkens it towards the field's deep violet;
+    // mode 1 / 2: one direction of the separable Gaussian (sigma `sigma` texels of the target
+    // along `dir`, the source's texel size), the first from the full image at quarter size
+    layer: Quad{
+        image_texture: texture_2d(float)
+        opacity: instance(1.0)
+        mode: instance(0.0)
+        dim: instance(0.0)
+        dir: instance(vec2(0.0))
+        sigma: instance(4.0)
+        pixel: fn() {
+            let uv = self.pos
+            if self.mode < 0.5 {
+                let c = self.image_texture.sample(uv)
+                let px = (self.rect.xy + self.pos * self.rect.zw) * max(self.dpi, 1.0)
+                let tone = mix(c.rgb, #0c0918.rgb * 0.6 + c.rgb * 0.4, self.dim)
+                let n = vec3(dither(px) * step(0.001, self.dim))
+                return vec4((tone + n) * self.opacity, self.opacity)
+            }
+            let s = self.dir
+            let q = 1.0 / (2.0 * self.sigma * self.sigma)
+            let w1 = exp(-1.0 * q)
+            let w2 = exp(-4.0 * q)
+            let w3 = exp(-9.0 * q)
+            let w4 = exp(-16.0 * q)
+            let w5 = exp(-25.0 * q)
+            let w6 = exp(-36.0 * q)
+            let w7 = exp(-49.0 * q)
+            let w8 = exp(-64.0 * q)
+            var c = self.image_texture.sample(uv)
+            c = c + (self.image_texture.sample(uv + s) + self.image_texture.sample(uv - s)) * w1
+            c = c + (self.image_texture.sample(uv + s * 2.0) + self.image_texture.sample(uv - s * 2.0)) * w2
+            c = c + (self.image_texture.sample(uv + s * 3.0) + self.image_texture.sample(uv - s * 3.0)) * w3
+            c = c + (self.image_texture.sample(uv + s * 4.0) + self.image_texture.sample(uv - s * 4.0)) * w4
+            c = c + (self.image_texture.sample(uv + s * 5.0) + self.image_texture.sample(uv - s * 5.0)) * w5
+            c = c + (self.image_texture.sample(uv + s * 6.0) + self.image_texture.sample(uv - s * 6.0)) * w6
+            c = c + (self.image_texture.sample(uv + s * 7.0) + self.image_texture.sample(uv - s * 7.0)) * w7
+            c = c + (self.image_texture.sample(uv + s * 8.0) + self.image_texture.sample(uv - s * 8.0)) * w8
+            let total = 1.0 + 2.0 * (w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8)
+            return vec4(c.rgb / total, 1.0)
+        }
+    }
+    icon: Quad{
+        image_texture: texture_2d(float)
+        pixel: fn() {
+            let c = self.image_texture.sample(self.pos)
+            return vec4(c.rgb * c.a, c.a)
+        }
+    }
+    glyph: Quad{
+        ..mod.glyph_coverage.AtlasCoverage
+        uv: instance(vec4(0.0))
+        atlas_plane: instance(0.0)
+        color_glyph: instance(0.0)
+        color: instance(#fff)
+        grayscale_texture: texture_2d(float)
+        radius: uniform(8.0)
+        cutoff: uniform(0.25)
+        sdf_sharpness: uniform(1.0)
+        sdf_luma_bias: uniform(0.03)
+        pixel: fn() {
+            // `uv` is in texels, so it stays right when the host's atlas grows
+            let t = mix(self.uv.xy, self.uv.zw, self.pos)
+            let tex_size = self.grayscale_texture.size()
+            let p = clamp(t, self.uv.xy + vec2(0.5), self.uv.zw - vec2(0.5)) / tex_size
+            if self.color_glyph > 0.5 {
+                let c = self.grayscale_texture.sample(p)
+                return vec4(c.rgb * c.a, c.a)
+            }
+            let scale = (length(dFdx(t)) + length(dFdy(t))) * 0.5
+            let coverage = self.sdf(scale, p, self.color)
+            return coverage * vec4(self.color.rgb * self.color.a, self.color.a)
+        }
+    }
+}

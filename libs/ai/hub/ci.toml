@@ -1,0 +1,16 @@
+# CI (devhub ci): [ci] is hand-written settings; the other sections are proofs devhub writes.
+
+[ci]
+test_features = "claude-stub,flux,paint,tts,indextts,video,interpolate,audio,mesh,matte-native,depth-native,segment-native,body-native,upscale-native,motion-native,splat-native,rig-native,beats-native,stems-native,notes-native"
+
+[job.jit_01.linux]
+date = "2026-11-04"
+digest = "5b677f2030670bad9d8092144709962c1eb227792a15dc6be252cd2887766dbd"
+main = "5f4597d2fb65f354696542829214d4c6b99c39ab"
+work = "7d8695372c6cd232c174a43ee12e1ee51ba72023"
+
+[tests.linux]
+date = "2026-11-18"
+digest = "dcc37c539a982836ea0e5f3f205327c25d506d6b539719f9f02d2ecc4e8fcbc1"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"

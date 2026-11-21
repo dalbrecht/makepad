@@ -1,0 +1,2478 @@
+use crate::{
+    animator::{Animate, Animator, AnimatorImpl},
+    makepad_derive_widget::*,
+    makepad_draw::*,
+    makepad_script::ScriptFnRef,
+    widget::*,
+    widget_async::{CxWidgetToScriptCallExt, ScriptAsyncResult},
+};
+
+use crate::makepad_draw::DrawSvg;
+use crate::pointer_field::{FieldArbiter, PointerField};
+
+script_mod! {
+    use mod.prelude.widgets_internal.*
+    use mod.widgets.*
+
+    mod.widgets.ButtonBase = #(Button::register_widget(vm))
+
+    /** The flat button: the standard face with no outset gradient; the
+     * other button variants inherit from it. */
+    mod.widgets.ButtonFlat = set_type_default() do mod.widgets.ButtonBase{
+        /** the label text */
+        text: "Button"
+
+        // The compact face, worn when the row this sits on runs out of width.
+        // Declared with `:=` rather than `:` so it lands in the instance's vec:
+        // a widget proto is frozen VALIDATED, so a key its props do not list is
+        // a hard error at construction -- but the checked path falls back to the
+        // vec first, which is what makes `tight: {...}` legal at the use site.
+        // The vec is also invisible to the derived apply, so the block never
+        // clobbers the button's own text.
+        /** the face this button wears when its row runs out of width */
+        tight := {}
+        width: Fit
+        height: Fit
+        /** gap between icon and label 0..24 step 1 */
+        spacing: theme.space_2
+        align: Center
+        /** inner face padding around icon and label */
+        padding: theme.mspace_1{left: theme.space_2, right: theme.space_2}
+        /** outer gap to neighbouring widgets */
+        margin: theme.mspace_v_1
+        /** the label's box inside the face */
+        label_walk: Walk{width: Fit, height: Fit}
+
+        /** The button label ink, state-mixed with the face. */
+        draw_text +: {
+            /** pointer-hover mix 0..1 step 0.01 */
+            hover: 0.0
+            /** pressed mix 0..1 step 0.01 */
+            down: instance(0.0)
+            /** keyboard-focus mix 0..1 step 0.01 */
+            focus: instance(0.0)
+            /** disabled mix 0..1 step 0.01 */
+            disabled: instance(0.0)
+            /** loading mix: fades the label out under the spinner 0..1 step 0.01 */
+            loading: instance(0.0)
+            /** latched mix: the label of a button shown on, lit as a held one is 0..1 step 0.01 */
+            active: instance(0.0)
+
+            // A button face is a box with one line of text in it: center the
+            // ink, not the line box, or the label reads as sitting high.
+            /** center the ink, not the line box */
+            ink_centered: true
+
+            /** label ink at rest */
+            color: theme.color_label_inner
+            /** label ink under the pointer */
+            color_hover: theme.color_label_inner_hover
+            /** label ink while held */
+            color_down: uniform(theme.color_label_inner_down)
+            /** label ink when key-focused */
+            color_focus: uniform(theme.color_label_inner_focus)
+            /** label ink when disabled */
+            color_disabled: uniform(theme.color_label_inner_disabled)
+
+            /** the label typeface */
+            text_style: theme.font_regular{
+                /** label type size in points 6..32 step 0.5 */
+                font_size: theme.font_size_p
+            }
+            /** how far the label lifts toward the glow ink while held; the theme's material_ink_glow, 0 in every stock theme 0..1 step 0.01 */
+            material_ink_glow: uniform(theme.material_ink_glow)
+            /** how far past full brightness lit ink is pushed before it clips 1..4 step 0.05 */
+            material_ink_lift: uniform(theme.material_ink_lift)
+            /** the emissive ink lit label ink is pushed toward */
+            material_glow_ink: uniform(theme.color_material_glow)
+
+            /** ink mix order: focus, hover, down, disabled; lit toward the
+             * glow ink while held or latched under an illuminating
+             * material; then faded out while loading */
+            get_color: fn() {
+                let ink = self.color
+                    .mix(self.color_focus, self.focus)
+                    .mix(self.color_hover, self.hover)
+                    .mix(self.color_down, self.down)
+                    .mix(self.color_disabled, self.disabled)
+                // Lit ink is one mix on a value already computed once per
+                // pixel: the glow's halo comes from the face, never from
+                // sampling the glyph again.
+                let lit = self.material_ink_glow * max(self.down, self.active) * (1.0 - self.disabled)
+                let glow = self.material_glow_ink.rgb * self.material_ink_lift
+                return vec4(mix(ink.rgb, glow, lit), ink.a * (1.0 - self.loading))
+            }
+        }
+
+        /** the icon's box inside the face; draw_icon paints the SVG into it */
+        icon_walk: Walk{/** icon width in pixels 8..64 step 1 */ width: 22.0, height: Fit}
+        /** the trailing icon's box after the label; draw_icon_end paints the SVG into it */
+        icon_end_walk: Walk{/** icon width in pixels 8..64 step 1 */ width: 22.0, height: Fit}
+
+        /** The button face material: an SDF box with a bevel stroke and an
+         * optional two-stop gradient fill, state-mixed by the animator's
+         * hover/down/focus/disabled instances. */
+        draw_bg +: {
+            /** pointer-hover mix 0..1 step 0.01 */
+            hover: instance(0.0)
+            /** keyboard-focus mix 0..1 step 0.01 */
+            focus: instance(0.0)
+            /** pressed mix 0..1 step 0.01 */
+            down: instance(0.0)
+            /** disabled mix 0..1 step 0.01 */
+            disabled: instance(0.0)
+            /** loading mix: fades the spinner arc in over the face 0..1 step 0.01 */
+            loading: instance(0.0)
+            /** latched mix: a button shown on, as a toggle holds it. Under a material it stays where a press leaves it and keeps the light a press gives it; without one it draws nothing 0..1 step 0.01 */
+            active: instance(0.0)
+            /** the spinner's clock, ramped 0..1 once a second by the time track 0..1 step 0.01 */
+            anim_time: instance(0.0)
+            /** the pointer's field over the face, 0..1, written by the widget while cap_field_reach is above zero */
+            cap_field: instance(0.0)
+            /** the pointer along the face from its centre, in points, while the field is up */
+            cap_pointer_along: instance(0.0)
+            /** the pointer across the face from its centre, in points, while the field is up */
+            cap_pointer_across: instance(0.0)
+            /** a clock in seconds while the field is up */
+            cap_time: instance(0.0)
+
+            /** spinner arc ink while loading */
+            loading_color: uniform(theme.color_label_inner)
+            /** spinner arc thickness in pixels 0.5..6 step 0.25 */
+            loading_stroke: uniform(2.0)
+            /** spinner arc inset from the face edge in pixels 0..12 step 0.5 */
+            loading_inset: uniform(3.0)
+
+            /** bevel border thickness in pixels 0..4 step 0.5 */
+            border_size: uniform(theme.beveling)
+            /** corner rounding radius 0..24 step 0.5 */
+            border_radius: uniform(theme.corner_radius)
+            /** top-left corner; -1 follows border_radius -1..24 step 0.5 */
+            border_radius_tl: uniform(-1.0)
+            /** top-right corner; -1 follows border_radius -1..24 step 0.5 */
+            border_radius_tr: uniform(-1.0)
+            /** bottom-right corner; -1 follows border_radius -1..24 step 0.5 */
+            border_radius_br: uniform(-1.0)
+            /** bottom-left corner; -1 follows border_radius -1..24 step 0.5 */
+            border_radius_bl: uniform(-1.0)
+
+            /** dither the gradient fill to hide banding 0..1 step 1 */
+            color_dither: uniform(1.0)
+            /** bevel gradient axis: 0 vertical, 1 horizontal 0..1 step 1 */
+            gradient_border_horizontal: uniform(0.0)
+            /** fill gradient axis: 0 vertical, 1 horizontal 0..1 step 1 */
+            gradient_fill_horizontal: uniform(0.0)
+
+            /** face fill at rest */
+            color: uniform(theme.color_outset)
+            /** face fill under the pointer */
+            color_hover: uniform(theme.color_outset_hover)
+            /** face fill while held */
+            color_down: uniform(theme.color_outset_down)
+            /** face fill when key-focused */
+            color_focus: uniform(theme.color_outset_focus)
+            /** face fill when disabled */
+            color_disabled: uniform(theme.color_outset_disabled)
+            /** this variant's own resting fill, which a style sheet that draws a face of its own draws for; `color` set away from it is a host's colour (see host_over) */
+            color_default: uniform(theme.color_outset)
+
+            /** fill gradient end stop; negative alpha means flat fill */
+            color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+            /** fill end stop under the pointer */
+            color_2_hover: uniform(theme.color_outset_2_hover)
+            /** fill end stop while held */
+            color_2_down: uniform(theme.color_outset_2_down)
+            /** fill end stop when key-focused */
+            color_2_focus: uniform(theme.color_outset_2_focus)
+            /** fill end stop when disabled */
+            color_2_disabled: uniform(theme.color_outset_2_disabled)
+
+            /** bevel stroke at rest */
+            border_color: uniform(theme.color_bevel)
+            /** bevel stroke under the pointer */
+            border_color_hover: uniform(theme.color_bevel_hover)
+            /** bevel stroke while held */
+            border_color_down: uniform(theme.color_bevel_down)
+            /** bevel stroke when key-focused */
+            border_color_focus: uniform(theme.color_bevel_focus)
+            /** bevel stroke when disabled */
+            border_color_disabled: uniform(theme.color_bevel_disabled)
+
+            /** bevel gradient end stop; negative alpha means flat stroke */
+            border_color_2: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+            /** bevel end stop under the pointer */
+            border_color_2_hover: uniform(theme.color_bevel_outset_2_hover)
+            /** bevel end stop while held */
+            border_color_2_down: uniform(theme.color_bevel_outset_2_down)
+            /** bevel end stop when key-focused */
+            border_color_2_focus: uniform(theme.color_bevel_outset_2_focus)
+            /** bevel end stop when disabled */
+            border_color_2_disabled: uniform(theme.color_bevel_outset_2_disabled)
+
+            /** state layer ink laid over the face by hover and press; negative alpha means none */
+            layer_color: uniform(vec4(-1.0, -1.0, -1.0, -1.0))
+            /** state layer opacity under the pointer 0..1 step 0.01 */
+            layer_hover: uniform(theme.state_hover_opacity)
+            /** state layer opacity added while held 0..1 step 0.01 */
+            layer_down: uniform(theme.state_press_opacity)
+            /** dash length of the bevel stroke in pixels; 0 draws it solid 0..16 step 0.5 */
+            border_dash: uniform(0.0)
+
+            // THE MATERIAL, from the theme, packed as `ReliefView` and
+            // `RoundedView` pack theirs. Zero in every stock theme: at
+            // `material` 0 this shader draws what it always drew, and the
+            // uniform branch costs one compare per draw call.
+            /** surface material tier: 0 flat, 1 relief, 2 relief with rim, gloss and specular 0..2 step 1 */
+            material: uniform(theme.material_level)
+            /** key light: direction (x right, y down, z out) and intensity */
+            material_light: uniform(vec4(theme.material_light_x, theme.material_light_y, theme.material_light_z, theme.material_light_intensity))
+            /** bevel width, profile curve, raise, specular */
+            material_relief: uniform(vec4(theme.material_bevel_width, theme.material_bevel_curve, theme.material_raise, theme.material_specular))
+            /** occlusion, rim, gloss, roughness */
+            material_finish: uniform(vec4(theme.material_ao, theme.material_rim, theme.material_gloss, theme.material_roughness))
+            /** face gradient, hairline, occlusion reach, sink */
+            material_tune: uniform(vec4(theme.material_face_gradient, theme.material_hairline, theme.material_ao_reach, theme.material_sink))
+            /** cast shadow strength, blur, falloff (0 linear 1 expo), contact occlusion */
+            material_shadow: uniform(vec4(theme.material_shadow, theme.material_shadow_blur, theme.material_shadow_falloff, theme.material_contact_ao))
+            /** inner shadow, inner blur, ground lip, glow */
+            material_inner: uniform(vec4(theme.material_inner_shadow, theme.material_inner_radius, theme.material_ground_lip, theme.material_glow))
+            /** the margin the face keeps back from the quad under a material, where its cast shadow and glow fall, in points 0..32 step 0.5 */
+            material_margin: uniform(theme.material_margin)
+            /** signed change in elevation while held: past -raise the face inverts, short of it it deepens -32..8 step 0.5 */
+            material_press: uniform(theme.material_press_depth)
+            /** how far a held face dishes as well as descends: 0 stays convex, 1 fully inverts 0..1 step 0.01 */
+            material_press_invert: uniform(theme.material_press_invert)
+            /** the ink a lit shoulder is tinted toward */
+            material_light_ink: uniform(theme.color_material_light)
+            /** the ink a shaded shoulder and the occlusion are tinted toward */
+            material_shadow_ink: uniform(theme.color_material_shadow)
+            /** the emissive ink a held face and its halo take */
+            material_glow_ink: uniform(theme.color_material_glow)
+
+            /** THE HOST'S COLOUR UNDER A STYLE SHEET. A sheet that replaces
+             * `pixel` with a face of its own still owes the host the colour
+             * it paints: an app lights a latch -- the page it is on, a mute
+             * that is down -- by setting `color`, and that has to show
+             * under every sheet. `color_default` is what the variant rests
+             * in; where `color` has been set away from it, `host_face`
+             * moves a face colour by the difference (the sheet's bevels,
+             * gloss and grain stay, its colour becomes the host's) and a
+             * host colour let through lets the face through as far. At the
+             * default both helpers return what they are given, so the sheet
+             * draws exactly what it always drew. */
+            host_face: fn(face: vec3) -> vec3 {
+                let d = (self.color.rgb - self.color_default.rgb) * (1.0 - self.disabled) * step(0.5, self.color_default.a)
+                return clamp(face + d, vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0))
+            }
+
+            /** how much of an opaque sheet face the host's colour lets
+             * through: 1 at the default, 0 for a face the host keeps
+             * transparent (a readout that takes a click) */
+            host_alpha: fn() -> float {
+                return mix(1.0, clamp(self.color.a / max(self.color_default.a, 0.001), 0.0, 1.0), step(0.5, self.color_default.a))
+            }
+
+            /** `host_face` for a finished, premultiplied face: moved inside
+             * the button's rect only, so the shadows and glows a sheet
+             * throws outside it keep their own colour. `m` is how far the
+             * sheet grew its quad round the rect. A variant that has no
+             * face at rest (a borderless button) gets the host's colour laid
+             * under what the sheet drew, in the rect's rounded shape. */
+            host_over: fn(res: vec4, m: float) -> vec4 {
+                let host = self.color
+                let own = self.color_default
+                let apart = abs(host - own)
+                if max(max(apart.x, apart.y), max(apart.z, apart.w)) < 0.002 {
+                    return res
+                }
+                let p = self.pos * (self.rect_size + vec2(2.0 * m, 2.0 * m)) - vec2(m, m)
+                let h = self.rect_size * 0.5
+                let r = clamp(self.border_radius, 0.0, min(h.x, h.y))
+                let q = abs(p - h) - h + vec2(r, r)
+                let sd = min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0, 0.0))) - r
+                let inside = clamp(0.5 - sd, 0.0, 1.0)
+                let on = 1.0 - self.disabled
+                if own.a > 0.5 {
+                    let d = (host.rgb - own.rgb) * inside * on
+                    // Not capped at res.a: a sheet's face is not held to
+                    // premultiplied colour (the light it throws past its
+                    // edge, and a glass face, carry colour above their
+                    // alpha), and capping cut every glow at the rect and
+                    // emptied the outline face.
+                    let rgb = clamp(res.rgb + d * res.a, vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0))
+                    // Where the sheet's face lets the ground through (glass,
+                    // a face that is only its frame), the host's colour is
+                    // the body under it, as far as the host moved it: a lit
+                    // latch reads on glass too, and a face the host only
+                    // nudged stays nearly the sheet's.
+                    let moved = max(max(apart.x, apart.y), apart.z)
+                    let ba = host.a * smoothstep(0.0, 0.25, moved) * inside * on * (1.0 - res.a)
+                    return (vec4(rgb, res.a) + vec4(host.rgb * ba, ba)) * self.host_alpha()
+                }
+                let fa = host.a * inside * on
+                return res + vec4(host.rgb * fa, fa) * (1.0 - res.a)
+            }
+
+            /** THE STATE CONTRACT, as one elevation. Raised at rest; the
+             * pointer lifts it a quarter more (hover adds subtle elevation);
+             * a press adds material_press, whose sign and size pick the
+             * idiom -- past -raise the face crosses zero and INVERTS, short
+             * of it the cap only DEEPENS, near zero the glow carries the
+             * press; disabled moulds it flat into the ground, which also
+             * takes its shadow away. hover stays at 1 while held, so a held
+             * face starts from its lifted height. A latched face is a held
+             * one the pointer has left. */
+            material_elev: fn() -> float {
+                let raise = self.material_relief.z
+                return (raise + raise * 0.25 * self.hover + self.material_held() * self.material_press) * (1.0 - self.disabled)
+            }
+
+            /** how far the face is held: by a press, or by a latch */
+            material_held: fn() -> float {
+                return max(self.down, self.active)
+            }
+
+            /** signed distance to the face box with its four corner radii,
+             * doubled and clamped exactly as Sdf2d.box_all draws them, so
+             * this agrees with sdf.shape and can be read off-pixel */
+            material_sd: fn(p: vec2, c: vec2, h: vec2, r_tl: float, r_tr: float, r_br: float, r_bl: float) -> float {
+                let q0 = p - c
+                var r = r_tl
+                if q0.x > 0.0 {
+                    r = r_tr
+                    if q0.y > 0.0 {
+                        r = r_br
+                    }
+                } else {
+                    if q0.y > 0.0 {
+                        r = r_bl
+                    }
+                }
+                let k = min(2.0 * r, min(h.x, h.y))
+                let q = abs(q0) - h + vec2(k, k)
+                return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0, 0.0))) - k
+            }
+
+            /** the face box's outward gradient at p, by central differences of material_sd */
+            material_grad: fn(p: vec2, c: vec2, h: vec2, r_tl: float, r_tr: float, r_br: float, r_bl: float) -> vec2 {
+                let e = 0.5
+                let g = vec2(
+                    self.material_sd(p + vec2(e, 0.0), c, h, r_tl, r_tr, r_br, r_bl) - self.material_sd(p - vec2(e, 0.0), c, h, r_tl, r_tr, r_br, r_bl),
+                    self.material_sd(p + vec2(0.0, e), c, h, r_tl, r_tr, r_br, r_bl) - self.material_sd(p - vec2(0.0, e), c, h, r_tl, r_tr, r_br, r_bl)
+                )
+                if length(g) > 0.00001 {
+                    return normalize(g)
+                }
+                return vec2(0.0, 1.0)
+            }
+
+            /** what the face throws on the ground round it, premultiplied,
+             * to lay UNDER the face: its cast shadow, contact occlusion and
+             * light-side lip, and its glow while held; faded out before the
+             * quad edge along a box rounded like the face, so a shadow
+             * never ends on a straight line. `d` and `g` are the face's
+             * distance and gradient at `p`, `m` the margin it falls into. */
+            material_under: fn(p: vec2, d: float, g: vec2, c: vec2, h: vec2, m: float, r_tl: float, r_tr: float, r_br: float, r_bl: float) -> vec4 {
+                let px = 1.0 / max(self.draw_pass.dpi_factor, 0.5)
+                let elev = self.material_elev()
+                let off = Material.cast_offset(elev, self.material_light)
+                // A shadow wider than the margin it falls into would only be
+                // cut off: its blur stays within reach of the quad's edge.
+                let sh = vec4(self.material_shadow.x, Material.blur_fit(self.material_shadow.y, m, length(off)), self.material_shadow.z, self.material_shadow.w)
+                var under = Material.cast(
+                    d,
+                    self.material_sd(p - off, c, h, r_tl, r_tr, r_br, r_bl),
+                    self.material_sd(p + off, c, h, r_tl, r_tr, r_br, r_bl),
+                    g, px, elev, self.material_relief.z,
+                    self.material_light, sh, self.material_inner.z,
+                    self.material_shadow_ink.rgb, self.material_light_ink.rgb
+                ) * (1.0 - self.disabled)
+                // The halo of a held face under an illuminating material.
+                let glow = self.material_inner.w
+                if glow > 0.001 {
+                    let a3 = clamp(Material.tail(d, glow * 26.0, sh.z) * glow, 0.0, 1.0) * 0.85 * self.material_held() * (1.0 - self.disabled)
+                    under = vec4(self.material_glow_ink.rgb * a3, a3) + under * (1.0 - a3)
+                }
+                let qc = self.rect_size * 0.5
+                let rq = min((r_tl + r_tr + r_br + r_bl) * 0.5 + m, min(qc.x, qc.y))
+                let edge = -Material.sd_box(p, qc, qc, rq)
+                return under * Material.window(edge, m)
+            }
+
+            /** the face lit by the material: convex at rest, dished as far
+             * as material_press_invert says when held below zero, with the
+             * surround's inner shadow (the outline shifted down-light and
+             * blurred) once it has dropped below its ground, and lit toward
+             * the glow ink while held under an illuminating material. Tier 1
+             * is the relief alone: no rim, gloss or specular. */
+            material_face: fn(fill: vec4, p: vec2, d: float, g: vec2, c: vec2, h: vec2, r_tl: float, r_tr: float, r_br: float, r_bl: float) -> vec4 {
+                let elev = self.material_elev()
+                let convex = mix(self.material_relief.z * (1.0 - self.disabled), elev, self.material_press_invert)
+                var insh = 0.0
+                if self.material_inner.x > 0.001 && elev < 0.0 {
+                    let ioff = Material.shadow_dir(self.material_light) * abs(elev) * 1.6
+                    let rq = min((r_tl + r_tr + r_br + r_bl) * 0.5, min(h.x, h.y))
+                    insh = 1.0 - Material.box_cov(c - h + ioff, c + h + ioff, p, max(self.material_inner.y * 0.5, 0.35), rq)
+                }
+                let t2 = step(1.5, self.material)
+                let fin = vec4(self.material_finish.x, self.material_finish.y * t2, self.material_finish.z * t2, self.material_finish.w)
+                let rel = vec4(self.material_relief.x, self.material_relief.y, self.material_relief.z, self.material_relief.w * t2)
+                let uv = (p - c) / (2.0 * h) + vec2(0.5, 0.5)
+                var o = Material.face(
+                    fill.rgb, d, g, uv, elev, convex, 0.0, insh, 0.0,
+                    self.material_light, rel, fin, self.material_tune, self.material_inner.x,
+                    self.material_light_ink.rgb, self.material_shadow_ink.rgb, 1.0
+                )
+                let glow = self.material_inner.w
+                if glow > 0.001 {
+                    o = mix(o, self.material_glow_ink.rgb, min(glow * 1.6, 1.0) * 0.72 * self.material_held() * (1.0 - self.disabled))
+                }
+                return vec4(o, fill.a)
+            }
+
+            /** the face fill for the current state: gradient resolved at
+             * this pixel, state-mixed, then the state layer laid over it
+             * (under a material the relief carries the state instead: a
+             * face that both darkens and re-lights reads as muddy) */
+            face_fill: fn() -> vec4 {
+                let border_sz_uv = vec2(
+                    self.border_size / self.rect_size.x
+                    self.border_size / self.rect_size.y
+                )
+
+                let sz_inner_px = vec2(
+                    self.rect_size.x - self.border_size * 2.
+                    self.rect_size.y - self.border_size * 2.
+                )
+
+                let scale_factor_fill = vec2(
+                    self.rect_size.x / sz_inner_px.x
+                    self.rect_size.y / sz_inner_px.y
+                )
+
+                // We premultiply every color before mixing, so a fade to or from a transparent color
+                // doesn't pass through a darker, half-transparent version of the other one.
+                let mut color_fill = Pal.premul(self.color)
+                let mut color_fill_hover = Pal.premul(self.color_hover)
+                let mut color_fill_down = Pal.premul(self.color_down)
+                let mut color_fill_focus = Pal.premul(self.color_focus)
+                let mut color_fill_disabled = Pal.premul(self.color_disabled)
+
+                if self.color_2.x > -0.5 {
+                    let dither = Math.random_2d(self.pos.xy) * /** dither grain 0..0.5 step 0.01 */ 0.04 * self.color_dither
+                    let gradient_fill = vec2(
+                        self.pos.x * scale_factor_fill.x - border_sz_uv.x * 2. + dither
+                        self.pos.y * scale_factor_fill.y - border_sz_uv.y * 2. + dither
+                    )
+                    let dir = if self.gradient_fill_horizontal > 0.5 gradient_fill.x else gradient_fill.y
+                    color_fill = mix(Pal.premul(self.color), Pal.premul(self.color_2), dir)
+                    color_fill_hover = mix(Pal.premul(self.color_hover), Pal.premul(self.color_2_hover), dir)
+                    color_fill_down = mix(Pal.premul(self.color_down), Pal.premul(self.color_2_down), dir)
+                    color_fill_focus = mix(Pal.premul(self.color_focus), Pal.premul(self.color_2_focus), dir)
+                    color_fill_disabled = mix(Pal.premul(self.color_disabled), Pal.premul(self.color_2_disabled), dir)
+                }
+
+                let mut fill = color_fill
+                    .mix(color_fill_focus, self.focus)
+                    .mix(color_fill_hover, self.hover)
+                    .mix(color_fill_down, self.down)
+                    .mix(color_fill_disabled, self.disabled)
+
+                // The state layer below and every caller want straight alpha, so we convert back here.
+                // Dither can push a gradient's alpha below zero, which they'd multiply into bright specks.
+                fill = vec4(fill.rgb / max(fill.a, 0.0001), max(fill.a, 0.0))
+
+                if self.layer_color.x > -0.5 && self.material < 0.5 {
+                    // The state layer composites over the fill with straight
+                    // alpha, so a transparent face still shows the tint.
+                    let layer_a = clamp(self.hover * self.layer_hover + self.down * self.layer_down, 0.0, 1.0) * (1.0 - self.disabled)
+                    let a = fill.a + layer_a * (1.0 - fill.a)
+                    let rgb = (fill.rgb * fill.a * (1.0 - layer_a) + self.layer_color.rgb * layer_a) / max(a, 0.0001)
+                    fill = vec4(rgb, a)
+                }
+                return fill
+            }
+
+            /** the bevel stroke for the current state, dashed when border_dash is set */
+            face_stroke: fn() -> vec4 {
+                let mut color_stroke = Pal.premul(self.border_color)
+                let mut color_stroke_hover = Pal.premul(self.border_color_hover)
+                let mut color_stroke_down = Pal.premul(self.border_color_down)
+                let mut color_stroke_focus = Pal.premul(self.border_color_focus)
+                let mut color_stroke_disabled = Pal.premul(self.border_color_disabled)
+
+                if self.border_color_2.x > -0.5 {
+                    let dither = Math.random_2d(self.pos.xy) * /** dither grain 0..0.5 step 0.01 */ 0.04 * self.color_dither
+                    let gradient_border = vec2(
+                        self.pos.x + dither
+                        self.pos.y + dither
+                    )
+                    let dir = if self.gradient_border_horizontal > 0.5 gradient_border.x else gradient_border.y
+                    color_stroke = mix(Pal.premul(self.border_color), Pal.premul(self.border_color_2), dir)
+                    color_stroke_hover = mix(Pal.premul(self.border_color_hover), Pal.premul(self.border_color_2_hover), dir)
+                    color_stroke_down = mix(Pal.premul(self.border_color_down), Pal.premul(self.border_color_2_down), dir)
+                    color_stroke_focus = mix(Pal.premul(self.border_color_focus), Pal.premul(self.border_color_2_focus), dir)
+                    color_stroke_disabled = mix(Pal.premul(self.border_color_disabled), Pal.premul(self.border_color_2_disabled), dir)
+                }
+
+                let mut stroke = color_stroke
+                    .mix(color_stroke_focus, self.focus)
+                    .mix(color_stroke_hover, self.hover)
+                    .mix(color_stroke_down, self.down)
+                    .mix(color_stroke_disabled, self.disabled)
+                stroke = vec4(stroke.rgb / max(stroke.a, 0.0001), max(stroke.a, 0.0))
+
+                if self.border_dash > 0.0 {
+                    // Dashes along x + y: regular on every straight edge.
+                    let p = self.pos * self.rect_size
+                    let on = step(0.5, fract((p.x + p.y) / (self.border_dash * 2.0)))
+                    stroke = vec4(stroke.rgb, stroke.a * on)
+                }
+                return stroke
+            }
+
+            /** the face: rounded SDF box, gradient fill, bevel stroke */
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+
+                // Each corner follows border_radius unless it has been given
+                // one of its own. A button group squares the two corners at
+                // each joint this way, so a connected row reads as one
+                // object; every other button leaves all four at -1 and draws
+                // exactly the shape it always did.
+                let r_tl = mix(self.border_radius, self.border_radius_tl, step(0., self.border_radius_tl))
+                let r_tr = mix(self.border_radius, self.border_radius_tr, step(0., self.border_radius_tr))
+                let r_br = mix(self.border_radius, self.border_radius_br, step(0., self.border_radius_br))
+                let r_bl = mix(self.border_radius, self.border_radius_bl, step(0., self.border_radius_bl))
+
+                // Under a material the face keeps back from the quad by
+                // material_margin on every side: makepad clips by default,
+                // so a control buys the room its shadow falls into out of
+                // its own rect rather than by growing its geometry, and the
+                // stylesheet pays for it in padding. Zero without a material.
+                let m = self.material_margin * step(0.5, self.material)
+                let inset = self.border_size + m
+                sdf.box_all(
+                    inset
+                    inset
+                    self.rect_size.x - inset * 2.
+                    self.rect_size.y - inset * 2.
+                    r_tl
+                    r_tr
+                    r_br
+                    r_bl
+                )
+
+                var face = self.face_fill()
+                if self.material > 0.5 {
+                    let p = self.pos * self.rect_size
+                    let c = self.rect_size * 0.5
+                    let h = max(c - vec2(inset, inset), vec2(0.5, 0.5))
+                    let d = sdf.shape
+                    let g = self.material_grad(p, c, h, r_tl, r_tr, r_br, r_bl)
+                    // A face that is not there (a borderless button at rest)
+                    // casts nothing. `clear` premultiplies what it is given.
+                    let under = self.material_under(p, d, g, c, h, m, r_tl, r_tr, r_br, r_bl) * face.a
+                    sdf.clear(vec4(under.rgb / max(under.a, 0.0001), under.a))
+                    face = self.material_face(face, p, d, g, c, h, r_tl, r_tr, r_br, r_bl)
+                }
+                sdf.fill_keep(face)
+                sdf.stroke(self.face_stroke(), self.border_size)
+
+                // The wait spinner: a three-quarter arc turning once a second
+                // in the middle of the face, where the label was.
+                if self.loading > 0.0 {
+                    let c = self.rect_size * 0.5
+                    let r = max(min(self.rect_size.x, self.rect_size.y) * 0.5 - inset - self.loading_inset, 1.0)
+                    let a0 = self.anim_time * 2.0 * PI
+                    sdf.arc_round_caps(c.x, c.y, r, a0, a0 + 1.5 * PI, self.loading_stroke)
+                    sdf.fill(vec4(self.loading_color.rgb, self.loading_color.a * self.loading))
+                }
+                return sdf.result
+            }
+        }
+
+        /** The description ink for a compound button: a second, quieter
+         * line under the label. */
+        draw_description +: {
+            /** center the ink, not the line box */
+            ink_centered: true
+            /** description ink */
+            color: theme.color_on_surface_variant
+            /** the description typeface */
+            text_style: theme.font_regular{
+                /** description type size in points 6..32 step 0.5 */
+                font_size: theme.type_label_m_size
+            }
+        }
+        /** the description's box under the label */
+        description_walk: Walk{width: Fit, height: Fit, margin: Inset{top: 1.}}
+
+        /** the state machine driving the face and label mixes */
+        animator: Animator{
+            /** enabled/disabled track: drives the disabled mix on face and label */
+            disabled: {
+                default: @off
+                /** enabled: face and label at full strength, cut instantly */
+                off: AnimatorState{
+                    from: {all: Forward {duration: 0.}}
+                    apply: {
+                        draw_bg: {disabled: 0.0}
+                        draw_text: {disabled: 0.0}
+                    }
+                }
+                /** disabled: 0.2s fade of face and label to the disabled colors */
+                on: AnimatorState{
+                    from: {all: Forward {duration: 0.2}}
+                    apply: {
+                        draw_bg: {disabled: 1.0}
+                        draw_text: {disabled: 1.0}
+                    }
+                }
+            }
+            /** free-running clock track for animated faces */
+            time: {
+                default: @off
+                /** clock stopped: nothing applied */
+                off: AnimatorState{
+                    from: {all: Forward {duration: 0.}}
+                    apply: {
+                    }
+                }
+                /** clock running: ramps draw_bg.anim_time 0..1 once per second, forever */
+                on: AnimatorState{
+                    from: {all: Loop {duration: 1.0, end: 1000000000.0}}
+                    apply: {
+                        draw_bg: {anim_time: [{time: 0.0, value: 0.0}, {time: 1.0, value: 1.0}]}
+                    }
+                }
+            }
+            /** pointer track: drives both the hover and down mixes */
+            hover: {
+                default: @off
+                /** pointer away: 0.1s fade of hover and down back to 0 */
+                off: AnimatorState{
+                    from: {all: Forward {duration: 0.1}}
+                    apply: {
+                        draw_bg: {down: 0.0, hover: 0.0}
+                        draw_text: {down: 0.0, hover: 0.0}
+                    }
+                }
+
+                /** pointer over: hover snaps to 1, down releases in 0.01s */
+                on: AnimatorState{
+                    from: {
+                        all: Forward {duration: 0.1}
+                        down: Forward {duration: 0.01}
+                    }
+                    apply: {
+                        draw_bg: {down: 0.0, hover: snap(1.0)}
+                        draw_text: {down: 0.0, hover: snap(1.0)}
+                    }
+                }
+
+                /** held down: down snaps to 1 with hover held on under it */
+                down: AnimatorState{
+                    from: {all: Forward {duration: 0.2}}
+                    apply: {
+                        draw_bg: {down: snap(1.0), hover: 1.0}
+                        draw_text: {down: snap(1.0), hover: 1.0}
+                    }
+                }
+            }
+            /** keyboard-focus track: drives the focus mix on face and label */
+            focus: {
+                default: @off
+                /** focus lost: 0.2s fade of the focus mix back to 0 */
+                off: AnimatorState{
+                    from: {all: Forward {duration: 0.2}}
+                    apply: {
+                        draw_bg: {focus: 0.0}
+                        draw_text: {focus: 0.0}
+                    }
+                }
+                /** focused: focus mix on immediately, arrow cursor */
+                on: AnimatorState{
+                    cursor: MouseCursor.Arrow
+                    from: {all: Forward {duration: 0.0}}
+                    apply: {
+                        draw_bg: {focus: 1.0}
+                        draw_text: {focus: 1.0}
+                    }
+                }
+            }
+            /** loading track: swaps the label for the spinner arc */
+            loading: {
+                default: @off
+                /** not loading: 0.15s fade of the arc out and the label back */
+                off: AnimatorState{
+                    from: {all: Forward {duration: 0.15}}
+                    apply: {
+                        draw_bg: {loading: 0.0}
+                        draw_text: {loading: 0.0}
+                    }
+                }
+                /** loading: 0.15s fade of the label out and the arc in */
+                on: AnimatorState{
+                    from: {all: Forward {duration: 0.15}}
+                    apply: {
+                        draw_bg: {loading: 1.0}
+                        draw_text: {loading: 1.0}
+                    }
+                }
+            }
+        }
+    }
+
+    /** The borderless button: face and bevel hidden until disabled. */
+    mod.widgets.ButtonFlatter = mod.widgets.ButtonFlat{
+        draw_bg +: {
+            color: theme.color_u_hidden
+            color_default: theme.color_u_hidden
+            color_hover: theme.color_u_hidden
+            color_down: theme.color_u_hidden
+            /** the one state that paints a face: disabled */
+            color_disabled: theme.color_outset_disabled
+
+            border_color: theme.color_u_hidden
+            border_color_hover: theme.color_u_hidden
+            border_color_down: theme.color_u_hidden
+            border_color_focus: theme.color_u_hidden
+            border_color_disabled: theme.color_u_hidden
+        }
+    }
+
+    /** The standard button: the flat face plus the outset gradient fill
+     * and bevel colors from the theme. */
+    mod.widgets.Button = mod.widgets.ButtonFlat{
+        draw_bg +: {
+            border_color: theme.color_bevel_outset_1
+            border_color_hover: theme.color_bevel_outset_1_hover
+            border_color_down: theme.color_bevel_outset_1_down
+            border_color_focus: theme.color_bevel_outset_1_focus
+            border_color_disabled: theme.color_bevel_outset_1_disabled
+
+            /** second bevel stop: turns the flat stroke into a gradient */
+            border_color_2: theme.color_bevel_outset_2
+            border_color_2_hover: theme.color_bevel_outset_2_hover
+            border_color_2_down: theme.color_bevel_outset_2_down
+            border_color_2_focus: theme.color_bevel_outset_2_focus
+            border_color_2_disabled: theme.color_bevel_outset_2_disabled
+        }
+    }
+
+    /** The gradient button: the standard face filled with a two-stop
+     * vertical gradient instead of a flat color. */
+    mod.widgets.ButtonGradientX = mod.widgets.Button{
+        draw_bg +: {
+            /** gradient start stop at rest */
+            color: theme.color_outset_1
+            color_default: theme.color_outset_1
+            /** gradient start stop under the pointer */
+            color_hover: theme.color_outset_1_hover
+            /** gradient start stop while held */
+            color_down: theme.color_outset_1_down
+            /** gradient start stop when key-focused */
+            color_focus: theme.color_outset_1_focus
+            /** gradient start stop when disabled */
+            color_disabled: theme.color_outset_1_disabled
+
+            /** second fill stop: a positive alpha here switches the fill to a gradient */
+            color_2: theme.color_outset_2
+        }
+    }
+
+    /** The gradient button turned sideways: the same fill run left to right. */
+    mod.widgets.ButtonGradientY = mod.widgets.ButtonGradientX{
+        draw_bg.gradient_fill_horizontal: /** fill gradient axis: 1 horizontal 0..1 step 1 */ 1.0
+    }
+
+    /** The standard button carrying only an icon: no label, no gap. */
+    mod.widgets.ButtonIcon = mod.widgets.Button{
+        /** no gap: there is no label to sit beside the icon 0..24 step 1 */
+        spacing: 0.
+        /** icon only: the label is empty */
+        text: ""
+    }
+
+    /** The vertical-gradient button carrying only an icon. */
+    mod.widgets.ButtonGradientXIcon = mod.widgets.ButtonGradientX{
+        /** no gap: there is no label to sit beside the icon 0..24 step 1 */
+        spacing: 0.
+        /** icon only: the label is empty */
+        text: ""
+    }
+
+    /** The horizontal-gradient button carrying only an icon. */
+    mod.widgets.ButtonGradientYIcon = mod.widgets.ButtonGradientY{
+        /** no gap: there is no label to sit beside the icon 0..24 step 1 */
+        spacing: 0.
+        /** icon only: the label is empty */
+        text: ""
+    }
+
+    /** The flat button carrying only an icon. */
+    mod.widgets.ButtonFlatIcon = mod.widgets.ButtonFlat{
+        /** no gap: there is no label to sit beside the icon 0..24 step 1 */
+        spacing: 0.
+        /** icon only: the label is empty */
+        text: ""
+    }
+
+    /** The borderless button carrying only an icon: a bare clickable mark. */
+    mod.widgets.ButtonFlatterIcon = mod.widgets.ButtonFlatter{
+        draw_bg.color_focus: theme.color_u_hidden
+        /** no gap: there is no label to sit beside the icon 0..24 step 1 */
+        spacing: 0.
+        /** icon only: the label is empty */
+        text: ""
+    }
+
+    /** The filled button for the page's one main action: the primary role
+     * as the face, its on-colour as the ink, a state layer for hover and
+     * press, and a focus ring in the ink. */
+    mod.widgets.ButtonPrimary = mod.widgets.ButtonFlat{
+        draw_bg +: {
+            color: theme.color_primary
+            color_default: theme.color_primary
+            color_hover: theme.color_primary
+            color_down: theme.color_primary
+            color_focus: theme.color_primary
+            color_disabled: theme.color_outset_disabled
+            border_color: theme.color_primary
+            border_color_hover: theme.color_primary
+            border_color_down: theme.color_primary
+            border_color_focus: theme.color_on_primary
+            border_color_disabled: theme.color_outset_disabled
+            layer_color: theme.color_on_primary
+        }
+        draw_text +: {
+            color: theme.color_on_primary
+            color_hover: theme.color_on_primary
+            color_down: theme.color_on_primary
+            color_focus: theme.color_on_primary
+            color_disabled: theme.color_label_inner_disabled
+        }
+        draw_icon +: {
+            color: theme.color_on_primary
+        }
+    }
+
+    /** The filled button for the second action: the secondary role. */
+    mod.widgets.ButtonSecondary = mod.widgets.ButtonPrimary{
+        draw_bg +: {
+            color: theme.color_secondary
+            color_default: theme.color_secondary
+            color_hover: theme.color_secondary
+            color_down: theme.color_secondary
+            color_focus: theme.color_secondary
+            border_color: theme.color_secondary
+            border_color_hover: theme.color_secondary
+            border_color_down: theme.color_secondary
+            border_color_focus: theme.color_on_secondary
+            layer_color: theme.color_on_secondary
+        }
+        draw_text +: {
+            color: theme.color_on_secondary
+            color_hover: theme.color_on_secondary
+            color_down: theme.color_on_secondary
+            color_focus: theme.color_on_secondary
+        }
+        draw_icon +: {
+            color: theme.color_on_secondary
+        }
+    }
+
+    /** The tonal button: a quieter fill from the tertiary container, for
+     * actions that matter but must not compete with the primary. */
+    mod.widgets.ButtonTertiary = mod.widgets.ButtonPrimary{
+        draw_bg +: {
+            color: theme.color_tertiary_container
+            color_default: theme.color_tertiary_container
+            color_hover: theme.color_tertiary_container
+            color_down: theme.color_tertiary_container
+            color_focus: theme.color_tertiary_container
+            border_color: theme.color_tertiary_container
+            border_color_hover: theme.color_tertiary_container
+            border_color_down: theme.color_tertiary_container
+            border_color_focus: theme.color_on_tertiary_container
+            layer_color: theme.color_on_tertiary_container
+        }
+        draw_text +: {
+            color: theme.color_on_tertiary_container
+            color_hover: theme.color_on_tertiary_container
+            color_down: theme.color_on_tertiary_container
+            color_focus: theme.color_on_tertiary_container
+        }
+        draw_icon +: {
+            color: theme.color_on_tertiary_container
+        }
+    }
+
+    /** The outlined button: no face, a one-pixel outline, primary ink,
+     * and the state layer tinting the inside on hover and press. */
+    mod.widgets.ButtonOutline = mod.widgets.ButtonFlat{
+        draw_bg +: {
+            /** outline thickness in pixels 0..4 step 0.5 */
+            border_size: 1.0
+            color: theme.color_u_hidden
+            color_default: theme.color_u_hidden
+            color_hover: theme.color_u_hidden
+            color_down: theme.color_u_hidden
+            color_focus: theme.color_u_hidden
+            color_disabled: theme.color_u_hidden
+            border_color: theme.color_outline
+            border_color_hover: theme.color_outline
+            border_color_down: theme.color_outline
+            border_color_focus: theme.color_primary
+            border_color_disabled: theme.color_outline_variant
+            layer_color: theme.color_primary
+        }
+        draw_text +: {
+            color: theme.color_primary
+            color_hover: theme.color_primary
+            color_down: theme.color_primary
+            color_focus: theme.color_primary
+            color_disabled: theme.color_label_inner_disabled
+        }
+        draw_icon +: {
+            color: theme.color_primary
+        }
+    }
+
+    /** The outlined button with a dashed outline: an add-here or drop-here
+     * affordance rather than a firm action. */
+    mod.widgets.ButtonDashed = mod.widgets.ButtonOutline{
+        /** dash length in pixels 0..16 step 0.5 */
+        draw_bg.border_dash: 4.0
+    }
+
+    /** The destructive button: the error role as the face. */
+    mod.widgets.ButtonDanger = mod.widgets.ButtonPrimary{
+        draw_bg +: {
+            color: theme.color_error
+            color_default: theme.color_error
+            color_hover: theme.color_error
+            color_down: theme.color_error
+            color_focus: theme.color_error
+            border_color: theme.color_error
+            border_color_hover: theme.color_error
+            border_color_down: theme.color_error
+            border_color_focus: theme.color_on_error
+            layer_color: theme.color_on_error
+        }
+        draw_text +: {
+            color: theme.color_on_error
+            color_hover: theme.color_on_error
+            color_down: theme.color_on_error
+            color_focus: theme.color_on_error
+        }
+        draw_icon +: {
+            color: theme.color_on_error
+        }
+    }
+
+    /** The extra-small button: the shortest rung of the control ladder,
+     * for dense toolbars and table rows. */
+    mod.widgets.ButtonXs = mod.widgets.ButtonFlat{
+        /** fixed face height in pixels 12..64 step 1 */
+        height: theme.size_control_s - theme.space_1
+        padding: theme.mspace_1{top: 0., bottom: 0., left: theme.space_1, right: theme.space_1}
+        draw_text.text_style.font_size: theme.type_label_s_size
+        icon_walk: Walk{width: 12.0, height: Fit}
+    }
+
+    /** The small button: the control ladder's small rung. */
+    mod.widgets.ButtonSm = mod.widgets.ButtonFlat{
+        /** fixed face height in pixels 12..64 step 1 */
+        height: theme.size_control_s
+        padding: theme.mspace_1{top: 0., bottom: 0., left: theme.space_2, right: theme.space_2}
+        draw_text.text_style.font_size: theme.type_label_m_size
+        icon_walk: Walk{width: 16.0, height: Fit}
+    }
+
+    /** The large button: the control ladder's large rung. */
+    mod.widgets.ButtonLg = mod.widgets.ButtonFlat{
+        /** fixed face height in pixels 12..64 step 1 */
+        height: theme.size_control_l
+        padding: theme.mspace_1{top: 0., bottom: 0., left: theme.space_3, right: theme.space_3}
+        draw_text.text_style.font_size: theme.type_title_s_size
+        icon_walk: Walk{width: 24.0, height: Fit}
+    }
+
+    /** The extra-large button: above the ladder, for hero actions. */
+    mod.widgets.ButtonXl = mod.widgets.ButtonFlat{
+        /** fixed face height in pixels 12..64 step 1 */
+        height: theme.size_control_l + theme.space_2
+        padding: theme.mspace_1{top: 0., bottom: 0., left: theme.space_4, right: theme.space_4}
+        draw_text.text_style.font_size: theme.type_title_m_size
+        icon_walk: Walk{width: 28.0, height: Fit}
+    }
+
+    /** The compound button: a label with a quieter description line
+     * under it, the icon beside both. */
+    mod.widgets.ButtonCompound = mod.widgets.ButtonFlat{
+        /** the second line under the label */
+        description: "Description"
+        padding: theme.mspace_1{left: theme.space_3, right: theme.space_3}
+        icon_walk: Walk{width: 28.0, height: Fit}
+    }
+
+    /** The tonal icon button: an icon alone on the tertiary container. */
+    mod.widgets.ButtonTonalIcon = mod.widgets.ButtonTertiary{
+        /** no gap: there is no label to sit beside the icon 0..24 step 1 */
+        spacing: 0.
+        /** icon only: the label is empty */
+        text: ""
+        padding: theme.mspace_1
+    }
+
+    /** The subtle icon button: an icon alone with no face until the
+     * pointer arrives, when the state layer tints it. */
+    mod.widgets.ButtonSubtleIcon = mod.widgets.ButtonFlatterIcon{
+        padding: theme.mspace_1
+        draw_bg +: {
+            layer_color: theme.color_on_surface
+        }
+        draw_icon +: {
+            color: theme.color_on_surface_variant
+        }
+    }
+
+    /** The close button: a standalone cross drawn in the face shader, with
+     * a round state layer under the pointer. Dialogs, toasts and drawers
+     * take one as their close control. */
+    mod.widgets.CloseButton = mod.widgets.ButtonFlatterIcon{
+        /** the square the cross sits in, in pixels 10..48 step 1 */
+        width: 20.
+        height: 20.
+        padding: 0.
+        margin: 0.
+        draw_bg +: {
+            border_radius: theme.radius_full
+            layer_color: theme.color_on_surface
+            /** cross span as a fraction of the shorter side 0.1..0.9 step 0.05 */
+            cross_size: uniform(0.42)
+            /** cross stroke in pixels 0.5..4 step 0.25 */
+            cross_stroke: uniform(1.25)
+            /** cross ink at rest */
+            cross_color: uniform(theme.color_label_inner)
+            /** cross ink under the pointer */
+            cross_color_hover: uniform(theme.color_label_inner_hover)
+            /** cross ink when disabled */
+            cross_color_disabled: uniform(theme.color_label_inner_disabled)
+
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(
+                    self.border_size
+                    self.border_size
+                    self.rect_size.x - self.border_size * 2.
+                    self.rect_size.y - self.border_size * 2.
+                    self.border_radius
+                )
+                sdf.fill_keep(self.face_fill())
+                sdf.stroke(self.face_stroke(), self.border_size)
+
+                let mid = self.rect_size * 0.5
+                let half = min(self.rect_size.x, self.rect_size.y) * self.cross_size * 0.5
+                sdf.move_to(mid.x - half, mid.y - half)
+                sdf.line_to(mid.x + half, mid.y + half)
+                sdf.move_to(mid.x - half, mid.y + half)
+                sdf.line_to(mid.x + half, mid.y - half)
+                let ink = self.cross_color
+                    .mix(self.cross_color_hover, self.hover)
+                    .mix(self.cross_color_disabled, self.disabled)
+                sdf.stroke(ink, self.cross_stroke)
+                return sdf.result
+            }
+        }
+    }
+
+    /** The small close button, for chips and dense rows. */
+    mod.widgets.CloseButtonSm = mod.widgets.CloseButton{
+        width: 16.
+        height: 16.
+        draw_bg.cross_stroke: 1.0
+    }
+
+    /** The large close button, for dialogs and full-screen panels. */
+    mod.widgets.CloseButtonLg = mod.widgets.CloseButton{
+        width: 28.
+        height: 28.
+        draw_bg.cross_stroke: 1.5
+    }
+
+    /** The copy button: a click copies text_to_copy to the clipboard, the
+     * two sheets at the start of the face give way to a check, and the
+     * label reads copied_text for copied_secs. */
+    mod.widgets.CopyButton = mod.widgets.ButtonFlat{
+        text: "Copy"
+        /** the label shown after a copy */
+        copied_text: "Copied"
+        /** the face's left padding leaves room for the glyph */
+        padding: theme.mspace_1{left: theme.space_2 + 16., right: theme.space_2}
+        draw_bg +: {
+            /** copied mix: sheets out, check in 0..1 step 0.01 */
+            copied: instance(0.0)
+            /** glyph side in pixels 6..24 step 0.5 */
+            glyph_size: uniform(11.0)
+            /** glyph inset from the face's left edge in pixels 0..24 step 0.5 */
+            glyph_inset: uniform(theme.space_2)
+            /** glyph ink at rest */
+            glyph_color: uniform(theme.color_label_inner)
+            /** glyph ink under the pointer */
+            glyph_color_hover: uniform(theme.color_label_inner_hover)
+            /** glyph ink when disabled */
+            glyph_color_disabled: uniform(theme.color_label_inner_disabled)
+
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(
+                    self.border_size
+                    self.border_size
+                    self.rect_size.x - self.border_size * 2.
+                    self.rect_size.y - self.border_size * 2.
+                    self.border_radius
+                )
+                let face = self.face_fill()
+                sdf.fill_keep(face)
+                sdf.stroke(self.face_stroke(), self.border_size)
+
+                // The glyph zone: two stacked sheets at rest, the front one
+                // filled with the face so it hides the back one's edges.
+                let g = self.glyph_size
+                let gx = self.glyph_inset
+                let gy = (self.rect_size.y - g) * 0.5
+                let ink = self.glyph_color
+                    .mix(self.glyph_color_hover, self.hover)
+                    .mix(self.glyph_color_disabled, self.disabled)
+                let sheet = g * 0.66
+                let sheet_ink = vec4(ink.rgb, ink.a * (1.0 - self.copied))
+                sdf.box(gx + g - sheet, gy, sheet, sheet, 1.0)
+                sdf.stroke(sheet_ink, 1.0)
+                sdf.box(gx, gy + g - sheet, sheet, sheet, 1.0)
+                sdf.fill_keep(vec4(face.rgb, face.a * (1.0 - self.copied)))
+                sdf.stroke(sheet_ink, 1.0)
+
+                // The check, faded in once copied.
+                sdf.move_to(gx + g * 0.12, gy + g * 0.55)
+                sdf.line_to(gx + g * 0.4, gy + g * 0.82)
+                sdf.line_to(gx + g * 0.9, gy + g * 0.2)
+                sdf.stroke(vec4(ink.rgb, ink.a * self.copied), 1.5)
+                return sdf.result
+            }
+        }
+        animator +: {
+            /** copied track: sheets out and the check in, and back */
+            copied: {
+                default: @off
+                off: AnimatorState{
+                    from: {all: Forward {duration: 0.2}}
+                    apply: {
+                        draw_bg: {copied: 0.0}
+                    }
+                }
+                on: AnimatorState{
+                    from: {all: Forward {duration: 0.15}}
+                    apply: {
+                        draw_bg: {copied: 1.0}
+                    }
+                }
+            }
+        }
+    }
+
+    /** The burger button: three bars that turn into a cross as open goes
+     * to 1, for a drawer or a collapsed navigation. */
+    mod.widgets.BurgerButton = mod.widgets.ButtonFlatterIcon{
+        /** the square the bars sit in, in pixels 16..48 step 1 */
+        width: 28.
+        height: 28.
+        padding: 0.
+        draw_bg +: {
+            border_radius: theme.radius_s
+            layer_color: theme.color_on_surface
+            /** 0 draws three bars, 1 a cross; the open track drives it 0..1 step 0.01 */
+            open: instance(0.0)
+            /** bar span as a fraction of the shorter side 0.1..0.9 step 0.05 */
+            bar_size: uniform(0.55)
+            /** bar stroke in pixels 0.5..4 step 0.25 */
+            bar_stroke: uniform(1.5)
+            /** gap between the bars as a fraction of half the span 0.1..1 step 0.05 */
+            bar_gap: uniform(0.6)
+            /** bar ink at rest */
+            bar_color: uniform(theme.color_label_inner)
+            /** bar ink under the pointer */
+            bar_color_hover: uniform(theme.color_label_inner_hover)
+            /** bar ink when disabled */
+            bar_color_disabled: uniform(theme.color_label_inner_disabled)
+
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(
+                    self.border_size
+                    self.border_size
+                    self.rect_size.x - self.border_size * 2.
+                    self.rect_size.y - self.border_size * 2.
+                    self.border_radius
+                )
+                sdf.fill_keep(self.face_fill())
+                sdf.stroke(self.face_stroke(), self.border_size)
+
+                let mid = self.rect_size * 0.5
+                let half = min(self.rect_size.x, self.rect_size.y) * self.bar_size * 0.5
+                let gap = half * self.bar_gap * (1.0 - self.open)
+                let ink = self.bar_color
+                    .mix(self.bar_color_hover, self.hover)
+                    .mix(self.bar_color_disabled, self.disabled)
+
+                // The outer bars close on the middle and turn to the
+                // diagonals; the middle bar shrinks away.
+                let angle = self.open * PI * 0.25
+                sdf.rotate(angle, mid.x, mid.y)
+                sdf.move_to(mid.x - half, mid.y - gap)
+                sdf.line_to(mid.x + half, mid.y - gap)
+                sdf.stroke(ink, self.bar_stroke)
+                sdf.rotate(-2.0 * angle, mid.x, mid.y)
+                sdf.move_to(mid.x - half, mid.y + gap)
+                sdf.line_to(mid.x + half, mid.y + gap)
+                sdf.stroke(ink, self.bar_stroke)
+                sdf.rotate(angle, mid.x, mid.y)
+                let middle = half * (1.0 - self.open)
+                sdf.move_to(mid.x - middle, mid.y)
+                sdf.line_to(mid.x + middle, mid.y)
+                sdf.stroke(vec4(ink.rgb, ink.a * (1.0 - self.open)), self.bar_stroke)
+                return sdf.result
+            }
+        }
+        animator +: {
+            /** open track: bars to cross and back */
+            open: {
+                default: @off
+                off: AnimatorState{
+                    ease: OutQuad
+                    from: {all: Forward {duration: 0.2}}
+                    apply: {
+                        draw_bg: {open: 0.0}
+                    }
+                }
+                on: AnimatorState{
+                    ease: OutQuad
+                    from: {all: Forward {duration: 0.2}}
+                    apply: {
+                        draw_bg: {open: 1.0}
+                    }
+                }
+            }
+        }
+    }
+
+    /** The round face of a floating action: a plus drawn in the face shader
+     * that turns to a cross as open goes to 1, so the button that brings a
+     * set of actions out is also the one that puts them away. */
+    mod.widgets.ButtonFloating = mod.widgets.ButtonFlatIcon{
+        /** the disc's diameter in pixels 40..96 step 4 */
+        width: 56.
+        height: 56.
+        padding: 0.
+        margin: 0.
+        align: Center
+        draw_bg +: {
+            // The base declares these inputs, so they take plain values here.
+            color: theme.color_primary_container
+            color_hover: theme.color_primary_container
+            color_down: theme.color_primary_container
+            color_focus: theme.color_primary_container
+            color_disabled: theme.color_outset_disabled
+            /** the stroke the focus ring is drawn with, in pixels 0..4 step 0.5 */
+            border_size: 2.
+            border_radius: theme.radius_full
+            // No outline at rest: the ring appears only with key focus.
+            border_color: #0000
+            border_color_hover: #0000
+            border_color_down: #0000
+            border_color_focus: theme.color_primary
+            border_color_disabled: #0000
+            layer_color: theme.color_on_primary_container
+
+            /** 0 draws the plus, 1 the turned glyph; the open track drives it 0..1 step 0.01 */
+            open: instance(0.0)
+            /** how far the glyph turns when open, in radians 0..3.1416 step 0.01 */
+            turn: uniform(0.7853982)
+            /** plus span as a fraction of the shorter side 0.1..0.8 step 0.02 */
+            glyph_size: uniform(0.36)
+            /** glyph stroke in pixels 0.5..4 step 0.25 */
+            glyph_stroke: uniform(2.0)
+            /** glyph ink */
+            glyph_color: uniform(theme.color_on_primary_container)
+            /** glyph ink when disabled */
+            glyph_color_disabled: uniform(theme.color_label_inner_disabled)
+
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(
+                    self.border_size
+                    self.border_size
+                    self.rect_size.x - self.border_size * 2.
+                    self.rect_size.y - self.border_size * 2.
+                    self.border_radius
+                )
+                sdf.fill_keep(self.face_fill())
+                sdf.stroke(self.face_stroke(), self.border_size)
+
+                // One plus turned as a whole: a quarter turn of a plus is
+                // the same plus, so an eighth reads as the cross.
+                let mid = self.rect_size * 0.5
+                let half = min(self.rect_size.x, self.rect_size.y) * self.glyph_size * 0.5
+                let ink = self.glyph_color.mix(self.glyph_color_disabled, self.disabled)
+                sdf.rotate(self.open * self.turn, mid.x, mid.y)
+                sdf.move_to(mid.x - half, mid.y)
+                sdf.line_to(mid.x + half, mid.y)
+                sdf.move_to(mid.x, mid.y - half)
+                sdf.line_to(mid.x, mid.y + half)
+                sdf.stroke(ink, self.glyph_stroke)
+                return sdf.result
+            }
+        }
+        animator +: {
+            /** open track: the plus turns to the cross and back on the theme's motion eases, the same a floating action's set moves on; a floating action cuts this track and plays the turn on its own clock */
+            open: {
+                default: @off
+                off: AnimatorState{
+                    ease: theme.motion_ease_standard_accelerate
+                    from: {all: Forward {duration: theme.motion_short_3}}
+                    apply: {
+                        draw_bg: {open: 0.0}
+                    }
+                }
+                on: AnimatorState{
+                    ease: theme.motion_ease_emphasized_decelerate
+                    from: {all: Forward {duration: theme.motion_short_4}}
+                    apply: {
+                        draw_bg: {open: 1.0}
+                    }
+                }
+            }
+        }
+    }
+
+    /** The small round face of a sub-action: an icon, centred on the disc. */
+    mod.widgets.ButtonFloatingSm = mod.widgets.ButtonFlatIcon{
+        /** the disc's diameter in pixels 24..64 step 2 */
+        width: 40.
+        height: 40.
+        padding: 0.
+        margin: 0.
+        align: Center
+        icon_walk: Walk{/** icon width in pixels 8..48 step 1 */ width: 20., height: Fit}
+        draw_bg +: {
+            color: theme.color_surface_container_high
+            color_hover: theme.color_surface_container_high
+            color_down: theme.color_surface_container_high
+            color_focus: theme.color_surface_container_high
+            /** the stroke the focus ring is drawn with, in pixels 0..4 step 0.5 */
+            border_size: 2.
+            border_radius: theme.radius_full
+            border_color: #0000
+            border_color_hover: #0000
+            border_color_down: #0000
+            border_color_focus: theme.color_primary
+            border_color_disabled: #0000
+            layer_color: theme.color_on_surface
+        }
+        draw_icon +: {
+            color: theme.color_on_surface
+        }
+    }
+}
+
+/// Raised by a copy button once the text is on the clipboard.
+#[derive(Clone, Debug, Default)]
+pub enum CopyButtonAction {
+    #[default]
+    None,
+    Copied,
+}
+
+/// Actions emitted by a button widget, including the key modifiers
+/// that were active when the action occurred.
+///
+/// The sequence of actions emitted by a button is as follows:
+/// 1. `ButtonAction::Pressed` when the button is pressed.
+/// 2. `ButtonAction::LongPressed` when the button has been pressed for a long time.
+///    * This only occurs on platforms that support a *native* long press, e.g., mobile.
+/// 3. Then, either one of the following, but not both:
+///    * `ButtonAction::Clicked` when the mouse/finger is lifted up while over the button area.
+///    * `ButtonAction::Released` when the mouse/finger is lifted up while *not* over the button area.
+#[derive(Clone, Debug, Default)]
+pub enum ButtonAction {
+    #[default]
+    None,
+    /// The button was pressed (a "down" event).
+    Pressed(KeyModifiers),
+    /// The button was pressed for a long time (only occurs on mobile platforms).
+    LongPressed,
+    /// The button was clicked (an "up" event).
+    Clicked(KeyModifiers),
+    /// The button was released (an "up" event), but should not be considered clicked
+    /// because the mouse/finger was not over the button area when released.
+    Released(KeyModifiers),
+}
+
+/// A clickable button widget that emits actions when pressed, and when either released or clicked.
+#[derive(Script, Widget, WidgetSet, Animator)]
+pub struct Button {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+    #[apply_default]
+    animator: Animator,
+
+    /// Public so a host can recolour the face from its own draw: an apply
+    /// redraws the button, and in a draw that asks for the next frame.
+    #[redraw]
+    #[live]
+    pub draw_bg: DrawQuad,
+    /// Public for the same reason as `draw_bg`.
+    #[live]
+    pub draw_text: DrawText,
+    #[live]
+    /// Public so a host can recolour the mark directly. Going through a
+    /// script apply instead re-applies the whole object and drops the loaded
+    /// document, which renders the icon as a white silhouette.
+    pub draw_icon: DrawSvg,
+    #[live]
+    icon_walk: Walk,
+    /// The trailing icon, drawn after the label; leave the svg unset for none.
+    #[live]
+    pub draw_icon_end: DrawSvg,
+    #[live]
+    icon_end_walk: Walk,
+    #[live]
+    label_walk: Walk,
+    /// Per-row horizontal alignment of the label, which only shows once the text
+    /// wraps onto more rows; give `label_walk` a `Fill` width so the rows have
+    /// room to move within.
+    #[live]
+    label_align: Align,
+    #[walk]
+    walk: Walk,
+
+    /// The button is waiting: the label gives way to a spinner arc and
+    /// clicks are ignored until it is cleared.
+    #[live]
+    pub loading: bool,
+
+    /// How far from the face, in points, the pointer's field reaches, for
+    /// a material whose face answers the pointer's approach: the draw gets
+    /// `cap_field`, `cap_pointer_along`, `cap_pointer_across` and
+    /// `cap_time` while it is above zero. Only the nearest two faces on a
+    /// window carry a field at once. Zero (the default) keeps it off.
+    #[live]
+    pub cap_field_reach: f64,
+    #[rust]
+    field: PointerField,
+
+    /// Text a click puts on the clipboard; set, it makes this a copy button
+    /// that shows `copied_text` for `copied_secs` and raises
+    /// `CopyButtonAction::Copied`.
+    #[live]
+    pub text_to_copy: String,
+    /// The label shown after a copy; empty keeps `text`.
+    #[live]
+    pub copied_text: String,
+    /// How long the copied label and check stay, in seconds.
+    #[live(1.5)]
+    pub copied_secs: f64,
+    #[rust]
+    copied: bool,
+    #[rust]
+    copied_timer: Timer,
+
+    /// The burger button's state: bars while closed, a cross while open.
+    #[live]
+    pub open: bool,
+
+    #[layout]
+    layout: Layout,
+
+    /// The quieter second line under the label; empty draws none.
+    #[live]
+    pub description: String,
+    /// The description's ink.
+    #[live]
+    draw_description: DrawText,
+    /// The description's box under the label.
+    #[live]
+    description_walk: Walk,
+
+    #[live(true)]
+    grab_key_focus: bool,
+
+    /// Whether a tap on this button hides the soft keyboard (the focused text input loses its focus),
+    /// even while it's disabled. Turn it off for, e.g., a chat's send button.
+    #[live(true)]
+    hide_keyboard_on_tap: bool,
+
+    #[live(true)]
+    enabled: bool,
+
+    #[live(true)]
+    #[visible]
+    visible: bool,
+
+    /// Set the long-press handling behavior of this button.
+    /// * If `false` (default), the button will ignore long-press events
+    ///   and will never emit [`ButtonAction::LongPressed`].
+    ///   * Also, the button logic will *not* call [`FingerUpEvent::was_tap()`]
+    ///     to check if the button press was a short tap.
+    ///     This means that this button will consider itself to be clicked
+    ///     (and thus emit a [`ButtonAction::Clicked`] event)
+    ///     if the finger-up/release event occurs within the button area,
+    ///     *regardless* of how long the button was pressed down before it was released.
+    /// * If `true`, the button will respond to a long-press event
+    ///   by emitting [`ButtonAction::LongPressed`], which can only occur on
+    ///   mobile platforms that support a *native* long press event.
+    ///   * Also, the button will only consider itself to be clicked
+    ///     (and thus emit [`ButtonAction::Clicked`]) if [`FingerUpEvent::was_tap()`] returns `true`,
+    ///     meaning that a long press did *not* occur and that the button was released over the button area
+    ///     within a short time frame (~0.5 seconds) after the initial down press.
+    #[live]
+    pub enable_long_press: bool,
+
+    /// It indicates if the hover state will be reset when the button is clicked.
+    /// This could be useful for buttons that disappear when clicked, where the hover state
+    /// should not be preserved.
+    #[live]
+    reset_hover_on_click: bool,
+
+    #[live]
+    pub text: ArcStringMut,
+
+    /// What assistive technology calls a button that shows no text (an icon).
+    #[live]
+    a11y_name: ArcStringMut,
+
+    #[live]
+    on_click: ScriptFnRef,
+
+    #[live]
+    on_press: ScriptFnRef,
+
+    /// Legacy compatibility flag that fires `on_click` on press instead of click.
+    #[live]
+    trigger_on_press: bool,
+
+    #[action_data]
+    #[rust]
+    action_data: WidgetActionData,
+}
+
+impl ScriptHook for Button {
+    /// Every apply that is not an animation frame may have set `loading`
+    /// or `open` from the script side; bring the animator in line with
+    /// them. A new or reloaded button cuts to the state, an edit animates
+    /// into it.
+    fn on_after_apply(
+        &mut self,
+        vm: &mut ScriptVm,
+        apply: &Apply,
+        _scope: &mut Scope,
+        _value: ScriptValue,
+    ) {
+        if apply.is_animate() {
+            return;
+        }
+        let animate = if apply.is_eval() { Animate::Yes } else { Animate::No };
+        vm.with_cx_mut(|cx| {
+            self.sync_loading(cx, animate);
+            self.sync_open(cx, animate);
+        });
+    }
+}
+
+impl Widget for Button {
+    fn handle_action(
+        &mut self,
+        cx: &mut Cx,
+        action: &a11y_tree::ActionRequest,
+        _scope: &mut Scope,
+    ) -> a11y_tree::ActionResult {
+        use a11y_tree::{ActionResult, Actions as A};
+        if action.action != A::PRESS {
+            return ActionResult::Unhandled;
+        }
+        if !self.enabled || self.disabled(cx) || self.loading {
+            return ActionResult::Disabled;
+        }
+        let uid = self.widget_uid();
+        if self.grab_key_focus && self.hide_keyboard_on_tap {
+            cx.set_key_focus_from_user(self.draw_bg.area());
+        }
+        cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_press.clone(), &[]);
+        if self.trigger_on_press {
+            cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_click.clone(), &[]);
+        }
+        cx.widget_action_with_data(
+            &self.action_data,
+            uid,
+            ButtonAction::Clicked(KeyModifiers::default()),
+        );
+        if !self.trigger_on_press {
+            cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_click.clone(), &[]);
+        }
+        if !self.text_to_copy.is_empty() {
+            self.copy_now(cx);
+        }
+        self.animator_play(cx, ids!(hover.off));
+        ActionResult::Handled
+    }
+
+    fn semantics(&self, cx: &Cx, node: &mut a11y_tree::Node) {
+        node.role = a11y_tree::Role::Button;
+        let name: &str = self.a11y_name.as_ref();
+        makepad_platform::a11y::set_string(&mut node.name, if name.is_empty() { self.shown_label() } else { name });
+        node.actions = a11y_tree::Actions::PRESS | a11y_tree::Actions::FOCUS;
+        node.states = a11y_tree::States::FOCUSABLE;
+        node.states.set(
+            a11y_tree::States::DISABLED,
+            !self.enabled || self.disabled(cx) || self.loading,
+        );
+        node.states.set(a11y_tree::States::BUSY, self.loading);
+    }
+
+    /// Its text, laid out (hidden buttons draw nothing).
+    fn scan(&mut self, cx: &mut Cx, _scan: &ScanEvent, _scope: &mut Scope) {
+        self.draw_text.scan_text(cx, self.text.as_ref());
+    }
+
+    /// What this button would be worth on a row, with `over` in force.
+    ///
+    /// Measured, not drawn: `DrawText::layout` touches no turtle and comes out
+    /// of an LRU cache keyed on the string and its style, so measuring a label
+    /// here and drawing it afterwards is a cache hit rather than a second
+    /// shaping pass.
+    ///
+    /// `None` wherever an honest number is not available -- an icon whose
+    /// document has not loaded answers `None` rather than a guess, because a
+    /// rung priced wrong is a rung the ladder never gives back.
+    fn measure_width(
+        &mut self,
+        cx: &mut Cx2d,
+        over: Option<&crate::width_override::WidthOverride>,
+    ) -> Option<f64> {
+        if over.is_some_and(|o| o.opaque) {
+            return None;
+        }
+        // A block that states `visible` states it: the child may be wearing the
+        // opposite right now, and a price taken off what it is wearing is a
+        // price of the concession rather than of the face being priced.
+        let visible = over.and_then(|o| o.visible).unwrap_or(self.visible);
+        if !visible {
+            return Some(0.0);
+        }
+
+        let margin = over.and_then(|o| o.margin).unwrap_or(self.walk.margin);
+        // A stated width is the answer whatever is inside it.
+        let width = over.and_then(|o| o.width).unwrap_or(self.walk.width);
+        if let Size::Fixed(w) = width {
+            return Some(w + margin.width());
+        }
+        // A Fill takes what the others leave, so what it adds to the row's own
+        // width is its minimum -- nothing, for a plain spacer. Answering None
+        // here would make a row with a spacer in it unpriceable, which is most
+        // rows.
+        if let Size::Fill { min, .. } = width {
+            return Some(min.unwrap_or(0.0) + margin.width());
+        }
+
+        let pad = over.and_then(|o| o.padding).unwrap_or(self.layout.padding);
+        let gap = over.and_then(|o| o.spacing).unwrap_or(self.layout.spacing);
+
+        let label: &str = match over.and_then(|o| o.text.as_deref()) {
+            Some(t) => t,
+            None if self.copied && !self.copied_text.is_empty() => self.copied_text.as_str(),
+            None => self.text.as_ref(),
+        };
+        let mut text_w = if label.is_empty() {
+            0.0
+        } else {
+            crate::badge::advance(&self.draw_text, cx, label)
+        };
+        // A description stacks BELOW the label, so the pair is as wide as the
+        // wider of the two, not as wide as both.
+        if !self.description.is_empty() {
+            text_w = text_w.max(crate::badge::advance(
+                &self.draw_description,
+                cx,
+                &self.description,
+            ));
+        }
+
+        let mut icon_w = 0.0;
+        let mut parts = if text_w > 0.0 { 1 } else { 0 };
+        let icons = [
+            (self.icon_walk, self.draw_icon.svg.is_none()),
+            (self.icon_end_walk, self.draw_icon_end.svg.is_none()),
+        ];
+        for (i, (iw, empty)) in icons.into_iter().enumerate() {
+            if empty {
+                continue;
+            }
+            let svg = if i == 0 {
+                &mut self.draw_icon
+            } else {
+                &mut self.draw_icon_end
+            };
+            // `None` means the walk leaves this icon's width to a turtle and
+            // the document has not loaded. Either way there is no honest number.
+            icon_w += crate::badge::icon_extent(svg, cx, iw)?;
+            parts += 1;
+        }
+
+        Some(
+            pad.width()
+                + text_w
+                + icon_w
+                + gap * (parts as f64 - 1.0).max(0.0)
+                + margin.width(),
+        )
+    }
+
+    fn script_call(
+        &mut self,
+        vm: &mut ScriptVm,
+        method: LiveId,
+        args: ScriptValue,
+    ) -> ScriptAsyncResult {
+        if method == live_id!(text) {
+            let str_val = vm.new_string(self.text.as_ref());
+            return ScriptAsyncResult::Return(str_val.into());
+        }
+        if method == live_id!(set_text) {
+            if let Some(args_obj) = args.as_object() {
+                let value = vm.vec_value_trap(args_obj, 0);
+                if !value.is_err() {
+                    if let Some(new_text) = vm.cast_to_owned_string(value, "copying button text")
+                    {
+                        vm.with_cx_mut(|cx| {
+                            self.set_text(cx, &new_text);
+                        });
+                    }
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        if method == live_id!(on_click) {
+            let uid = self.widget_uid();
+            vm.with_cx_mut(|cx| {
+                cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_click.clone(), &[]);
+            });
+            return ScriptAsyncResult::Return(TRUE);
+        }
+        if method == live_id!(on_press) {
+            let uid = self.widget_uid();
+            vm.with_cx_mut(|cx| {
+                cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_press.clone(), &[]);
+            });
+            return ScriptAsyncResult::Return(TRUE);
+        }
+        ScriptAsyncResult::MethodNotFound
+    }
+
+    fn set_disabled(&mut self, cx: &mut Cx, disabled: bool) {
+        self.animator_toggle(
+            cx,
+            disabled,
+            Animate::Yes,
+            ids!(disabled.on),
+            ids!(disabled.off),
+        );
+    }
+
+    fn disabled(&self, cx: &Cx) -> bool {
+        self.animator_in_state(cx, ids!(disabled.on))
+    }
+
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        let uid = self.widget_uid();
+        if self.animator_handle_event(cx, event).must_redraw() {
+            self.draw_bg.redraw(cx);
+        }
+
+        if self.cap_field_reach > 0.0 {
+            self.field_event(cx, event);
+        }
+
+        if let Event::ClearHover = event {
+            self.animator_cut(cx, ids!(hover.off));
+        }
+
+        if self.copied_timer.is_event(event).is_some() {
+            self.copied = false;
+            self.animator_play(cx, ids!(copied.off));
+            self.draw_bg.redraw(cx);
+        }
+
+        let hit = event.hits(cx, self.draw_bg.area());
+        if let Hit::FingerDown(fe) = &hit {
+            // We also get every other finger that lands while we hold one, so only one that lands on us is a tap on us.
+            if !self.hide_keyboard_on_tap && fe.device.is_touch() && fe.rect.contains(fe.abs) {
+                cx.fingers.mark_press_as_keeping_key_focus(fe.digit_id);
+            }
+        }
+
+        // The button only handles hits when it's visible and enabled.
+        // If it's not enabled, we still show the button, but we set
+        // the NotAllowed mouse cursor upon hover instead of the Hand cursor.
+        // While loading it takes no presses either, and shows the wait cursor.
+        let takes_input = self.enabled && !self.loading;
+        match hit {
+            Hit::KeyFocus(_) => {
+                self.animator_play(cx, ids!(focus.on));
+            }
+            Hit::KeyFocusLost(_) => {
+                self.animator_play(cx, ids!(focus.off));
+                self.draw_bg.redraw(cx);
+            }
+            // A focused button activates from the keyboard, with the keys the web and the
+            // desktop toolkits use. Holding the key repeats the press, so repeats are ignored.
+            Hit::KeyDown(ke) if takes_input && is_activation_key(ke.key_code) && !ke.is_repeat => {
+                cx.widget_action_with_data(
+                    &self.action_data,
+                    uid,
+                    ButtonAction::Pressed(ke.modifiers),
+                );
+                cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_press.clone(), &[]);
+                if self.trigger_on_press {
+                    cx.widget_to_script_call(
+                        uid,
+                        NIL,
+                        self.source.clone(),
+                        self.on_click.clone(),
+                        &[],
+                    );
+                }
+                self.animator_play(cx, ids!(hover.down));
+            }
+            Hit::KeyUp(ke) if takes_input && is_activation_key(ke.key_code) => {
+                crate::makepad_platform::makepad_error_log::flight_mark!("ui.click", uid.0, 0, "button `{}` (key)", self.text.as_ref());
+                cx.widget_action_with_data(
+                    &self.action_data,
+                    uid,
+                    ButtonAction::Clicked(ke.modifiers),
+                );
+                if !self.trigger_on_press {
+                    cx.widget_to_script_call(
+                        uid,
+                        NIL,
+                        self.source.clone(),
+                        self.on_click.clone(),
+                        &[],
+                    );
+                }
+                self.animator_play(cx, ids!(hover.off));
+            }
+            Hit::FingerDown(fe) if takes_input && fe.is_primary_hit() => {
+                // A touch waits until it clicks us, so a drag that scrolls from here keeps the keyboard up.
+                if self.grab_key_focus && !fe.device.is_touch() {
+                    cx.set_key_focus_from_user(self.draw_bg.area());
+                }
+                cx.widget_action_with_data(
+                    &self.action_data,
+                    uid,
+                    ButtonAction::Pressed(fe.modifiers),
+                );
+                cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_press.clone(), &[]);
+                if self.trigger_on_press {
+                    cx.widget_to_script_call(
+                        uid,
+                        NIL,
+                        self.source.clone(),
+                        self.on_click.clone(),
+                        &[],
+                    );
+                }
+                self.animator_play(cx, ids!(hover.down));
+            }
+            Hit::FingerHoverIn(_) => {
+                if takes_input {
+                    cx.set_cursor(MouseCursor::Hand);
+                    self.animator_play(cx, ids!(hover.on));
+                } else if self.loading {
+                    cx.set_cursor(MouseCursor::Wait);
+                } else {
+                    cx.set_cursor(MouseCursor::NotAllowed);
+                }
+            }
+            Hit::FingerHoverOut(_) => {
+                self.animator_play(cx, ids!(hover.off));
+            }
+            Hit::FingerLongPress(_lp) if takes_input && self.enable_long_press => {
+                cx.widget_action_with_data(&self.action_data, uid, ButtonAction::LongPressed);
+            }
+            Hit::FingerUp(fe) if takes_input && fe.is_primary_hit() => {
+                let was_clicked = fe.is_over
+                    && if self.enable_long_press {
+                        fe.was_tap()
+                    } else {
+                        true
+                    };
+                if was_clicked {
+                    if self.grab_key_focus && self.hide_keyboard_on_tap && fe.device.is_touch() {
+                        cx.set_key_focus_from_user(self.draw_bg.area());
+                    }
+                    crate::makepad_platform::makepad_error_log::flight_mark!("ui.click", uid.0, 0, "button `{}`", self.text.as_ref());
+                    cx.widget_action_with_data(
+                        &self.action_data,
+                        uid,
+                        ButtonAction::Clicked(fe.modifiers),
+                    );
+                    if !self.trigger_on_press {
+                        cx.widget_to_script_call(
+                            uid,
+                            NIL,
+                            self.source.clone(),
+                            self.on_click.clone(),
+                            &[],
+                        );
+                    }
+                    if !self.text_to_copy.is_empty() {
+                        self.copy_now(cx);
+                    }
+                    if self.reset_hover_on_click {
+                        self.animator_cut(cx, ids!(hover.off));
+                    } else if fe.has_hovers() {
+                        self.animator_play(cx, ids!(hover.on));
+                    } else {
+                        self.animator_play(cx, ids!(hover.off));
+                    }
+                } else {
+                    cx.widget_action_with_data(
+                        &self.action_data,
+                        uid,
+                        ButtonAction::Released(fe.modifiers),
+                    );
+                    self.animator_play(cx, ids!(hover.off));
+                }
+            }
+            _ => (),
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        if !self.visible {
+            return DrawStep::done();
+        }
+
+        self.draw_bg.begin(cx, walk, self.layout);
+        self.draw_icon.draw_walk(cx, self.icon_walk);
+        // An icon-only button has no label part: walking an empty label still
+        // took a turtle step, and the spacing before it pushed the icon off
+        // centre (the width measurement above already counts no label part).
+        if !self.shown_label().is_empty() || !self.description.is_empty() {
+            self.draw_label(cx);
+        }
+        self.draw_icon_end.draw_walk(cx, self.icon_end_walk);
+        self.draw_bg.end(cx);
+        cx.add_nav_stop(self.draw_bg.area(), NavRole::TextInput, Inset::default());
+        DrawStep::done()
+    }
+
+    /// The label as shown: the copied text while a copy is fresh, else `text`.
+    fn text(&self) -> String {
+        self.shown_label().to_string()
+    }
+
+    fn set_text(&mut self, cx: &mut Cx, v: &str) {
+        if self.text.as_ref() == v { return }
+        self.text.as_mut_empty().push_str(v);
+        self.redraw(cx);
+    }
+}
+
+/// The keys that activate the focused button: `Space`, like a checkbox, and
+/// `Enter`, like following a link.
+fn is_activation_key(key_code: KeyCode) -> bool {
+    matches!(key_code, KeyCode::Space | KeyCode::ReturnKey | KeyCode::NumpadEnter)
+}
+
+impl Button {
+    /// The pointer's field: its frame steps, the pointer read against the
+    /// face (points from the face's centre; the distance to the face's
+    /// edge goes to the arbiter, so faces of every size compete alike),
+    /// and the leave. The material gets the values on the drawn area.
+    fn field_event(&mut self, cx: &mut Cx, event: &Event) {
+        let press = if self.animator_in_state(cx, ids!(hover.down)) { 1.0 } else { 0.0 };
+        if self.field.tick(cx, event, press) {
+            let (f, a, c, t) = self.field.read(press);
+            self.draw_bg.set_instance_on_area(cx, id!(cap_field), &[f]);
+            self.draw_bg.set_instance_on_area(cx, id!(cap_pointer_along), &[a]);
+            self.draw_bg.set_instance_on_area(cx, id!(cap_pointer_across), &[c]);
+            self.draw_bg.set_instance_on_area(cx, id!(cap_time), &[t]);
+        }
+        match event {
+            Event::MouseMove(e) => {
+                let rect = self.draw_bg.area().rect(cx);
+                if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+                    return;
+                }
+                let centre = rect.pos + rect.size * 0.5;
+                let rel = (e.abs.x - centre.x, e.abs.y - centre.y);
+                let dx = (rel.0.abs() - rect.size.x * 0.5).max(0.0);
+                let dy = (rel.1.abs() - rect.size.y * 0.5).max(0.0);
+                let dist = (dx * dx + dy * dy).sqrt();
+                let granted = FieldArbiter::report(e.abs, self.widget_uid().0, dist);
+                let near = dist < self.cap_field_reach && granted;
+                self.field.pointer(cx, rel, near);
+            }
+            Event::MouseLeave(_) => self.field.leave(cx),
+            _ => (),
+        }
+    }
+
+    /// The label the face shows right now.
+    fn shown_label(&self) -> &str {
+        if self.copied && !self.copied_text.is_empty() {
+            &self.copied_text
+        } else {
+            self.text.as_ref()
+        }
+    }
+
+    /// Puts `text_to_copy` on the clipboard and starts the copied moment.
+    fn copy_now(&mut self, cx: &mut Cx) {
+        let uid = self.widget_uid();
+        cx.copy_to_clipboard(&self.text_to_copy);
+        self.copied = true;
+        cx.stop_timer(self.copied_timer);
+        self.copied_timer = cx.start_timeout(self.copied_secs.max(0.1));
+        self.animator_play(cx, ids!(copied.on));
+        cx.widget_action_with_data(&self.action_data, uid, CopyButtonAction::Copied);
+        self.draw_bg.redraw(cx);
+    }
+
+    /// Returns `true` if this copy button put its text on the clipboard.
+    pub fn copied(&self, actions: &Actions) -> bool {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            matches!(item.cast(), CopyButtonAction::Copied)
+        } else {
+            false
+        }
+    }
+
+    /// Whether a burger button shows the cross.
+    pub fn open(&self) -> bool {
+        self.open
+    }
+
+    /// Turns a burger button's bars into the cross, or back.
+    pub fn set_open(&mut self, cx: &mut Cx, open: bool) {
+        self.set_open_with(cx, open, Animate::Yes);
+    }
+
+    /// As [`Self::set_open`], choosing whether the turn animates. A host
+    /// with its motion switched off passes `Animate::No` to land on the end
+    /// state at once instead of playing the track.
+    pub fn set_open_with(&mut self, cx: &mut Cx, open: bool, animate: Animate) {
+        if self.open == open {
+            return;
+        }
+        self.open = open;
+        self.sync_open(cx, animate);
+        self.draw_bg.redraw(cx);
+    }
+
+    /// Brings the open track in line with the `open` prop; a button whose
+    /// animator has no such track, or already agrees, is left alone.
+    fn sync_open(&mut self, cx: &mut Cx, animate: Animate) {
+        let open = self.open;
+        if open == self.animator_in_state(cx, ids!(open.on)) {
+            return;
+        }
+        self.animator_toggle(cx, open, animate, ids!(open.on), ids!(open.off));
+    }
+
+    pub fn draw_button(&mut self, cx: &mut Cx2d, label: &str) {
+        self.draw_bg.begin(cx, self.walk, self.layout);
+        self.draw_icon.draw_walk(cx, self.icon_walk);
+        self.draw_text
+            .draw_walk(cx, self.label_walk, self.label_align, label);
+        self.draw_bg.end(cx);
+    }
+
+    /// The label, alone or stacked over the description in its own column
+    /// when there is one.
+    fn draw_label(&mut self, cx: &mut Cx2d) {
+        let label: &str = if self.copied && !self.copied_text.is_empty() {
+            &self.copied_text
+        } else {
+            self.text.as_ref()
+        };
+        if self.description.is_empty() {
+            self.draw_text
+                .draw_walk(cx, self.label_walk, self.label_align, label);
+            return;
+        }
+        cx.begin_turtle(
+            Walk::fit(),
+            Layout {
+                flow: Flow::Down,
+                clip_x: false,
+                clip_y: false,
+                ..Default::default()
+            },
+        );
+        self.draw_text
+            .draw_walk(cx, self.label_walk, self.label_align, label);
+        self.draw_description
+            .draw_walk(cx, self.description_walk, Align::default(), &self.description);
+        cx.end_turtle();
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Whether the button is waiting: spinner shown, clicks ignored.
+    pub fn loading(&self) -> bool {
+        self.loading
+    }
+
+    /// Starts or ends the wait: the label fades under a turning arc and
+    /// presses are ignored while it lasts.
+    pub fn set_loading(&mut self, cx: &mut Cx, loading: bool) {
+        if self.loading == loading {
+            return;
+        }
+        self.loading = loading;
+        self.sync_loading(cx, Animate::Yes);
+        self.draw_bg.redraw(cx);
+    }
+
+    /// Brings the loading and clock tracks in line with the `loading` prop.
+    /// A button whose animator already agrees is left alone, so the common
+    /// case costs nothing.
+    fn sync_loading(&mut self, cx: &mut Cx, animate: Animate) {
+        let loading = self.loading;
+        if loading == self.animator_in_state(cx, ids!(loading.on)) {
+            return;
+        }
+        self.animator_toggle(cx, loading, animate, ids!(loading.on), ids!(loading.off));
+        // The clock only ever plays: cutting a loop would park it at its end.
+        if loading {
+            self.animator_play(cx, ids!(time.on));
+        } else {
+            self.animator_cut(cx, ids!(time.off));
+        }
+    }
+
+    /// Returns `true` if this button was clicked.
+    ///
+    /// See [`ButtonAction`] for more details.
+    pub fn clicked(&self, actions: &Actions) -> bool {
+        self.clicked_modifiers(actions).is_some()
+    }
+
+    /// Returns `true` if this button was pressed down.
+    ///
+    /// See [`ButtonAction`] for more details.
+    pub fn pressed(&self, actions: &Actions) -> bool {
+        self.pressed_modifiers(actions).is_some()
+    }
+
+    /// Returns `true` if this button was long-pressed on.
+    ///
+    /// Note that this does not mean the button has been released yet.
+    /// See [`ButtonAction`] for more details.
+    pub fn long_pressed(&self, actions: &Actions) -> bool {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            matches!(item.cast(), ButtonAction::LongPressed)
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if this button was released, which is *not* considered to be clicked.
+    ///
+    /// See [`ButtonAction`] for more details.
+    pub fn released(&self, actions: &Actions) -> bool {
+        self.released_modifiers(actions).is_some()
+    }
+
+    /// Returns `Some` (with active keyboard modifiers) if this button was clicked.
+    ///
+    /// See [`ButtonAction`] for more details.
+    pub fn clicked_modifiers(&self, actions: &Actions) -> Option<KeyModifiers> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let ButtonAction::Clicked(m) = item.cast() {
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// Returns `Some` (with active keyboard modifiers) if this button was pressed down.
+    ///
+    /// See [`ButtonAction`] for more details.
+    pub fn pressed_modifiers(&self, actions: &Actions) -> Option<KeyModifiers> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let ButtonAction::Pressed(m) = item.cast() {
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// Returns `Some` (with active keyboard modifiers) if this button was released,
+    /// which is *not* considered to be clicked.
+    ///
+    /// See [`ButtonAction`] for more details.
+    pub fn released_modifiers(&self, actions: &Actions) -> Option<KeyModifiers> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let ButtonAction::Released(m) = item.cast() {
+                return Some(m);
+            }
+        }
+        None
+    }
+}
+
+impl ButtonRef {
+    /// See [`Button::clicked()`].
+    pub fn clicked(&self, actions: &Actions) -> bool {
+        self.borrow().is_some_and(|inner| inner.clicked(actions))
+    }
+
+    /// See [`Button::pressed()`].
+    pub fn pressed(&self, actions: &Actions) -> bool {
+        self.borrow().is_some_and(|inner| inner.pressed(actions))
+    }
+
+    /// See [`Button::long_pressed()`].
+    pub fn long_pressed(&self, actions: &Actions) -> bool {
+        self.borrow()
+            .is_some_and(|inner| inner.long_pressed(actions))
+    }
+
+    /// See [`Button::released()`].
+    pub fn released(&self, actions: &Actions) -> bool {
+        self.borrow().is_some_and(|inner| inner.released(actions))
+    }
+
+    /// See [`Button::clicked_modifiers()`].
+    pub fn clicked_modifiers(&self, actions: &Actions) -> Option<KeyModifiers> {
+        self.borrow()
+            .and_then(|inner| inner.clicked_modifiers(actions))
+    }
+
+    /// See [`Button::pressed_modifiers()`].
+    pub fn pressed_modifiers(&self, actions: &Actions) -> Option<KeyModifiers> {
+        self.borrow()
+            .and_then(|inner| inner.pressed_modifiers(actions))
+    }
+
+    /// See [`Button::released_modifiers()`].
+    pub fn released_modifiers(&self, actions: &Actions) -> Option<KeyModifiers> {
+        self.borrow()
+            .and_then(|inner| inner.released_modifiers(actions))
+    }
+
+    /// Redraws only when the button changes: callers re-assert it every frame.
+    pub fn set_visible(&self, cx: &mut Cx, visible: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.visible != visible {
+                inner.visible = visible;
+                inner.redraw(cx);
+            }
+        }
+    }
+
+    /// Redraws only when the button changes: callers re-assert it every frame.
+    pub fn set_enabled(&self, cx: &mut Cx, enabled: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.enabled != enabled {
+                inner.enabled = enabled;
+                inner.redraw(cx);
+            }
+        }
+    }
+
+    /// See [`Button::loading()`].
+    pub fn loading(&self) -> bool {
+        self.borrow().is_some_and(|inner| inner.loading())
+    }
+
+    /// See [`Button::set_loading()`].
+    pub fn set_loading(&self, cx: &mut Cx, loading: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_loading(cx, loading);
+        }
+    }
+
+    /// See [`Button::copied()`].
+    pub fn copied(&self, actions: &Actions) -> bool {
+        self.borrow().is_some_and(|inner| inner.copied(actions))
+    }
+
+    /// See [`Button::open()`].
+    pub fn open(&self) -> bool {
+        self.borrow().is_some_and(|inner| inner.open())
+    }
+
+    /// See [`Button::set_open()`].
+    pub fn set_open(&self, cx: &mut Cx, open: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_open(cx, open);
+        }
+    }
+
+    /// See [`Button::set_open_with()`].
+    pub fn set_open_with(&self, cx: &mut Cx, open: bool, animate: Animate) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_open_with(cx, open, animate);
+        }
+    }
+
+    /// Resets the hover state of this button.
+    ///
+    /// This is useful in certain cases where the hover state should be reset
+    /// (cleared) regardelss of whether the mouse is over it.
+    pub fn reset_hover(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.animator_cut(cx, ids!(hover.off));
+        }
+    }
+}
+
+impl ButtonSet {
+    pub fn clicked(&self, actions: &Actions) -> bool {
+        self.iter().any(|v| v.clicked(actions))
+    }
+    pub fn pressed(&self, actions: &Actions) -> bool {
+        self.iter().any(|v| v.pressed(actions))
+    }
+    pub fn released(&self, actions: &Actions) -> bool {
+        self.iter().any(|v| v.released(actions))
+    }
+
+    pub fn reset_hover(&self, cx: &mut Cx) {
+        for item in self.iter() {
+            item.reset_hover(cx)
+        }
+    }
+
+    pub fn which_clicked_modifiers(&self, actions: &Actions) -> Option<(usize, KeyModifiers)> {
+        for (index, btn) in self.iter().enumerate() {
+            if let Some(km) = btn.clicked_modifiers(actions) {
+                return Some((index, km));
+            }
+        }
+        None
+    }
+
+    pub fn set_visible(&self, cx: &mut Cx, visible: bool) {
+        for item in self.iter() {
+            item.set_visible(cx, visible)
+        }
+    }
+    pub fn set_enabled(&self, cx: &mut Cx, enabled: bool) {
+        for item in self.iter() {
+            item.set_enabled(cx, enabled)
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    /// The floating face carries the burger's open track. Without motion the
+    /// turn is cut to its end state, so nothing is left animating; with it,
+    /// the track plays.
+    #[test]
+    fn set_open_with_lands_at_once_without_motion() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let value = crate::script_eval!(vm, {use mod.widgets.* ButtonFloating{}});
+            let mut button = Button::script_from_value(vm, value);
+            vm.with_cx_mut(|cx| {
+                assert!(!button.open());
+                button.set_open_with(cx, true, Animate::No);
+                assert!(button.open());
+                assert!(button.animator_in_state(cx, ids!(open.on)));
+                assert!(!button.animator.is_track_animating(live_id!(open)), "cut, not played");
+                button.set_open_with(cx, false, Animate::Yes);
+                assert!(!button.open());
+                assert!(button.animator_in_state(cx, ids!(open.off)));
+                assert!(button.animator.is_track_animating(live_id!(open)), "played");
+            });
+        });
+    }
+
+    /// Both round faces compile: the floating face draws its glyph in a
+    /// pixel function of its own, and a shader error there would only show
+    /// as a blank disc at run time.
+    #[test]
+    fn the_round_faces_compile() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            for (name, value) in [
+                ("ButtonFloating", crate::script_eval!(vm, {
+                    mod.shader.test_compile_draw_source(mod.widgets.ButtonFloating.draw_bg, "glsl", false)
+                })),
+                ("ButtonFloatingSm", crate::script_eval!(vm, {
+                    mod.shader.test_compile_draw_source(mod.widgets.ButtonFloatingSm.draw_bg, "glsl", false)
+                })),
+            ] {
+                let text = vm.heap()
+                    .string_with(value, |_heap, text| text.to_string())
+                    .expect("the compiler answers with source");
+                assert!(!text.starts_with("ERRORS:"), "{name} did not compile: {text}");
+                assert!(!text.is_empty(), "{name} compiled to nothing");
+                if name == "ButtonFloating" {
+                    assert!(text.contains("glyph_stroke"), "{name} draws its glyph");
+                }
+            }
+        });
+    }
+
+    /// A sheet's face reaches the finish library by its bare name, as a
+    /// sheet writes it after the widgets prelude, and compiles.
+    #[test]
+    fn a_sheet_face_reaches_the_finish_library() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            crate::script_eval!(vm, {
+                use mod.prelude.widgets_internal.*
+                mod.widgets.Button.draw_bg.pixel = fn() {
+                    let p = self.pos * self.rect_size
+                    let px = 1.0 / max(self.draw_pass.dpi_factor, 0.5)
+                    let c = self.rect_size * 0.5
+                    let h = c - vec2(3.0, 3.0)
+                    let d = Finish.sd_chamfer(p, c, h, 4.0)
+                    let sh = Finish.drop(p, c, h, 0.0, vec2(0.0, 1.0), 2.0)
+                    var face = vec3(0.2, 0.22, 0.25) * (1.0 + 0.2 * Finish.bevel(d, vec2(0.0, -1.0), 1.5, vec2(-0.3, -0.9)))
+                    face = Finish.lift(face, 0.3 * self.hover + Finish.grain(p / px, 0.01))
+                    let a = Finish.cover(d, px)
+                    return Finish.over(vec4(0.0, 0.0, 0.0, sh * 0.4), vec4(face * a, a))
+                }
+            });
+            let value = crate::script_eval!(vm, {
+                mod.shader.test_compile_draw_source(mod.widgets.Button.draw_bg, "glsl", false)
+            });
+            let text = vm.heap()
+                .string_with(value, |_heap, text| text.to_string())
+                .expect("the compiler answers with source");
+            assert!(!text.starts_with("ERRORS:"), "the sheet face did not compile: {text}");
+            for name in ["sd_chamfer", "drop", "bevel", "lift", "grain", "cover", "over"] {
+                assert!(text.contains(&format!("_{name}(")), "{name} is not in the face: {text}");
+            }
+        });
+    }
+}

@@ -1,0 +1,211 @@
+# CI (devhub ci): [ci] is hand-written settings; the other sections are proofs devhub writes.
+
+[job.arm64.macos]
+date = "2026-11-15"
+digest = "1ba44c409b5ede4674a4e021e7b6f7cc6ead94e56ca52898ca19325e57837301"
+main = "9e9e2bb192ffcf228f0d0e2ba2b99a4f3e07c025"
+work = "bf4ca3ecdfff063baa5596b88cc761975537e627"
+
+[job.jit_16.linux]
+date = "2026-11-04"
+digest = "5aa540ece367681055b532e41fde3bd9dc53cbb570f62a471e4b19f2edb053b5"
+main = "5f4597d2fb65f354696542829214d4c6b99c39ab"
+work = "7d8695372c6cd232c174a43ee12e1ee51ba72023"
+
+[job.live_allow-c-cached.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_allow-c-dylib.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_allow-c-script-native.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_allow-c.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_boot-panic.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_caught-report.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_check-rustc.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_check-server.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_edit-undone.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_gates.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_hold-back.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_hot-fail.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_kinds.linux]
+date = "2026-11-15"
+digest = "f0afca6ed0edc5eb79e00161f7b7a958f29e3ef1577fecefe71d2a4e195f7f6e"
+main = "3887f442322ed9565ea4e386841d301b4444ee3f"
+work = "169e0213dc826e66294c7e9a0119b48e3b4a02d2"
+
+[job.live_landing-hold.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_landing-whole.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_rebuild.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_relax-app.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_replay.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_restart.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_run-env.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_shared-std.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_test-dep-gaps.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_test-dep-keys.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_test-results.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_test-warnings.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_test-workspace.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_two-module-file.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_warm-image-patch.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_warm-image-union.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_warm-manifest-layout.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.live_wm-rest.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"
+
+[job.nocodegen.macos]
+date = "2026-11-08"
+digest = "b03f4b29dc237ca8e7a1bc9aa9e9e9baa0c57c6a49f087fce3b550ca56a48698"
+main = "7a3bfa2fed356bd7323016f85ff43cae31292417"
+work = "914befad8de650b0a5abf2b720760b518aadf4f3"
+
+[tests.linux]
+date = "2026-11-18"
+digest = "2028f2aa338478af61d3db6a66cff113494fbb7c5efdc0b72a8f6d7b9483a1a9"
+main = "7fdc2c08f44b0bcfd151a16758624829e1ebee84"
+work = "fe9ba5d9b1ef12fbef5afae0c11d63c01a018637"

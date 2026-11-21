@@ -2,13 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::str;
+use std::sync::Arc;
+#[path = "http_checkout.rs"]
+mod checkout;
 
 use crate::error::GitError;
-use crate::index::{write_index, Index, IndexEntry};
+use crate::index::{write_index, Index};
 use crate::object::{write_loose_object_fast, Object, ObjectKind};
 use crate::oid::{hash_object, ObjectId};
 use crate::refs::{self, RefTarget};
-use crate::repo::Repository;
+use crate::repo::{Repository, RepositoryPaths};
 use crate::tree::Tree;
 use crate::worktree;
 
@@ -48,7 +51,12 @@ pub struct HttpSyncReport {
     pub checked_out_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ImportPhase { Inflate, Resolve, Write, SavePack }
+
 pub trait HttpSyncHooks {
+    fn on_import_progress(&mut self, _phase: ImportPhase, _done: usize, _total: usize) {}
+    fn on_checkout_start(&mut self, _total: usize) {}
     fn on_checkout_file(&mut self, _path: &str) {}
 }
 
@@ -406,6 +414,29 @@ pub fn extract_pack_from_response(response: &GitHttpResponse) -> Result<Option<V
         return Ok(Some(response.body.clone()));
     }
 
+    // without side-band the pack follows the negotiation lines raw (pack-protocol.txt:
+    // "NAK" / "ACK ..." / "shallow ..." pkt-lines, then the pack bytes unframed)
+    let body = &response.body;
+    let mut at = 0;
+    while at + 4 <= body.len() {
+        if body[at..].starts_with(b"PACK") {
+            return Ok(Some(body[at..].to_vec()));
+        }
+        let Some(len) = std::str::from_utf8(&body[at..at + 4]).ok().and_then(|h| usize::from_str_radix(h, 16).ok()) else { break };
+        if len == 0 {
+            at += 4;
+            continue;
+        }
+        if len < 4 || at + len > body.len() {
+            break;
+        }
+        let line = &body[at + 4..at + len];
+        if !(line.starts_with(b"NAK") || line.starts_with(b"ACK ") || line.starts_with(b"shallow ") || line.starts_with(b"unshallow ")) {
+            break;
+        }
+        at += len;
+    }
+
     let mut reader = PktLineReader::new(&response.body);
     let mut pack_data = Vec::new();
     let mut saw_pkt_lines = false;
@@ -472,30 +503,29 @@ pub fn apply_pack_and_checkout(
     pack_data: &[u8],
     hooks: &mut dyn HttpSyncHooks,
 ) -> Result<HttpSyncReport, GitError> {
-    let old_head = Repository::open(dst)
-        .ok()
-        .and_then(|repo| repo.head_oid().ok());
-
-    ensure_repo_layout(dst, remote_url)?;
-
+    let layout = ensure_repo_layout(dst, remote_url)?;
     let mut existing_repo = Repository::open(dst).ok();
-    let imported_objects = if pack_data.is_empty() {
-        0
+    // Initialize the destination before discovering HEAD. Otherwise a new
+    // checkout inside another repository inherits its ancestor's HEAD.
+    let old_head = existing_repo.as_ref().and_then(|repo| repo.head_oid().ok());
+    let imported = if pack_data.is_empty() {
+        HashMap::new()
     } else {
-        import_pack_to_loose(&dst.join(".git"), pack_data, existing_repo.as_mut())?
+        import_pack(&layout.common_dir, pack_data, existing_repo.as_mut(), old_head.is_none(), hooks)?
     };
 
     let mut repo = Repository::open(dst)?;
     let (checked_out_files, checked_out_bytes) =
-        checkout_commit(&mut repo, old_head, target_oid, hooks)?;
+        checkout_commit(&mut repo, old_head, target_oid, &imported, hooks)?;
 
     if let Some(ref_name) = target_ref {
-        refs::write_ref(&repo.git_dir, ref_name, &target_oid)?;
+        refs::write_ref_in(&repo.git_dir, &repo.common_dir, ref_name, &target_oid)?;
         if ref_name.starts_with("refs/heads/") {
             refs::update_head(&repo.git_dir, &RefTarget::Symbolic(ref_name.to_string()))?;
             if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
-                let _ = refs::write_ref(
+                let _ = refs::write_ref_in(
                     &repo.git_dir,
+                    &repo.common_dir,
                     &format!("refs/remotes/origin/{}", branch),
                     &target_oid,
                 );
@@ -507,15 +537,16 @@ pub fn apply_pack_and_checkout(
         refs::update_head(&repo.git_dir, &RefTarget::Direct(target_oid))?;
     }
 
+    // `shallow` and `config` are shared state of the repository.
     fs::write(
-        repo.git_dir.join("shallow"),
+        repo.common_dir.join("shallow"),
         format!("{}\n", target_oid.to_hex()),
     )?;
 
-    write_basic_config(&repo.git_dir, remote_url)?;
+    write_basic_config_if_missing(&repo.common_dir, remote_url)?;
 
     Ok(HttpSyncReport {
-        imported_objects,
+        imported_objects: imported.len(),
         checked_out_files,
         checked_out_bytes,
     })
@@ -525,7 +556,11 @@ fn normalize_remote_url(remote_url: &str) -> String {
     remote_url.trim_end_matches('/').to_string()
 }
 
-fn ensure_repo_layout(dst: &Path, remote_url: &str) -> Result<(), GitError> {
+/// Make sure `dst` is a repository we can import into. An existing
+/// repository (a plain one or a linked worktree) keeps its layout: shared
+/// state goes to its common dir, `HEAD` to its private dir, and an existing
+/// `config` is never overwritten. A fresh destination gets a plain `.git`.
+fn ensure_repo_layout(dst: &Path, remote_url: &str) -> Result<RepositoryPaths, GitError> {
     if dst.exists() {
         if !dst.is_dir() {
             return Err(GitError::InvalidRef(format!(
@@ -537,20 +572,38 @@ fn ensure_repo_layout(dst: &Path, remote_url: &str) -> Result<(), GitError> {
         fs::create_dir_all(dst)?;
     }
 
-    let git_dir = dst.join(".git");
-    fs::create_dir_all(git_dir.join("objects/info"))?;
-    fs::create_dir_all(git_dir.join("refs/heads"))?;
-    fs::create_dir_all(git_dir.join("refs/tags"))?;
+    let paths = match crate::repo::repository_paths(dst)? {
+        Some(paths) => paths,
+        None => {
+            let git_dir = dst.join(".git");
+            RepositoryPaths {
+                workdir: dst.to_path_buf(),
+                git_dir: git_dir.clone(),
+                common_dir: git_dir,
+            }
+        }
+    };
+    fs::create_dir_all(paths.common_dir.join("objects/info"))?;
+    fs::create_dir_all(paths.common_dir.join("refs/heads"))?;
+    fs::create_dir_all(paths.common_dir.join("refs/tags"))?;
+    fs::create_dir_all(&paths.git_dir)?;
 
-    if !git_dir.join("HEAD").exists() {
+    if !paths.git_dir.join("HEAD").exists() {
         refs::update_head(
-            &git_dir,
+            &paths.git_dir,
             &RefTarget::Symbolic("refs/heads/main".to_string()),
         )?;
     }
 
-    write_basic_config(&git_dir, remote_url)?;
-    Ok(())
+    write_basic_config_if_missing(&paths.common_dir, remote_url)?;
+    Ok(paths)
+}
+
+fn write_basic_config_if_missing(common_dir: &Path, remote_url: &str) -> Result<(), GitError> {
+    if common_dir.join("config").exists() {
+        return Ok(());
+    }
+    write_basic_config(common_dir, remote_url)
 }
 
 fn write_basic_config(git_dir: &Path, remote_url: &str) -> Result<(), GitError> {
@@ -582,12 +635,22 @@ struct ResolvedPackObject {
     oid: ObjectId,
 }
 
-fn import_pack_to_loose(
-    git_dir: &Path,
+/// A pack parsed and every object resolved (deltas applied), in memory.
+struct ResolvedPack {
+    /// The entries' offsets in pack order.
+    offsets: Vec<u64>,
+    checksum_at: usize,
+    by_offset: HashMap<u64, ResolvedPackObject>,
+    /// Whether a base came from outside the pack (a thin pack).
+    used_external: bool,
+}
+
+fn parse_and_resolve(
     pack_data: &[u8],
-    mut existing_repo: Option<&mut Repository>,
-) -> Result<usize, GitError> {
-    if pack_data.len() < 12 {
+    external: &mut dyn FnMut(&ObjectId) -> Option<Object>,
+    hooks: &mut dyn HttpSyncHooks,
+) -> Result<ResolvedPack, GitError> {
+    if pack_data.len() < 32 {
         return Err(GitError::CorruptPack("pack too small".to_string()));
     }
     if &pack_data[..4] != b"PACK" {
@@ -602,11 +665,19 @@ fn import_pack_to_loose(
         )));
     }
 
+    let checksum_at = pack_data.len() - 20;
+    let mut checksum = crate::sha1::Sha1::new();
+    checksum.update(&pack_data[..checksum_at]);
+    if checksum.finalize() != pack_data[checksum_at..] {
+        return Err(GitError::CorruptPack("pack checksum mismatch".into()));
+    }
     let num_objects = read_u32_be(pack_data, 8)? as usize;
+    if num_objects > checksum_at { return Err(GitError::CorruptPack("invalid object count".into())); }
     let mut pos = 12usize;
     let mut parsed = Vec::with_capacity(num_objects);
 
-    for _ in 0..num_objects {
+    hooks.on_import_progress(ImportPhase::Inflate, 0, num_objects);
+    for ordinal in 0..num_objects {
         let offset = pos as u64;
         if pos >= pack_data.len() {
             return Err(GitError::CorruptPack(
@@ -678,7 +749,7 @@ fn import_pack_to_loose(
                 });
             }
             7 => {
-                if pos + 20 > pack_data.len() {
+                if pos > checksum_at || checksum_at - pos < 20 {
                     return Err(GitError::CorruptPack(
                         "truncated ref-delta base oid".to_string(),
                     ));
@@ -701,9 +772,10 @@ fn import_pack_to_loose(
                 )));
             }
         }
+        hooks.on_import_progress(ImportPhase::Inflate, ordinal + 1, num_objects);
     }
 
-    if pos + 20 > pack_data.len() {
+    if pos != checksum_at {
         return Err(GitError::CorruptPack(
             "pack missing trailing checksum".to_string(),
         ));
@@ -713,20 +785,21 @@ fn import_pack_to_loose(
     let mut resolved_oid_to_offset = HashMap::<ObjectId, u64>::new();
     let mut external_cache = HashMap::<ObjectId, Object>::new();
 
+    hooks.on_import_progress(ImportPhase::Resolve, 0, num_objects);
     let mut unresolved: Vec<usize> = (0..parsed.len()).collect();
     while !unresolved.is_empty() {
         let mut next = Vec::new();
         let mut progressed = false;
 
         for idx in unresolved {
-            let entry = &parsed[idx];
+            let entry = &mut parsed[idx];
 
-            match &entry.kind {
+            match &mut entry.kind {
                 ParsedPackEntryKind::Full { kind, data } => {
                     let oid = hash_object(kind.as_str(), data);
                     let resolved = ResolvedPackObject {
                         kind: *kind,
-                        data: data.clone(),
+                        data: std::mem::take(data),
                         oid,
                     };
                     resolved_oid_to_offset.insert(oid, entry.offset);
@@ -758,14 +831,9 @@ fn import_pack_to_loose(
                         })
                     } else if let Some(obj) = external_cache.get(base_oid).cloned() {
                         Some(obj)
-                    } else if let Some(repo) = existing_repo.as_deref_mut() {
-                        match repo.read_object(base_oid) {
-                            Ok(obj) => {
-                                external_cache.insert(*base_oid, obj.clone());
-                                Some(obj)
-                            }
-                            Err(_) => None,
-                        }
+                    } else if let Some(obj) = external(base_oid) {
+                        external_cache.insert(*base_oid, obj.clone());
+                        Some(obj)
                     } else {
                         None
                     };
@@ -787,6 +855,7 @@ fn import_pack_to_loose(
                     progressed = true;
                 }
             }
+            hooks.on_import_progress(ImportPhase::Resolve, resolved_by_offset.len(), num_objects);
         }
 
         if !progressed {
@@ -798,19 +867,66 @@ fn import_pack_to_loose(
         unresolved = next;
     }
 
-    for entry in &parsed {
-        let obj = resolved_by_offset.get(&entry.offset).ok_or_else(|| {
-            GitError::CorruptPack("resolved object missing by offset".to_string())
-        })?;
-        let written_oid = write_loose_object_fast(git_dir, obj.kind, &obj.data)?;
-        if written_oid != obj.oid {
-            return Err(GitError::CorruptPack(
-                "object hash mismatch while writing loose object".to_string(),
-            ));
+    Ok(ResolvedPack {
+        offsets: parsed.iter().map(|e| e.offset).collect(),
+        checksum_at,
+        used_external: !external_cache.is_empty(),
+        by_offset: resolved_by_offset,
+    })
+}
+
+/// Every object of `pack_data` with its id, deltas resolved in memory (ref-delta bases outside
+/// the pack come from `external`), in pack order. Nothing is written anywhere.
+pub fn unpack_pack(
+    pack_data: &[u8],
+    external: &mut dyn FnMut(&ObjectId) -> Option<Object>,
+) -> Result<Vec<(ObjectId, Object)>, GitError> {
+    let mut r = parse_and_resolve(pack_data, external, &mut NoopHttpSyncHooks)?;
+    Ok(r.offsets.iter().map(|o| {
+        let obj = r.by_offset.remove(o).expect("resolved");
+        (obj.oid, Object { kind: obj.kind, data: obj.data })
+    }).collect())
+}
+
+fn import_pack(
+    git_dir: &Path,
+    pack_data: &[u8],
+    mut existing_repo: Option<&mut Repository>,
+    fresh: bool,
+    hooks: &mut dyn HttpSyncHooks,
+) -> Result<HashMap<ObjectId, Arc<Object>>, GitError> {
+    let mut external = |oid: &ObjectId| existing_repo.as_deref_mut().and_then(|repo| repo.read_object(oid).ok());
+    let resolved = parse_and_resolve(pack_data, &mut external, hooks)?;
+    let num_objects = resolved.offsets.len();
+    let checksum_at = resolved.checksum_at;
+    let resolved_by_offset = resolved.by_offset;
+    let parsed_offsets = resolved.offsets;
+    let used_external = resolved.used_external;
+    if fresh && !used_external {
+        // The server sends a complete depth-one pack. Keep its compression and
+        // deltas; materializing thousands of loose objects doubles file I/O.
+        hooks.on_import_progress(ImportPhase::SavePack, 0, pack_data.len());
+        let entries: Vec<_> = parsed_offsets.iter().enumerate().map(|(i, offset)| {
+            let end = parsed_offsets.get(i + 1).map_or(checksum_at as u64, |e| *e);
+            (resolved_by_offset[offset].oid, *offset, end)
+        }).collect();
+        crate::pack::write_imported_pack(git_dir, pack_data, &entries)?;
+        hooks.on_import_progress(ImportPhase::SavePack, pack_data.len(), pack_data.len());
+    } else {
+        // A thin fetch can depend on objects outside this pack; preserve the
+        // general HTTP fetch path until it has a self-contained pack.
+        hooks.on_import_progress(ImportPhase::Write, 0, num_objects);
+        for (ordinal, offset) in parsed_offsets.iter().enumerate() {
+            let obj = &resolved_by_offset[offset];
+            if write_loose_object_fast(git_dir, obj.kind, &obj.data)? != obj.oid {
+                return Err(GitError::CorruptPack("object hash mismatch".into()));
+            }
+            hooks.on_import_progress(ImportPhase::Write, ordinal + 1, num_objects);
         }
     }
-
-    Ok(parsed.len())
+    Ok(resolved_by_offset.into_values().map(|obj| {
+        (obj.oid, Arc::new(Object { kind: obj.kind, data: obj.data }))
+    }).collect())
 }
 
 fn decompress_object_data(
@@ -836,34 +952,32 @@ fn checkout_commit(
     repo: &mut Repository,
     old_head: Option<ObjectId>,
     new_head: ObjectId,
+    imported: &HashMap<ObjectId, Arc<Object>>,
     hooks: &mut dyn HttpSyncHooks,
 ) -> Result<(usize, u64), GitError> {
-    let commit = repo.read_commit(&new_head)?;
-    let tree = repo.read_tree(&commit.tree)?;
+    let commit = match imported.get(&new_head) {
+        Some(object) => crate::commit::parse_commit(&object.data)?,
+        None => repo.read_commit(&new_head)?,
+    };
+    let tree = read_imported_tree(repo, &commit.tree, imported)?;
 
     let mut old_files = HashMap::new();
     if let Some(old_head) = old_head {
         if let Ok(old_commit) = repo.read_commit(&old_head) {
             let old_tree = repo.read_tree(&old_commit.tree)?;
-            flatten_tree_recursive(repo, &old_tree, "", &mut old_files)?;
+            flatten_tree_recursive(repo, &old_tree, "", &mut old_files, imported)?;
         }
     }
 
     let mut new_files = HashMap::new();
-    flatten_tree_recursive(repo, &tree, "", &mut new_files)?;
+    flatten_tree_recursive(repo, &tree, "", &mut new_files, imported)?;
 
     worktree::remove_worktree_files(&repo.workdir, &old_files, &new_files)?;
 
-    let mut index_entries = Vec::new();
-    let mut checked_out_bytes = 0u64;
-    checkout_tree_recursive(
-        repo,
-        &tree,
-        "",
-        &mut index_entries,
-        &mut checked_out_bytes,
-        hooks,
-    )?;
+    hooks.on_checkout_start(new_files.len());
+    let mut files = Vec::new();
+    collect_checkout_files(repo, &tree, "", &mut files, imported)?;
+    let (mut index_entries, checked_out_bytes) = checkout::write(repo, files, imported, hooks)?;
 
     index_entries.sort_by(|a, b| a.path.cmp(&b.path));
     let checked_out_files = index_entries.len();
@@ -879,11 +993,19 @@ fn checkout_commit(
     Ok((checked_out_files, checked_out_bytes))
 }
 
+fn read_imported_tree(repo: &mut Repository, oid: &ObjectId, imported: &HashMap<ObjectId, Arc<Object>>) -> Result<Tree, GitError> {
+    match imported.get(oid) {
+        Some(object) if object.kind == ObjectKind::Tree => crate::tree::parse_tree(&object.data),
+        _ => repo.read_tree(oid),
+    }
+}
+
 fn flatten_tree_recursive(
     repo: &mut Repository,
     tree: &Tree,
     prefix: &str,
     out: &mut HashMap<String, ObjectId>,
+    imported: &HashMap<ObjectId, Arc<Object>>,
 ) -> Result<(), GitError> {
     for entry in &tree.entries {
         let path = if prefix.is_empty() {
@@ -893,8 +1015,8 @@ fn flatten_tree_recursive(
         };
 
         if entry.is_tree() {
-            let sub_tree = repo.read_tree(&entry.oid)?;
-            flatten_tree_recursive(repo, &sub_tree, &format!("{}/", path), out)?;
+            let sub_tree = read_imported_tree(repo, &entry.oid, imported)?;
+            flatten_tree_recursive(repo, &sub_tree, &format!("{}/", path), out, imported)?;
         } else if !entry.is_gitlink() {
             out.insert(path, entry.oid);
         }
@@ -903,114 +1025,23 @@ fn flatten_tree_recursive(
     Ok(())
 }
 
-fn checkout_tree_recursive(
+fn collect_checkout_files(
     repo: &mut Repository,
     tree: &Tree,
     prefix: &str,
-    index_entries: &mut Vec<IndexEntry>,
-    checked_out_bytes: &mut u64,
-    hooks: &mut dyn HttpSyncHooks,
+    files: &mut Vec<checkout::File>,
+    imported: &HashMap<ObjectId, Arc<Object>>,
 ) -> Result<(), GitError> {
     for entry in &tree.entries {
-        let path = if prefix.is_empty() {
-            entry.name.clone()
-        } else {
-            format!("{}{}", prefix, entry.name)
-        };
-
+        let path = format!("{prefix}{}", entry.name);
         if entry.is_tree() {
-            let sub_tree = repo.read_tree(&entry.oid)?;
             fs::create_dir_all(repo.workdir.join(&path))?;
-            checkout_tree_recursive(
-                repo,
-                &sub_tree,
-                &format!("{}/", path),
-                index_entries,
-                checked_out_bytes,
-                hooks,
-            )?;
-            continue;
-        }
-
-        if entry.is_gitlink() {
-            continue;
-        }
-
-        let data = repo.read_blob(&entry.oid)?;
-        let file_path = repo.workdir.join(&path);
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        if entry.is_symlink() {
-            #[cfg(unix)]
-            {
-                let target = std::str::from_utf8(&data).unwrap_or("");
-                let _ = fs::remove_file(&file_path);
-                std::os::unix::fs::symlink(target, &file_path)?;
-            }
-            #[cfg(not(unix))]
-            {
-                fs::write(&file_path, &data)?;
-            }
-        } else {
-            fs::write(&file_path, &data)?;
-            #[cfg(unix)]
-            if entry.mode == 0o100755 {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755))?;
-            }
-        }
-
-        hooks.on_checkout_file(&path);
-        *checked_out_bytes += data.len() as u64;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = if entry.is_symlink() {
-                fs::symlink_metadata(&file_path)?
-            } else {
-                fs::metadata(&file_path)?
-            };
-
-            index_entries.push(IndexEntry {
-                ctime_sec: metadata.mtime() as u32,
-                ctime_nsec: 0,
-                mtime_sec: metadata.mtime() as u32,
-                mtime_nsec: 0,
-                dev: metadata.dev() as u32,
-                ino: metadata.ino() as u32,
-                mode: entry.mode,
-                uid: metadata.uid(),
-                gid: metadata.gid(),
-                file_size: metadata.len() as u32,
-                oid: entry.oid,
-                flags: (path.len().min(0x0fff)) as u16,
-                path,
-            });
-        }
-
-        #[cfg(not(unix))]
-        {
-            index_entries.push(IndexEntry {
-                ctime_sec: 0,
-                ctime_nsec: 0,
-                mtime_sec: 0,
-                mtime_nsec: 0,
-                dev: 0,
-                ino: 0,
-                mode: entry.mode,
-                uid: 0,
-                gid: 0,
-                file_size: data.len() as u32,
-                oid: entry.oid,
-                flags: (path.len().min(0x0fff)) as u16,
-                path,
-            });
+            let tree = read_imported_tree(repo, &entry.oid, imported)?;
+            collect_checkout_files(repo, &tree, &format!("{path}/"), files, imported)?;
+        } else if !entry.is_gitlink() {
+            files.push(checkout::File { path, oid: entry.oid, mode: entry.mode });
         }
     }
-
     Ok(())
 }
 

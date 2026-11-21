@@ -10,14 +10,40 @@ pub trait PackLookup {
     fn find_offset(&self, oid: &ObjectId) -> Option<u64>;
 }
 
-/// In-memory representation of a pack index (.idx v2) with cached pack data.
-pub struct PackIndex {
-    pub pack_path: PathBuf,
+/// The parsed tables of a pack index. Every reader of the same .idx file in
+/// the process shares one copy: a large repository's index (the Linux
+/// kernel's 14M objects parse to ~500 MB) is not parsed again per reader
+/// thread.
+struct IdxTables {
     fanout: [u32; 256],
     oids: Vec<ObjectId>,
     offsets: Vec<u64>,
-    /// Cached pack file data — loaded once on first read.
-    pack_data: std::cell::RefCell<Option<Vec<u8>>>,
+    sorted_offsets: Vec<u64>,
+}
+
+/// Parsed indexes survive reader closes, by canonical .idx path, length and
+/// mtime. A new index retires entries whose files have been removed by repack.
+type SharedTables = std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>, std::sync::Arc<IdxTables>)>;
+static SHARED_TABLES: std::sync::Mutex<Option<SharedTables>> = std::sync::Mutex::new(None);
+
+/// In-memory representation of a pack index (.idx v2) with positional object reads.
+pub struct PackIndex {
+    pub pack_path: PathBuf,
+    tables: std::sync::Arc<IdxTables>,
+    read_account: crate::memory::MemoryAccount,
+    metadata_lease: Option<crate::memory::Reservation>,
+    stats: std::cell::Cell<ReadPhases>,
+    /// The pack file kept open for bounded reads and `object_size`.
+    header_file: std::cell::RefCell<Option<fs::File>>,
+    delta_bases: std::cell::RefCell<crate::memory::ReadLru<u64, (ObjectKind, std::sync::Arc<[u8]>)>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReadPhases {
+    pub pack_load_ms: f64,
+    pub inflate_ms: f64,
+    pub pack_bytes_read: u64,
+    pub objects_inflated: u64,
 }
 
 impl PackLookup for PackIndex {
@@ -26,23 +52,52 @@ impl PackLookup for PackIndex {
         let start = if first_byte == 0 {
             0
         } else {
-            self.fanout[first_byte - 1] as usize
+            self.tables.fanout[first_byte - 1] as usize
         };
-        let end = self.fanout[first_byte] as usize;
-        let slice = &self.oids[start..end];
+        let end = self.tables.fanout[first_byte] as usize;
+        let slice = &self.tables.oids[start..end];
         match slice.binary_search_by(|probe| probe.as_bytes().cmp(oid.as_bytes())) {
-            Ok(idx) => Some(self.offsets[start + idx]),
+            Ok(idx) => Some(self.tables.offsets[start + idx]),
             Err(_) => None,
         }
     }
 }
 
-/// Read and parse a v2 pack index file.
+/// Read and parse a v2 pack index file (or share the tables of a reader
+/// that already has).
 pub fn read_pack_index(idx_path: &Path) -> Result<PackIndex, GitError> {
-    let data = fs::read(idx_path)?;
+    let path = idx_path.canonicalize().map_err(|e| GitError::io_at("resolve pack index", idx_path, e))?;
+    let idx_path = path.as_path();
+    let meta = fs::metadata(idx_path).map_err(|e| GitError::io_at("stat pack index", idx_path, e))?;
+    let key = (meta.len(), meta.modified().ok());
+    // Held while parsing, so readers opening together parse once.
+    let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let shared = shared.get_or_insert_with(Default::default);
+    let tables = match shared.get(idx_path).filter(|(len, time, _)| (*len, *time) == key).map(|(_, _, t)| t.clone()) {
+        Some(tables) => tables,
+        None => {
+            let tables = std::sync::Arc::new(parse_pack_index(idx_path)?);
+            shared.retain(|path, _| path.exists());
+            shared.insert(idx_path.to_path_buf(), (key.0, key.1, tables.clone()));
+            tables
+        }
+    };
+    Ok(PackIndex {
+        pack_path: idx_path.with_extension("pack"),
+        tables,
+        read_account: crate::memory::read_account(),
+        metadata_lease: None,
+        stats: std::cell::Cell::new(ReadPhases::default()),
+        header_file: std::cell::RefCell::new(None),
+        delta_bases: std::cell::RefCell::new(crate::memory::ReadLru::new(crate::memory::READ_CACHE_BYTES)),
+    })
+}
+
+fn parse_pack_index(idx_path: &Path) -> Result<IdxTables, GitError> {
+    let data = fs::read(idx_path).map_err(|e| GitError::io_at("read pack index", idx_path, e))?;
 
     // Check v2 magic: ff744f63
-    if data.len() < 8 {
+    if data.len() < 8 + 1024 + 40 {
         return Err(GitError::CorruptPack("index too small".into()));
     }
     let magic = &data[0..4];
@@ -67,14 +122,9 @@ pub fn read_pack_index(idx_path: &Path) -> Result<PackIndex, GitError> {
     let total_objects = fanout[255] as usize;
 
     // OID table: total_objects x 20 bytes
-    let mut oids = Vec::with_capacity(total_objects);
-    for _ in 0..total_objects {
-        if pos + 20 > data.len() {
-            return Err(GitError::CorruptPack("truncated OID table".into()));
-        }
-        oids.push(ObjectId::from_slice(&data[pos..pos + 20])?);
-        pos += 20;
-    }
+    let table = data.get(pos..pos + total_objects * 20).ok_or_else(|| GitError::CorruptPack("truncated OID table".into()))?;
+    let oids: Vec<ObjectId> = table.chunks_exact(20).map(|c| ObjectId::from_bytes(c.try_into().unwrap())).collect();
+    pos += total_objects * 20;
 
     // CRC32 table: skip (total_objects x 4 bytes)
     pos += total_objects * 4;
@@ -82,6 +132,7 @@ pub fn read_pack_index(idx_path: &Path) -> Result<PackIndex, GitError> {
     // Offset table: total_objects x 4 bytes
     let mut offsets = Vec::with_capacity(total_objects);
     let large_offset_start = pos + total_objects * 4;
+    if large_offset_start + 40 > data.len() { return Err(GitError::CorruptPack("truncated offset table".into())); }
     for _ in 0..total_objects {
         let off = read_u32(&data, pos);
         pos += 4;
@@ -100,160 +151,248 @@ pub fn read_pack_index(idx_path: &Path) -> Result<PackIndex, GitError> {
         }
     }
 
-    // Derive pack path from index path (.idx -> .pack)
-    let pack_path = idx_path.with_extension("pack");
+    let sorted_offsets = match reverse_index(idx_path, &data, &offsets) {
+        Some(sorted) => sorted,
+        None => {
+            let mut sorted = offsets.clone();
+            sorted.sort_unstable();
+            sorted
+        }
+    };
+    Ok(IdxTables { fanout, oids, offsets, sorted_offsets })
+}
 
-    Ok(PackIndex {
-        pack_path,
-        fanout,
-        oids,
-        offsets,
-        pack_data: std::cell::RefCell::new(None),
-    })
+/// The offsets in pack order from the pack's reverse index (`.rev`, which
+/// git writes beside the pack: each object's index position, in pack
+/// order), instead of sorting them: a 12M-object pack's sort took half a
+/// second of every index parse. `None` without a valid one for this pack.
+fn reverse_index(idx_path: &Path, idx: &[u8], offsets: &[u64]) -> Option<Vec<u64>> {
+    let data = fs::read(idx_path.with_extension("rev")).ok()?;
+    let n = offsets.len();
+    // "RIDX", version 1, hash id 1 (SHA-1), n positions, the pack's
+    // checksum and the file's own.
+    if data.len() != 12 + 4 * n + 40 || data[0..4] != *b"RIDX" || read_u32(&data, 4) != 1 || read_u32(&data, 8) != 1 {
+        return None;
+    }
+    // The pack checksum both files name must agree.
+    if idx.len() < 40 || data[12 + 4 * n..12 + 4 * n + 20] != idx[idx.len() - 40..idx.len() - 20] {
+        return None;
+    }
+    let mut sorted = Vec::with_capacity(n);
+    for i in 0..n {
+        sorted.push(*offsets.get(read_u32(&data, 12 + 4 * i) as usize)?);
+    }
+    sorted.windows(2).all(|w| w[0] < w[1]).then_some(sorted)
 }
 
 impl PackIndex {
-    /// Ensure pack data is loaded into memory (read once, cached).
-    pub fn ensure_loaded(&self) -> Result<(), GitError> {
-        let mut cache = self.pack_data.borrow_mut();
-        if cache.is_none() {
-            *cache = Some(fs::read(&self.pack_path)?);
-        }
+    pub fn retained_bytes(&self) -> usize {
+        let t = &self.tables;
+        t.oids.capacity() * std::mem::size_of::<ObjectId>() + (t.offsets.capacity() + t.sorted_offsets.capacity()) * 8
+    }
+    pub fn read_phases(&self) -> ReadPhases { self.stats.get() }
+    /// Bind optional retention to the caller's existing history account.
+    /// Metadata and active objects must remain readable even above its budget;
+    /// optional cache entries use `try_reserve` and simply cease being retained.
+    pub fn set_read_budget(&mut self, account: crate::memory::MemoryAccount, bytes: usize) -> Result<(), GitError> {
+        self.delta_bases.borrow_mut().clear();
+        self.delta_bases.borrow_mut().resize(bytes.min(crate::memory::READ_CACHE_BYTES));
+        self.metadata_lease = None;
+        self.metadata_lease = Some(account.reserve(self.retained_bytes()));
+        self.read_account = account;
         Ok(())
     }
 
-    /// Read an object at the given offset, using cached pack data.
+    /// Open the pack handle without reading the pack into memory.
+    pub fn ensure_loaded(&self) -> Result<(), GitError> {
+        let mut slot = self.header_file.borrow_mut();
+        if slot.is_none() { *slot = Some(fs::File::open(&self.pack_path).map_err(|e| GitError::io_at("open pack", &self.pack_path, e))?); }
+        Ok(())
+    }
+
+    /// An independent bounded reader sharing only immutable parsed tables.
+    pub(crate) fn reader(&self) -> Self {
+        Self {
+            pack_path: self.pack_path.clone(), tables: self.tables.clone(),
+            read_account: self.read_account.clone(), metadata_lease: None,
+            stats: Default::default(), header_file: Default::default(),
+            delta_bases: std::cell::RefCell::new(crate::memory::ReadLru::new(crate::memory::READ_CACHE_BYTES)),
+        }
+    }
+
+    /// Resolve iteratively: long delta chains do not consume the call stack.
     pub fn read_object(&self, offset: u64) -> Result<Object, GitError> {
+        let mut at = offset;
+        let mut chain = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let (kind, mut data) = loop {
+            if !seen.insert(at) { return Err(GitError::CorruptPack("cyclic delta chain".into())); }
+            if let Some(hit) = self.delta_bases.borrow_mut().get(&at).cloned() { break hit; }
+            if let Some(base) = self.delta_parent(at)? {
+                // Keep only offsets while finding the base. Retaining inflated
+                // delta programs here makes memory scale with chain depth.
+                chain.push(at);
+                at = base;
+            } else {
+                let (kind, bytes, _) = self.read_window(at)?;
+                let kind = ObjectKind::from_type_num(kind)?;
+                let data: std::sync::Arc<[u8]> = bytes.into();
+                self.cache_base(at, kind, &data);
+                break (kind, data);
+            }
+        };
+        let mut _base = self.read_account.reserve(data.len());
+        while let Some(at) = chain.pop() {
+            let (_, delta, _) = self.read_window(at)?;
+            let _delta = self.read_account.reserve(delta.len());
+            let (_, n) = read_delta_size(&delta, 0)?;
+            let (size, _) = read_delta_size(&delta, n)?;
+            let result_lease = self.read_account.reserve(usize::try_from(size).map_err(|_| GitError::CorruptPack("delta result too large".into()))?);
+            data = apply_delta(&data, &delta)?.into();
+            _base = result_lease;
+            self.cache_base(at, kind, &data);
+        }
+        Ok(Object { kind, data: data.to_vec() })
+    }
+
+    fn cache_base(&self, at: u64, kind: ObjectKind, data: &std::sync::Arc<[u8]>) {
+        self.delta_bases.borrow_mut().insert(at, data.len().saturating_add(128), &self.read_account, || (kind, data.clone()));
+    }
+
+    fn range_end(&self, offset: u64, file: &fs::File) -> Result<u64, GitError> {
+        if self.tables.sorted_offsets.binary_search(&offset).is_err() {
+            return Err(GitError::CorruptPack("offset absent from index".into()));
+        }
+        let i = self.tables.sorted_offsets.partition_point(|o| *o <= offset);
+        Ok(match self.tables.sorted_offsets.get(i) {
+            Some(end) => *end,
+            None => file.metadata()?.len().saturating_sub(20),
+        })
+    }
+
+    /// The largest valid size + delta-base header fits in 30 bytes. Reading
+    /// this prefix lets us walk arbitrarily long chains without retaining any
+    /// compressed or inflated delta programs from the walk.
+    fn delta_parent(&self, offset: u64) -> Result<Option<u64>, GitError> {
+        let start = crate::clock::Stopwatch::start();
         self.ensure_loaded()?;
-        let cache = self.pack_data.borrow();
-        let data = cache.as_ref().unwrap();
-        read_pack_object_at(data, offset as usize, self, data)
+        let slot = self.header_file.borrow();
+        let file = slot.as_ref().unwrap();
+        let end = self.range_end(offset, file)?;
+        let len = end.checked_sub(offset).ok_or_else(|| GitError::CorruptPack("invalid object range".into()))?.min(32) as usize;
+        let mut prefix = [0; 32];
+        read_exact_at(file, &mut prefix[..len], offset)?;
+        let mut stats = self.stats.get();
+        stats.pack_load_ms += start.elapsed_ms();
+        stats.pack_bytes_read += len as u64;
+        self.stats.set(stats);
+        Ok(entry_header(&prefix[..len], offset, self)?.2)
     }
 
-    /// Get a clone of the cached pack data (for thread-safe sharing).
-    pub fn get_cached_data(&self) -> Option<Vec<u8>> {
-        self.pack_data.borrow().clone()
+    fn read_window(&self, offset: u64) -> Result<(u8, Vec<u8>, Option<u64>), GitError> {
+        let account = &self.read_account;
+        let start = crate::clock::Stopwatch::start();
+        self.ensure_loaded()?;
+        let slot = self.header_file.borrow();
+        let file = slot.as_ref().unwrap();
+        let end = self.range_end(offset, file)?;
+        let length = usize::try_from(end.checked_sub(offset).ok_or_else(|| GitError::CorruptPack("invalid object range".into()))?).map_err(|_| GitError::CorruptPack("object too large".into()))?;
+        let _compressed = account.reserve(length);
+        let mut data = vec![0; length];
+        read_exact_at(file, &mut data, offset)?;
+        drop(slot);
+        let mut stats = self.stats.get(); stats.pack_load_ms += start.elapsed_ms(); stats.pack_bytes_read += length as u64; self.stats.set(stats);
+        let (kind, size, base_offset, pos) = entry_header(&data, offset, self)?;
+        let _inflated = account.reserve(size);
+        let start = crate::clock::Stopwatch::start();
+        let inflated = zlib_decompress(&data[pos..], size)?;
+        let mut stats = self.stats.get(); stats.inflate_ms += start.elapsed_ms(); stats.objects_inflated += 1; self.stats.set(stats);
+        Ok((kind, inflated, base_offset))
     }
 
-    /// Get copies of index metadata for thread-safe use.
-    pub fn fanout_copy(&self) -> [u32; 256] {
-        self.fanout
-    }
-
-    pub fn oids_copy(&self) -> Vec<ObjectId> {
-        self.oids.clone()
-    }
-
-    pub fn offsets_copy(&self) -> Vec<u64> {
-        self.offsets.clone()
-    }
-}
-
-/// Read an object from a pack file at the given offset.
-/// Uses the PackIndex's cached pack data (loaded once on first call).
-pub fn read_pack_object(
-    _pack_path: &Path,
-    offset: u64,
-    idx: &PackIndex,
-) -> Result<Object, GitError> {
-    idx.read_object(offset)
-}
-
-/// Read an object from raw pack data with a PackLookup for delta resolution.
-/// This is the thread-safe entry point used by the parallel clone.
-pub fn read_pack_object_from_data(
-    pack_data: &[u8],
-    offset: usize,
-    lookup: &dyn PackLookup,
-) -> Result<Object, GitError> {
-    read_pack_object_at(pack_data, offset, lookup, pack_data)
-}
-
-fn read_pack_object_at(
-    pack_data: &[u8],
-    offset: usize,
-    lookup: &dyn PackLookup,
-    full_pack: &[u8],
-) -> Result<Object, GitError> {
-    let mut pos = offset;
-
-    if pos >= pack_data.len() {
-        return Err(GitError::CorruptPack("offset beyond pack data".into()));
-    }
-
-    let first = pack_data[pos];
-    pos += 1;
-    let type_num = (first >> 4) & 0x7;
-    let mut size: u64 = (first & 0x0F) as u64;
-    let mut shift = 4;
-
-    let mut byte = first;
-    while byte & 0x80 != 0 {
-        if pos >= pack_data.len() {
-            return Err(GitError::CorruptPack("truncated size header".into()));
+    /// The inflated size of the object at `offset`, from its pack entry
+    /// header, without reading its content or any delta base. A base
+    /// object's size is the header varint. A delta's result size is the
+    /// second varint of the delta payload, so the (small) delta payload is
+    /// inflated; its base chain is never touched. Uses positional reads from
+    /// the same kept-open handle as object reads.
+    pub fn object_size(&self, offset: u64) -> Result<u64, GitError> {
+        self.ensure_loaded()?;
+        let slot = self.header_file.borrow();
+        let file = slot.as_ref().unwrap();
+        let end = self.range_end(offset, file)?;
+        let length = end.checked_sub(offset).ok_or_else(|| GitError::CorruptPack("invalid object range".into()))?;
+        let mut owned = vec![0; length.min(32) as usize];
+        read_exact_at(file, &mut owned, offset)?;
+        if (owned.first().copied().unwrap_or(0) >> 4) & 7 >= 6 {
+            owned.resize(usize::try_from(length).map_err(|_| GitError::CorruptPack("object too large".into()))?, 0);
+            read_exact_at(file, &mut owned, offset)?;
         }
-        byte = pack_data[pos];
-        pos += 1;
-        size |= ((byte & 0x7F) as u64) << shift;
-        shift += 7;
-    }
-
-    match type_num {
-        1 | 2 | 3 | 4 => {
-            let kind = ObjectKind::from_type_num(type_num)?;
-            let decompressed = zlib_decompress(&pack_data[pos..], size as usize)?;
-            Ok(Object {
-                kind,
-                data: decompressed,
-            })
+        let entry = owned.as_slice();
+        let mut pos = 0;
+        let mut next = || -> Result<u8, GitError> { let b = *entry.get(pos).ok_or_else(|| GitError::CorruptPack("truncated object header".into()))?; pos += 1; Ok(b) };
+        let first = next()?;
+        let kind = (first >> 4) & 7;
+        let mut size = (first & 15) as u64;
+        let (mut byte, mut shift) = (first, 4);
+        while byte & 128 != 0 {
+            byte = next()?;
+            if shift > 57 { return Err(GitError::CorruptPack("object size overflow".into())); }
+            size |= ((byte & 127) as u64) << shift;
+            shift += 7;
         }
-        6 => {
-            // OFS_DELTA
-            let mut byte = pack_data[pos];
-            pos += 1;
-            let mut delta_offset: u64 = (byte & 0x7F) as u64;
-            while byte & 0x80 != 0 {
-                if pos >= pack_data.len() {
-                    return Err(GitError::CorruptPack("truncated ofs-delta offset".into()));
-                }
-                byte = pack_data[pos];
-                pos += 1;
-                delta_offset = ((delta_offset + 1) << 7) | (byte & 0x7F) as u64;
+        match kind {
+            1..=4 => Ok(size),
+            6 | 7 => {
+                if kind == 6 { while next()? & 128 != 0 {} } else { for _ in 0..20 { next()?; } }
+                let delta = zlib_decompress(entry.get(pos..).unwrap_or(&[]), size as usize)?;
+                let (_, n) = read_delta_size(&delta, 0)?;
+                Ok(read_delta_size(&delta, n)?.0)
             }
-
-            let base_offset = offset as u64 - delta_offset;
-            let base = read_pack_object_at(full_pack, base_offset as usize, lookup, full_pack)?;
-            let delta_data = zlib_decompress(&pack_data[pos..], size as usize)?;
-            let patched = apply_delta(&base.data, &delta_data)?;
-            Ok(Object {
-                kind: base.kind,
-                data: patched,
-            })
+            _ => Err(GitError::CorruptPack(format!("unknown pack object type: {kind}"))),
         }
-        7 => {
-            // REF_DELTA
-            if pos + 20 > pack_data.len() {
-                return Err(GitError::CorruptPack("truncated ref-delta base oid".into()));
-            }
-            let base_oid = ObjectId::from_slice(&pack_data[pos..pos + 20])?;
-            pos += 20;
-
-            let base_offset = lookup.find_offset(&base_oid).ok_or_else(|| {
-                GitError::CorruptPack(format!("ref-delta base not in pack: {}", base_oid))
-            })?;
-            let base = read_pack_object_at(full_pack, base_offset as usize, lookup, full_pack)?;
-            let delta_data = zlib_decompress(&pack_data[pos..], size as usize)?;
-            let patched = apply_delta(&base.data, &delta_data)?;
-            Ok(Object {
-                kind: base.kind,
-                data: patched,
-            })
-        }
-        _ => Err(GitError::CorruptPack(format!(
-            "unknown pack object type: {}",
-            type_num
-        ))),
     }
+
+}
+
+fn entry_header(data: &[u8], offset: u64, lookup: &dyn PackLookup) -> Result<(u8, usize, Option<u64>, usize), GitError> {
+    let mut pos = 0;
+    let next = |pos: &mut usize| -> Result<u8, GitError> { let b = data.get(*pos).copied().ok_or_else(|| GitError::CorruptPack("truncated object header".into()))?; *pos += 1; Ok(b) };
+    let first = next(&mut pos)?;
+    let kind = (first >> 4) & 7;
+    let mut size = (first & 15) as usize;
+    let mut byte = first; let mut shift = 4;
+    while byte & 128 != 0 { byte = next(&mut pos)?; if shift >= usize::BITS { return Err(GitError::CorruptPack("object size overflow".into())); } size |= ((byte & 127) as usize) << shift; shift += 7; }
+    let base_offset = match kind {
+        6 => { let mut byte = next(&mut pos)?; let mut back = (byte & 127) as u64; while byte & 128 != 0 { byte = next(&mut pos)?; back = back.checked_add(1).and_then(|b| b.checked_mul(128)).and_then(|b| b.checked_add((byte & 127) as u64)).ok_or_else(|| GitError::CorruptPack("delta offset overflow".into()))?; } Some(offset.checked_sub(back).ok_or_else(|| GitError::CorruptPack("delta before pack".into()))?) }
+        7 => { let end = pos + 20; let oid = ObjectId::from_slice(data.get(pos..end).ok_or_else(|| GitError::CorruptPack("truncated delta oid".into()))?)?; pos = end; Some(lookup.find_offset(&oid).ok_or_else(|| GitError::CorruptPack("delta base absent".into()))?) }
+        _ => None,
+    };
+    Ok((kind, size, base_offset, pos))
+}
+
+/// Positional I/O does not mutate a shared file cursor.
+fn read_exact_at(file: &fs::File, mut data: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !data.is_empty() {
+        #[cfg(unix)]
+        let result = { use std::os::unix::fs::FileExt; file.read_at(data, offset) };
+        #[cfg(windows)]
+        let result = { use std::os::windows::fs::FileExt; file.seek_read(data, offset) };
+        #[cfg(not(any(unix, windows)))]
+        let result = {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = file.try_clone()?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read(data)
+        };
+        match result {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(n) => { offset += n as u64; data = &mut data[n..]; }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Apply a git delta to a base object.
@@ -378,20 +517,33 @@ fn read_u32(data: &[u8], pos: usize) -> u32 {
 
 /// Find all pack files in .git/objects/pack/
 pub fn find_packs(git_dir: &Path) -> Result<Vec<PackIndex>, GitError> {
-    let pack_dir = git_dir.join("objects").join("pack");
+    find_packs_in_objects_dir(&git_dir.join("objects"))
+}
+
+/// Find all pack files under an `objects` directory (the repository's own or
+/// an alternate's).
+pub fn find_packs_in_objects_dir(objects_dir: &Path) -> Result<Vec<PackIndex>, GitError> {
+    let pack_dir = objects_dir.join("pack");
     let mut packs = Vec::new();
 
     let entries = match fs::read_dir(&pack_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(packs),
-        Err(e) => return Err(GitError::Io(e)),
+        Err(e) => return Err(GitError::io_at("list pack directory", &pack_dir, e)),
     };
 
     for entry in entries {
-        let entry = entry?;
+        let entry = entry.map_err(|e| GitError::io_at("list pack directory", &pack_dir, e))?;
         let path = entry.path();
         if path.extension().map(|e| e == "idx").unwrap_or(false) {
-            packs.push(read_pack_index(&path)?);
+            // an index a repack removed after the listing: its objects are in the pack that
+            // replaced it, as git skips such a pack too. Its error failed every read of a
+            // repository listed while another process repacked it (11-13).
+            match read_pack_index(&path) {
+                Ok(pack) => packs.push(pack),
+                Err(GitError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -401,53 +553,128 @@ pub fn find_packs(git_dir: &Path) -> Result<Vec<PackIndex>, GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+
+    #[test]
+    fn indexes_survive_closed_readers_and_refresh_after_replacement() {
+        let dir = crate::test_support::tempdir().unwrap();
+        crate::test_support::write_pack(dir.path(), &[(ObjectKind::Blob, b"one".to_vec())]).unwrap();
+        let pack = find_packs(dir.path()).unwrap().pop().unwrap();
+        let path = pack.pack_path.with_extension("idx");
+        let tables = std::sync::Arc::downgrade(&pack.tables);
+        drop(pack);
+        let reopened = read_pack_index(&path).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&tables.upgrade().unwrap(), &reopened.tables), "closing readers must not trigger another parse");
+        let other = crate::test_support::tempdir().unwrap();
+        crate::test_support::write_pack(other.path(), &[(ObjectKind::Blob, b"two".to_vec()), (ObjectKind::Blob, b"three".to_vec())]).unwrap();
+        let replacement = find_packs(other.path()).unwrap().pop().unwrap();
+        fs::copy(replacement.pack_path.with_extension("idx"), &path).unwrap();
+        let changed = read_pack_index(&path).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&reopened.tables, &changed.tables), "changed size/mtime must invalidate parsed tables");
+        assert_eq!(changed.tables.oids.len(), 2);
+        // an index a repack removed between the listing and its open (a dangling link stands in
+        // for it) is skipped, and the others still read
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("gone"), path.with_file_name("pack-gone.idx")).unwrap();
+            assert_eq!(find_packs(dir.path()).unwrap().len(), 1, "a vanished index is skipped");
+        }
+    }
+
+    #[test]
+    fn an_object_read_that_fails_names_what_it_did_to_which_file() {
+        // a pack directory that does not list (a file where it should be): the packs' error names
+        // the listing and its path, and the read says the object is no loose one either
+        let dir = crate::test_support::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(git_dir.join("objects").join("pack"), "").unwrap();
+        let pack_dir = git_dir.join("objects").join("pack");
+        let e = find_packs(&git_dir).err().unwrap().to_string();
+        assert!(e.starts_with(&format!("IO error: list pack directory {}: ", pack_dir.display())), "{e}");
+        let oid = ObjectId::from_hex("5e4999f3bfe35be914c4bba7b0a362112cd4474c").unwrap();
+        let mut repo = crate::Repository::open_git_dir(git_dir.clone(), dir.path().to_path_buf()).unwrap();
+        let e = repo.read_commit(&oid).err().unwrap().to_string();
+        assert!(e.contains(&format!("list pack directory {}", pack_dir.display())) && e.ends_with(&format!("; and {} is no loose object", oid.to_hex())), "{e}");
+    }
 
     #[test]
     fn test_read_from_pack() {
         let dir = crate::test_support::tempdir().unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        fs::write(dir.path().join("test.txt"), "packed content\n").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "test"])
-            .current_dir(dir.path())
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "info@makepad.nl")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "info@makepad.nl")
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["gc", "--aggressive"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
         let git_dir = dir.path().join(".git");
-        let packs = find_packs(&git_dir).unwrap();
-        assert!(!packs.is_empty(), "should have at least one pack after gc");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let ids = crate::test_support::write_pack(
+            &git_dir,
+            &[(ObjectKind::Blob, b"packed content\n".to_vec())],
+        )
+        .unwrap();
 
-        let output = Command::new("git")
-            .args(["hash-object", "test.txt"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        let blob_hex = String::from_utf8(output.stdout).unwrap().trim().to_string();
-        let blob_oid = ObjectId::from_hex(&blob_hex).unwrap();
+        let packs = find_packs(&git_dir).unwrap();
+        assert!(!packs.is_empty(), "should have at least one pack");
+
+        // The id git assigns to this content.
+        let blob_oid = ObjectId::from_hex("5e4999f3bfe35be914c4bba7b0a362112cd4474c").unwrap();
+        assert_eq!(ids[0], blob_oid);
 
         let pack = &packs[0];
         let offset = pack.find_offset(&blob_oid).expect("blob should be in pack");
-        let obj = read_pack_object(&pack.pack_path, offset, pack).unwrap();
+        let obj = pack.read_object(offset).unwrap();
         assert_eq!(obj.kind, ObjectKind::Blob);
         assert_eq!(obj.data, b"packed content\n");
     }
+}
+
+/// Save a verified, self-contained incoming pack and its standard v2 index.
+/// Offsets and object identities come from the importer's delta resolution.
+pub(crate) fn write_imported_pack(
+    git_dir: &Path, data: &[u8], entries: &[(ObjectId, u64, u64)],
+) -> Result<(), GitError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let checksum = &data[data.len() - 20..];
+    let name = ObjectId::from_slice(checksum)?.to_hex();
+    let mut sorted = entries.to_vec();
+    sorted.sort_unstable_by_key(|e| *e.0.as_bytes());
+    let mut index = Vec::with_capacity(1072 + entries.len() * 28);
+    index.extend_from_slice(&[0xff, 0x74, 0x4f, 0x63]);
+    index.extend_from_slice(&2u32.to_be_bytes());
+    let mut fanout = [0u32; 256];
+    for entry in &sorted { fanout[entry.0.as_bytes()[0] as usize] += 1; }
+    let mut total = 0u32;
+    for count in fanout { total += count; index.extend_from_slice(&total.to_be_bytes()); }
+    for entry in &sorted { index.extend_from_slice(entry.0.as_bytes()); }
+    for (_, start, end) in &sorted {
+        let packed = data.get(*start as usize..*end as usize).ok_or_else(|| GitError::CorruptPack("invalid indexed object range".into()))?;
+        index.extend_from_slice(&makepad_fast_inflate::crc32(packed).to_be_bytes());
+    }
+    let mut large = Vec::new();
+    for (_, offset, _) in &sorted {
+        let offset = if *offset < 0x80000000 { *offset as u32 } else {
+            let entry = 0x80000000 | large.len() as u32;
+            large.push(*offset); entry
+        };
+        index.extend_from_slice(&offset.to_be_bytes());
+    }
+    for offset in large { index.extend_from_slice(&offset.to_be_bytes()); }
+    index.extend_from_slice(checksum);
+    let mut hash = crate::sha1::Sha1::new(); hash.update(&index);
+    index.extend_from_slice(&hash.finalize());
+    let dir = git_dir.join("objects/pack");
+    fs::create_dir_all(&dir)?;
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+    // Publish the index last; readers discover packs through their index files.
+    for (extension, bytes) in [("pack", data), ("idx", index.as_slice())] {
+        let destination = dir.join(format!("pack-{name}.{extension}"));
+        let temporary = dir.join(format!("tmp-{}-{serial}.{extension}", std::process::id()));
+        let result = (|| -> Result<(), GitError> {
+            fs::write(&temporary, bytes)?;
+            match fs::rename(&temporary, &destination) {
+                Ok(()) => Ok(()),
+                Err(_) if destination.is_file() => { fs::remove_file(&temporary)?; Ok(()) }
+                Err(e) => Err(e.into()),
+            }
+        })();
+        if result.is_err() { let _ = fs::remove_file(&temporary); }
+        result?;
+    }
+    Ok(())
 }

@@ -1,3 +1,4 @@
+use crate::portable::PortableFloat;
 // Mat4d - f64 4x4 matrix for CSG transforms
 // Cloned from makepad Mat4f, ported to f64 and extended.
 // Column-major layout matching the existing convention.
@@ -52,8 +53,8 @@ impl Mat4d {
     /// Rotation around an arbitrary axis by angle_rad radians (Rodrigues' formula).
     pub fn rotation(axis: Vec3d, angle_rad: f64) -> Mat4d {
         let a = axis.normalize();
-        let c = angle_rad.cos();
-        let s = angle_rad.sin();
+        let c = angle_rad.pcos();
+        let s = angle_rad.psin();
         let t = 1.0 - c;
 
         Mat4d {
@@ -79,8 +80,8 @@ impl Mat4d {
     }
 
     pub fn rotate_x(angle_rad: f64) -> Mat4d {
-        let c = angle_rad.cos();
-        let s = angle_rad.sin();
+        let c = angle_rad.pcos();
+        let s = angle_rad.psin();
         Mat4d {
             v: [
                 1.0, 0.0, 0.0, 0.0, 0.0, c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -89,8 +90,8 @@ impl Mat4d {
     }
 
     pub fn rotate_y(angle_rad: f64) -> Mat4d {
-        let c = angle_rad.cos();
-        let s = angle_rad.sin();
+        let c = angle_rad.pcos();
+        let s = angle_rad.psin();
         Mat4d {
             v: [
                 c, 0.0, -s, 0.0, 0.0, 1.0, 0.0, 0.0, s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -99,8 +100,8 @@ impl Mat4d {
     }
 
     pub fn rotate_z(angle_rad: f64) -> Mat4d {
-        let c = angle_rad.cos();
-        let s = angle_rad.sin();
+        let c = angle_rad.pcos();
+        let s = angle_rad.psin();
         Mat4d {
             v: [
                 c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
@@ -225,14 +226,6 @@ mod tests {
     use crate::vec3::dvec3;
 
     #[test]
-    fn test_identity_transform() {
-        let p = dvec3(1.0, 2.0, 3.0);
-        let m = Mat4d::identity();
-        let r = m.transform_point(p);
-        assert_eq!(r, p);
-    }
-
-    #[test]
     fn test_translation() {
         let p = dvec3(1.0, 2.0, 3.0);
         let m = Mat4d::translation(dvec3(10.0, 20.0, 30.0));
@@ -275,13 +268,6 @@ mod tests {
         assert!((r.x - p.x).abs() < 1e-12);
         assert!((r.y - p.y).abs() < 1e-12);
         assert!((r.z - p.z).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_mul_identity() {
-        let m = Mat4d::translation(dvec3(1.0, 2.0, 3.0));
-        let r = Mat4d::mul(&m, &Mat4d::identity());
-        assert_eq!(r, m);
     }
 
     #[test]

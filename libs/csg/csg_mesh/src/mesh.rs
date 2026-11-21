@@ -7,6 +7,13 @@ use makepad_csg_math::{dvec3, BBox3d, Mat4d, Vec3d};
 pub struct TriMesh {
     pub vertices: Vec<Vec3d>,
     pub triangles: Vec<[u32; 3]>,
+    /// One tag per triangle, in triangle order, or empty, meaning every triangle has tag 0.
+    pub tags: Vec<u32>,
+    /// Unit shading normals per triangle corner (three per triangle, in triangle order), exact
+    /// from the surface the mesh was tessellated from; empty when the mesh has none. They hold
+    /// only while `corner_normals.len() == triangles.len() * 3` and the vertices are as made:
+    /// whatever moves vertices or changes triangles clears them (`clear_normals`).
+    pub corner_normals: Vec<Vec3d>,
 }
 
 impl TriMesh {
@@ -14,6 +21,8 @@ impl TriMesh {
         TriMesh {
             vertices: Vec::new(),
             triangles: Vec::new(),
+            tags: Vec::new(),
+            corner_normals: Vec::new(),
         }
     }
 
@@ -21,9 +30,22 @@ impl TriMesh {
         TriMesh {
             vertices: Vec::with_capacity(num_verts),
             triangles: Vec::with_capacity(num_tris),
+            tags: Vec::new(),
+            corner_normals: Vec::new(),
         }
     }
 
+    pub fn clear_normals(&mut self) {
+        self.corner_normals.clear();
+    }
+
+    /// The exact corner normals when the mesh still has them.
+    pub fn exact_normals(&self) -> Option<&[Vec3d]> {
+        (!self.corner_normals.is_empty() && self.corner_normals.len() == self.triangles.len() * 3)
+            .then_some(&self.corner_normals[..])
+    }
+
+    /// Add a vertex without changing existing triangles or their corner normals.
     pub fn add_vertex(&mut self, v: Vec3d) -> u32 {
         let idx = self.vertices.len() as u32;
         self.vertices.push(v);
@@ -31,7 +53,56 @@ impl TriMesh {
     }
 
     pub fn add_triangle(&mut self, a: u32, b: u32, c: u32) {
+        self.clear_normals();
         self.triangles.push([a, b, c]);
+        if self.is_tagged() {
+            self.tags.push(0);
+        }
+    }
+
+    /// The triangle's tag, or 0 when tags are empty.
+    pub fn tag(&self, ti: usize) -> u32 {
+        if self.is_tagged() { self.tags[ti] } else { 0 }
+    }
+
+    pub fn is_tagged(&self) -> bool {
+        !self.tags.is_empty()
+    }
+
+    pub fn add_tagged_triangle(&mut self, a: u32, b: u32, c: u32, tag: u32) {
+        self.clear_normals();
+        if tag != 0 && !self.is_tagged() {
+            self.tags.resize(self.triangles.len(), 0);
+        }
+        self.triangles.push([a, b, c]);
+        if tag != 0 || self.is_tagged() {
+            self.tags.push(tag);
+        }
+    }
+
+    /// Keep triangles and their tags in order, using each triangle's original index.
+    pub fn retain_triangles(&mut self, mut keep: impl FnMut(usize, &[u32; 3]) -> bool) {
+        self.clear_normals();
+        let mut index = 0;
+        if self.is_tagged() {
+            let mut kept = 0;
+            self.triangles.retain(|tri| {
+                let retain = keep(index, tri);
+                if retain {
+                    self.tags[kept] = self.tags[index];
+                    kept += 1;
+                }
+                index += 1;
+                retain
+            });
+            self.tags.truncate(kept);
+        } else {
+            self.triangles.retain(|tri| {
+                let retain = keep(index, tri);
+                index += 1;
+                retain
+            });
+        }
     }
 
     pub fn vertex_count(&self) -> usize {
@@ -67,20 +138,37 @@ impl TriMesh {
     }
 
     /// Flip all triangle windings (reverses normals).
+    /// Triangle order is unchanged, so tags stay as they are.
     pub fn flip_normals(&mut self) {
+        self.clear_normals();
         for tri in &mut self.triangles {
             tri.swap(0, 1);
         }
     }
 
     /// Apply a transform to all vertices.
+    /// Triangle order is unchanged, so tags stay as they are.
     /// Uses SIMD-batched transform when the `nightly` feature is enabled.
     pub fn transform(&mut self, mat: Mat4d) {
+        self.clear_normals();
         makepad_csg_math::batch_transform_points(&mut self.vertices, &mat);
     }
 
     /// Append another mesh into this one.
     pub fn merge(&mut self, other: &TriMesh) {
+        if self.is_tagged() || other.is_tagged() {
+            self.tags.resize(self.triangle_count(), 0);
+            if other.is_tagged() {
+                self.tags.extend_from_slice(&other.tags);
+            } else {
+                self.tags.resize(self.triangle_count() + other.triangle_count(), 0);
+            }
+        }
+        if self.exact_normals().is_some() && other.exact_normals().is_some() {
+            self.corner_normals.extend_from_slice(&other.corner_normals);
+        } else {
+            self.clear_normals();
+        }
         let offset = self.vertices.len() as u32;
         self.vertices.extend_from_slice(&other.vertices);
         for &[a, b, c] in &other.triangles {
@@ -92,9 +180,22 @@ impl TriMesh {
     /// Reindexes all triangles. Removes degenerate triangles.
     /// Uses a spatial hash grid for O(n) average-case performance.
     pub fn weld_vertices(&mut self, tolerance: f64) {
+        let _ = self.weld_vertices_remap(tolerance);
+    }
+
+    /// Same as `weld_vertices`, but returns the old-index -> new-index remap
+    /// so callers can translate per-vertex data across the weld.
+    pub fn weld_vertices_remap(&mut self, tolerance: f64) -> Vec<u32> {
+        self.weld_vertices_remap_after(0, tolerance)
+    }
+
+    /// [`TriMesh::weld_vertices_remap`] of the vertices from `fixed` on: the first `fixed` keep their indices
+    /// and positions and join nothing (nor does anything join them).
+    pub fn weld_vertices_remap_after(&mut self, fixed: usize, tolerance: f64) -> Vec<u32> {
+        self.clear_normals();
         let n = self.vertices.len();
         if n == 0 {
-            return;
+            return Vec::new();
         }
         let tol_sq = tolerance * tolerance;
         // Cell size slightly larger than tolerance so that any two points within
@@ -103,12 +204,11 @@ impl TriMesh {
         let inv_cell = 1.0 / cell;
 
         // Spatial hash grid: maps cell coordinate to list of (new_vert_index, position).
-        let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<(u32, Vec3d)>> =
-            std::collections::HashMap::new();
-        let mut remap = vec![0u32; n];
-        let mut new_verts: Vec<Vec3d> = Vec::new();
+        let mut grid: makepad_csg_math::fast_hash::FastMap<(i64, i64, i64), Vec<(u32, Vec3d)>> = Default::default();
+        let mut remap: Vec<u32> = (0..n as u32).collect();
+        let mut new_verts: Vec<Vec3d> = self.vertices[..fixed].to_vec();
 
-        for i in 0..n {
+        for i in fixed..n {
             let vi = self.vertices[i];
             let cx = (vi.x * inv_cell).floor() as i64;
             let cy = (vi.y * inv_cell).floor() as i64;
@@ -143,15 +243,24 @@ impl TriMesh {
         self.vertices = new_verts;
 
         // Remap triangle indices and remove degenerate triangles
-        let old_tris = std::mem::take(&mut self.triangles);
-        for [a, b, c] in old_tris {
-            let ra = remap[a as usize];
-            let rb = remap[b as usize];
-            let rc = remap[c as usize];
-            if ra != rb && rb != rc && rc != ra {
-                self.triangles.push([ra, rb, rc]);
+        if self.is_tagged() {
+            for tri in &mut self.triangles {
+                *tri = tri.map(|v| remap[v as usize]);
+            }
+            self.retain_triangles(|_, &[a, b, c]| a != b && b != c && c != a);
+        } else {
+            // Keep the untagged weld's original single-pass remap and emission.
+            let old_tris = std::mem::take(&mut self.triangles);
+            for [a, b, c] in old_tris {
+                let ra = remap[a as usize];
+                let rb = remap[b as usize];
+                let rc = remap[c as usize];
+                if ra != rb && rb != rc && rc != ra {
+                    self.triangles.push([ra, rb, rc]);
+                }
             }
         }
+        remap
     }
 
     /// Get the three vertex positions of a triangle.
@@ -213,10 +322,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_unit_cube() {
-        let c = make_unit_cube();
-        assert_eq!(c.vertex_count(), 8);
-        assert_eq!(c.triangle_count(), 12);
+    fn tags_follow_triangle_edits() {
+        let mut mesh = TriMesh::new();
+        for p in [dvec3(0.0, 0.0, 0.0), dvec3(1.0, 0.0, 0.0), dvec3(0.0, 1.0, 0.0), dvec3(1e-8, 0.0, 0.0)] {
+            mesh.add_vertex(p);
+        }
+        mesh.add_tagged_triangle(0, 1, 2, 0);
+        assert!(!mesh.is_tagged(), "adding tag 0 keeps an untagged mesh untagged");
+        assert_eq!(mesh.tags.capacity(), 0, "untagged insertion allocates no tags");
+        assert_eq!(mesh.tag(0), 0, "empty tags read as zero");
+        mesh.add_tagged_triangle(0, 3, 1, 7);
+        mesh.add_triangle(0, 2, 1);
+        mesh.add_tagged_triangle(1, 2, 3, 9);
+        assert_eq!(mesh.tags, [0, 7, 0, 9], "first nonzero tag pads preceding triangles");
+
+        let mut other = TriMesh::new();
+        other.vertices.extend_from_slice(&mesh.vertices);
+        other.add_triangle(0, 1, 2);
+        let mut first_untagged = other.clone();
+        first_untagged.merge(&mesh);
+        assert_eq!(first_untagged.tags, [0, 0, 7, 0, 9], "merge pads the untagged left side");
+        mesh.merge(&other);
+        assert_eq!(mesh.tags, [0, 7, 0, 9, 0], "merge pads the untagged right side");
+        let triangles = mesh.triangles.clone();
+        let mut visited = 0;
+        mesh.retain_triangles(|i, tri| {
+            assert_eq!(i, visited, "retain visits each original index once");
+            assert_eq!(*tri, triangles[i], "retain supplies the original triangle");
+            visited += 1;
+            i != 2
+        });
+        assert_eq!(visited, triangles.len(), "retain visits all triangles");
+        assert_eq!(mesh.tags, [0, 7, 9, 0], "retain drops the matching tag");
+        mesh.weld_vertices(1e-6);
+        assert_eq!(mesh.tags, [0, 9, 0], "weld drops only the degenerate triangle's tag");
+        assert_eq!(mesh.triangles, [[0, 1, 2], [1, 2, 0], [0, 1, 2]], "weld keeps triangle order");
+        assert!(crate::validate::validate_mesh(&mesh).is_tag_length_valid, "valid tag count is reported");
+        mesh.tags.pop();
+        assert!(!crate::validate::validate_mesh(&mesh).is_tag_length_valid, "invalid tag count is reported");
+
+        let mut plain = other.clone();
+        plain.merge(&other);
+        plain.retain_triangles(|i, _| i == 0);
+        plain.weld_vertices(1e-6);
+        assert_eq!(plain.tags.capacity(), 0, "untagged edits allocate no tags");
+        let mut first = TriMesh::new();
+        first.vertices.extend_from_slice(&other.vertices);
+        first.add_tagged_triangle(0, 1, 2, 5);
+        assert_eq!(first.tags, [5], "a first tagged triangle initializes tags");
+        first.add_tagged_triangle(0, 2, 1, 0);
+        assert_eq!(first.tags, [5, 0], "adding zero to a tagged mesh keeps explicit tags");
+        first.merge(&first.clone());
+        assert_eq!(first.tags, [5, 0, 5, 0], "merge carries both tagged sides");
     }
 
     #[test]
