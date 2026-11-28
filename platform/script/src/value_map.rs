@@ -1,4 +1,3 @@
-#[cfg(not(target_arch = "wasm32"))]
 use relax_api::relax_api;
 use crate::makepad_live_id::LiveId;
 
