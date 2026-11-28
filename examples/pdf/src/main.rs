@@ -46,12 +46,16 @@ impl App {
             direct
         };
 
-        let Some(mut inner) = pdf_view.borrow_mut::<PdfView>() else {
-            self.pdf_data = Some(data);
-            self.ui.redraw(cx);
-            return;
-        };
-        inner.load_pdf_data(cx, data);
+        {
+            let Some(mut inner) = pdf_view.borrow_mut::<PdfView>() else {
+                self.pdf_data = Some(data);
+                self.ui.redraw(cx);
+                return;
+            };
+            inner.load_pdf_data(cx, data);
+            // The RefMut must drop before redraw walks the tree and
+            // borrows this widget again.
+        }
         self.ui.redraw(cx);
         cx.redraw_all();
     }
@@ -84,6 +88,8 @@ impl MatchEvent for App {
 
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+        #[cfg(feature = "tweaker")]
+        makepad_widgets_tweaker::link(vm);
         crate::makepad_widgets::script_mod(vm);
         self::script_mod(vm)
     }

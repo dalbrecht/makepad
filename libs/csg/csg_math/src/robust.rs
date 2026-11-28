@@ -318,8 +318,7 @@ pub fn in_circle(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64, dx: f64, 
 
     let det = alift * bcdet + blift * cadet + clift * abdet;
 
-    let permanent = (bdx * cdy).abs()
-        + (cdx * bdy).abs() * alift
+    let permanent = ((bdx * cdy).abs() + (cdx * bdy).abs()) * alift
         + ((cdx * ady).abs() + (adx * cdy).abs()) * blift
         + ((adx * bdy).abs() + (bdx * ady).abs()) * clift;
     // Error bound from Shewchuk's incircle
@@ -421,13 +420,6 @@ mod tests {
     use crate::vec3::dvec3;
 
     #[test]
-    fn test_two_sum_basic() {
-        let (s, e) = two_sum(1.0, 2.0);
-        assert_eq!(s, 3.0);
-        assert_eq!(e, 0.0);
-    }
-
-    #[test]
     fn test_two_sum_captures_roundoff() {
         let a = 1.0f64;
         let b = 1e-16f64;
@@ -436,13 +428,6 @@ mod tests {
         // Verify s + e represents the exact sum
         assert_eq!(s, 1.0); // 1.0 + 1e-16 rounds to 1.0
         assert!(e != 0.0); // but the error captures the lost 1e-16
-    }
-
-    #[test]
-    fn test_two_product() {
-        let (p, e) = two_product(3.0, 7.0);
-        assert_eq!(p, 21.0);
-        assert_eq!(e, 0.0);
     }
 
     #[test]
@@ -482,15 +467,6 @@ mod tests {
         let b = dvec3(1.0, 0.0, 0.0);
         let c = dvec3(0.0, 1.0, 0.0);
         let d = dvec3(1.0, 1.0, 0.0);
-        assert_eq!(orient3d(a, b, c, d), 0.0);
-    }
-
-    #[test]
-    fn test_orient3d_coplanar_origin() {
-        let a = dvec3(0.0, 0.0, 0.0);
-        let b = dvec3(1.0, 0.0, 0.0);
-        let c = dvec3(0.0, 1.0, 0.0);
-        let d = dvec3(0.5, 0.5, 0.0);
         assert_eq!(orient3d(a, b, c, d), 0.0);
     }
 

@@ -1,0 +1,406 @@
+//! GPU completion: each submitted batch (a frame, uploads, readbacks) ends with
+//! `IDXGIDevice2::EnqueueSetEvent`, which flushes the context and signals an event when the GPU
+//! has finished everything submitted so far. One completion thread waits for those events in
+//! submission order (no polling), maps finished readbacks, releases what the batch kept alive
+//! and posts the results to the mailbox the backend drains. Replaces the old backend's
+//! per-frame event query poll (os/windows/d3d11.rs `is_gpu_done`, `d3d_poll_readback_leases`).
+
+use super::device::{lock, Device};
+use crate::font::FrameProgress;
+use crate::types::*;
+use makepad_windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use makepad_windows_sys::Win32::Graphics::Direct3D11::*;
+use makepad_windows_sys::Win32::Graphics::Dxgi::IDXGIDevice2;
+use makepad_windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+/// WaitForSingleObject's INFINITE timeout
+const INFINITE: u32 = u32::MAX;
+use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Clone)]
+pub struct Token {
+    pub sid: u32,
+    pub incarnation: Arc<FrameProgress>,
+}
+
+pub enum Event {
+    /// `gpu_span`: the frame's first and last timestamps in seconds of the GPU's clock (one
+    /// clock for every frame of the device: the frame timer orders passes by it).
+    DispatchTime { name: String, gpu_ns: u64 },
+    Frame { target: Id, kind: u32, frame: u64, window: bool, gpu_ns: u64, gpu_span: [f64; 2] },
+    BufferLeases { req: u32, status: u32, leases: Vec<crate::lease::Lease> },
+    Readback { req: u32, status: u32, rect: [u32; 4], lease: Option<crate::lease::Lease> },
+}
+
+pub struct Done {
+    pub token: Token,
+    pub time: u64,
+    pub event: Event,
+}
+
+#[derive(Clone)]
+pub struct Mailbox {
+    events: Arc<Mutex<Vec<Done>>>,
+    pub wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Mailbox {
+    pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self { events: Arc::new(Mutex::new(Vec::new())), wake }
+    }
+    pub fn push(&self, token: Token, event: Event) {
+        lock(&self.events).push(Done { token, event, time: crate::clock_ns() });
+        (self.wake)();
+    }
+    pub fn take(&self) -> Vec<Done> {
+        std::mem::take(&mut *lock(&self.events))
+    }
+}
+
+/// A finished copy into a staging texture, mapped once the GPU is done.
+pub struct Staged {
+    pub tex: ID3D11Texture2D,
+    pub format: u32,
+    pub w: u32,
+    pub h: u32,
+    /// on the ledger until the pixels are read
+    pub _charge: crate::ledger::Charge,
+}
+
+/// A frame's GPU timing queries, reused through `Timers`.
+pub struct Timer {
+    pub disjoint: ID3D11Query,
+    pub begin: ID3D11Query,
+    pub end: ID3D11Query,
+    /// Timestamp pairs around the passes of a frame the GPU profiler records (`crate::gpu_prof`),
+    /// kept with the timer for its next frames; the first `used` are this frame's.
+    stamps: Vec<ID3D11Query>,
+    used: usize,
+    /// The profiled frame and its timed passes: (the pass's index in it, its first stamp).
+    pub prof: Option<(crate::gpu_prof::FrameKey, Vec<(u16, usize)>)>,
+    pub dispatches: Vec<(String, usize)>,
+}
+
+impl Timer {
+    /// The first of a free pair of timestamps for one pass (`None` when the device makes none).
+    pub fn stamp_pair(&mut self, dev: &Device) -> Option<usize> {
+        while self.stamps.len() < self.used + 2 {
+            self.stamps.push(make_query(dev, D3D11_QUERY_TIMESTAMP)?);
+        }
+        self.used += 2;
+        Some(self.used - 2)
+    }
+
+    pub fn stamp(&self, i: usize) -> &ID3D11Query {
+        &self.stamps[i]
+    }
+}
+
+fn make_query(dev: &Device, q: D3D11_QUERY) -> Option<ID3D11Query> {
+    let mut out = None;
+    unsafe { dev.device.CreateQuery(&D3D11_QUERY_DESC { Query: q, MiscFlags: 0 }, Some(&mut out)) }.ok()?;
+    out
+}
+
+/// Timing query sets coming back from the completion thread for reuse.
+#[derive(Clone, Default)]
+pub struct Timers(Arc<Mutex<Vec<Timer>>>);
+
+impl Timers {
+    pub fn take(&self, dev: &Device) -> Option<Timer> {
+        if let Some(t) = lock(&self.0).pop() {
+            return Some(t);
+        }
+        let make = |q| make_query(dev, q);
+        Some(Timer { disjoint: make(D3D11_QUERY_TIMESTAMP_DISJOINT)?, begin: make(D3D11_QUERY_TIMESTAMP)?, end: make(D3D11_QUERY_TIMESTAMP)?, stamps: Vec::new(), used: 0, prof: None, dispatches: Vec::new() })
+    }
+    fn give(&self, mut t: Timer) {
+        t.used = 0;
+        t.prof = None;
+        t.dispatches.clear();
+        lock(&self.0).push(t);
+    }
+}
+
+/// The frame's GPU clock: ticks per second and its two timestamps (`None` when unknown or
+/// disjoint). The frame is complete, so the data is there: read without flushing.
+fn clock(dev: &Device, t: &Timer) -> Option<(u64, u64, u64)> {
+    let mut dj = D3D11_QUERY_DATA_TIMESTAMP_DISJOINT::default();
+    if !get_data(dev, &t.disjoint, &mut dj) || dj.Disjoint.as_bool() || dj.Frequency == 0 {
+        return None;
+    }
+    let (mut b, mut e) = (0u64, 0u64);
+    (get_data(dev, &t.begin, &mut b) && get_data(dev, &t.end, &mut e) && e >= b).then_some((dj.Frequency, b, e))
+}
+
+fn get_data<T>(dev: &Device, q: &ID3D11Query, out: &mut T) -> bool {
+    unsafe { (dev.ctx.vtable().GetData)(dev.ctx.as_raw(), q.as_raw(), out as *mut T as *mut _, std::mem::size_of::<T>() as u32, D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32).0 == 0 }
+}
+
+/// The GPU nanoseconds between a frame's two timestamps and their span in seconds of the GPU's
+/// clock ((0, [0, 0]) when unknown or disjoint).
+fn gpu_ns(clock: Option<(u64, u64, u64)>) -> (u64, [f64; 2]) {
+    let Some((freq, b, e)) = clock else { return (0, [0.0; 2]) };
+    let f = freq as f64;
+    (((e - b) as u128 * 1_000_000_000 / freq as u128) as u64, [b as f64 / f, e as f64 / f])
+}
+
+/// A profiled frame's timed passes to the GPU profiler, on the host clock: the frame's last
+/// timestamp is placed where its completion was seen (late by this thread's wake-up), every
+/// other one before it by its distance in ticks.
+fn prof_passes(dev: &Device, t: &Timer, clock: Option<(u64, u64, u64)>, key: crate::gpu_prof::FrameKey, passes: &[(u16, usize)]) {
+    let Some((freq, _, end)) = clock else {
+        passes.iter().for_each(|_| crate::gpu_prof::gpu_none(key));
+        return;
+    };
+    let now = crate::clock_ns();
+    let host = |ticks: u64| now.saturating_sub((end.saturating_sub(ticks) as u128 * 1_000_000_000 / freq as u128) as u64);
+    for (pass, q) in passes {
+        let (mut a, mut b) = (0u64, 0u64);
+        if get_data(dev, t.stamp(*q), &mut a) && get_data(dev, t.stamp(*q + 1), &mut b) && b >= a {
+            crate::gpu_prof::gpu_pass(key, *pass, crate::gpu_prof::PassGpu { start: host(a), end: host(b), ..Default::default() });
+        } else {
+            crate::gpu_prof::gpu_none(key);
+        }
+    }
+}
+
+pub enum Ticket {
+    BufferLeases { token: Token, req: u32, staging: super::leases::Staging, ranges: Vec<(u64, u64)> },
+    Frame { token: Token, target: Id, kind: u32, frame: u64, window: bool, timer: Option<Timer> },
+    Read { token: Token, req: u32, rect: [u32; 4], staged: Staged },
+    Copy { token: Token, req: u32, rect: [u32; 4] },
+    Host { reply: std::sync::mpsc::SyncSender<Option<crate::backend::Pixels>>, staged: Staged },
+}
+
+/// What one submission produced: its tickets and the objects its commands use, held until the
+/// GPU is done with them.
+#[derive(Default)]
+pub struct Batch {
+    pub tickets: Vec<Ticket>,
+    pub keep: Vec<Box<dyn std::any::Any + Send>>,
+}
+
+impl Batch {
+    pub fn is_empty(&self) -> bool {
+        self.tickets.is_empty() && self.keep.is_empty()
+    }
+}
+
+struct Pending {
+    event: HANDLE,
+    batch: Batch,
+}
+
+// SAFETY: an event HANDLE is a process-wide kernel object reference
+unsafe impl Send for Pending {}
+
+struct Queue {
+    pending: VecDeque<Pending>,
+    /// signalled events back for reuse (auto-reset: unsignalled again after the wait)
+    free: Vec<usize>,
+    stop: bool,
+}
+
+pub struct Completion {
+    pub timers: Timers,
+    queue: Arc<(Mutex<Queue>, Condvar)>,
+    dxgi: IDXGIDevice2,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Completion {
+    pub fn new(dev: Arc<Device>, mailbox: Mailbox) -> Result<Self, String> {
+        let dxgi = unsafe { IDXGIDevice2::query(dev.device.as_raw()) }.map_err(|e| format!("IDXGIDevice2 (DXGI 1.3): {e}"))?;
+        let queue = Arc::new((Mutex::new(Queue { pending: VecDeque::new(), free: Vec::new(), stop: false }), Condvar::new()));
+        let q = queue.clone();
+        let timers = Timers::default();
+        let t = timers.clone();
+        let thread = std::thread::Builder::new()
+            .name("makepad-d3d11-complete".into())
+            .spawn(move || run(dev, q, mailbox, t))
+            .map_err(|e| format!("completion thread: {e}"))?;
+        Ok(Self { timers, queue, dxgi, thread: Some(thread) })
+    }
+
+    /// Ends a batch: flushes the context and queues its completion. Never waits.
+    pub fn submit(&self, batch: Batch) {
+        if batch.is_empty() {
+            return;
+        }
+        let (m, cv) = &*self.queue;
+        let event = lock(m).free.pop().map(|h| HANDLE(h as _));
+        let event = match event {
+            Some(e) => e,
+            None => match unsafe { CreateEventW(None, false, false, None) } {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[hal-d3d11] CreateEventW: {e}; completing the batch without a fence");
+                    HANDLE(std::ptr::null_mut())
+                }
+            },
+        };
+        if !event.0.is_null() {
+            if let Err(e) = unsafe { self.dxgi.EnqueueSetEvent(event) } {
+                eprintln!("[hal-d3d11] EnqueueSetEvent: {e}");
+            }
+        }
+        lock(m).pending.push_back(Pending { event, batch });
+        cv.notify_one();
+    }
+}
+
+impl Completion {
+    /// The completion thread answers every batch submitted so far (it waits for each one's
+    /// GPU event) and ends; this returns once it has. The end of the process
+    /// (`D3d11::before_exit`) and `Drop`.
+    pub fn stop(&mut self) {
+        let (m, cv) = &*self.queue;
+        lock(m).stop = true;
+        cv.notify_one();
+        if let Some(t) = self.thread.take() {
+            if t.join().is_err() { eprintln!("[hal-d3d11] the completion thread panicked"); }
+        }
+    }
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        self.stop();
+        let (m, _) = &*self.queue;
+        for h in lock(m).free.drain(..) {
+            unsafe {
+                let _ = CloseHandle(HANDLE(h as _));
+            }
+        }
+    }
+}
+
+fn run(dev: Arc<Device>, queue: Arc<(Mutex<Queue>, Condvar)>, mailbox: Mailbox, timers: Timers) {
+    let (m, cv) = &*queue;
+    loop {
+        let front = {
+            let mut q = lock(m);
+            loop {
+                if let Some(p) = q.pending.pop_front() {
+                    break Some(p);
+                }
+                if q.stop {
+                    break None;
+                }
+                q = cv.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let Some(Pending { event, batch }) = front else { return };
+        if !event.0.is_null() {
+            // GPU work is finite; a removed device signals too (its work is discarded)
+            let wait = unsafe { WaitForSingleObject(event, INFINITE) };
+            if wait != WAIT_OBJECT_0 {
+                eprintln!("[hal-d3d11] completion wait: {wait:?}");
+            }
+            lock(m).free.push(event.0 as usize);
+        }
+        let lost = dev.check_lost();
+        complete(&dev, batch, lost, &mailbox, &timers);
+    }
+}
+
+fn read_staged(dev: &Device, s: &Staged) -> Option<Vec<u8>> {
+    let row = crate::types::format::level_bytes(s.format, s.w, 1) as usize;
+    let rows = if crate::types::format::is_block(s.format) { s.h.div_ceil(4) } else { s.h } as usize;
+    let row = if crate::types::format::is_block(s.format) { crate::types::format::level_bytes(s.format, s.w, 4) as usize } else { row };
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe {
+        // the batch is complete (its event fired); some drivers still answer WAS_STILL_DRAWING to a
+        // non-waiting map, so this thread maps waiting (it never holds anything else)
+        dev.ctx.Map(s.tex.as_ID3D11Resource(), 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
+        let mut out = vec![0u8; row * rows];
+        for y in 0..rows {
+            let src = (mapped.pData as *const u8).add(y * mapped.RowPitch as usize);
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr().add(y * row), row);
+        }
+        dev.ctx.Unmap(s.tex.as_ID3D11Resource(), 0);
+        Some(out)
+    }
+}
+
+/// BGRA texels as the RGBA every 8-bit readback answers in.
+fn to_rgba(format: u32, pixels: &mut [u8]) {
+    if format == crate::types::format::BGRA8 {
+        for p in pixels.chunks_exact_mut(4) {
+            p.swap(0, 2);
+        }
+    }
+}
+
+fn complete(dev: &Device, mut batch: Batch, lost: bool, mailbox: &Mailbox, timers: &Timers) {
+    let mut out: Vec<(Token, Event)> = Vec::new();
+    for ticket in batch.tickets.drain(..) {
+        match ticket {
+            Ticket::BufferLeases { token, req, staging, ranges } => {
+                let result = if lost { Err("device lost".to_string()) } else { staging.map(&ranges) };
+                let status = if lost || (result.is_err() && dev.check_lost()) { readback::DEVICE_LOST } else if result.is_ok() { readback::OK } else { readback::FAILED };
+                out.push((token, Event::BufferLeases { req, status, leases: result.unwrap_or_default() }));
+            }
+
+            Ticket::Frame { token, target, kind, frame, window, timer } => {
+                token.incarnation.done(frame);
+                let (gpu_ns, gpu_span) = match timer {
+                    Some(t) => {
+                        let clock = if lost { None } else { clock(dev, &t) };
+                        if let Some((key, passes)) = &t.prof {
+                            prof_passes(dev, &t, clock, *key, passes);
+                        }
+                        if let Some((frequency, _, _)) = clock {
+                            for (name, q) in &t.dispatches {
+                                let (mut begin, mut end) = (0u64, 0u64);
+                                if get_data(dev, t.stamp(*q), &mut begin) && get_data(dev, t.stamp(*q + 1), &mut end) && end >= begin {
+                                    out.push((token.clone(), Event::DispatchTime { name: name.clone(), gpu_ns: ((end - begin) as f64 * 1e9 / frequency as f64) as u64 }));
+                                }
+                            }
+                        }
+                        timers.give(t);
+                        gpu_ns(clock)
+                    }
+                    None => (0, [0.0; 2]),
+                };
+                // a frame of a lost device still finishes (nothing reached the glass): the app's
+                // frame accounting closes, the reset that follows makes it paint again
+                out.push((token, Event::Frame { target, kind, frame, window: window && !lost, gpu_ns, gpu_span }));
+            }
+            Ticket::Copy { token, req, rect } => {
+                out.push((token, Event::Readback { req, rect, status: if lost { readback::FAILED } else { readback::OK }, lease: None }));
+            }
+            Ticket::Host { reply, staged } => {
+                let pixels = if lost { None } else {
+                    read_staged(dev, &staged).map(|mut rgba| {
+                        to_rgba(staged.format, &mut rgba);
+                        crate::backend::Pixels { w: staged.w, h: staged.h, rgba }
+                    })
+                };
+                let _ = reply.try_send(pixels);
+            }
+            Ticket::Read { token, req, rect, staged } => {
+                let pixels = if lost { None } else { read_staged(dev, &staged) };
+                match pixels {
+                    Some(mut pixels) => {
+                        to_rgba(staged.format, &mut pixels);
+                        let status = if matches!(staged.format, format::RGBA8 | format::BGRA8) { readback::OK } else { readback::NATIVE };
+                        out.push((token, Event::Readback { req, rect, status, lease: Some(crate::lease::Lease::from_vec(pixels, 0)) }));
+                    }
+                    None => out.push((token, Event::Readback { req, rect, status: readback::FAILED, lease: None })),
+                }
+            }
+        }
+    }
+    // what the batch used goes before anyone hears it finished
+    drop(batch);
+    if lost {
+        dev.lost.store(true, Ordering::Release);
+    }
+    for (token, event) in out {
+        mailbox.push(token, event);
+    }
+}

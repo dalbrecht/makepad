@@ -1,0 +1,3 @@
+[workspace]
+members = ["app", "callback", "plain", "shared"]
+resolver = "2"

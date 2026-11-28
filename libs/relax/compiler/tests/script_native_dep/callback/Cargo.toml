@@ -1,0 +1,13 @@
+[package]
+name = "snd-callback"
+version = "0.1.0"
+edition = "2021"
+publish = false
+links = "snd_callback"
+build = "build.rs"
+
+[dependencies]
+snd-shared = { path = "../shared" }
+
+[build-dependencies]
+snd-shared = { path = "../shared" }

@@ -2,8 +2,7 @@
 name = "makepad-csg-boolean"
 version = "0.1.0"
 edition = "2021"
-
-[workspace]
+license = "MIT OR Apache-2.0"
 
 [features]
 default = ["threads"]
@@ -14,3 +13,7 @@ threads = ["makepad-csg-math/threads"]
 makepad-csg-math = { path = "../csg_math" }
 makepad-csg-mesh = { path = "../csg_mesh" }
 makepad-csg-exact = { path = "../csg_exact" }
+
+[dev-dependencies]
+makepad-csg-primitives = { path = "../csg_primitives" }
+makepad-csg-sdf = { path = "../csg_sdf" }

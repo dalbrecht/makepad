@@ -2,18 +2,24 @@ pub mod content;
 pub mod document;
 pub mod filter;
 pub mod font;
+pub mod font_program;
 pub mod image;
 pub mod lexer;
 pub mod object;
 pub mod page;
 pub mod parser;
+pub mod structure;
+
+#[cfg(test)]
+mod structure_tests;
 
 #[cfg(test)]
 mod tests;
 
 pub use content::{parse_content_stream, PdfOp, TextArrayItem};
 pub use document::PdfDocument;
-pub use font::{char_width, decode_text};
+pub use font::{char_width, decode_codes_named, decode_text, glyph_name};
+pub use font_program::{FontNameStatus, FontProgram, FontProgramError, FontProgramKind};
 pub use image::{decode_inline_image, extract_image, PdfImage};
 pub use lexer::{PdfError, PdfResult};
 pub use object::*;

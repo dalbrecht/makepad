@@ -24,129 +24,50 @@ fn ref_array_to_array_of_refs<T, const N: usize>(ref_array: &[T; N]) -> [&T; N] 
 // ============================================================================
 use crate::texture::Texture;
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-const LINUX_SOFTWARE_FALLBACK_DRM_FOURCC: u32 = 0;
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-const LINUX_SOFTWARE_FALLBACK_DRM_MODIFIERS: u64 = u64::MAX;
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-#[derive(Debug)]
-pub struct LinuxSharedSoftwareBuffer {
-    fd: std::os::fd::OwnedFd,
-    ptr: *mut u8,
-    len: usize,
-    pub stride: u32,
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-impl LinuxSharedSoftwareBuffer {
-    pub fn create(len: usize, stride: u32) -> std::io::Result<Self> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        const MFD_CLOEXEC: u32 = 0x0001;
-
-        unsafe extern "C" {
-            fn memfd_create(name: *const std::os::raw::c_char, flags: u32) -> i32;
-            fn ftruncate(fd: i32, length: i64) -> i32;
-        }
-
-        let name = b"makepad-runview\0";
-        let raw_fd = unsafe { memfd_create(name.as_ptr() as *const _, MFD_CLOEXEC) };
-        if raw_fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) };
-
-        let len_i64 = i64::try_from(len).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "software buffer too large",
-            )
-        })?;
-        if unsafe { ftruncate(fd.as_raw_fd(), len_i64) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        let ptr = unsafe {
-            crate::os::linux::libc_sys::mmap(
-                std::ptr::null_mut(),
-                len,
-                crate::os::linux::libc_sys::PROT_READ | crate::os::linux::libc_sys::PROT_WRITE,
-                crate::os::linux::libc_sys::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr as isize == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        Ok(Self {
-            fd,
-            ptr: ptr.cast::<u8>(),
-            len,
-            stride,
-        })
-    }
-
-    pub fn from_fd(fd: std::os::fd::OwnedFd, len: usize, stride: u32) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd;
-
-        let ptr = unsafe {
-            crate::os::linux::libc_sys::mmap(
-                std::ptr::null_mut(),
-                len,
-                crate::os::linux::libc_sys::PROT_READ | crate::os::linux::libc_sys::PROT_WRITE,
-                crate::os::linux::libc_sys::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr as isize == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        Ok(Self {
-            fd,
-            ptr: ptr.cast::<u8>(),
-            len,
-            stride,
-        })
-    }
-
-    pub fn clone_fd(&self) -> std::io::Result<std::os::fd::OwnedFd> {
-        use std::os::fd::AsFd;
-        self.fd.as_fd().try_clone_to_owned()
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-
-    pub fn as_mut_ptr(&mut self) -> *mut std::os::raw::c_void {
-        self.ptr.cast::<std::os::raw::c_void>()
-    }
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-impl Drop for LinuxSharedSoftwareBuffer {
-    fn drop(&mut self) {
-        let _ = unsafe {
-            crate::os::linux::libc_sys::munmap(self.ptr.cast::<std::os::raw::c_void>(), self.len)
-        };
-    }
-}
-
 #[derive(Debug)]
 pub struct HostPresentableImage {
     pub id: PresentableImageId,
     pub texture: Texture,
-    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    pub software_buffer: Option<LinuxSharedSoftwareBuffer>,
+    #[cfg(target_os = "linux")]
+    frame: std::cell::RefCell<Option<(u64, crate::texture::WeakTexture)>>,
+}
+
+impl HostPresentableImage {
+    /// Return a texture retaining this specific completed frame. Vulkan reads
+    /// hold a lease instead of exposing the writer's reusable allocation.
+    ///
+    /// `snapshot` is the swapchain's one copy of its newest frame (Linux), reused frame
+    /// after frame.
+    pub fn texture_for_draw(&self, cx: &mut Cx, draw: &PresentableDraw, width: u32, height: u32, snapshot: &std::cell::RefCell<Option<Texture>>) -> Option<Texture> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (width, height);
+            if let Some((sequence, texture)) = &*self.frame.borrow() {
+                if *sequence == draw.sequence { return texture.upgrade(); }
+            }
+            let previous = snapshot.borrow().clone();
+            return match cx.hal_copy_presentable_frame(&self.texture, draw.sequence, previous.as_ref()) {
+                Ok(texture) => {
+                    makepad_hal::profile::child_frame(snapshot as *const _ as usize);
+                    *self.frame.borrow_mut() = Some((draw.sequence, texture.downgrade()));
+                    *snapshot.borrow_mut() = Some(texture.clone());
+                    Some(texture)
+                },
+                Err(error) => {
+                    // a snapshot without storage (its create failed, or it was evicted) is not
+                    // reused: the next frame makes a new one
+                    *snapshot.borrow_mut() = None;
+                    crate::error!("Shared HAL frame rejected: {error}");
+                    None
+                }
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (cx, draw, width, height, snapshot);
+            Some(self.texture.clone())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -155,6 +76,8 @@ pub struct HostSwapchain {
     pub alloc_width: u32,
     pub alloc_height: u32,
     pub presentable_images: [HostPresentableImage; SWAPCHAIN_IMAGE_COUNT],
+    /// The copy of the child's newest frame that is drawn (Linux), reused for the next one.
+    pub snapshot: std::cell::RefCell<Option<Texture>>,
 }
 
 impl HostSwapchain {
@@ -164,6 +87,7 @@ impl HostSwapchain {
         alloc_height: u32,
         cx: &mut crate::cx::Cx,
     ) -> Self {
+        #[cfg(target_arch = "wasm32")]
         use crate::texture::TextureFormat;
         Self {
             window_id,
@@ -173,6 +97,11 @@ impl HostSwapchain {
                 let id = PresentableImageId::alloc();
                 HostPresentableImage {
                     id,
+                    #[cfg(target_os = "linux")]
+                    frame: Default::default(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    texture: cx.create_shared_texture(alloc_width as usize, alloc_height as usize),
+                    #[cfg(target_arch = "wasm32")]
                     texture: Texture::new_with_format(
                         cx,
                         TextureFormat::SharedBGRAu8 {
@@ -182,10 +111,9 @@ impl HostSwapchain {
                             initial: true,
                         },
                     ),
-                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-                    software_buffer: None,
                 }
             }),
+            snapshot: Default::default(),
         }
     }
 
@@ -193,63 +121,40 @@ impl HostSwapchain {
         self.presentable_images.iter().find(|pi| pi.id == id)
     }
 
-    pub fn regenerate_ids(&mut self) {
-        for pi in &mut self.presentable_images {
-            pi.id = PresentableImageId::alloc();
-        }
-    }
 }
 
 // ============================================================================
 // macOS: IOSurface-based swapchain (for serialization)
 // ============================================================================
-#[cfg(target_os = "macos")]
-pub fn shared_swapchain_from_host_swapchain(
-    host: &HostSwapchain,
-    cx: &mut crate::cx::Cx,
-) -> SharedSwapchain {
-    SharedSwapchain {
-        window_id: host.window_id,
-        alloc_width: host.alloc_width,
-        alloc_height: host.alloc_height,
-        presentable_images: std::array::from_fn(|i| SharedPresentableImage {
-            id: host.presentable_images[i].id,
-            iosurface_id: cx
-                .share_texture_for_presentable_image(&host.presentable_images[i].texture),
-        }),
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn shared_swapchain_from_host_swapchain(host: &HostSwapchain, cx: &mut Cx) -> Option<SharedSwapchain> {
+    let mut images = Vec::with_capacity(SWAPCHAIN_IMAGE_COUNT);
+    for image in &host.presentable_images {
+        let handle = cx.shared_texture_handle(&image.texture)?;
+        if handle == 0 { return None; }
+        images.push(SharedPresentableImage { id: image.id,
+            #[cfg(target_os = "macos")] iosurface_id: handle as u32,
+            #[cfg(target_os = "windows")] handle,
+        });
     }
-}
-
-// ============================================================================
-// Windows: HANDLE-based swapchain
-// ============================================================================
-#[cfg(target_os = "windows")]
-pub fn shared_swapchain_from_host_swapchain(
-    host: &HostSwapchain,
-    cx: &mut crate::cx::Cx,
-) -> SharedSwapchain {
-    SharedSwapchain {
-        window_id: host.window_id,
-        alloc_width: host.alloc_width,
-        alloc_height: host.alloc_height,
-        presentable_images: std::array::from_fn(|i| SharedPresentableImage {
-            id: host.presentable_images[i].id,
-            handle: cx.share_texture_for_presentable_image(&host.presentable_images[i].texture),
-        }),
-    }
-}
-
-pub fn shared_swapchain_get_image(
-    swapchain: &SharedSwapchain,
-    id: PresentableImageId,
-) -> Option<&SharedPresentableImage> {
-    swapchain.presentable_images.iter().find(|pi| pi.id == id)
+    Some(SharedSwapchain {
+        window_id: host.window_id, alloc_width: host.alloc_width, alloc_height: host.alloc_height,
+        presentable_images: images.try_into().ok()?,
+    })
 }
 
 // ============================================================================
 // Linux: DMA-BUF-based swapchain
 // ============================================================================
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+/// DRM layout metadata carried by the hosted image protocol.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct DrmFormat {
+    pub fourcc: u32,
+    pub modifiers: u64,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LinuxOwnedImagePlane {
     pub dma_buf_fd: std::os::fd::OwnedFd,
@@ -257,182 +162,96 @@ pub struct LinuxOwnedImagePlane {
     pub stride: u32,
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct LinuxOwnedVulkanImage {
+    pub info: makepad_studio_protocol::LinuxVulkanSharedImage,
+    pub semaphore_fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LinuxOwnedImage {
-    pub drm_format: crate::os::linux::dma_buf::DrmFormat,
+    pub vulkan: Option<LinuxOwnedVulkanImage>,
+    pub dma_buf_timeline: Option<std::os::fd::OwnedFd>,
+    pub drm_format: DrmFormat,
     pub plane: LinuxOwnedImagePlane,
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-impl LinuxOwnedImage {
-    pub fn is_software_fallback(&self) -> bool {
-        self.drm_format.fourcc == LINUX_SOFTWARE_FALLBACK_DRM_FOURCC
-            && self.drm_format.modifiers == LINUX_SOFTWARE_FALLBACK_DRM_MODIFIERS
-    }
-
-    pub fn software_fallback(dma_buf_fd: std::os::fd::OwnedFd, stride: u32) -> Self {
-        Self {
-            drm_format: crate::os::linux::dma_buf::DrmFormat {
-                fourcc: LINUX_SOFTWARE_FALLBACK_DRM_FOURCC,
-                modifiers: LINUX_SOFTWARE_FALLBACK_DRM_MODIFIERS,
-            },
-            plane: LinuxOwnedImagePlane {
-                dma_buf_fd,
-                offset: 0,
-                stride,
-            },
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LinuxPresentableImage {
     pub id: PresentableImageId,
     pub image: LinuxOwnedImage,
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub enum SharedSwapchainCreateError {
-    AuxChannelSend(std::io::Error),
-    SoftwareFallback(std::io::Error),
+    /// GPU allocation/export is pending; retain this swapchain and retry after its completion event.
+    NotReady,
+    Vulkan(String),
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub fn shared_presentable_image_recv_fds_from_aux_chan(
-    image: SharedPresentableImage,
-    client_endpoint: &aux_chan::ClientEndpoint,
-) -> std::io::Result<LinuxPresentableImage> {
-    let id = image.id;
-    let owned_image = aux_chan::recv_image_fds_from_aux_chan(id, image.image, client_endpoint)?;
-    Ok(LinuxPresentableImage {
-        id,
-        image: owned_image,
-    })
-}
+#[cfg(target_os = "linux")]
+pub use crate::os::hosted_gpu_sender::{LinuxSwapchainSender, NativeDescriptors, SentSwapchain};
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn software_fallback_image(
-    host_image: &mut HostPresentableImage,
+/// An exported handle batch, with no CPU pixel payload. Ownership can move
+/// to a worker after Vulkan export has completed on the renderer thread.
+#[cfg(target_os = "linux")]
+pub struct ExportedHostSwapchain {
+    window_id: usize,
     alloc_width: u32,
     alloc_height: u32,
-) -> Result<LinuxOwnedImage, SharedSwapchainCreateError> {
-    let stride = alloc_width.checked_mul(4).ok_or_else(|| {
-        SharedSwapchainCreateError::SoftwareFallback(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "software fallback stride overflow",
-        ))
-    })?;
-    let len = usize::try_from(stride)
-        .ok()
-        .and_then(|stride| {
-            usize::try_from(alloc_height)
-                .ok()
-                .and_then(|height| stride.checked_mul(height))
-        })
-        .ok_or_else(|| {
-            SharedSwapchainCreateError::SoftwareFallback(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "software fallback buffer size overflow",
-            ))
-        })?;
-
-    let needs_new_buffer = match host_image.software_buffer.as_ref() {
-        Some(buffer) => buffer.as_bytes().len() != len || buffer.stride != stride,
-        None => true,
-    };
-    if needs_new_buffer {
-        host_image.software_buffer = Some(
-            LinuxSharedSoftwareBuffer::create(len, stride)
-                .map_err(SharedSwapchainCreateError::SoftwareFallback)?,
-        );
-    }
-
-    let send_fd = host_image
-        .software_buffer
-        .as_ref()
-        .expect("software buffer initialized")
-        .clone_fd()
-        .map_err(SharedSwapchainCreateError::SoftwareFallback)?;
-
-    Ok(LinuxOwnedImage::software_fallback(send_fd, stride))
+    images: [LinuxPresentableImage; SWAPCHAIN_IMAGE_COUNT],
 }
 
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub fn shared_swapchain_from_host_swapchain(
-    host: &mut HostSwapchain,
-    cx: &mut crate::cx::Cx,
-    host_endpoint: &aux_chan::HostEndpoint,
-) -> Result<SharedSwapchain, SharedSwapchainCreateError> {
+#[cfg(target_os = "linux")]
+impl ExportedHostSwapchain {
+    pub(crate) fn send(self, endpoint: &makepad_hal::hosted_ipc::HostEndpoint) -> std::io::Result<SharedSwapchain> {
+        let mut shared = Vec::with_capacity(SWAPCHAIN_IMAGE_COUNT);
+        for image in self.images {
+            shared.push(SharedPresentableImage { id: image.id,
+                image: aux_chan::send_image_fds_to_aux_chan(image.id, image.image, endpoint)? });
+        }
+        Ok(SharedSwapchain { window_id: self.window_id,
+            alloc_width: self.alloc_width, alloc_height: self.alloc_height,
+            presentable_images: shared.try_into().map_err(|_| std::io::Error::other("incomplete framebuffer export"))? })
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn export_host_swapchain(host: &mut HostSwapchain, cx: &mut Cx)
+    -> Result<ExportedHostSwapchain, SharedSwapchainCreateError> {
     let mut owned_images: [Option<LinuxOwnedImage>; SWAPCHAIN_IMAGE_COUNT] =
         std::array::from_fn(|_| None);
-    let mut use_software_fallback = false;
     for i in 0..SWAPCHAIN_IMAGE_COUNT {
-        if let Some(image) =
-            cx.share_texture_for_presentable_image(&host.presentable_images[i].texture)
-        {
-            owned_images[i] = Some(image);
-        } else {
-            use_software_fallback = true;
-            break;
+        if cx.shared_texture_handle(&host.presentable_images[i].texture).is_none() {
+            return Err(SharedSwapchainCreateError::NotReady);
         }
+        owned_images[i] = Some(cx.hal_export_presentable_image(&host.presentable_images[i].texture)
+            .map_err(SharedSwapchainCreateError::Vulkan)?);
     }
 
-    if use_software_fallback {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static LOG_SOFTWARE_FALLBACK: AtomicBool = AtomicBool::new(false);
-        if !LOG_SOFTWARE_FALLBACK.swap(true, Ordering::Relaxed) {
-            crate::warning!(
-                "Linux DMA-BUF export unavailable for RunView; using software readback fallback"
-            );
-        }
-        for i in 0..SWAPCHAIN_IMAGE_COUNT {
-            owned_images[i] = Some(software_fallback_image(
-                &mut host.presentable_images[i],
-                host.alloc_width,
-                host.alloc_height,
-            )?);
-        }
-    } else {
-        for image in &mut host.presentable_images {
-            image.software_buffer = None;
-        }
-    }
-
-    let mut presentable_images: [Option<SharedPresentableImage>; SWAPCHAIN_IMAGE_COUNT] =
-        [None; SWAPCHAIN_IMAGE_COUNT];
-    for i in 0..SWAPCHAIN_IMAGE_COUNT {
-        let id = host.presentable_images[i].id;
-        let image = owned_images[i].take().expect("image exported");
-        let image = aux_chan::send_image_fds_to_aux_chan(id, image, host_endpoint)
-            .map_err(SharedSwapchainCreateError::AuxChannelSend)?;
-        presentable_images[i] = Some(SharedPresentableImage { id, image });
-    }
-    let presentable_images = presentable_images.map(|image| image.expect("filled"));
-
-    Ok(SharedSwapchain {
+    Ok(ExportedHostSwapchain {
         window_id: host.window_id,
         alloc_width: host.alloc_width,
         alloc_height: host.alloc_height,
-        presentable_images,
+        images: std::array::from_fn(|i| LinuxPresentableImage {
+            id: host.presentable_images[i].id, image: owned_images[i].take().expect("image exported"),
+        }),
     })
 }
 
 // ============================================================================
 // Fallback for unsupported platforms
 // ============================================================================
-#[cfg(not(any(
-    all(target_os = "linux", not(target_env = "ohos")),
-    target_os = "macos",
-    target_os = "windows"
-)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn shared_swapchain_from_host_swapchain(
     host: &HostSwapchain,
     _cx: &mut crate::cx::Cx,
-) -> SharedSwapchain {
-    SharedSwapchain {
+) -> Option<SharedSwapchain> {
+    Some(SharedSwapchain {
         window_id: host.window_id,
         alloc_width: host.alloc_width,
         alloc_height: host.alloc_height,
@@ -440,21 +259,20 @@ pub fn shared_swapchain_from_host_swapchain(
             id: host.presentable_images[i].id,
             _dummy: None,
         }),
-    }
+    })
 }
 
 /// Auxiliary communication channel, besides stdin (only on Linux).
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(target_os = "linux")]
+// Unix-domain studio IPC is a native-only process boundary.
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod aux_chan {
     use super::*;
-    use crate::os::linux::ipc::{self as linux_ipc, FixedSizeEncoding};
+    use makepad_hal::hosted_ipc::{aux_path, HostEndpoint};
     use std::{
         io,
-        os::fd::OwnedFd,
-        os::unix::net::{UnixListener, UnixStream},
+        os::unix::net::UnixListener,
         path::PathBuf,
-        thread,
-        time::{Duration, Instant},
     };
 
     // HACK(eddyb) `io::Error::other` stabilization is too recent.
@@ -462,34 +280,31 @@ pub mod aux_chan {
         io::Error::new(io::ErrorKind::Other, error)
     }
 
-    fn path_for_studio(studio: &str, studio_build_id: Option<&str>) -> io::Result<PathBuf> {
-        let without_scheme = studio
+    fn path_for_studio(studio_host: &str, studio_build_id: Option<&str>) -> io::Result<PathBuf> {
+        let without_scheme = studio_host
             .split_once("://")
             .map(|(_, rest)| rest)
-            .unwrap_or(studio);
+            .unwrap_or(studio_host);
         let host_port = without_scheme
             .split_once('/')
             .map(|(host_port, _)| host_port)
             .unwrap_or(without_scheme);
         if host_port.trim().is_empty() {
-            return Err(io_error_other("invalid STUDIO value"));
+            return Err(io_error_other("invalid STUDIO_HOST value"));
         }
-        let port = host_port
+        let port: u16 = host_port
             .rsplit_once(':')
-            .map(|(_, port)| port)
-            .unwrap_or("80");
+            .map_or(Ok(80), |(_, port)| port.parse())
+            .map_err(|_| io_error_other("invalid STUDIO_HOST port"))?;
         let studio_build_id = studio_build_id
             .map(str::trim)
             .filter(|build_id| !build_id.is_empty())
             .map(ToOwned::to_owned)
-            .or_else(|| crate::app_main::extract_studio_build_id(studio));
+            .or_else(|| crate::app_main::resolve_studio_build());
         let Some(studio_build_id) = studio_build_id else {
-            return Err(io_error_other("missing app id in STUDIO"));
+            return Err(io_error_other("missing app id in STUDIO_BUILD"));
         };
-        Ok(PathBuf::from(format!(
-            "/tmp/makepad-stdin-aux-{port}-{}.sock",
-            studio_build_id
-        )))
+        Ok(aux_path(port, &studio_build_id))
     }
 
     pub struct ExternalEndpointListener {
@@ -510,32 +325,20 @@ pub mod aux_chan {
             Ok(Self { path, listener })
         }
 
-        pub fn accept_host_endpoint(&self) -> io::Result<HostEndpoint> {
-            let deadline = Instant::now() + Duration::from_secs(120);
-            loop {
-                match self.listener.accept() {
-                    Ok((stream, _)) => {
-                        let owned_fd: OwnedFd = stream.into();
-                        return linux_ipc::InheritableChannel::<H2C, C2H>::from(owned_fd)
-                            .into_uninheritable();
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        if Instant::now() >= deadline {
-                            return Err(io_error_other(
-                                "timeout while waiting for child aux-channel connection",
-                            ));
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(err) => return Err(err),
-                }
+        /// One nonblocking accept attempt. A UI poll may call this without
+        /// occupying a shared worker while a hosted app is dormant.
+        pub fn try_accept_host_endpoint(&self) -> io::Result<Option<HostEndpoint>> {
+            match self.listener.accept() {
+                Ok((stream, _)) => Ok(Some(HostEndpoint::from(stream))),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => Ok(None),
+                Err(err) => Err(err),
             }
         }
+
     }
 
     impl Drop for ExternalEndpointListener {
@@ -544,52 +347,12 @@ pub mod aux_chan {
         }
     }
 
-    // Host->Client and Client->Host message types.
-    pub type H2C = (PresentableImageId, OwnedFd);
-    pub type C2H = linux_ipc::Never;
-
-    impl FixedSizeEncoding<{ u64::BYTE_LEN }, 0> for PresentableImageId {
-        fn encode(&self) -> ([u8; Self::BYTE_LEN], [std::os::fd::BorrowedFd<'_>; 0]) {
-            let (bytes, []) = self.as_u64().encode();
-            (bytes, [])
-        }
-        fn decode(bytes: [u8; Self::BYTE_LEN], fds: [OwnedFd; 0]) -> Self {
-            Self::from_u64(u64::decode(bytes, fds))
-        }
-    }
-
-    pub type HostEndpoint = linux_ipc::Channel<H2C, C2H>;
-    pub type ClientEndpoint = linux_ipc::Channel<C2H, H2C>;
-
-    impl ClientEndpoint {
-        pub fn connect_from_studio_env() -> io::Result<Self> {
-            let studio = std::env::var("STUDIO").map_err(io_error_other)?;
-            let path = path_for_studio(&studio, None)?;
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match UnixStream::connect(&path) {
-                    Ok(stream) => {
-                        let owned_fd: OwnedFd = stream.into();
-                        return linux_ipc::InheritableChannel::<C2H, H2C>::from(owned_fd)
-                            .into_uninheritable();
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            io::ErrorKind::NotFound
-                                | io::ErrorKind::ConnectionRefused
-                                | io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        if Instant::now() >= deadline {
-                            return Err(err);
-                        }
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-        }
+    /// Where this child's host listens for its descriptor channel, from the hub environment
+    /// (or the window manager that admitted it).
+    pub fn client_path() -> io::Result<PathBuf> {
+        let studio_host = crate::app_main::resolve_studio_host();
+        if studio_host.is_empty() { return Err(io_error_other("missing STUDIO_HOST")); }
+        path_for_studio(&studio_host, None)
     }
 
     pub fn send_image_fds_to_aux_chan(
@@ -597,9 +360,21 @@ pub mod aux_chan {
         image: LinuxOwnedImage,
         host_endpoint: &HostEndpoint,
     ) -> io::Result<makepad_studio_protocol::LinuxSharedImage> {
-        let LinuxOwnedImage { drm_format, plane } = image;
+        let LinuxOwnedImage { drm_format, plane, vulkan, dma_buf_timeline } = image;
+        if vulkan.is_some() && dma_buf_timeline.is_some() { return Err(io_error_other("ambiguous hosted image transport")); }
         host_endpoint.send((id, plane.dma_buf_fd))?;
+        let vulkan = match vulkan {
+            Some(image) => {
+                host_endpoint.send((id, image.semaphore_fd))?;
+                Some(image.info)
+            }
+            None => None,
+        };
+        let has_dma_buf_timeline = dma_buf_timeline.is_some();
+        if let Some(fd) = dma_buf_timeline { host_endpoint.send((id, fd))?; }
         Ok(makepad_studio_protocol::LinuxSharedImage {
+            vulkan,
+            dma_buf_timeline: has_dma_buf_timeline,
             drm_format: makepad_studio_protocol::DrmFormat {
                 fourcc: drm_format.fourcc,
                 modifiers: drm_format.modifiers,
@@ -611,46 +386,8 @@ pub mod aux_chan {
             },
         })
     }
-
-    pub fn recv_image_fds_from_aux_chan(
-        id: PresentableImageId,
-        image: makepad_studio_protocol::LinuxSharedImage,
-        client_endpoint: &ClientEndpoint,
-    ) -> io::Result<LinuxOwnedImage> {
-        let makepad_studio_protocol::LinuxSharedImage { drm_format, plane } = image;
-        let mut mismatches = 0usize;
-        let dma_buf_fd = loop {
-            let (recv_id, recv_fd) = client_endpoint.recv()?;
-            if recv_id == id {
-                break recv_fd;
-            }
-            mismatches += 1;
-            if mismatches >= 64 {
-                return Err(io_error_other(format!(
-                    "recv_fds_from_aux_chan: ID mismatch \
-                     (expected {id:?}, last got {recv_id:?}, dropped {mismatches} stale images)",
-                )));
-            }
-        };
-        if mismatches != 0 {
-            crate::warning!(
-                "recv_fds_from_aux_chan: dropped {mismatches} stale swapchain images before {id:?}"
-            );
-        }
-        Ok(LinuxOwnedImage {
-            drm_format: crate::os::linux::dma_buf::DrmFormat {
-                fourcc: drm_format.fourcc,
-                modifiers: drm_format.modifiers,
-            },
-            plane: LinuxOwnedImagePlane {
-                dma_buf_fd,
-                offset: plane.offset,
-                stride: plane.stride,
-            },
-        })
-    }
 }
-#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+#[cfg(not(target_os = "linux"))]
 pub mod aux_chan {
     use std::io;
 
@@ -699,12 +436,9 @@ impl WindowKindId {
 
 impl Cx {}
 
-use std::time::Duration;
-use std::time::Instant;
-
 pub struct PollTimer {
-    pub start_time: Instant,
-    pub interval: Duration,
+    pub start_time: f64,
+    pub interval: f64,
     pub repeats: bool,
     pub step: u64,
 }
@@ -712,45 +446,54 @@ pub struct PollTimer {
 impl PollTimer {
     pub fn new(interval_s: f64, repeats: bool) -> Self {
         Self {
-            start_time: Instant::now(),
-            interval: Duration::from_secs_f64(interval_s),
+            start_time: Cx::monotonic_now(),
+            interval: interval_s,
             repeats,
             step: 0,
         }
+    }
+
+    /// How long until this timer fires next, which is negative once it's due.
+    pub fn time_until_due(&self, now: f64) -> f64 {
+        self.interval * (self.step + 1) as f64 - (now - self.start_time)
     }
 }
 
 pub struct PollTimers {
     pub timers: HashMap<u64, PollTimer>,
-    pub time_start: Instant,
-    pub last_time: Instant,
+    pub time_start: f64,
+    pub last_time: f64,
 }
 impl Default for PollTimers {
     fn default() -> Self {
         Self {
-            time_start: Instant::now(),
-            last_time: Instant::now(),
+            time_start: Cx::monotonic_now(),
+            last_time: Cx::monotonic_now(),
             timers: Default::default(),
         }
     }
 }
 impl PollTimers {
     pub fn time_now(&self) -> f64 {
-        let time_now = Instant::now(); //unsafe {mach_absolute_time()};
-        (time_now.duration_since(self.time_start)).as_secs_f64()
+        Cx::monotonic_now() - self.time_start
+    }
+
+    /// Seconds until the earliest timer is due (0 when one is overdue).
+    pub fn next_due_in(&self) -> Option<f64> {
+        let now = Cx::monotonic_now();
+        self.timers
+            .values()
+            .map(|timer| (timer.start_time + timer.interval * (timer.step + 1) as f64 - now).max(0.0))
+            .min_by(f64::total_cmp)
     }
 
     pub fn get_dispatch(&mut self) -> Vec<TimerEvent> {
         let mut to_be_dispatched = Vec::with_capacity(self.timers.len());
         let mut to_be_removed = Vec::with_capacity(self.timers.len());
-        let now = Instant::now();
+        let now = Cx::monotonic_now();
         let time = self.time_now();
         for (id, timer) in self.timers.iter_mut() {
-            let elapsed_time = now - timer.start_time;
-            let next_due_time =
-                Duration::from_nanos(timer.interval.as_nanos() as u64 * (timer.step + 1));
-
-            if elapsed_time > next_due_time {
+            if timer.time_until_due(now) < 0.0 {
                 to_be_dispatched.push(TimerEvent {
                     timer_id: *id,
                     time: Some(time),

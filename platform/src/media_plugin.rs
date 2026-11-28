@@ -149,15 +149,6 @@ pub trait VideoFrameDecoder: Send {
 pub trait MediaVideoEncoder: Send + Sync {
     fn push_frame(&self, frame: CameraFrameRef<'_>);
 
-    #[cfg(all(any(target_os = "macos", target_os = "ios"), not(headless)))]
-    fn push_apple_pixel_buffer(
-        &self,
-        _pixel_buffer: crate::os::apple::apple_sys::CVPixelBufferRef,
-        _timestamp_ns: u64,
-    ) -> bool {
-        false
-    }
-
     fn request_keyframe(&self) -> Result<(), VideoEncodeError>;
     fn stop(&self);
 }
@@ -201,6 +192,11 @@ pub trait MediaPlaybackSession {
     fn check_prepared(&mut self) -> Option<Result<PlaybackPrepared, String>>;
     fn poll_frame(&mut self) -> bool;
     fn take_yuv_frame(&mut self) -> Option<YuvPlaneData>;
+    /// Optional Android zero-copy present: OES texture id for `sample_video`.
+    #[cfg(target_os = "android")]
+    fn take_oes_frame(&mut self) -> Option<crate::gpu_texture::OesFrame> {
+        None
+    }
     fn check_eos(&mut self) -> bool;
     fn play(&mut self);
     fn pause(&mut self);

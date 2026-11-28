@@ -148,11 +148,10 @@ impl StoreId {
 
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-        Self(
-            NEXT_ID
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
-                .unwrap(),
-        )
+        let id = NEXT_ID
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .unwrap();
+        Self(id)
     }
 }
 

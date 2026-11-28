@@ -1,0 +1,3821 @@
+//! The frame builder: ONE walk of the draw tree per pass into the HAL's command writer.
+//!
+//! Metal, D3D11, GL and Vulkan each walk the draw lists themselves; this is the walk done once
+//! (HAL.md section 4). It recurses sub-lists, runs the paint-order counter (zbias reset / floor /
+//! hold / step and the per-call resolve), skips freed lists and stale geometry, emits the
+//! create / update / destroy commands for what the dirty state of textures, geometry, uniform
+//! buffers, retained instances and draw shaders owes the HAL (then clears those flags), and writes
+//! a `Pass` with its `Draw`s per pass.
+//!
+//! Ids: textures use the Cx pool slot and generation, windows their `WindowId`, pipelines the
+//! builder's shader table index, and every buffer (geometry, uniform, retained instance, shared
+//! block) an id from one allocator here, since Cx keeps those in four pools and the HAL has one
+//! buffer table. Uniform and instance data is pointed at (`Slice`), not copied, and so are the
+//! upload bytes of Cx's textures, geometry, uniform buffers and retained instances (the writer's
+//! `*_borrowed` uploads): they are read during `hal_submit` and nothing in Cx changes between the
+//! build and the submit. Bytes the builder makes itself move into the writer (`*_owned`).
+//!
+//! Unsupported facilities are reported when their command path is encountered.
+
+use crate::{
+    cx::Cx,
+    draw_list::{CxDrawItem, DrawListId, DrawListUniforms},
+    draw_pass::{CxDrawPassParent, DrawPassClearColor, DrawPassClearDepth, DrawPassId},
+    draw_shader::{CxDrawShaderCode, CxDrawShaderMapping, DrawShaderBlendOp, DrawShaderColorFormat},
+    geometry::GeometryId,
+    gpu_ledger::GpuOrigin,
+    makepad_live_id::*,
+    makepad_math::{PointUsize, RectUsize, SizeUsize},
+    shared_instances::PublishReceipt,
+    texture::{CompressedTextureFormat, TextureCategory, Texture, TextureAlloc, TextureFormat, TextureId, TexturePixel, TextureUpdated, VolumeRegion},
+    uniform_buffer::UniformBufferId,
+};
+use makepad_hal::{
+    cmds::PipelineLayout,
+    format, pass_load as load, pipeline_binding as binding, pipeline_blend, pipeline_flags, usage, Attr, CmdWriter, Draw, FrameMeta, HalInfo, Id, Inst, Pass, PipelineDesc, Slice, StrId,
+};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+struct TexRec {
+    id: Id,
+    gen: u64,
+    shared: Option<u64>,
+    /// array layers it was made with (a multiview pass's depth has one per view)
+    layers: usize,
+}
+
+struct GeoRec {
+    gen: u64,
+    vb: Id,
+    ib: Id,
+    vb_bytes: u64,
+    ib_bytes: u64,
+}
+
+struct UbufRec {
+    /// the pool generation of the uniform buffer
+    slot_gen: u64,
+    gen: u64,
+    id: Id,
+    bytes: u64,
+    uploaded: u64,
+}
+
+/// A retained publication's buffer, shared by every draw item that draws the same publication
+/// with the same count: an app drawing it in two passes (a G-buffer and the lit pass), or one
+/// whose draw item moved (a draw added before it), uploads it once.
+struct InstRec {
+    id: Id,
+    /// the draw list of the item that made it: where the inventory counts its bytes
+    list: usize,
+    /// the draw items drawing from it
+    users: u32,
+}
+
+/// What a draw item draws from: a publication and the bytes of the prefix it draws.
+type InstKey = (u64, u64);
+
+struct SharedRec {
+    id: Id,
+}
+
+/// What a pass that has a picture waits for before it paints again ([`Cx::fb_pipelines_wait`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PipelineWait {
+    None,
+    /// a pipeline the HAL is still compiling: its PipelineReady repaints
+    Hal,
+    /// a shader queued for compilation: compiled at the next draw
+    Compile,
+}
+
+struct PipeLayoutRec {
+    layout: u32,
+    wanted: bool,
+    ready: bool,
+}
+
+/// The window (also the clock for offscreen XR) and the sampling mode of the HAL pass.
+struct PassTarget {
+    window: Option<crate::window::WindowId>,
+    stereo: bool,
+    offscreen_xr: bool,
+    samples: u32,
+    views: u32,
+}
+
+impl PassTarget {
+    fn render_window(&self) -> Option<crate::window::WindowId> {
+        self.window.filter(|_| !self.offscreen_xr)
+    }
+}
+
+/// One HAL pipeline: the draw shaders with the same code, colour format and blend op share it.
+pub(crate) struct PipeRec {
+    id: Id,
+    /// the first draw shader that created it: its mapping holds the code the others compare with
+    first_shader: usize,
+    ready: bool,
+    /// Graphics keep their legacy ready bit across reset. A layout probe needs the base
+    /// answer from the replacement device as well as its layout answer.
+    rebuilding: bool,
+    /// a draw was built for it before the HAL said it was ready (the HAL skipped that draw)
+    drawn_unready: bool,
+    failed: bool,
+    /// what the HAL said when it failed (the backend compiler's log)
+    failure: Option<Box<str>>,
+    pick: Option<usize>,
+    /// the HAL was told a frame draws it while it compiles (`PipelineWanted`, sent once)
+    wanted: bool,
+    /// a caller with a fallback asked whether it can draw while it compiled
+    /// ([`FrameBuilder::probed_unready`]): the frame would draw it
+    probed: std::cell::Cell<bool>,
+    /// Only layouts a caller has probed.
+    layouts: RefCell<Vec<PipeLayoutRec>>,
+}
+
+impl PipeRec {
+    fn new(id: Id, first_shader: usize) -> Self {
+        Self { id, first_shader, ready: false, rebuilding: false, drawn_unready: false, failed: false, failure: None, pick: None, wanted: false, probed: Default::default(), layouts: Default::default() }
+    }
+
+    fn ready_on_device(&self) -> bool {
+        self.ready && !self.rebuilding
+    }
+}
+
+/// Counters of the last build, for the check run and the traces.
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct BuildStats {
+    /// repaints built (a repaint is one or more pass frames)
+    pub(crate) repaints: u64,
+    pub(crate) frames: u64,
+    pub(crate) passes: u64,
+    pub(crate) draws: u64,
+    pub(crate) texture_creates: u64,
+    pub(crate) buffer_creates: u64,
+    pub(crate) pipeline_creates: u64,
+    /// pass frames not built because a pipeline their draws use was still compiling (the pass
+    /// kept its last picture)
+    pub(crate) held_for_pipelines: u64,
+    pub(crate) bytes_uploaded: u64,
+    /// CPU time the walks took (ns), summed over the pass frames
+    pub(crate) build_ns: u64,
+}
+
+#[derive(Default)]
+struct BufIds {
+    next: u32,
+    free: Vec<(u32, u32)>,
+}
+
+impl BufIds {
+    fn alloc(&mut self) -> Id {
+        match self.free.pop() {
+            Some((index, gen)) => Id::new(index, gen + 1),
+            None => {
+                self.next += 1;
+                Id::new(self.next - 1, 1)
+            }
+        }
+    }
+    fn release(&mut self, id: Id) {
+        self.free.push((id.index, id.gen));
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FrameBuilder {
+    pub(crate) w: CmdWriter,
+    /// a pipeline was probed while it compiled since the last `want_probed`
+    probes: std::cell::Cell<bool>,
+    /// Interned on the first probe of a layout. Its index is the id the HAL echoes.
+    layouts: RefCell<Vec<PipelineLayout>>,
+    /// Terminal driver diagnostics for a pipeline generation and one of its pass layouts.
+    layout_failures: HashMap<(Id, u32), Box<str>>,
+    draw_layout: Option<PipelineLayout>,
+    warned_layouts: Vec<(usize, PipelineLayout)>,
+    /// (pipe, entry in that pipe's layouts) to want on the next submit.
+    layout_probes: RefCell<Vec<(usize, usize)>>,
+    /// an app was told a draw shader cannot draw yet (`Cx::draw_shader_ready`) since the last
+    /// `Event::DrawShadersReady`
+    asked: std::cell::Cell<bool>,
+    /// a pipeline was made or failed since then ([`FrameBuilder::take_answer`])
+    answered: bool,
+    /// Window targets in the current batch, recorded during the existing pass walk.
+    pub(crate) window_frames: Vec<Id>,
+    window_submitted: HashMap<Id, u64>,
+    window_completed: HashMap<Id, u64>,
+    /// Window frames (target, serial) handed to the HAL to present and not done yet, each with the
+    /// live patches (`Cx::live_patches`) it was built with.
+    window_presenting: HashMap<(Id, u64), u64>,
+    /// Packet serial -> (window/repaint group, pass name, closes the presented frame).
+    pub(crate) timings: HashMap<u64, (u64, Rc<str>, bool)>,
+    timing_names: HashSet<Rc<str>>,
+    /// Packets painting a pass with GPU timing on, answered by their `FrameDone`.
+    pub(crate) gpu_times: crate::draw_pass::PendingGpuTimes,
+    pub(crate) info: HalInfo,
+    strings: HashMap<String, StrId>,
+    live_names: HashMap<u64, StrId>,
+    next_str: StrId,
+    bufs: BufIds,
+    tex: HashMap<usize, TexRec>,
+    /// pool slot -> (generation, surface): textures that show a surface the HAL lent (a child's window)
+    lent: HashMap<usize, (u64, Id)>,
+    /// the last HAL generation each texture slot used: a destroyed id's generation is stale for
+    /// good, so every create of a slot (a new texture, a resize) takes the next one
+    tex_gen: HashMap<usize, u32>,
+    geo: HashMap<usize, GeoRec>,
+    ubuf: HashMap<usize, UbufRec>,
+    inst: HashMap<InstKey, InstRec>,
+    /// draw item (list index, item) -> (list generation, the buffer it draws from)
+    inst_items: HashMap<(usize, usize), (u64, InstKey)>,
+    inst_by_buffer: HashMap<u32, InstKey>,
+    /// list index -> one past the highest item that took a retained buffer: a list recorded
+    /// again with fewer items lets go of its spares' buffers ([`Self::inst_release_spares`]).
+    inst_top: HashMap<usize, usize>,
+    shared: HashMap<u64, SharedRec>,
+    retiring: Vec<(u64, PublishReceipt)>,
+    pipes: Vec<PipeRec>,
+    pipe_by_hash: HashMap<u64, Vec<usize>>,
+    /// How often the HAL moved to another backend: the pipelines made since have the next
+    /// generation, so an answer about an older one is never theirs.
+    backend_changes: u32,
+    /// `Vec*` textures opting into `discard_cpu_after_upload` whose upload went into this batch.
+    pub(crate) post_submit_discard_textures: Vec<TextureId>,
+    /// Retired pool slots whose CPU items are cleared once `hal_submit` has read any pending slices.
+    pub(crate) post_submit_retired_textures: Vec<usize>,
+    pub(crate) post_submit_retired_geometries: Vec<usize>,
+    pub(crate) post_submit_retired_ubufs: Vec<usize>,
+    ranges: Vec<[u32; 2]>,
+    /// the sampled texture ids of the draw being encoded (reused)
+    tex_ids: Vec<Id>,
+    /// the owner (string id) of the draw list being walked
+    owner: StrId,
+    /// recorded draw owners (widget uid or label key) already interned as strings
+    owner_names: HashMap<u64, StrId>,
+    /// the pass being built: its origin (logical px) and dpi, mapping instance rects to target
+    /// pixels (`Draw::bounds`)
+    pass_px: (f32, f32, f32),
+    warned: std::collections::HashSet<&'static str>,
+    /// textures already reported as sampled by a pass that draws into them
+    feedback_warned: std::collections::HashSet<usize>,
+    /// The pass being built draws all it recorded, from whole pictures: a draw left out for a
+    /// pipeline the HAL is still compiling, or a sample of an unfinished picture, clears it.
+    pass_whole: bool,
+    /// Of `pass_whole`, its own draws: only a draw left out clears it, not a sample.
+    pass_drew_all: bool,
+    /// What staged uploads ([`crate::Texture::set_staged_upload`]) may still send this frame.
+    staged_left: usize,
+    pub(crate) stats: BuildStats,
+}
+
+/// A draw's instance rows in order: a retained publication segment by segment (never its
+/// contiguous copy, which `RetainedInstances::data` would build and keep), or a recording.
+struct Records<'a> {
+    rest: &'a [crate::retained_instances::InstanceSegment],
+    cur: std::slice::ChunksExact<'a, f32>,
+    slots: usize,
+    left: usize,
+}
+
+impl<'a> Records<'a> {
+    fn of(item: &'a CxDrawItem, slots: usize, instances: usize) -> Option<Self> {
+        if slots == 0 { return None; }
+        match (&item.retained_instances, item.instances.as_deref()) {
+            (Some(p), _) => Some(Self::of_publication(p, slots, instances)),
+            (None, Some(data)) => Some(Records { rest: &[], cur: data.chunks_exact(slots), slots, left: instances }),
+            (None, None) => None,
+        }
+    }
+}
+
+impl<'a> Records<'a> {
+    fn of_publication(p: &'a crate::retained_instances::RetainedInstances, slots: usize, instances: usize) -> Self {
+        Records { rest: p.segments(), cur: [].chunks_exact(slots.max(1)), slots: slots.max(1), left: instances }
+    }
+}
+
+impl<'a> Iterator for Records<'a> {
+    type Item = &'a [f32];
+    fn next(&mut self) -> Option<&'a [f32]> {
+        if self.left == 0 { return None; }
+        loop {
+            if let Some(row) = self.cur.next() {
+                self.left -= 1;
+                return Some(row);
+            }
+            // a segment holds whole rows (`RetainedInstances::from_segments` checks the stride)
+            let (first, rest) = self.rest.split_first()?;
+            self.rest = rest;
+            self.cur = first.data().chunks_exact(self.slots);
+        }
+    }
+}
+
+/// Where a shader keeps an instance's rect and clip in its row, and the list and pass the rows
+/// are drawn under: everything an instance rect depends on beside the row itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RectFrame {
+    rect_pos: usize,
+    rect_size: usize,
+    draw_clip: Option<usize>,
+    view_shift: [f32; 2],
+    view_clip: [f32; 4],
+    /// the pass origin (logical px) and dpi
+    pass_px: (f32, f32, f32),
+}
+
+impl RectFrame {
+    /// None when the shader has no rect or the list transforms its rows (its rects are not
+    /// screen rects then).
+    fn of(m: &CxDrawShaderMapping, list: &DrawListUniforms, pass_px: (f32, f32, f32)) -> Option<Self> {
+        let (rect_pos, rect_size) = (m.rect_pos?, m.rect_size?);
+        if list.view_transform != crate::makepad_math::Mat4f::identity() { return None; }
+        let (sh, cl) = (list.view_shift, list.view_clip);
+        Some(RectFrame { rect_pos, rect_size, draw_clip: m.draw_clip, view_shift: [sh.x, sh.y], view_clip: [cl.x, cl.y, cl.z, cl.w], pass_px })
+    }
+
+    /// Each clipped row's target-pixel rect.
+    fn rects<'a>(self, rows: Records<'a>) -> impl Iterator<Item = [f32; 4]> + 'a {
+        let RectFrame { rect_pos: rp, rect_size: rs, draw_clip, view_shift, view_clip, pass_px: (ox, oy, dpi) } = self;
+        rows.filter_map(move |inst| {
+            let (mut a, mut b) = (inst[rp], inst[rp + 1]);
+            let (mut c, mut d) = (a + inst[rs], b + inst[rs + 1]);
+            if let Some(k) = draw_clip {
+                a = a.max(inst[k]); b = b.max(inst[k + 1]);
+                c = c.min(inst[k + 2]); d = d.min(inst[k + 3]);
+            }
+            a = (a + view_shift[0]).max(view_clip[0]);
+            b = (b + view_shift[1]).max(view_clip[1]);
+            c = (c + view_shift[0]).min(view_clip[2]);
+            d = (d + view_shift[1]).min(view_clip[3]);
+            (c > a && d > b).then_some([(a - ox) * dpi, (b - oy) * dpi, (c - a) * dpi, (d - b) * dpi])
+        })
+    }
+}
+
+/// The union of rects, `[0; 4]` when it is empty.
+fn rects_union(rects: impl Iterator<Item = [f32; 4]>) -> [f32; 4] {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for r in rects {
+        x0 = x0.min(r[0]); y0 = y0.min(r[1]);
+        x1 = x1.max(r[0] + r[2]); y1 = y1.max(r[1] + r[3]);
+    }
+    if x1 <= x0 || y1 <= y0 { return [0.0; 4]; }
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+/// What a retained draw's bounds are a function of: its publication (whose rows never change),
+/// how many rows it draws and their stride, and the rect frame, floats by their bits (so equal
+/// keys give the walk's bounds bit for bit). A draw redrawn under an unchanged key keeps its
+/// bounds instead of walking every instance again each frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RetainedBoundsKey {
+    publication: u64,
+    slots: usize,
+    instances: usize,
+    rect_pos: usize,
+    rect_size: usize,
+    draw_clip: Option<usize>,
+    view_shift: [u32; 2],
+    view_clip: [u32; 4],
+    pass_px: [u32; 3],
+}
+
+impl RetainedBoundsKey {
+    fn of(publication: u64, slots: usize, instances: usize, f: &RectFrame) -> Self {
+        RetainedBoundsKey {
+            publication, slots, instances,
+            rect_pos: f.rect_pos, rect_size: f.rect_size, draw_clip: f.draw_clip,
+            view_shift: f.view_shift.map(f32::to_bits),
+            view_clip: f.view_clip.map(f32::to_bits),
+            pass_px: [f.pass_px.0.to_bits(), f.pass_px.1.to_bits(), f.pass_px.2.to_bits()],
+        }
+    }
+}
+
+/// `walk`'s bounds for `key`, from `memo` when it holds that key.
+fn memo_bounds(memo: &std::cell::Cell<Option<(RetainedBoundsKey, [f32; 4])>>, key: RetainedBoundsKey, walk: impl FnOnce() -> [f32; 4]) -> [f32; 4] {
+    if let Some((k, b)) = memo.get() {
+        if k == key { return b; }
+    }
+    let b = walk();
+    memo.set(Some((key, b)));
+    b
+}
+
+/// Each clipped instance's target-pixel rect. Keep the pieces for native input: the
+/// union of four corner decorations covers a whole window, though the corners do not.
+fn instance_rects<'a>(m: &CxDrawShaderMapping, list: &DrawListUniforms, item: &'a CxDrawItem,
+    slots: usize, instances: usize, pass_px: (f32, f32, f32)) -> Option<impl Iterator<Item = [f32; 4]> + 'a>
+{
+    let frame = RectFrame::of(m, list, pass_px)?;
+    Some(frame.rects(Records::of(item, slots, instances)?))
+}
+
+/// Draw bounds still size the Metal surface by the union; native input uses its pieces.
+/// A retained draw's bounds are remembered on the item by `RetainedBoundsKey`.
+fn instance_bounds(m: &CxDrawShaderMapping, list: &DrawListUniforms, item: &CxDrawItem, slots: usize, instances: usize, pass_px: (f32, f32, f32)) -> [f32; 4] {
+    let Some(frame) = RectFrame::of(m, list, pass_px) else { return [f32::NAN; 4]; };
+    let walk = || Records::of(item, slots, instances).map_or([f32::NAN; 4], |rows| rects_union(frame.rects(rows)));
+    match &item.retained_instances {
+        Some(p) if slots != 0 => memo_bounds(&item.retained_bounds, RetainedBoundsKey::of(p.id(), slots, instances, &frame), walk),
+        _ => walk(),
+    }
+}
+
+impl FrameBuilder {
+    pub(crate) fn open(&mut self, session: u32, info: HalInfo) {
+        *self = FrameBuilder { w: CmdWriter::new(session), info, ..Default::default() };
+    }
+
+    /// The HAL draws with another backend now (`BackendChanged`): the pipelines it had are gone,
+    /// so every shader makes its own again.
+    pub(crate) fn backend_changed(&mut self, info: HalInfo) {
+        self.info = info;
+        self.pipes.clear();
+        self.layout_failures.clear();
+        self.warned_layouts.clear();
+        self.layout_probes.get_mut().clear();
+        self.pipe_by_hash.clear();
+        self.backend_changes += 1;
+    }
+
+    /// The batch is submitted: what the commands pointed at may change again.
+    pub(crate) fn submitted(&mut self) {
+        self.w.clear();
+        self.window_frames.clear();
+    }
+
+    #[cfg_attr(target_os = "android", allow(dead_code))] // read by the remote bridge, which Android has none of
+    pub(crate) fn window_submission(&self, window: Id) -> u64 {
+        self.window_submitted.get(&window).copied().unwrap_or(0)
+    }
+
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    pub(crate) fn window_completion(&self, window: Id) -> u64 {
+        self.window_completed.get(&window).copied().unwrap_or(0)
+    }
+
+    /// When `serial` was a window frame submitted to `target` for presenting (a frame on the
+    /// glass): the live patches it was built with.
+    pub(crate) fn frame_done(&mut self, target: Id, serial: u64) -> Option<u64> {
+        // Texture targets may reuse a window's numeric id; only a submitted window frame counts.
+        if self.window_submitted.get(&target) == Some(&serial) {
+            self.window_completed.insert(target, serial);
+        }
+        self.window_presenting.remove(&(target, serial))
+    }
+
+    pub(crate) fn window_closed(&mut self, window: Id) {
+        self.window_submitted.remove(&window);
+        self.window_completed.remove(&window);
+        self.window_presenting.retain(|(target, _), _| *target != window);
+    }
+
+    /// Logs a gap in the HAL's command set once per reason.
+    pub(crate) fn gap(&mut self, what: &'static str) {
+        if self.warned.insert(what) {
+            crate::warning!("hal: {what}");
+        }
+    }
+
+    pub(crate) fn time_pass(&mut self, serial: u64, group: u64, name: &str, closes: bool) {
+        let name = match self.timing_names.get(name) {
+            Some(name) => Rc::clone(name),
+            None => {
+                let name = Rc::<str>::from(name);
+                self.timing_names.insert(Rc::clone(&name));
+                name
+            }
+        };
+        self.timings.insert(serial, (group, name, closes));
+    }
+
+    pub(crate) fn intern(&mut self, s: &str) -> StrId {
+        if s.is_empty() {
+            return 0;
+        }
+        if let Some(id) = self.strings.get(s) {
+            return *id;
+        }
+        self.next_str += 1;
+        let id = self.next_str;
+        self.w.str_def(id, s.as_bytes());
+        self.strings.insert(s.to_string(), id);
+        id
+    }
+
+    fn intern_live(&mut self, id: LiveId) -> StrId {
+        if id.0 == 0 {
+            return 0;
+        }
+        if let Some(s) = self.live_names.get(&id.0) {
+            return *s;
+        }
+        let s = self.intern(&format!("{id}"));
+        self.live_names.insert(id.0, s);
+        s
+    }
+
+    pub(crate) fn attr(&mut self, origin: &GpuOrigin, kind: u32) -> Attr {
+        // the site is already "file:line", copied out of the program's code at creation
+        let site = origin.site.as_deref().unwrap_or_default();
+        Attr { owner: self.intern(&origin.scope), site: self.intern(site), label: origin.label.as_deref().map_or(0, |l| self.intern(l)), kind }
+    }
+
+    fn next_tex_id(&mut self, slot: usize) -> Id {
+        let gen = self.tex_gen.entry(slot).or_insert(0);
+        *gen += 1;
+        Id::new(slot as u32, *gen)
+    }
+
+    /// The pool slot's texture shows the HAL's lent surface `id` from now on.
+    pub(crate) fn lend(&mut self, slot: usize, gen: u64, id: Id) {
+        self.lent.insert(slot, (gen, id));
+    }
+
+    /// The pool texture a HAL texture id stands for, while it is the slot's current one.
+    pub(crate) fn texture_pool_id(&self, id: Id) -> Option<TextureId> {
+        let rec = self.tex.get(&(id.index as usize)).filter(|r| r.id == id)?;
+        Some(TextureId::from_pool_slot(id.index as usize, rec.gen))
+    }
+
+    /// The HAL id of a texture whose storage the HAL's media module makes (a decoded video
+    /// frame, a camera frame): named once per pool texture, created by the media command that
+    /// names it.
+    pub(crate) fn external_texture(&mut self, slot: usize, gen: u64) -> Id {
+        if let Some(rec) = self.tex.get(&slot).filter(|r| r.gen == gen) {
+            return rec.id;
+        }
+        self.texture_destroy(slot);
+        let id = self.next_tex_id(slot);
+        self.tex.insert(slot, TexRec { id, gen, shared: None, layers: 1 });
+        id
+    }
+
+    /// The HAL id of a pool texture, while the HAL holds one for that generation.
+    pub(crate) fn texture_hal_id(&self, slot: usize, gen: u64) -> Option<Id> {
+        self.tex.get(&slot).filter(|r| r.gen == gen).map(|r| r.id)
+    }
+
+    /// The HAL instance buffers by draw list (the list's pool index): what `Cx::gpu_inventory`
+    /// attributes the ledger's instance bytes to.
+    pub(crate) fn instance_buffers(&self) -> impl Iterator<Item = (usize, Id)> + '_ {
+        self.inst.values().map(|rec| (rec.list, rec.id))
+    }
+
+    /// Every pipeline this client created on the HAL (pick variants included; never destroyed).
+    pub(crate) fn pipeline_count(&self) -> usize {
+        self.pipes.len()
+    }
+
+    pub(crate) fn pipelines_pending(&self) -> usize {
+        self.pipes.iter().filter(|p| !p.ready && !p.failed).count()
+    }
+
+    pub(crate) fn texture_shared(&mut self, id: Id, handle: u64) {
+        if let Some(rec) = self.tex.get_mut(&(id.index as usize)).filter(|r| r.id == id) {
+            rec.shared = Some(handle);
+        }
+    }
+
+    /// Frees the HAL texture of a pool slot, when it has one.
+    pub(crate) fn texture_destroy(&mut self, slot: usize) {
+        if let Some(rec) = self.tex.remove(&slot) {
+            self.w.texture_destroy(rec.id);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn texture_create(&mut self, slot: usize, gen: u64, usage: u16, fmt: u32, w: usize, h: usize, layers: usize, mips: usize, origin: &GpuOrigin) -> Id {
+        self.texture_destroy(slot);
+        let id = self.next_tex_id(slot);
+        let attr = self.attr(origin, 0);
+        self.w.texture_create(id, usage, fmt, w.max(1) as u32, h.max(1) as u32, [layers.max(1) as u16, mips.max(1) as u16], attr);
+        self.tex.insert(slot, TexRec { id, gen, shared: None, layers: if usage & usage::VOLUME != 0 { 1 } else { layers.max(1) } });
+        self.stats.texture_creates += 1;
+        id
+    }
+
+    pub(crate) fn buffer_create(&mut self, kind: u16, size: u64, origin: Attr) -> Id {
+        let id = self.bufs.alloc();
+        self.w.buffer_create(id, kind, size, origin);
+        self.stats.buffer_creates += 1;
+        id
+    }
+
+    pub(crate) fn buffer_destroy(&mut self, id: Id) {
+        self.w.buffer_destroy(id);
+        self.bufs.release(id);
+    }
+
+    /// Frees the HAL buffers of a geometry slot.
+    fn geometry_destroy(&mut self, slot: usize) {
+        if let Some(rec) = self.geo.remove(&slot) {
+            for id in [rec.vb, rec.ib].into_iter().filter(|i| !i.is_none()) {
+                self.buffer_destroy(id);
+            }
+        }
+    }
+
+    /// The retained buffer a draw item draws `want` from: the one another item made for it, else
+    /// a new one (`make` creates and uploads it). An item that drew something else lets go of it.
+    fn inst_use(&mut self, item: (usize, usize), list_gen: u64, want: InstKey, make: impl FnOnce(&mut Self, u64) -> Id) -> Id {
+        if self.inst_items.get(&item).is_some_and(|&(gen, held)| gen != list_gen || held != want) {
+            self.inst_release(item);
+        }
+        if !self.inst_items.contains_key(&item) {
+            if let Some(rec) = self.inst.get_mut(&want) {
+                rec.users += 1;
+            } else {
+                let id = make(self, want.1);
+                self.inst_by_buffer.insert(id.index, want);
+                self.inst.insert(want, InstRec { id, list: item.0, users: 1 });
+            }
+            self.inst_items.insert(item, (list_gen, want));
+            let top = self.inst_top.entry(item.0).or_default();
+            *top = (*top).max(item.1 + 1);
+        }
+        self.inst[&want].id
+    }
+
+    /// A list walked with `len` items: the items past them (spares a shorter recording left)
+    /// draw nothing, so the buffers they took go.
+    pub(crate) fn inst_release_spares(&mut self, list: usize, len: usize) {
+        let Some(top) = self.inst_top.get_mut(&list) else { return };
+        if *top <= len {
+            return;
+        }
+        let top = std::mem::replace(top, len);
+        for item in len..top {
+            self.inst_release((list, item));
+        }
+    }
+
+    /// A draw item stops drawing from its retained buffer; the last one frees it.
+    pub(crate) fn inst_release(&mut self, item: (usize, usize)) {
+        let Some((_, key)) = self.inst_items.remove(&item) else { return };
+        let Some(rec) = self.inst.get_mut(&key) else { return };
+        rec.users -= 1;
+        if rec.users == 0 {
+            let id = rec.id;
+            self.inst.remove(&key);
+            self.inst_by_buffer.remove(&id.index);
+            self.buffer_destroy(id);
+        }
+    }
+
+    /// The draw items drawing from a retained buffer that is gone (evicted, device reset): each
+    /// uploads it again on its next draw.
+    fn inst_users(&mut self, key: InstKey) -> Vec<(usize, usize)> {
+        let items: Vec<(usize, usize)> = self.inst_items.iter().filter(|(_, (_, k))| *k == key).map(|(item, _)| *item).collect();
+        for item in &items {
+            self.inst_items.remove(item);
+        }
+        items
+    }
+
+    /// The HAL replaced its GPU device (`DeviceReset`): every id is still valid, the contents are
+    /// gone. Vec textures (`reupload(slot, generation)`) and geometry are made again with their
+    /// data, uniform buffers upload again, shared and retained instance buffers are made again
+    /// (the retained ones' draw items are returned: they upload on their next draw); render
+    /// targets keep their ids and are painted again. Frames the old device dropped count as done.
+    pub(crate) fn device_reset(&mut self, reupload: impl Fn(usize, u64) -> bool) -> Vec<(usize, usize)> {
+        self.layout_failures.clear();
+        self.layout_probes.get_mut().clear();
+        for pipe in &mut self.pipes {
+            pipe.layouts.get_mut().clear();
+            if pipe.first_shader == usize::MAX { pipe.ready = false; pipe.failed = false; pipe.failure = None; }
+            pipe.rebuilding = pipe.ready;
+        }
+        let slots: Vec<usize> = self.tex.iter().filter(|(slot, r)| reupload(**slot, r.gen)).map(|(slot, _)| *slot).collect();
+        for slot in slots {
+            self.texture_destroy(slot);
+        }
+        let geo: Vec<usize> = self.geo.keys().copied().collect();
+        for slot in geo {
+            self.geometry_destroy(slot);
+        }
+        for rec in self.ubuf.values_mut() {
+            rec.uploaded = 0;
+        }
+        for (_, rec) in std::mem::take(&mut self.shared) {
+            self.buffer_destroy(rec.id);
+        }
+        let inst: Vec<(usize, usize)> = self.inst_items.keys().copied().collect();
+        for item in &inst {
+            self.inst_release(*item);
+        }
+        for (window, serial) in &self.window_submitted {
+            self.window_completed.insert(*window, *serial);
+        }
+        self.window_presenting.clear();
+        inst
+    }
+
+    /// The HAL dropped a retained buffer under pressure: the items drawing from it upload it again.
+    pub(crate) fn buffer_evicted(&mut self, buffer: Id) -> Vec<(usize, usize)> {
+        let Some(&key) = self.inst_by_buffer.get(&buffer.index) else { return Vec::new() };
+        if self.inst.get(&key).is_none_or(|rec| rec.id != buffer) {
+            return Vec::new();
+        }
+        self.inst_by_buffer.remove(&buffer.index);
+        self.inst.remove(&key);
+        self.bufs.release(buffer);
+        self.inst_users(key)
+    }
+
+    // ---- pipelines
+
+    pub(crate) fn compute_pipeline(&mut self, name: &str, blob: &[u8]) -> Id {
+        let id = Id::new(self.pipes.len() as u32, 1);
+        let label = self.intern(name);
+        self.w.pipeline_create(id, self.info.dialect, Attr { label, ..Default::default() }, blob);
+        self.pipes.push(PipeRec::new(id, usize::MAX));
+        id
+    }
+    pub(crate) fn owned_texture_update(&mut self, id: Id, rect: [u32; 4], bytes: Vec<u8>) {
+        self.w.texture_update_owned(id, 0, rect, 0, bytes);
+    }
+
+    pub(crate) fn owned_buffer_update(&mut self, id: Id, offset: u64, bytes: Vec<u8>) {
+        self.w.buffer_update_owned(id, offset, bytes);
+    }
+
+    /// Whether the app paints again: a draw was built before the pipeline was ready (the HAL
+    /// skipped it), or the HAL says it is ready again, which it does when the state for another
+    /// target layout of the pipeline (an HDR target, MRT) has been built and a draw into that
+    /// layout was skipped.
+    pub(crate) fn pipeline_ready(&mut self, id: Id) -> bool {
+        match self.pipes.get_mut(id.index as usize) {
+            Some(p) if p.id == id => {
+                // A failed pipeline can come back (built again on a new device, or once there's
+                // memory for it), and then its draws, left out so far, paint again.
+                let was_failed = std::mem::take(&mut p.failed);
+                p.failure = None;
+                p.rebuilding = false;
+                let again = std::mem::replace(&mut p.ready, true);
+                self.answered = true;
+                std::mem::take(&mut p.drawn_unready) || again || was_failed
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn pipeline_layout_ready(&mut self, id: Id, layout: u32) -> bool {
+        if self.layout_failures.contains_key(&(id, layout)) { return false; }
+        let Some(p) = self.pipes.get_mut(id.index as usize).filter(|p| p.id == id) else { return false };
+        let Some(entry) = p.layouts.get_mut().iter_mut().find(|e| e.layout == layout && e.wanted) else { return false };
+        if std::mem::replace(&mut entry.ready, true) { return false; }
+        self.answered = true;
+        // Like a repeat PipelineReady, this can complete a draw the HAL skipped on a ready
+        // pipeline. If the base is pending, its own answer still owes that repaint.
+        p.ready_on_device()
+    }
+
+    pub(crate) fn pipeline_layout_failed(&mut self, id: Id, layout: u32, log: &str) -> Option<usize> {
+        let p = self.pipes.get_mut(id.index as usize).filter(|p| p.id == id)?;
+        // A capability rejection already answered every layout with the base failure.
+        if p.failed { return None; }
+        if layout != PipelineLayout::UNPROBED {
+            let entry = p.layouts.get_mut().iter_mut().find(|e| e.layout == layout && e.wanted)?;
+            let std::collections::hash_map::Entry::Vacant(slot) = self.layout_failures.entry((id, layout)) else { return None };
+            slot.insert(log.into());
+            entry.ready = false;
+        }
+        self.answered = true;
+        Some(p.first_shader)
+    }
+
+    /// An app asked whether a draw shader can draw, and it cannot yet: the next pipeline
+    /// answer tells it so ([`FrameBuilder::take_answer`]).
+    pub(crate) fn asked_unready(&self) {
+        self.asked.set(true);
+    }
+
+    /// Whether an app told "not yet" hears `Event::DrawShadersReady` now: a pipeline was made
+    /// or failed since. Clears both marks; the next "not yet" asks again.
+    pub(crate) fn take_answer(&mut self) -> bool {
+        std::mem::take(&mut self.answered) && self.asked.replace(false)
+    }
+
+    /// Whether a pass must wait for the pipeline: the HAL is still compiling it. The wait is
+    /// marked, so its PipelineReady (or PipelineFailed) repaints; a failed one is waited for by nobody.
+    pub(crate) fn pipeline_waited_for(&mut self, pipe: usize) -> bool {
+        let Some(p) = self.pipes.get_mut(pipe) else { return false };
+        if p.ready || p.failed { return false; }
+        p.drawn_unready = true;
+        self.want(pipe);
+        true
+    }
+
+    /// A frame draws pipeline `pipe` while the HAL compiles it: the HAL hears so once, and its
+    /// compile goes ahead of those no frame draws.
+    pub(crate) fn want(&mut self, pipe: usize) {
+        let p = &mut self.pipes[pipe];
+        if !p.ready && !p.failed && !std::mem::replace(&mut p.wanted, true) {
+            self.w.pipeline_wanted(p.id);
+        }
+    }
+
+    /// A caller with a fallback asked whether pipeline `pipe` can draw, and it cannot yet: the
+    /// frame would draw it. A frame that waits counts it as drawn
+    /// ([`Cx::fb_frame_pipelines_pending`]); the next submit wants it.
+    pub(crate) fn probed_unready(&self, pipe: usize) {
+        if let Some(p) = self.pipes.get(pipe).filter(|p| !p.ready && !p.failed) {
+            if !p.probed.replace(true) { self.probes.set(true); }
+        }
+    }
+
+    /// A known pair needs only the pipeline's small list and an index into the layout table.
+    /// A new pair is also the probe to submit, even if the base pipeline already answered.
+    pub(crate) fn pipeline_ready_in(&self, pipe: usize, desc: PipelineLayout) -> bool {
+        self.pipeline_status_in(pipe, desc).unwrap_or(false)
+    }
+
+    pub(crate) fn pipeline_status_in(&self, pipe: usize, desc: PipelineLayout) -> Result<bool, &str> {
+        let Some(p) = self.pipes.get(pipe) else { return Ok(false) };
+        if let Some(log) = p.failure.as_deref() { return Err(log); }
+        let mut layouts = self.layouts.borrow_mut();
+        let mut entries = p.layouts.borrow_mut();
+        if let Some(entry) = entries.iter().find(|e| layouts[e.layout as usize] == desc) {
+            if entry.ready { return Ok(p.ready_on_device()); }
+            if let Some(log) = self.layout_failures.get(&(p.id, entry.layout)) { return Err(log); }
+            return Ok(false);
+        }
+        let layout = layouts.iter().position(|l| *l == desc).unwrap_or_else(|| {
+            layouts.push(desc);
+            layouts.len() - 1
+        }) as u32;
+        self.layout_probes.borrow_mut().push((pipe, entries.len()));
+        entries.push(PipeLayoutRec { layout, wanted: false, ready: false });
+        if !p.ready { p.probed.set(true); }
+        Ok(false)
+    }
+
+    /// Wants newly probed layouts and promotes base pipelines probed while compiling.
+    pub(crate) fn want_probed(&mut self) {
+        let want_pipelines = self.probes.replace(false);
+        if !want_pipelines && self.layout_probes.get_mut().is_empty() { return; }
+        for (pipe, index) in self.layout_probes.get_mut().drain(..) {
+            let p = &mut self.pipes[pipe];
+            let entry = &mut p.layouts.get_mut()[index];
+            if !entry.ready && !entry.wanted {
+                let desc = self.layouts.get_mut()[entry.layout as usize];
+                self.w.pipeline_wanted_in(p.id, entry.layout, desc.window, desc.colors, desc.depth, u16::from_le_bytes([desc.samples, desc.views]));
+                entry.wanted = true;
+                p.wanted = true; // PipelineWantedIn also promotes the base compile
+            }
+        }
+        if want_pipelines {
+            for pipe in 0..self.pipes.len() {
+                if self.pipes[pipe].probed.get() { self.want(pipe); }
+            }
+        }
+    }
+
+    /// Whether the HAL said the pipeline is ready (a draw built for it before is skipped by the HAL).
+    pub(crate) fn pipeline_is_ready(&self, pipe: usize) -> bool {
+        self.pipes.get(pipe).is_some_and(|p| p.ready)
+    }
+
+    /// Whether the HAL said the pipeline failed: it never draws, and nothing waits for it.
+    pub(crate) fn pipeline_has_failed(&self, pipe: usize) -> bool {
+        self.pipes.get(pipe).is_some_and(|p| p.failed)
+    }
+
+    /// What the HAL said when pipeline `pipe` failed (the backend compiler's log), while it is failed.
+    pub(crate) fn pipeline_failure(&self, pipe: usize) -> Option<&str> {
+        self.pipes.get(pipe).filter(|p| p.failed).and_then(|p| p.failure.as_deref())
+    }
+
+    /// Whether the draws of pipeline `pipe` show this frame, or `None` while the HAL is still compiling it.
+    pub(crate) fn pipeline_draws(&self, pipe: usize) -> Option<bool> {
+        let p = self.pipes.get(pipe)?;
+        if p.failed { Some(false) } else { p.ready.then_some(true) }
+    }
+
+    /// The HAL surface a texture shows when the HAL lent it, as one number.
+    pub(crate) fn lent_surface(&self, id: TextureId) -> Option<u64> {
+        let (_, surface) = self.lent.get(&id.0).filter(|(gen, _)| *gen == id.generation())?;
+        Some((surface.index as u64) << 32 | surface.gen as u64)
+    }
+
+    /// The failed pipeline's first shader and whether to repaint a waiting or previously
+    /// ready picture. `log` is kept for [`Self::pipeline_failure`].
+    pub(crate) fn pipeline_failed(&mut self, id: Id, log: &str) -> Option<(usize, bool)> {
+        let p = self.pipes.get_mut(id.index as usize).filter(|p| p.id == id)?;
+        let was_ready = std::mem::take(&mut p.ready);
+        p.failed = true;
+        p.failure = Some(log.into());
+        self.answered = true;
+        Some((p.first_shader, std::mem::take(&mut p.drawn_unready) || was_ready))
+    }
+
+    /// A draw of the pass being built is left out (its shader is still queued for
+    /// compilation, or what it samples is not there yet): this paint is not whole.
+    pub(crate) fn left_out(&mut self) {
+        self.pass_whole = false;
+        self.pass_drew_all = false;
+    }
+
+    /// Whether the pass just built left no draw out: only such a paint of a window is grabbed.
+    pub(crate) fn paint_whole(&self) -> bool {
+        self.pass_whole
+    }
+
+    /// A draw of the pass being built uses pipeline `pipe`: whether to send it. One the HAL has
+    /// not answered yet is sent and skipped by the HAL, so this paint is not whole and the
+    /// answer repaints; a failed one is never drawn, and its picture is final without it.
+    pub(crate) fn draw_with(&mut self, pipe: usize) -> bool {
+        let p = &mut self.pipes[pipe];
+        if let Some(layout) = self.draw_layout {
+            let asked = p.layouts.get_mut();
+            let layouts = self.layouts.get_mut();
+            if !asked.is_empty() && !asked.iter().any(|entry| layouts[entry.layout as usize] == layout)
+                && !self.warned_layouts.contains(&(pipe, layout))
+            {
+                self.warned_layouts.push((pipe, layout));
+                let asked: Vec<_> = asked.iter().map(|entry| layouts[entry.layout as usize]).collect();
+                crate::warning!("pipeline {:?} was asked ready for {:?} but draws into {:?}: its readiness gate does not cover this pass", p.id, asked, layout);
+            }
+        }
+        if !p.ready && !p.failed {
+            p.drawn_unready = true;
+            self.pass_whole = false;
+            self.pass_drew_all = false;
+            self.want(pipe);
+        }
+        !self.pipes[pipe].failed
+    }
+
+    /// A draw of the pass being built sampled a render target in state `picture`, and `got`
+    /// says whether there was anything to sample. An unfinished picture makes this paint not
+    /// whole, and so does nothing where a picture is still to be painted; a picture still to
+    /// paint is sampled as its producer painted it last and costs nothing (a consumer
+    /// painted before an animating producer would otherwise never be whole).
+    pub(crate) fn sampled(&mut self, picture: crate::os::cx_shared::SampledPicture, got: bool) {
+        if picture.unfinished || (picture.to_paint && !got) {
+            self.pass_whole = false;
+        }
+    }
+}
+
+pub(crate) fn hal_format(pixel: &TexturePixel) -> Option<u32> {
+    Some(match pixel {
+        TexturePixel::BGRAu8 => format::BGRA8,
+        TexturePixel::RGBAu8 => format::RGBA8,
+        TexturePixel::RGBAf16 => format::RGBA16F,
+        TexturePixel::RGBAf32 => format::RGBA32F,
+        TexturePixel::Ru8 => format::R8,
+        TexturePixel::RGu8 => format::RG8,
+        TexturePixel::Rf32 => format::R32F,
+        TexturePixel::RGf16 => format::RG16F,
+        TexturePixel::Rf16 => format::R16F,
+        TexturePixel::Ru32 => format::R32UINT,
+        TexturePixel::D32 => format::DEPTH32F,
+        TexturePixel::Bc7 => format::BC7,
+        TexturePixel::Bc5 => format::BC5,
+        TexturePixel::Astc4x4 => format::ASTC4X4,
+        TexturePixel::Nv12 => format::NV12,
+        _ => return None,
+    })
+}
+
+pub(crate) fn attachment_format(format: &TextureFormat, depth: bool, allocated: Option<&TextureAlloc>) -> u32 {
+    // The allocation recipe selects the format independently of size. A shared
+    // texture can have its format only in its existing allocation.
+    let recipe = if depth { format.as_depth_alloc(1, 1) } else { format.as_render_alloc(1, 1) };
+    recipe.as_ref().or(allocated).and_then(|alloc| hal_format(&alloc.pixel)).unwrap_or(PipelineLayout::ABSENT)
+}
+
+fn pipeline_color_format(f: DrawShaderColorFormat) -> u32 {
+    match f {
+        DrawShaderColorFormat::Bgra8Unorm | DrawShaderColorFormat::Bgra8NoBlend => format::BGRA8,
+        DrawShaderColorFormat::Rf32 => format::R32F,
+        DrawShaderColorFormat::Rgba16F => format::RGBA16F,
+        DrawShaderColorFormat::Rgba32F => format::RGBA32F,
+        DrawShaderColorFormat::Rf16 => format::R16F,
+        DrawShaderColorFormat::Ru8 => format::R8,
+    }
+}
+
+/// The band of `rect` ([x, y, w, h]) a staged upload sends with `budget` bytes left this frame:
+/// its first rows, as many as fit (none once the budget is spent), and the rows left after them.
+fn staged_band([x, y, w, h]: [usize; 4], bpp: usize, budget: usize) -> ([usize; 4], Option<[usize; 4]>) {
+    let rows = (budget / (w * bpp).max(1)).min(h);
+    let rest = (rows < h).then_some([x, y + rows, w, h - rows]);
+    ([x, y, w, rows], rest)
+}
+
+/// Tightly packed rows of the `x, y, w, h` rect of an image `width` texels wide.
+fn pack_rect(bytes: &[u8], width: usize, bpp: usize, [x, y, w, h]: [usize; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w * h * bpp);
+    for row in 0..h {
+        let at = ((y + row) * width + x) * bpp;
+        out.extend_from_slice(&bytes[at..at + w * bpp]);
+    }
+    out
+}
+
+fn as_bytes<T: Copy>(data: &[T]) -> &[u8] {
+    // u8 / u32 / f32 image words: plain data without padding
+    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+}
+
+/// How a vec texture's CPU data is laid out for upload.
+enum VecLayout {
+    Plain,
+    /// `layers` mip chains (levels 0..=max_level each), layer-major; 1 layer
+    /// unless the texture is a 2D array
+    Mip { max_level: usize, layers: usize },
+    Cube,
+    Compressed { max_level: usize, layers: usize },
+}
+
+struct VecImage<'a> {
+    width: usize,
+    height: usize,
+    bpp: usize,
+    layout: VecLayout,
+    bytes: &'a [u8],
+}
+
+impl VecImage<'_> {
+    /// The mip levels whose data is present, from level 0 (at least 1).
+    fn levels(&self) -> usize {
+        let max_level = match self.layout {
+            // an array's layers sit at a fixed stride: their chains are complete
+            VecLayout::Mip { max_level, layers } | VecLayout::Compressed { max_level, layers } if layers > 1 => return max_level + 1,
+            VecLayout::Mip { max_level, .. } | VecLayout::Compressed { max_level, .. } => max_level,
+            VecLayout::Plain | VecLayout::Cube => return 1,
+        };
+        let (mut w, mut h, mut offset) = (self.width.max(1), self.height.max(1), 0usize);
+        for level in 0..=max_level {
+            let len = match self.layout {
+                VecLayout::Compressed { .. } => CompressedTextureFormat::level_bytes(w, h),
+                _ => w * h * self.bpp,
+            };
+            if offset + len > self.bytes.len() {
+                return level.max(1);
+            }
+            offset += len;
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        max_level + 1
+    }
+}
+
+fn vec_image(format: &TextureFormat) -> Option<VecImage<'_>> {
+    let img = |width, height, bpp, layout, bytes| Some(VecImage { width, height, bpp, layout, bytes });
+    match format {
+        TextureFormat::VecBGRAu8_32 { width, height, data: Some(d), .. } => img(*width, *height, 4, VecLayout::Plain, as_bytes(d)),
+        TextureFormat::VecCubeBGRAu8_32 { width, height, data: Some(d), .. } => img(*width, *height, 4, VecLayout::Cube, as_bytes(d)),
+        TextureFormat::VecMipBGRAu8_32 { width, height, data: Some(d), max_level, .. } => {
+            img(*width, *height, 4, VecLayout::Mip { max_level: max_level.unwrap_or(0), layers: 1 }, as_bytes(d.as_slice()))
+        }
+        TextureFormat::VecMipRGBAf32 { width, height, data: Some(d), max_level, .. } => {
+            img(*width, *height, 16, VecLayout::Mip { max_level: max_level.unwrap_or(0), layers: 1 }, as_bytes(d))
+        }
+        TextureFormat::VecMipCompressed { width, height, data: Some(d), max_level, .. } => {
+            img(*width, *height, 0, VecLayout::Compressed { max_level: max_level.unwrap_or(0), layers: 1 }, d.as_slice())
+        }
+        TextureFormat::VecArrayMipBGRAu8_32 { width, height, layers, data: Some(d), max_level, .. } => {
+            img(*width, *height, 4, VecLayout::Mip { max_level: max_level.unwrap_or(0), layers: (*layers).max(1) }, as_bytes(d.as_slice()))
+        }
+        TextureFormat::VecArrayMipCompressed { width, height, layers, data: Some(d), max_level, .. } => {
+            img(*width, *height, 0, VecLayout::Compressed { max_level: max_level.unwrap_or(0), layers: (*layers).max(1) }, d.as_slice())
+        }
+        TextureFormat::VecRGBAf32 { width, height, data: Some(d), .. } => img(*width, *height, 16, VecLayout::Plain, as_bytes(d)),
+        TextureFormat::VecRu8 { width, height, data: Some(d), .. } => img(*width, *height, 1, VecLayout::Plain, d),
+        TextureFormat::VecRGu8 { width, height, data: Some(d), .. } => img(*width, *height, 2, VecLayout::Plain, d),
+        TextureFormat::VecRf32 { width, height, data: Some(d), .. } => img(*width, *height, 4, VecLayout::Plain, as_bytes(d)),
+        _ => None,
+    }
+}
+
+impl Cx {
+    /// Creates a BGRA surface in the HAL and requests its portable export handle.
+    /// `shared_texture_handle` becomes `Some` after `TextureShared`; zero means export failed.
+    /// Keep the texture alive while another renderer uses the handle. No GPU object crosses Cx.
+    #[track_caller]
+    pub fn create_shared_texture(&mut self, width: usize, height: usize) -> Texture {
+        let texture = Texture::new_with_format(self, TextureFormat::SharedBGRAu8 {
+            width, height, id: crate::shared_framebuf::PresentableImageId::alloc(), initial: true,
+        });
+        let id = texture.texture_id();
+        self.textures[id].alloc_shared();
+        let origin = self.textures[id].origin.clone();
+        let hal = self.hal.frames.texture_create(id.0, id.generation(),
+            usage::SHARED | usage::SAMPLED | usage::RENDER_TARGET, format::BGRA8,
+            width, height, 1, 1, &origin);
+        self.hal.frames.w.texture_share(hal);
+        texture
+    }
+
+    /// As [`Self::create_shared_texture`], a two-plane 4:2:0 picture (`TextureFormat::SharedNv12`,
+    /// `width` x `height`, both even): a pass renders into one plane (`DrawPass::set_color_texture_face`:
+    /// 0 luma, 1 chroma at half the size), an encoder reads it as its NV12 input. D3D11 alone
+    /// (elsewhere the HAL refuses it).
+    #[track_caller]
+    pub fn create_shared_nv12_texture(&mut self, width: usize, height: usize) -> Texture {
+        let texture = Texture::new_with_format(self, TextureFormat::SharedNv12 { width, height, initial: true });
+        let id = texture.texture_id();
+        self.textures[id].alloc_shared();
+        let origin = self.textures[id].origin.clone();
+        let hal = self.hal.frames.texture_create(id.0, id.generation(),
+            usage::SHARED | usage::RENDER_TARGET, format::NV12,
+            width, height, 1, 1, &origin);
+        self.hal.frames.w.texture_share(hal);
+        texture
+    }
+
+    /// Export result for this texture generation (macOS: an IOSurface ID).
+    pub fn shared_texture_handle(&self, texture: &Texture) -> Option<u64> {
+        let id = texture.texture_id();
+        self.hal.frames.tex.get(&id.0).filter(|r| r.gen == id.generation()).and_then(|r| r.shared)
+    }
+
+    // ------------------------------------------------------------------ textures
+
+    /// Emit as much of each queued box as this frame can stage. The ordinary case emits
+    /// one command per edit. Large boxes split on plane or row boundaries.
+    fn fb_volume_texture(&mut self, fb: &mut FrameBuilder, id: TextureId) -> Id {
+        let slot = id.0;
+        let known = fb.tex.get(&slot).is_some_and(|rec| rec.gen == id.generation());
+        let texture = &mut self.textures[id];
+        if known && texture.updated().is_empty() { return fb.tex[&slot].id; }
+        let reallocated = texture.alloc_vec();
+        let TextureFormat::VecVolume(volume) = &mut texture.format else { unreachable!() };
+        let desc = volume.desc;
+        let [width, height, depth] = desc.extent;
+        let fmt = match desc.format {
+            crate::texture::VolumeFormat::R8Unorm => format::R8,
+            crate::texture::VolumeFormat::Rgba8Unorm => format::RGBA8,
+        };
+        if fb.info.volume_formats & (1 << fmt) == 0 || width.max(height).max(depth) > fb.info.max_volume_dimension {
+            fb.gap("this device cannot sample the requested 3D texture");
+            return Id::NONE;
+        }
+        if reallocated || !known {
+            fb.texture_create(slot, id.generation(), usage::SAMPLED | usage::VOLUME, fmt,
+                width as usize, height as usize, depth as usize, 1, &texture.origin);
+            volume.mark_full();
+        }
+        let hal_id = fb.tex[&slot].id;
+        let Some(bytes) = volume.data.as_deref() else { return hal_id };
+        let bpp = desc.format.bytes();
+        let mut uploaded = 0;
+        while let Some(&region) = volume.dirty.front() {
+            // Bound temporary packing/staging size even for an unstaged whole-image restore.
+            // Unstaged textures send every band in this submission.
+            let mut room = crate::texture::STAGED_UPLOAD_BYTES;
+            if texture.staged_upload { room = room.min(fb.staged_left); }
+            let [x, y, z] = region.origin;
+            let [w, h, d] = region.extent;
+            let row = w as usize * bpp;
+            let rows = room / row;
+            if rows == 0 { break; }
+            let planes = (rows / h as usize).min(d as usize) as u32;
+            let (take_h, take_d) = if planes == 0 { (rows as u32, 1) } else { (h, planes) };
+            volume.dirty.pop_front();
+            if take_d < d {
+                volume.dirty.push_front(VolumeRegion { origin: [x, y, z + take_d], extent: [w, h, d - take_d] });
+            }
+            if take_h < h {
+                volume.dirty.push_front(VolumeRegion { origin: [x, y + take_h, z], extent: [w, h - take_h, 1] });
+            }
+
+            let at = |y: u32, z: u32| ((z as usize * height as usize + y as usize) * width as usize + x as usize) * bpp;
+            let rect = [x, y, w, take_h];
+            let slices = [z as u16, take_d as u16];
+            let length = row * take_h as usize * take_d as usize;
+            let contiguous = (take_h == 1 || w == width) && (take_d == 1 || (h == height && w == width));
+            if contiguous {
+                let start = at(y, z);
+                // SAFETY: the retained image outlives submission (module header).
+                unsafe { fb.w.texture_update_3d_borrowed(hal_id, rect, slices, &bytes[start..start + length]); }
+            } else {
+                let rows = (z..z + take_d).flat_map(|dz| (y..y + take_h).map(move |dy| {
+                    let start = at(dy, dz);
+                    &bytes[start..start + row]
+                }));
+                fb.w.texture_update_3d_rows(hal_id, rect, slices, length, rows);
+            }
+            if texture.staged_upload { fb.staged_left -= length; }
+            uploaded += length as u64;
+        }
+        if uploaded > 0 {
+            fb.stats.bytes_uploaded += uploaded;
+            texture.texel_generation += 1;
+            if texture.discard_cpu_after_upload && volume.dirty.is_empty() { fb.post_submit_discard_textures.push(id); }
+        }
+        hal_id
+    }
+
+    /// The HAL texture of a vec texture, created and brought up to date (the dirty rect goes up,
+    /// the whole image after a new allocation). `Id::NONE` for what the HAL cannot hold.
+    fn fb_vec_texture(&mut self, fb: &mut FrameBuilder, id: TextureId) -> Id {
+        if let TextureFormat::VecVolume(_) = self.textures[id].format { return self.fb_volume_texture(fb, id); }
+        let slot = id.0;
+        let gen = id.generation();
+        let known = fb.tex.get(&slot).is_some_and(|r| r.gen == gen);
+        // a size change always arrives with new data: nothing pending on a texture the HAL holds
+        // is the whole fast path
+        if known && self.textures[id].updated().is_empty() {
+            return fb.tex[&slot].id;
+        }
+        let reallocated = self.textures[id].alloc_vec();
+        let Some(alloc) = self.textures[id].alloc.clone() else { return Id::NONE };
+        let Some(fmt) = hal_format(&alloc.pixel) else {
+            fb.gap("a texture of this vec format has no HAL format");
+            return Id::NONE;
+        };
+        let (layers, mips) = match (&alloc.category, &self.textures[id].format) {
+            (TextureCategory::VecCube, _) => (6, 1),
+            (TextureCategory::VecArray(layers), format) => {
+                let fallback_mips = match format {
+                    TextureFormat::VecArrayMipBGRAu8_32 { max_level, .. }
+                    | TextureFormat::VecArrayMipCompressed { max_level, .. } => {
+                        max_level.map_or(1, |l| l + 1)
+                    }
+                    _ => 1,
+                };
+                ((*layers).max(1), vec_image(format).map_or(fallback_mips, |image| image.levels()))
+            }
+            // Only the levels the data holds: the HAL generates no mips for a sampled vec
+            // texture, so a level without data would sample as zeros (a minified image drawn
+            // transparent).
+            (_, format @ (TextureFormat::VecMipBGRAu8_32 { max_level, .. }
+            | TextureFormat::VecMipRGBAf32 { max_level, .. }
+            | TextureFormat::VecMipCompressed { max_level, .. })) => {
+                (1, vec_image(format).map_or(max_level.map_or(1, |l| l + 1), |image| image.levels()))
+            }
+            _ => (1, 1),
+        };
+        let mut fresh = false;
+        if reallocated || !known {
+            let origin = self.textures[id].origin.clone();
+            let array = if matches!(alloc.category, TextureCategory::VecArray(_)) { usage::ARRAY } else { 0 };
+            fb.texture_create(slot, gen, usage::SAMPLED | array, fmt, alloc.width, alloc.height, layers, mips, &origin);
+            fresh = true;
+        }
+        let hal_id = fb.tex[&slot].id;
+        // data still taken (`take_vec_*` without a `put_back`): the update stays pending
+        if vec_image(&self.textures[id].format).is_none() {
+            return hal_id;
+        }
+        let update = self.textures[id].take_updated();
+        let update = if fresh { TextureUpdated::Full } else { update };
+        if update.is_empty() {
+            return hal_id;
+        }
+        let image = vec_image(&self.textures[id].format).expect("checked above");
+        let (w, h) = (image.width, image.height);
+        if w == 0 || h == 0 {
+            return hal_id;
+        }
+        let full = w * h * image.bpp;
+        let bytes = image.bytes;
+        let mut uploaded = 0u64;
+        match image.layout {
+            VecLayout::Plain => {
+                if bytes.len() < full {
+                    crate::error!("vec texture upload: {} bytes of data for a {}x{} texture needing {}", bytes.len(), w, h, full);
+                    return hal_id;
+                }
+                let rect = match update {
+                    TextureUpdated::Partial(r) => {
+                        let x0 = r.origin.x.min(w);
+                        let y0 = r.origin.y.min(h);
+                        let x1 = r.origin.x.saturating_add(r.size.width).min(w);
+                        let y1 = r.origin.y.saturating_add(r.size.height).min(h);
+                        if x1 <= x0 || y1 <= y0 {
+                            return hal_id;
+                        }
+                        [x0, y0, x1 - x0, y1 - y0]
+                    }
+                    _ => [0, 0, w, h],
+                };
+                // A staged texture sends the rows the frame's budget holds; the rest stays
+                // dirty for the next frames.
+                let (rect, rest) = if self.textures[id].staged_upload {
+                    let (band, rest) = staged_band(rect, image.bpp, fb.staged_left);
+                    fb.staged_left -= band[2] * band[3] * image.bpp;
+                    (band, rest)
+                } else {
+                    (rect, None)
+                };
+                if rect[3] > 0 {
+                    let urect = rect.map(|v| v as u32);
+                    if rect[0] == 0 && rect[2] == w {
+                        // whole rows are one run of the image: no packing
+                        let run = &bytes[rect[1] * w * image.bpp..(rect[1] + rect[3]) * w * image.bpp];
+                        // SAFETY: Cx does not change it before the submit (module header)
+                        unsafe { fb.w.texture_update_borrowed(hal_id, 0, urect, 0, run) };
+                        uploaded += run.len() as u64;
+                    } else {
+                        let packed = pack_rect(bytes, w, image.bpp, rect);
+                        uploaded += packed.len() as u64;
+                        fb.w.texture_update_owned(hal_id, 0, urect, 0, packed);
+                    }
+                }
+                if let Some([x, y, rw, rh]) = rest {
+                    self.textures[id].set_updated(TextureUpdated::Partial(RectUsize::new(PointUsize::new(x, y), SizeUsize::new(rw, rh))));
+                }
+            }
+            VecLayout::Cube => {
+                if bytes.len() < full * 6 {
+                    crate::error!("cube texture upload: {} bytes for 6 faces of {}x{} needing {}", bytes.len(), w, h, full * 6);
+                    return hal_id;
+                }
+                for face in 0..6usize {
+                    // SAFETY: Cx does not change it before the submit (module header)
+                    unsafe { fb.w.texture_update_borrowed(hal_id, 0, [0, 0, w as u32, h as u32], face as u32, &bytes[face * full..(face + 1) * full]) };
+                    uploaded += full as u64;
+                }
+            }
+            VecLayout::Mip { max_level, layers } | VecLayout::Compressed { max_level, layers } => {
+                let compressed = matches!(image.layout, VecLayout::Compressed { .. });
+                let level_len = |lw: usize, lh: usize| if compressed { CompressedTextureFormat::level_bytes(lw, lh) } else { lw * lh * image.bpp };
+                // one layer's chain: the stride between an array's layers
+                let (mut lw, mut lh, mut stride) = (w.max(1), h.max(1), 0usize);
+                for _ in 0..=max_level {
+                    stride += level_len(lw, lh);
+                    lw = (lw / 2).max(1);
+                    lh = (lh / 2).max(1);
+                }
+                if layers > 1 && bytes.len() < stride * layers {
+                    crate::error!("array texture upload: {} bytes for {} layers of {}x{} ({} levels) needing {}", bytes.len(), layers, w, h, max_level + 1, stride * layers);
+                    return hal_id;
+                }
+                for layer in 0..layers {
+                    let (mut lw, mut lh, mut offset) = (w.max(1), h.max(1), layer * stride);
+                    for level in 0..=max_level {
+                        let len = level_len(lw, lh);
+                        if offset + len > bytes.len() {
+                            if level == 0 {
+                                crate::error!("mip texture upload: {} bytes for a {}x{} level 0 needing {}", bytes.len(), w, h, len);
+                            }
+                            break;
+                        }
+                        // SAFETY: Cx does not change it before the submit (module header)
+                        unsafe { fb.w.texture_update_borrowed(hal_id, level as u16, [0, 0, lw as u32, lh as u32], layer as u32, &bytes[offset..offset + len]) };
+                        uploaded += len as u64;
+                        offset += len;
+                        lw = (lw / 2).max(1);
+                        lh = (lh / 2).max(1);
+                    }
+                }
+            }
+        }
+        fb.stats.bytes_uploaded += uploaded;
+        if uploaded > 0
+            && self.textures[id].discard_cpu_after_upload
+            && self.textures[id].updated().is_empty()
+        {
+            fb.post_submit_discard_textures.push(id);
+        }
+        hal_id
+    }
+
+    /// The HAL texture a pass renders into, (re)created at `w` x `h` when its allocation changed.
+    pub(crate) fn fb_attachment(&mut self, fb: &mut FrameBuilder, id: TextureId, w: usize, h: usize, depth: bool) -> Id {
+        self.fb_attachment_views(fb, id, w, h, depth, 1)
+    }
+
+    /// `fb_attachment` of a pass with `views` views (a multiview pass: one array layer per view).
+    pub(crate) fn fb_attachment_views(&mut self, fb: &mut FrameBuilder, id: TextureId, w: usize, h: usize, depth: bool, views: usize) -> Id {
+        // zero-size targets cannot exist (a hosted child can draw before its geometry lands)
+        let (w, h) = (w.max(1), h.max(1));
+        let slot = id.0;
+        let gen = id.generation();
+        let tex = &mut self.textures[id];
+        if matches!(tex.format, TextureFormat::VecVolume(_)) {
+            fb.gap("sampled 3D textures cannot be attached to a render pass");
+            return Id::NONE;
+        }
+        let changed = if depth { tex.alloc_depth(w, h) } else { tex.alloc_render(w, h) };
+        let mips = if tex.render_mips && !depth && !matches!(tex.format, TextureFormat::RenderCubeBGRAu8 { .. }) {
+            (usize::BITS - w.max(h).leading_zeros()) as usize
+        } else {
+            1
+        };
+        let Some(alloc) = tex.alloc.clone() else { return Id::NONE };
+        let Some(fmt) = hal_format(&alloc.pixel) else { return Id::NONE };
+        let layers = if matches!(alloc.category, TextureCategory::RenderCube) { 6 } else { views.max(1) };
+        let mut flags = if matches!(tex.format, TextureFormat::Storage { .. }) { usage::STORAGE } else { usage::RENDER_TARGET };
+        if !depth || matches!(alloc.category, TextureCategory::DepthBufferSampled) {
+            flags |= usage::SAMPLED;
+        }
+        if tex.transient {
+            flags |= usage::TRANSIENT;
+        }
+        let known = fb.tex.get(&slot).is_some_and(|r| r.gen == gen && r.layers == layers);
+        if changed || !known {
+            let origin = tex.origin.clone();
+            fb.texture_create(slot, gen, flags, fmt, alloc.width, alloc.height, layers, mips, &origin);
+        }
+        fb.tex[&slot].id
+    }
+
+    /// The HAL texture a draw samples: a vec texture is brought up to date; a render target is
+    /// there once its pass created it; what the HAL cannot hold samples as the fallback (`NONE`).
+    pub(crate) fn fb_sampled(&mut self, fb: &mut FrameBuilder, id: TextureId) -> Id {
+        // a surface lent by a child domain: the HAL's id as it is (it skips the draw once the child's window is gone)
+        if let Some((gen, surface)) = fb.lent.get(&id.0) {
+            if *gen == id.generation() {
+                return *surface;
+            }
+        }
+        let format = &self.textures[id].format;
+        if let TextureFormat::Storage { width, height, .. } = *format {
+            return self.fb_attachment(fb, id, width, height, false);
+        }
+        if format.is_vec() {
+            return self.fb_vec_texture(fb, id);
+        }
+        if format.is_render() || format.is_depth() {
+            return match fb.tex.get(&id.0) {
+                Some(rec) if rec.gen == id.generation() => rec.id,
+                _ => Id::NONE,
+            };
+        }
+        if format.is_video() || format.is_shared() {
+            // the media module fills it: not named yet = no frame yet
+            return match fb.tex.get(&id.0) {
+                Some(rec) if rec.gen == id.generation() => rec.id,
+                _ => Id::NONE,
+            };
+        }
+        Id::NONE
+    }
+
+    // ------------------------------------------------------------------ buffers
+
+    /// The vertex and index buffers of a geometry, up to date; false when the draw has nothing to read.
+    fn fb_geometry(&mut self, fb: &mut FrameBuilder, gid: GeometryId) -> Option<(Id, Id, bool)> {
+        let slot = gid.slot_index();
+        let gen = gid.generation();
+        if fb.geo.get(&slot).is_some_and(|r| r.gen != gen) {
+            fb.geometry_destroy(slot);
+        }
+        let attr = fb.attr(&self.geometries[gid].origin, 0);
+        let rec = fb.geo.entry(slot).or_insert(GeoRec { gen, vb: Id::NONE, ib: Id::NONE, vb_bytes: 0, ib_bytes: 0 });
+        let (mut vb, mut ib, mut vb_bytes, mut ib_bytes) = (rec.vb, rec.ib, rec.vb_bytes, rec.ib_bytes);
+        let g = &mut self.geometries[gid];
+        if g.dirty_vertices || vb.is_none() {
+            let bytes = g.vertices.as_bytes();
+            if bytes.is_empty() {
+                // the CPU copy was released and the HAL holds nothing: nothing to upload
+                g.dirty_vertices = false;
+            } else {
+                if bytes.len() as u64 != vb_bytes || vb.is_none() {
+                    if !vb.is_none() {
+                        fb.buffer_destroy(vb);
+                    }
+                    vb = fb.buffer_create(makepad_hal::buffer_kind::VERTEX, bytes.len() as u64, attr);
+                    vb_bytes = bytes.len() as u64;
+                }
+                // SAFETY: Cx does not change it before the submit (module header)
+                unsafe { fb.w.buffer_update_borrowed(vb, 0, bytes) };
+                fb.stats.bytes_uploaded += bytes.len() as u64;
+                g.dirty_vertices = false;
+            }
+        }
+        if g.dirty_indices || ib.is_none() {
+            let bytes = g.indices.as_bytes();
+            if bytes.is_empty() {
+                g.dirty_indices = false;
+            } else {
+                if bytes.len() as u64 != ib_bytes || ib.is_none() {
+                    if !ib.is_none() {
+                        fb.buffer_destroy(ib);
+                    }
+                    ib = fb.buffer_create(makepad_hal::buffer_kind::INDEX, bytes.len() as u64, attr);
+                    ib_bytes = bytes.len() as u64;
+                }
+                // SAFETY: Cx does not change it before the submit (module header)
+                unsafe { fb.w.buffer_update_borrowed(ib, 0, bytes) };
+                fb.stats.bytes_uploaded += bytes.len() as u64;
+                g.dirty_indices = false;
+            }
+        }
+        g.dirty = g.dirty_vertices || g.dirty_indices;
+        let u32_indices = g.index_width == 4;
+        let rec = fb.geo.get_mut(&slot).expect("inserted above");
+        (rec.vb, rec.ib, rec.vb_bytes, rec.ib_bytes) = (vb, ib, vb_bytes, ib_bytes);
+        (!vb.is_none() && !ib.is_none() && !g.dirty).then_some((vb, ib, u32_indices))
+    }
+
+    /// A custom uniform buffer, uploaded when its generation moved.
+    fn fb_uniform_buffer(&mut self, fb: &mut FrameBuilder, id: UniformBufferId) -> Id {
+        let slot = id.0;
+        let ub = &self.uniform_buffers[id];
+        let (gen, len) = (ub.generation, ub.data.len() as u64);
+        let slot_gen = id.generation();
+        if len == 0 {
+            return Id::NONE;
+        }
+        let stale = fb.ubuf.get(&slot).is_some_and(|r| r.bytes != len || r.slot_gen != slot_gen);
+        if stale {
+            let rec = fb.ubuf.remove(&slot).expect("checked");
+            fb.buffer_destroy(rec.id);
+        }
+        if !fb.ubuf.contains_key(&slot) {
+            let attr = fb.attr(&ub.origin, 0);
+            let bid = fb.buffer_create(makepad_hal::buffer_kind::UNIFORM, len, attr);
+            fb.ubuf.insert(slot, UbufRec { slot_gen, gen: 0, id: bid, bytes: len, uploaded: 0 });
+        }
+        let rec = fb.ubuf.get_mut(&slot).expect("inserted");
+        if rec.gen != gen || rec.uploaded == 0 {
+            // SAFETY: Cx does not change it before the submit (module header)
+            unsafe { fb.w.buffer_update_borrowed(rec.id, 0, &ub.data) };
+            rec.gen = gen;
+            rec.uploaded = len;
+            fb.stats.bytes_uploaded += len;
+        }
+        rec.id
+    }
+
+    // ------------------------------------------------------------------ pipelines
+
+    /// Creates the HAL pipelines of the shaders queued for compilation. The HAL answers each with
+    /// `PipelineReady` / `PipelineFailed`.
+    pub(crate) fn fb_compile_shaders(&mut self, fb: &mut FrameBuilder) {
+        let queued: Vec<usize> = self.draw_shaders.compile_set.iter().copied().collect();
+        for index in queued {
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mapping = &self.draw_shaders[index].mapping;
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                mapping.code.hash(&mut h);
+                mapping.pick_code.hash(&mut h);
+                mapping.hal_code.hash(&mut h);
+                mapping.hal_pick_code.hash(&mut h);
+                (mapping.color_format as u32).hash(&mut h);
+                (mapping.blend_op as u32).hash(&mut h);
+                mapping.precise_math.hash(&mut h);
+                h.finish()
+            };
+            let shared = {
+                let mapping = &self.draw_shaders[index].mapping;
+                fb.pipe_by_hash.get(&key).and_then(|v| {
+                    v.iter().copied().find(|p| {
+                        let o = &self.draw_shaders[fb.pipes[*p].first_shader].mapping;
+                        o.code == mapping.code && o.pick_code == mapping.pick_code && o.hal_code == mapping.hal_code
+                            && o.hal_pick_code == mapping.hal_pick_code && o.color_format == mapping.color_format && o.blend_op == mapping.blend_op
+                            && o.precise_math == mapping.precise_math
+                    })
+                })
+            };
+            if let Some(pipe) = shared {
+                self.draw_shaders[index].pipeline_id = Some(pipe);
+                // an already answered pipeline answers this shader too: no PipelineReady comes
+                if fb.pipes[pipe].ready || fb.pipes[pipe].failed {
+                    fb.answered = true;
+                }
+                continue;
+            }
+            let debug_id = self.draw_shaders[index].debug_id;
+            let mapping = &self.draw_shaders[index].mapping;
+            let code_bytes: &[u8] = if let Some(payload) = &mapping.hal_code { payload } else { match &mapping.code {
+                CxDrawShaderCode::Combined { code } => code.as_bytes(),
+                // Vulkan uses the binary payload above; GLSL is only its compiler cache key.
+                CxDrawShaderCode::Separate { .. } => &[],
+            } };
+            let name = fb.intern_live(debug_id);
+            let source = mapping.source_loc.as_deref().map_or(0, |loc| fb.intern(loc));
+            let none = binding::NONE;
+            let bindings_in = &mapping.uniform_buffer_bindings;
+            let mut bindings = vec![none; binding::BUFFERS];
+            bindings[binding::DRAW_CALL] = bindings_in.get_by_type_name(id!(DrawCallUniforms)).map_or(none, |v| v as u32);
+            bindings[binding::PASS] = bindings_in.get_by_type_name(id!(DrawPassUniforms)).map_or(none, |v| v as u32);
+            bindings[binding::DRAW_LIST] = bindings_in.get_by_type_name(id!(DrawListUniforms)).map_or(none, |v| v as u32);
+            // the dyn uniforms ride in buffer 2 (the IoUniform struct), the scope block as bound
+            bindings[binding::DYN] = 2;
+            let spirv = fb.info.dialect == makepad_hal::dialect::SPIRV;
+            if spirv && mapping.dyn_uniforms.inputs.is_empty() { bindings[binding::DYN] = none; }
+            bindings[binding::SCOPE] = bindings_in.scope_uniform_buffer_index().map_or(none, |v| v as u32);
+            bindings[binding::TEXTURES] = mapping.textures.len() as u32;
+            bindings.extend(mapping.uniform_buffers.iter().map(|b| b.buffer_index as u32));
+            let volume = crate::makepad_script::shader::TextureType::Texture3d;
+            let metal_shapes = fb.info.dialect == makepad_hal::dialect::MSL && mapping.textures.iter().any(|t| t.tex_type == volume);
+            if metal_shapes {
+                bindings.extend(mapping.textures.iter().map(|t| if t.tex_type == volume { makepad_hal::TEXTURE_SHAPE_3D } else { none }));
+            }
+            // geometry inputs: stride in bytes, then (byte offset, format, lane count) each
+            let mut layout = vec![mapping.geometry_stride_bytes() as u32];
+            for input in &mapping.geometries.inputs {
+                layout.extend([input.byte_offset as u32, input.attr_format as u32, input.slots as u32]);
+            }
+            let desc = PipelineDesc {
+                storage_push_size: mapping.storage_push_size,
+                color_formats: [pipeline_color_format(mapping.color_format), 0, 0, 0],
+                blend: (match mapping.blend_op {
+                    DrawShaderBlendOp::Over => 0,
+                    DrawShaderBlendOp::Max => pipeline_blend::MAX,
+                    DrawShaderBlendOp::Add => pipeline_blend::ADD,
+                }) | (if mapping.color_format.blends() || mapping.blend_op == DrawShaderBlendOp::Add { 0 } else { pipeline_blend::RAW }),
+                flags: (if mapping.precise_math { pipeline_flags::PRECISE } else { 0 })
+                    | (if metal_shapes { pipeline_flags::METAL_TEXTURE_SHAPES } else { 0 }),
+                outputs: mapping.fragment_outputs as u32,
+                shader: index as u32,
+                name,
+                source,
+                instance_stride: if spirv && mapping.instances.stride_bytes != 0 {
+                    (mapping.instances.stride_bytes / 4) as u32
+                } else { mapping.instances.total_slots as u32 },
+                varyings: mapping.varying_total_slots as u32,
+                ..Default::default()
+            };
+            let storage: Vec<_> = mapping.storage_buffers.iter().map(|b| makepad_hal::StorageBinding { index: b.index, offset: b.offset, writable: 0 }).collect();
+            let blob = CmdWriter::draw_pipeline_blob(desc, code_bytes, &bindings, &layout, &storage);
+            let pipe = fb.pipes.len();
+            let id = Id::new(pipe as u32, 1 + fb.backend_changes);
+            // Cx emits the dialect the HAL advertised. Headless accepts the MSL fallback.
+            let dialect = match (code_bytes.is_empty(), fb.info.dialect) {
+                (true, _) => makepad_hal::dialect::NONE,
+                (false, makepad_hal::dialect::NONE) => makepad_hal::dialect::MSL,
+                (false, d) => d,
+            };
+            let attr = Attr { label: name, site: source, ..Default::default() };
+            fb.w.pipeline_create(id, dialect, attr, &blob);
+            fb.stats.pipeline_creates += 1;
+            fb.pipes.push(PipeRec::new(id, index));
+            let pick_bytes = mapping.hal_pick_code.as_deref().or_else(|| mapping.pick_code.as_ref().map(|s| s.as_bytes()));
+            if let Some(code) = pick_bytes {
+                let pick_index = fb.pipes.len();
+                let pick_id = Id::new(pick_index as u32, 1 + fb.backend_changes);
+                let mut pick_desc = desc;
+                pick_desc.color_formats = std::array::from_fn(|i| if desc.outputs & (1 << i) != 0 { format::BGRA8 } else { 0 });
+                pick_desc.blend = pipeline_blend::RAW;
+                let pick_blob = CmdWriter::draw_pipeline_blob(pick_desc, code, &bindings, &layout, &storage);
+                fb.w.pipeline_create(pick_id, dialect, attr, &pick_blob);
+                fb.pipes.push(PipeRec::new(pick_id, index));
+                fb.pipes[pipe].pick = Some(pick_index);
+                fb.stats.pipeline_creates += 1;
+            }
+            fb.pipe_by_hash.entry(key).or_default().push(pipe);
+            self.draw_shaders[index].pipeline_id = Some(pipe);
+        }
+        self.draw_shaders.compile_set.clear();
+    }
+
+    // ------------------------------------------------------------------ the walk
+
+    /// Builds the passes of this repaint into `fb.w`, in dependency order. Returns the HAL frame
+    /// ids built (one per pass), which `FrameDone` answers.
+    pub(crate) fn fb_build(&mut self, fb: &mut FrameBuilder, passes: &[DrawPassId], time_now: f32, input_ns: u64) -> Vec<u64> {
+        self.draw_owners_follow_profiler();
+        fb.staged_left = crate::texture::STAGED_UPLOAD_BYTES;
+        let mut built = Vec::new();
+        built.extend(self.fb_compute(fb));
+        for &pass_id in passes {
+            let uniforms_gen = self.next_uniform_gen();
+            self.passes[pass_id].set_time(time_now, uniforms_gen);
+            if let Some(serial) = self.fb_pass(fb, pass_id, input_ns) {
+                built.push(serial);
+            }
+        }
+        self.fb_staged_uploads(fb);
+        self.hal_compute_readbacks(fb);
+        self.fb_sweep(fb);
+        if !built.is_empty() {
+            self.draw_owners_frame_done();
+        }
+        built
+    }
+
+    /// The staged textures' uploads that no draw of this frame sent, within what is left of the
+    /// frame's budget: they land whether they are drawn or not.
+    fn fb_staged_uploads(&mut self, fb: &mut FrameBuilder) {
+        let ids = self.take_staged_textures();
+        for &id in &ids {
+            if fb.staged_left == 0 {
+                break;
+            }
+            if !self.textures[id].updated().is_empty() {
+                self.fb_vec_texture(fb, id);
+            }
+        }
+        self.staged_textures = ids;
+    }
+
+    /// Unattached work and its readbacks progress on HAL turns, independently
+    /// of the paint clock. Encode these before any drawable can be acquired.
+    pub(crate) fn fb_compute(&mut self, fb: &mut FrameBuilder) -> Vec<u64> {
+        self.hal.compute.beat = false;
+        let built = if self.hal.compute.has_unattached() && self.compute_prepare(fb, None) {
+            self.compute_encode(fb, None)
+        } else { Vec::new() };
+        self.hal_compute_readbacks(fb);
+        built
+    }
+
+    /// Replay the dependency passes into id targets, then request their pixels through the HAL.
+    pub(crate) fn fb_picks(&mut self, fb: &mut FrameBuilder) {
+        let Some(request) = self.pick.requests.first() else { return };
+        let (ticket, texture) = (request.ticket, request.texture.texture_id());
+        let target = self.passes.id_iter().find(|p| !self.passes.0.is_free(p.0) && self.passes[*p].color_textures.iter().any(|a| a.texture.texture_id() == texture));
+        let Some(target) = target else {
+            self.pick.requests.remove(0);
+            self.pick.results.push((ticket, Err(crate::pick::PickError::NotRendered)));
+            return;
+        };
+        let mut passes = Vec::new();
+        self.pick_feeders(target, &mut passes, &mut Vec::new());
+        // A ready base shader can still be compiling for a feeder's id attachments
+        // (in particular an MRT pass). Ask for all of those layouts in one batch.
+        let mut waiting = false;
+        let mut lists = Vec::new();
+        for &pass in &passes {
+            let Some(list) = self.passes[pass].main_draw_list_id else { continue };
+            let Some(target) = self.fb_pass_target(pass, true) else {
+                self.pick.requests.remove(0);
+                self.pick.results.push((ticket, Err(crate::pick::PickError::NotRendered)));
+                return;
+            };
+            let layout = self.fb_target_layout(pass, &target, true);
+            lists.clear();
+            self.pick_lists(list, &mut lists);
+            for &list in &lists {
+                for index in 0..self.draw_lists[list].draw_items.len() {
+                    let item = &self.draw_lists[list].draw_items[index];
+                    let Some(call) = item.kind.draw_call() else { continue };
+                    let Some(pipe) = self.draw_shaders[call.draw_shader_id.index].pipeline_id.and_then(|p| fb.pipes[p].pick) else { continue };
+                    match fb.pipeline_status_in(pipe, layout) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if !fb.pipes[pipe].ready { fb.pipes[pipe].drawn_unready = true; }
+                            waiting = true;
+                        }
+                        Err(_) => {
+                            self.pick.requests.remove(0);
+                            self.pick.results.push((ticket, Err(crate::pick::PickError::Failed)));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if waiting { return; }
+        let kept: Vec<_> = passes.iter().map(|p| (*p, self.passes[*p].paint_dirty, self.passes[*p].painted_serial)).collect();
+        self.pick.paint = Some(crate::pick::PickPaint { painted: Default::default() });
+        for pass in passes {
+            if self.fb_pass(fb, pass, 0).is_some() {
+                self.pick.paint.as_mut().unwrap().painted.extend(self.passes[pass].color_textures.iter().map(|a| a.texture.texture_id()));
+            }
+        }
+        for (pass, dirty, serial) in kept { self.passes[pass].paint_dirty = dirty; self.passes[pass].painted_serial = serial; }
+        let paint = self.pick.paint.take().unwrap();
+        self.pick.requests.remove(0);
+        if !paint.painted.contains(&texture) {
+            self.pick.results.push((ticket, Err(crate::pick::PickError::NotRendered)));
+            return;
+        }
+        let twin = self.pick.twins[&texture].clone();
+        self.hal_pick_readback(fb, ticket, twin);
+    }
+
+    /// The Activity shows our clear color in place of the surface whenever it hasn't drawn yet,
+    /// like at startup or while resuming.
+    #[cfg(target_os = "android")]
+    pub(crate) fn fb_send_app_background(&mut self, fb: &mut FrameBuilder, pass_id: DrawPassId) {
+        if let CxDrawPassParent::Window(w) = self.passes[pass_id].parent {
+            if !self.windows[w].is_popup {
+                let color = self.passes[pass_id].clear_color;
+                let [r, g, b] = [color.x, color.y, color.z].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u32);
+                let argb = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+                if self.hal.app_background_argb != Some(argb) {
+                    self.hal.app_background_argb = Some(argb);
+                    fb.w.mobile_ui(makepad_hal::mobile_ui::APP_BACKGROUND, argb);
+                }
+            }
+        }
+    }
+
+    fn fb_pass_target(&self, pass_id: DrawPassId, picking: bool) -> Option<PassTarget> {
+        let parent = &self.passes[pass_id].parent;
+        // An XR pass can also drive a single-view display.
+        let stereo = matches!(parent, CxDrawPassParent::Xr);
+        let offscreen_xr = stereo && self.hal_info_flags() & makepad_hal::info_flags::XR_OFFSCREEN != 0;
+        let window = match parent {
+            CxDrawPassParent::Window(w) => Some(*w),
+            // The XR window only paces this texture pass. Its layout can be probed
+            // before the window has been created or supplied its first frame.
+            CxDrawPassParent::Xr if offscreen_xr => self.hal.xr.as_ref().map(|xr| xr.window),
+            CxDrawPassParent::Xr => Some(self.hal.xr.as_ref()?.window),
+            _ => None,
+        };
+        let multiview = stereo && !offscreen_xr && !picking && self.hal.info.is_some_and(|i| i.flags & makepad_hal::info_flags::MULTIVIEW != 0);
+        let samples = if stereo && !picking { self.hal_xr_msaa_now() } else { 0 };
+        Some(PassTarget { window, stereo, offscreen_xr, samples, views: if multiview { 2 } else { 0 } })
+    }
+
+    pub(crate) fn fb_pass_layout(&self, pass_id: DrawPassId) -> Option<PipelineLayout> {
+        let target = self.fb_pass_target(pass_id, false)?;
+        Some(self.fb_target_layout(pass_id, &target, false))
+    }
+
+    fn fb_target_layout(&self, pass_id: DrawPassId, target: &PassTarget, picking: bool) -> PipelineLayout {
+        let pass = &self.passes[pass_id];
+        let texture_format = |texture: &Texture, depth: bool| {
+            // The formats of CxPick::twin, independent of the original texture.
+            if picking { return if depth { format::DEPTH32F } else { format::BGRA8 }; }
+            let tex = &self.textures[texture.texture_id()];
+            attachment_format(&tex.format, depth, tex.alloc.as_ref())
+        };
+        let mut colors = [PipelineLayout::ABSENT; 4];
+        let window = target.render_window();
+        if window.is_some() {
+            colors[0] = format::WINDOW_TARGET;
+        } else {
+            for (slot, attachment) in colors.iter_mut().zip(&pass.color_textures) {
+                *slot = match (texture_format(&attachment.texture, false), attachment.cube_face.unwrap_or(0)) {
+                    (format::NV12, 0) => format::R8,
+                    (format::NV12, 1) => format::RG8,
+                    (fmt, _) => fmt,
+                };
+            }
+        }
+        PipelineLayout {
+            window: window.map_or(Id::NONE, crate::event::hal_intake::hal_window_id),
+            colors,
+            depth: pass.depth_texture.as_ref().map_or(PipelineLayout::ABSENT, |t| texture_format(t, true)),
+            samples: target.samples.max(1) as u8,
+            views: target.views.max(1) as u8,
+        }
+    }
+
+    /// One pass into one FramePacket. None when the pass paints nothing now.
+    fn fb_pass(&mut self, fb: &mut FrameBuilder, pass_id: DrawPassId, input_ns: u64) -> Option<u64> {
+        let picking = self.pick.paint.is_some();
+        if !picking && !self.compute_prepare(fb, Some(pass_id)) {
+            // Its compute waits for a pipeline the HAL compiles (a part's field still to bake): it
+            // keeps its older picture, which is not what it recorded, and the answer repaints.
+            self.passes[pass_id].incomplete = true;
+            self.passes[pass_id].left_out = true;
+            return None;
+        }
+        let build_start = makepad_hal::clock_ns();
+        let Some(list_id) = self.passes[pass_id].main_draw_list_id else {
+            // a frozen texture: its producer detached and dropped its list
+            // a window not created yet (`create_on_start: false`) has nothing to draw: its pass
+            // waits quietly, and creating the window asks for a full redraw (`hal_create_window`)
+            let uncreated = matches!(self.passes[pass_id].parent, CxDrawPassParent::Window(w) if !self.windows[w].is_created);
+            if uncreated || matches!(self.passes[pass_id].parent, CxDrawPassParent::None) {
+                self.passes[pass_id].paint_dirty = false;
+                self.passes[pass_id].incomplete = false;
+                self.passes[pass_id].left_out = false;
+            } else {
+                crate::error!("Draw pass has no draw list!");
+            }
+            return None;
+        };
+        let target = self.fb_pass_target(pass_id, picking)?;
+        let (stereo, offscreen_xr) = (target.stereo, target.offscreen_xr);
+        if stereo && self.hal.xr.as_ref()?.frame.is_none() { return None; }
+        let views = if offscreen_xr { self.hal_xr_views() } else { 2 };
+        let multiview = target.views > 1;
+        let (window, is_window) = (target.window, target.render_window().is_some());
+        #[cfg(target_os = "android")]
+        self.fb_send_app_background(fb, pass_id);
+        if let Some(w) = window {
+            if !self.hal.window_ready(w) {
+                // the HAL has not confirmed the window yet: the pass stays dirty
+                return None;
+            }
+            if !picking && !self.hal.window_may_paint(w) {
+                // its display has not asked for the next frame yet: the pass stays dirty and
+                // paints at the window's own next FrameReady
+                return None;
+            }
+        } else if !picking && !self.passes[pass_id].background {
+            // A texture pass that feeds a window paints only when that window can show the
+            // result: while a hosted window has no free shared image (its frames are still on the
+            // GPU or with the host), its scene passes stay dirty with it. Painted anyway, every
+            // host Tick queued another full scene nobody would see; the GPU queue grew behind the
+            // in-flight window frame, which then took longer still (Sandbox hosted in the WM on a node:
+            // ~60 scene beats/s, window frames 125 ms p90 / 1.3 s max, ~1 fps, and thousands of
+            // upload arenas alive in the queue).
+            // A background pass (`DrawPass::set_background`) is not held: it presents nothing, and
+            // it runs after the window frames, when a paced window's frame has used its credit
+            // and a hosted window's image is in flight, so held it would wait every repaint and
+            // never paint (the path tracer's steps sat at 0 samples on a visible window). Its
+            // producer paces it: a trace step waits for the last one's paint, a bake paints once.
+            if let Some(w) = self.pass_root_window(pass_id) {
+                let shows = self.hal.window_ready(w) && self.hal.window_may_paint(w)
+                    && self.hal.hosted.as_ref().is_none_or(|hosted| hosted.can_present(w));
+                if !shows {
+                    makepad_hal::profile::count("pass waits for its window's image");
+                    return None;
+                }
+            }
+        }
+        // the XR window is in eye pixels
+        let dpi = if stereo { 1.0 } else { self.passes[pass_id].dpi_factor? };
+        // Whole device pixels for every pass, windows too (snapping a window to whole points
+        // first made a 715.5 pt hosted window 1432 px wide in its parent's 1431 px image, and
+        // it never drew). One rounding rule for a window: the surface pixels are the truth and
+        // points are px / dpi exactly, so its rect is the window's inner size.
+        let mut pass_rect = if stereo { crate::makepad_math::Rect::default() } else { self.get_pass_rect(pass_id, dpi)? };
+        if let Some(w) = window {
+            if self.windows.is_valid(w) && self.windows[w].window_geom.inner_size.x > 0.0 {
+                pass_rect.size = self.windows[w].window_geom.inner_size;
+            }
+        }
+        // A pass that has a picture keeps it while a pipeline its draws use is still compiling
+        // (a live shader edit, a widget tree re-evaluated with new shaders): drawn now, those
+        // draws would be left out and the picture would flash without them. It paints when the
+        // pipelines answer (PipelineReady repaints every pass); a failed one does not hold it.
+        if !picking && self.passes[pass_id].painted_serial != 0 && fb.pipelines_pending() != 0 {
+            match self.fb_pipelines_wait(fb, list_id) {
+                PipelineWait::None => {}
+                PipelineWait::Hal => {
+                    self.passes[pass_id].hold_picture();
+                    fb.stats.held_for_pipelines += 1;
+                    makepad_hal::profile::count("pass kept its picture: pipeline compiling");
+                    return None;
+                }
+                PipelineWait::Compile => {
+                    // queued for compilation: compiled at the next draw, the pass stays dirty
+                    self.passes[pass_id].incomplete = true;
+                    self.passes[pass_id].left_out = true;
+                    fb.stats.held_for_pipelines += 1;
+                    makepad_hal::profile::count("pass kept its picture: pipeline compiling");
+                    return None;
+                }
+            }
+        }
+        if !self.passes[pass_id].keep_camera_matrix {
+            let g = self.next_uniform_gen();
+            self.passes[pass_id].set_ortho_matrix(pass_rect.pos, pass_rect.size, g);
+        }
+        if pass_rect.size.x < 0.5 || pass_rect.size.y < 0.5 {
+            self.passes[pass_id].paint_dirty = false;
+            return None;
+        }
+        fb.pass_px = (pass_rect.pos.x as f32, pass_rect.pos.y as f32, dpi as f32);
+        // A window's target is its surface: its pixels (`makepad_hal::window_pixels`), the size the HAL
+        // and a host WM made it (the pass rect is ceiled in points, which at a fractional scale is up
+        // to 2 px more than the surface).
+        let size = match window {
+            // round one supersampled view to whole pixels before laying out the target
+            Some(w) if offscreen_xr && self.windows.is_valid(w) && self.windows[w].window_geom.inner_size.x > 0.0 => {
+                let s = self.hal_xr_supersample_now() as f64;
+                let inner = self.windows[w].window_geom.inner_size;
+                let views = views as f64;
+                crate::makepad_math::dvec2(views * (inner.x / views * s).round(), (inner.y * s).round())
+            }
+            Some(w) if self.windows.is_valid(w) && self.windows[w].window_geom.inner_size.x > 0.0 => {
+                let inner = self.windows[w].window_geom.inner_size;
+                let [pw, ph] = makepad_hal::window_pixels([inner.x, inner.y], dpi);
+                crate::makepad_math::dvec2(pw as f64, ph as f64)
+            }
+            _ => {
+                let (w, h) = Self::pass_pixel_size(pass_rect.size, dpi);
+                crate::makepad_math::dvec2(w as f64, h as f64)
+            }
+        };
+        // No pixels (a texture pass whose dpi is not known yet, 0 while a hosted app waits for
+        // its host's geometry): nothing to draw, as for an empty rect above. The pass draws when
+        // its size or dpi changes; sent, the HAL refused it ('invalid pass viewport').
+        if !(size.x >= 1.0 && size.y >= 1.0) {
+            self.passes[pass_id].paint_dirty = false;
+            return None;
+        }
+        let (tw, th) = (size.x as usize, size.y as usize);
+        if crate::makepad_error_log::trace_enabled("passpx") {
+            crate::log!("passpx {:?} window {:?} rect {:?} dpi {dpi} target {tw}x{th} inner*dpi {:?}", self.passes[pass_id].debug_name, window.map(|w| w.0),
+                pass_rect, window.map(|w| self.windows[w].window_geom.inner_size * dpi));
+        }
+        // the XR window is the headset's (its own swapchain or a remote sink), never a hosted one
+        let hosted_target = match (window, self.hal.hosted.as_ref()) {
+            (Some(window), Some(hosted)) if !stereo && is_window => Some(hosted.target(window, tw, th)?),
+            _ => None,
+        };
+        self.passes[pass_id].paint_dirty = false;
+        let g = self.next_uniform_gen();
+        self.passes[pass_id].set_dpi_factor(dpi, g);
+
+        if !picking { self.compute_encode(fb, Some(pass_id)); }
+        let serial = self.textures.1.serials.submit();
+
+        let mut pass = Pass { color: [Id::NONE; 4], depth: Id::NONE, samples: target.samples, views: target.views, ..Default::default() };
+        // the viewport is the target's pixel size: a fractional scale (2.7x on a phone) rounds the
+        // attachments, and a viewport rounding up would exceed them
+        pass.viewport = [0.0, 0.0, tw as f32, th as f32];
+        pass.dpi = dpi as f32;
+        if is_window {
+            if let Some((_, image)) = hosted_target {
+                pass.color[0] = image;
+            }
+            let c = self.passes[pass_id].clear_color;
+            pass.clear[0] = [c.x, c.y, c.z, c.w];
+            pass.load[0] = load::CLEAR;
+        } else {
+            // the attachments copied aside (self is borrowed mutably below) on the secondary stack:
+            // no heap allocation per pass per frame
+            makepad_stack::with_frame(|f| {
+                let n = self.passes[pass_id].color_textures.len();
+                let attachments = f.slice_from_fn(n, |i| self.passes[pass_id].color_textures[i].clone());
+                if attachments.len() > 4 {
+                    fb.gap("a pass has more than four colour attachments");
+                }
+                for (i, attachment) in attachments.iter().take(4).enumerate() {
+                    let original = attachment.texture.texture_id();
+                    let tid = if picking { self.pick.twin(&mut self.textures, original, false).texture_id() } else { original };
+                    pass.color[i] = self.fb_attachment(fb, tid, tw, th, false);
+                    let initial = self.textures[tid].take_initial();
+                    let (action, color) = match attachment.clear_color {
+                        DrawPassClearColor::InitWith(c) => (if initial { load::CLEAR } else { load::LOAD }, c),
+                        DrawPassClearColor::ClearWith(c) => (load::CLEAR, c),
+                    };
+                    pass.load[i] = if picking { load::CLEAR } else if self.passes[pass_id].color_scratch { load::DONT_CARE } else { action };
+                    pass.clear[i] = if picking { [0.0; 4] } else { [color.x, color.y, color.z, color.w] };
+                    pass.layer[i] = attachment.cube_face.unwrap_or(0);
+                }
+            });
+        }
+        if let Some(depth) = self.passes[pass_id].depth_texture.clone() {
+            let tid = if picking { self.pick.twin(&mut self.textures, depth.texture_id(), true).texture_id() } else { depth.texture_id() };
+            pass.depth = if multiview { self.fb_attachment_views(fb, tid, tw / 2, th, true, 2) } else { self.fb_attachment(fb, tid, tw, th, true) };
+            let initial = self.textures[tid].take_initial() || picking;
+            match self.passes[pass_id].clear_depth {
+                DrawPassClearDepth::InitWith(d) => {
+                    pass.load[4] = if initial { load::CLEAR } else { load::LOAD };
+                    pass.clear_depth = d;
+                }
+                DrawPassClearDepth::ClearWith(d) => {
+                    pass.load[4] = load::CLEAR;
+                    pass.clear_depth = d;
+                }
+            }
+        }
+        // A window image the HAL keeps between frames only needs what changed repainted.
+        let can_repaint_partially = is_window && !stereo && !picking && hosted_target.is_none()
+            && self.draw_damage.is_enabled
+            && self.hal_info_flags() & makepad_hal::info_flags::PARTIAL_REPAINT != 0;
+        if can_repaint_partially {
+            if let Some((rects, since)) = self.compute_pass_damage(fb, pass_id, pass_rect, (tw as i32, th as i32), serial) {
+                let hal_rects: Vec<[f32; 4]> = rects.iter()
+                    .map(|r| [r.x0 as f32, r.y0 as f32, (r.x1 - r.x0) as f32, (r.y1 - r.y0) as f32])
+                    .collect();
+                pass.damage = fb.w.put_rects(&hal_rects);
+                pass.damage_since = since;
+                self.draw_damage.start_repaint(pass_id, rects);
+            }
+        }
+        // SAFETY: Cx does not change it before the submit (module header)
+        pass.uniforms = unsafe { Slice::of(self.passes[pass_id].pass_uniforms.as_slice()) };
+        pass.name = fb.intern(&self.passes[pass_id].debug_name);
+        pass.owner = self.draw_lists[list_id].owner.map_or(0, |o| fb.intern(o));
+
+        fb.w.frame_begin(serial, FrameMeta { build_start_ns: build_start, input_ns, phases: self.hal.beat_phases, ..Default::default() });
+        if let Some(o) = self.draw_owners.as_mut().filter(|_| !picking) {
+            o.begin_packet(serial);
+        }
+        let sploded = self.passes[pass_id].sploded.is_some();
+        let step = self.passes[pass_id].zbias_step;
+        fb.pass_whole = true;
+        fb.pass_drew_all = true;
+        // Picking substitutes private pipelines and targets. Readiness probes describe
+        // the colour draw, which uses the pass's own attachments.
+        fb.draw_layout = if fb.layouts.get_mut().is_empty() || picking { None } else { Some(self.fb_target_layout(pass_id, &target, false)) };
+        if multiview {
+            // both eyes in one pass: the draws are built once, the GPU renders each eye's layer
+            // with its camera (the uniforms' `_r` matrices are the right eye's)
+            let base = self.passes[pass_id].pass_uniforms;
+            if let Some(uniforms) = self.hal_xr_stereo_uniforms(&base) {
+                let mut p = pass;
+                p.uniforms = fb.w.keep(uniforms.as_slice());
+                p.viewport = [0.0, 0.0, (tw / 2) as f32, th as f32];
+                if !p.depth.is_none() { p.load[4] = load::CLEAR; }
+                fb.w.pass(p);
+                let mut zbias = 0.0f32;
+                self.fb_list(fb, pass_id, list_id, sploded, &mut zbias, step, serial);
+            }
+        } else if stereo {
+            // one pass and one clear: the draws are built once and run in each view's rect
+            // with its corresponding camera block
+            let base = self.passes[pass_id].pass_uniforms;
+            if let Some(uniforms) = self.hal_xr_view_uniforms(&base, views) {
+                let mut p = pass;
+                p.uniforms = fb.w.keep::<f32>(crate::makepad_math::bytemuck::cast_slice(uniforms));
+                let width = (tw / views) as f32;
+                let rects = [[0.0, 0.0, width, th as f32], [width, 0.0, width, th as f32]];
+                p.view_rects = fb.w.put_rects(&rects[..views]);
+                if !p.depth.is_none() { p.load[4] = load::CLEAR; }
+                fb.w.pass(p);
+                let mut zbias = 0.0f32;
+                self.fb_list(fb, pass_id, list_id, sploded, &mut zbias, step, serial);
+            }
+        } else {
+            fb.w.pass(pass);
+            let mut zbias = 0.0f32;
+            self.fb_list(fb, pass_id, list_id, sploded, &mut zbias, step, serial);
+            self.draw_damage.end_repaint();
+        }
+        fb.draw_layout = None;
+        let end = makepad_hal::clock_ns();
+        let (target, kind) = match (window.filter(|_| is_window), self.passes[pass_id].color_textures.first()) {
+            (Some(w), _) => (Id::new(w.0 as u32, w.1 as u32), makepad_hal::target::WINDOW | capture_flag(w.0) | if self.window_snapshot_wanted(w.0) || self.hal_capture_due(w) || (fb.pass_whole && self.screenshot_requests.iter().any(|request| crate::remote::grab_waits_on_window(request.request_id, w.id()))) { makepad_hal::target::SNAPSHOT } else { 0 }),
+            (None, Some(_)) => (pass.color[0], makepad_hal::target::TEXTURE),
+            (None, None) => (Id::NONE, makepad_hal::target::TEXTURE),
+        };
+        fb.w.frame_set_build_end(end);
+        fb.stats.build_ns += end.saturating_sub(build_start);
+        fb.w.frame_end(target, kind | if picking { makepad_hal::target::PICK } else { 0 });
+        if let Some(o) = self.draw_owners.as_mut() {
+            o.end_packet();
+        }
+        if !picking {
+            self.readback_pass_submitted(pass_id, serial);
+            self.hal_texture_readbacks(fb, Some(pass_id));
+            if let Some(window) = window.filter(|_| is_window) {
+                self.hal_window_readbacks(fb, window, tw, th);
+            }
+        }
+        // an offscreen XR frame was built: the XR window's credit is used (its next XrFrame paces
+        // the next one)
+        if offscreen_xr && !picking {
+            if let Some(window) = window {
+                self.hal.window_painted(window);
+            }
+        }
+        if is_window {
+            if !picking {
+                if let Some(window) = window {
+                    self.hal.window_painted(window);
+                    makepad_hal::profile::window_frame(window.id());
+                }
+            }
+            fb.window_frames.push(target);
+            fb.window_submitted.insert(target, serial);
+            if !picking {
+                fb.window_presenting.insert((target, serial), self.live_patches);
+            }
+            if let (Some(window), Some((index, _))) = (window, hosted_target) {
+                self.hal.hosted.as_mut().unwrap().submitted(window, index, serial, [tw as u32, th as u32]);
+            }
+        }
+        if !picking && self.pass_load.enabled() {
+            let class = self.pass_class(pass_id);
+            self.pass_load.painted(serial, class);
+        }
+        if !picking {
+            fb.gpu_times.painted(serial, &self.passes[pass_id]);
+        }
+        if !picking && crate::gpu_frame_timer::enabled() {
+            if let Some(window) = self.get_pass_window_id(pass_id) {
+                let group = (window.id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.repaint_id;
+                let name = match self.passes[pass_id].debug_name.as_str() {
+                    "" if is_window => "window",
+                    "" => "unnamed",
+                    name => name,
+                };
+                // a frame closes with its window's pass, or with an offscreen XR pass (whose
+                // frame is never presented: it would fold into the next window frame)
+                fb.time_pass(serial, group, name, is_window || offscreen_xr);
+            }
+        }
+        fb.stats.frames += 1;
+        fb.stats.passes += 1;
+        if !picking {
+            // Painted whole when no draw was left out for a shader or pipeline still compiling
+            // and none sampled an unfinished picture (or nothing where a picture is still to
+            // come); only then does `painted_serial` move, so whatever waits for this recording
+            // (a host, a history pass) waits on. A picture still to paint costs nothing: the
+            // last one its producer painted is sampled, a frame older, as before.
+            let whole = fb.pass_whole;
+            // A draw left out of this paint shows up later, which the next walk can't see coming.
+            if !whole {
+                self.draw_damage.invalidate_pass(pass_id);
+            }
+            let before = self.passes[pass_id].painted_serial;
+            self.passes[pass_id].painted(whole, fb.pass_drew_all, self.repaint_id);
+            if whole {
+                self.passes[pass_id].painted_whole_in(serial, before);
+            }
+        }
+        Some(serial)
+    }
+
+    /// One draw list into the open pass: sub-lists recurse, draw calls become `Draw`s.
+    #[allow(clippy::too_many_arguments)]
+    fn fb_list(&mut self, fb: &mut FrameBuilder, pass_id: DrawPassId, list_id: DrawListId, sploded: bool, zbias: &mut f32, step: f32, serial: u64) {
+        let order_len = self.draw_lists[list_id].draw_item_order_len();
+        let debug_dump_count = self.draw_lists[list_id].debug_dump_count;
+        let dump = debug_dump_count > 0;
+        if self.draw_lists[list_id].debug_dump {
+            self.draw_lists[list_id].debug_dump = false;
+            self.draw_lists[list_id].debug_dump_count = 6; // dump 6 consecutive frames
+        }
+        if dump {
+            println!("=== DEBUG DUMP draw_list {:?} ({} items) repaint_id={} frames_left={} ===", list_id.index(), order_len, self.repaint_id, debug_dump_count);
+            self.draw_lists[list_id].debug_dump_count -= 1;
+        }
+        let list_name = fb.intern_live(self.draw_lists[list_id].debug_id);
+        let outer_owner = fb.owner;
+        if let Some(owner) = self.draw_lists[list_id].owner {
+            fb.owner = fb.intern(owner);
+        }
+        for order_index in 0..order_len {
+            let uniforms_gen = self.next_uniform_gen();
+            let Some(item_id) = self.draw_lists[list_id].draw_item_id_at_order_index(order_index) else { continue };
+            if let Some(sub) = self.draw_lists[list_id].draw_items[item_id].kind.sub_list() {
+                // a slot that drew a retained publication and holds a sub-list now
+                fb.inst_release((list_id.index(), item_id));
+                // a retained sub-list its owner dropped since the parent last recorded: the slot
+                // may hold another widget's list now
+                if self.draw_lists.is_id_freed(sub) {
+                    continue;
+                }
+                let mut own = 0.0f32;
+                let child = if self.draw_lists[sub].reset_zbias { &mut own } else { &mut *zbias };
+                // an overlay list carries a depth floor
+                self.draw_lists[sub].raise_zbias_to_floor(child);
+                // a retained list is one unit of paint order: its calls take the counter at entry
+                if let Some(steps) = self.draw_lists[sub].zbias_hold {
+                    let mut held = *child;
+                    self.fb_list(fb, pass_id, sub, sploded, &mut held, 0.0, serial);
+                    *child += steps as f32 * step;
+                } else {
+                    self.fb_list(fb, pass_id, sub, sploded, child, step, serial);
+                }
+                continue;
+            }
+            if let crate::draw_list::CxDrawKind::NativeLayer { id, rect, clip, style } = self.draw_lists[list_id].draw_items[item_id].kind {
+                fb.inst_release((list_id.index(), item_id));
+                if !sploded && self.pick.paint.is_none() && self.native_layer_window_pass(pass_id)
+                    && matches!(self.native_layer_mode(id), crate::native_layer::NativeLayerMode::Composited)
+                {
+                    let list = &self.draw_lists[list_id].draw_list_uniforms;
+                    let (ox, oy, dpi) = fb.pass_px;
+                    let x = rect.pos.x as f32 + list.view_shift.x;
+                    let y = rect.pos.y as f32 + list.view_shift.y;
+                    let x1 = x.max(clip.0.x as f32 + list.view_shift.x).max(list.view_clip.x);
+                    let y1 = y.max(clip.0.y as f32 + list.view_shift.y).max(list.view_clip.y);
+                    let x2 = (x + rect.size.x as f32).min(clip.1.x as f32 + list.view_shift.x).min(list.view_clip.z);
+                    let y2 = (y + rect.size.y as f32).min(clip.1.y as f32 + list.view_shift.y).min(list.view_clip.w);
+                    let mut flags = makepad_hal::native_layer::layer_flags::VISIBLE;
+                    if style.input_passthrough {
+                        flags |= makepad_hal::native_layer::layer_flags::INPUT_PASSTHROUGH;
+                    }
+                    // Conjugate the logical-space transform into window pixels: S T S^-1,
+                    // where S applies the pass origin and dpi, as the draw bounds do.
+                    let mut transform = list.view_transform.v;
+                    transform[12] = (list.view_transform.v[12] + transform[0] * ox + transform[4] * oy - ox) * dpi;
+                    transform[13] = (list.view_transform.v[13] + transform[1] * ox + transform[5] * oy - oy) * dpi;
+                    transform[14] = (list.view_transform.v[14] + transform[2] * ox + transform[6] * oy) * dpi;
+                    transform[3] /= dpi;
+                    transform[7] /= dpi;
+                    transform[11] /= dpi;
+                    fb.w.pass_native_layer(id.hal(), makepad_hal::NativeLayerGeom {
+                        rect: [(x - ox) * dpi, (y - oy) * dpi, rect.size.x as f32 * dpi, rect.size.y as f32 * dpi],
+                        clip: [(x1 - ox) * dpi, (y1 - oy) * dpi, (x2 - x1).max(0.0) * dpi, (y2 - y1).max(0.0) * dpi],
+                        radius: style.radius.map(|r| r.max(0.0) as f32 * dpi),
+                        transform,
+                        opacity: style.opacity.clamp(0.0, 1.0) as f32,
+                        flags,
+                    });
+                }
+                continue;
+            }
+            self.fb_draw(fb, pass_id, list_id, item_id, list_name, sploded, zbias, step, uniforms_gen, serial, dump);
+        }
+        fb.inst_release_spares(list_id.index(), self.draw_lists[list_id].draw_items.len());
+        fb.owner = outer_owner;
+    }
+
+    /// The pipelines a frame that waits (a window's first, a host-driven one) waits for: those
+    /// its live draw lists draw, and those a caller with a fallback asked for, while the HAL
+    /// still compiles them. A pipeline nothing draws (a hidden panel's, a renderer lane without
+    /// geometry) compiles on behind them without holding the frame. Each is wanted: it goes
+    /// ahead in the HAL's compile queue.
+    pub(crate) fn fb_frame_pipelines_pending(&mut self, fb: &mut FrameBuilder) -> usize {
+        fb.want_probed();
+        if fb.pipelines_pending() == 0 { return 0; }
+        let mut drawn = vec![false; fb.pipes.len()];
+        for list in self.draw_lists.iter_live() {
+            for index in 0..list.draw_items.len() {
+                let Some(call) = list.draw_items[index].kind.draw_call() else { continue };
+                if let Some(pipe) = self.draw_shaders[call.draw_shader_id.index].pipeline_id { drawn[pipe] = true; }
+            }
+        }
+        let mut pending = 0;
+        for (pipe, drawn) in drawn.into_iter().enumerate() {
+            let p = &fb.pipes[pipe];
+            if (drawn || p.probed.get()) && !p.ready && !p.failed {
+                pending += 1;
+                fb.want(pipe);
+            }
+        }
+        pending
+    }
+
+    /// What the draws of `list` (and its sub-lists) wait for: a shader still queued for
+    /// compilation, or a pipeline the HAL is still compiling (marked, so its PipelineReady
+    /// repaints). Failed pipelines wait for nothing: their draws are left out for good.
+    fn fb_pipelines_wait(&mut self, fb: &mut FrameBuilder, list: DrawListId) -> PipelineWait {
+        let mut lists = Vec::new();
+        self.pick_lists(list, &mut lists);
+        let mut wait = PipelineWait::None;
+        for list in lists {
+            for index in 0..self.draw_lists[list].draw_items.len() {
+                let Some(call) = self.draw_lists[list].draw_items[index].kind.draw_call() else { continue };
+                let shader = call.draw_shader_id.index;
+                match self.draw_shaders[shader].pipeline_id {
+                    None => {
+                        if self.draw_shaders.compile_set.contains(&shader) { wait = PipelineWait::Compile; }
+                    }
+                    Some(pipe) => {
+                        if fb.pipeline_waited_for(pipe) && wait == PipelineWait::None { wait = PipelineWait::Hal; }
+                    }
+                }
+            }
+        }
+        wait
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fb_draw(&mut self, fb: &mut FrameBuilder, pass_id: DrawPassId, list_id: DrawListId, item_id: usize, list_name: StrId, sploded: bool, zbias: &mut f32, step: f32, uniforms_gen: u64, serial: u64, dump: bool) {
+        let (shader_index, time_fps) = {
+            let (list, _) = self.draw_lists.list_and_upload_budget(list_id);
+            let Some(call) = list.draw_items.binding_mut(item_id).kind.draw_call_mut() else {
+                // an emptied slot draws nothing: what it drew goes
+                fb.inst_release((list_id.index(), item_id));
+                return;
+            };
+            (call.draw_shader_id.index, call.options.time_fps)
+        };
+        let sh = &self.draw_shaders[shader_index];
+        let Some(mut pipe_index) = sh.pipeline_id else {
+            // not compiled yet (queued): the frame is partial, the pass stays dirty; one that
+            // failed to compile is skipped without repainting
+            if self.draw_shaders.compile_set.contains(&shader_index) {
+                self.passes[pass_id].paint_dirty = true;
+                self.passes[pass_id].repaint_next = true;
+                fb.left_out();
+            }
+            self.pipeline_skips += 1;
+            return;
+        };
+        if self.pick.paint.is_some() {
+            let Some(pick) = fb.pipes[pipe_index].pick else { return };
+            pipe_index = pick;
+        }
+        if sh.mapping.uses_time {
+            // keeps the frame loop awake; only this pass repaints for it
+            self.demo_time_repaint |= self.passes[pass_id].request_time_repaint(time_fps, &mut self.time_fps_clock);
+        }
+        let slots = sh.mapping.instances.total_slots;
+
+        // the paint-order counter: update the call's zbias uniform, then step
+        let z = *zbias;
+        let instances;
+        {
+            let (list, _) = self.draw_lists.list_and_upload_budget(list_id);
+            let item = list.draw_items.binding_mut(item_id);
+            if let Some(call) = item.kind.draw_call_mut() {
+                call.resolve_zbias(z, sploded, uniforms_gen);
+                call.uniforms_dirty = false;
+            }
+            *zbias += step;
+            instances = if item.retained_instances.is_some() {
+                item.retained_instance_count
+            } else if slots == 0 {
+                0
+            } else {
+                item.instances.as_ref().map_or(0, |v| v.len() / slots)
+            };
+        }
+        if instances == 0 || slots == 0 {
+            // nothing to draw, nothing owed: the content is consumed as it is, and a buffer the
+            // item drew from before goes
+            fb.inst_release((list_id.index(), item_id));
+            let (list, _) = self.draw_lists.list_and_upload_budget(list_id);
+            let item = list.draw_items.binding_mut(item_id);
+            item.instance_upload_pending = false;
+            item.retained_gpu_evicted = false;
+            item.retained_instance_id = item.retained_instances.as_ref().map_or(0, |p| p.id());
+            item.resident_schema = item.retained_schema;
+            if let Some(call) = item.kind.draw_call_mut() {
+                call.instance_dirty = false;
+            }
+            return;
+        }
+        let owner = self.fb_draw_owner(fb, list_id.index(), item_id, slots, instances);
+
+        let Some(geometry_id) = self.draw_lists[list_id].draw_items[item_id].kind.draw_call().and_then(|c| c.geometry_id) else { return };
+        if self.geometries.skip_stale(geometry_id) {
+            return;
+        }
+        if !crate::geometry::geometry_layout_matches_shader(&mut self.geometries[geometry_id], &self.draw_shaders[shader_index].mapping.geometries) {
+            return;
+        }
+        let Some((vb, ib, index32)) = self.fb_geometry(fb, geometry_id) else { return };
+        let (index_count, index_width) = {
+            let g = &self.geometries[geometry_id];
+            (g.index_count, g.index_width)
+        };
+        if !matches!(index_width, 2 | 4) || index_count == 0 {
+            return;
+        }
+
+        // textures and custom uniform buffers the call binds
+        let (texture_ids, ubuf_ids) = {
+            let call = self.draw_lists[list_id].draw_items[item_id].kind.draw_call().expect("a draw call");
+            (
+                call.texture_slots.each_ref().map(|t| t.as_ref().map(|t| t.texture_id())),
+                call.uniform_buffer_slots.each_ref().map(|b| b.as_ref().map(|b| b.uniform_buffer_id())),
+            )
+        };
+        // one id per texture the shader samples, however many: no fixed slot count
+        let wanted = self.draw_shaders[shader_index].mapping.textures.len();
+        let mut tex = std::mem::take(&mut fb.tex_ids);
+        tex.clear();
+        tex.resize(wanted, Id::NONE);
+        for (i, tid) in texture_ids.iter().enumerate().take(wanted) {
+            let Some(tid) = tid else { continue };
+            let picture = crate::os::cx_shared::sampled_picture(&self.passes, &self.textures, *tid, pass_id, self.repaint_id);
+            if picture.to_paint {
+                self.passes[pass_id].paint_dirty = true;
+            }
+            // A draw may not sample a texture its own pass draws into: Vulkan refused the whole
+            // draw, Metal read undefined pixels. Every backend now samples the fallback (empty)
+            // in that slot and the draw goes on; the texture is named once in the log.
+            if self.passes[pass_id].color_textures.iter().any(|a| a.texture.texture_id() == *tid)
+                || self.passes[pass_id].depth_texture.as_ref().is_some_and(|d| d.texture_id() == *tid)
+            {
+                if fb.feedback_warned.insert(tid.0) {
+                    crate::warning!(
+                        "draw samples the texture its own pass draws into (made at {}): it reads empty there",
+                        self.textures[*tid].origin.site.as_deref().unwrap_or("?")
+                    );
+                }
+                continue;
+            }
+            tex[i] = self.fb_sampled(fb, *tid);
+            fb.sampled(picture, !tex[i].is_none());
+            // A transient target the HAL gave back (idle) and a pass samples again: its
+            // producers paint it first and this pass paints after them.
+            // (A withdrawn or frozen producer cannot paint it: nothing is owed.)
+            if tex[i].is_none() && self.textures[*tid].transient && self.textures[*tid].format.is_render() {
+                let producers = self.producers_that_paint(*tid, pass_id);
+                if !producers.is_empty() {
+                    fb.left_out();
+                    for producer in producers {
+                        self.passes[producer].paint_dirty = true;
+                    }
+                    self.passes[pass_id].paint_dirty = true;
+                }
+            }
+        }
+        let tex_range = fb.w.put_ids(&tex);
+        let mut pick_range = makepad_hal::Range::default();
+        if let Some(paint) = &self.pick.paint {
+            for (i, tid) in texture_ids.iter().enumerate().take(wanted) {
+                tex[i] = Id::NONE;
+                if let Some(twin) = tid.filter(|id| paint.painted.contains(id)).and_then(|id| self.pick.twins.get(&id)) {
+                    let id = twin.texture_id();
+                    tex[i] = fb.texture_hal_id(id.0, id.generation()).unwrap_or(Id::NONE);
+                }
+            }
+            pick_range = fb.w.put_ids(&tex);
+        }
+        fb.tex_ids = tex;
+        let mut ubufs = [Id::NONE; 4];
+        for (i, ub) in ubuf_ids.iter().enumerate().take(ubufs.len()) {
+            if let Some(ub) = ub {
+                ubufs[i] = self.fb_uniform_buffer(fb, *ub);
+            }
+        }
+
+        // the instances: inline floats, a retained publication's buffer, or a shared block's
+        let inst = match self.fb_instances(fb, list_id, item_id, slots, instances, serial) {
+            Some(inst) => inst,
+            None => return,
+        };
+
+        // the instance ranges, clamped to what is resident
+        let (list, _) = self.draw_lists.list_and_upload_budget(list_id);
+        let item = list.draw_items.binding_mut(item_id);
+        let mut inst_ranges = makepad_hal::Range::default();
+        if !item.instance_ranges.is_empty() {
+            fb.ranges.clear();
+            let count = instances as u32;
+            for r in &item.instance_ranges {
+                let (a, b) = (r.start.min(count), r.end.min(count));
+                if b > a {
+                    fb.ranges.push([a, b - a]);
+                }
+            }
+            if fb.ranges.is_empty() {
+                // every range clamps to nothing: consumed all the same
+                item.consumed_instance_id = item.retained_instance_id;
+                item.consumed_schema = item.resident_schema;
+                item.consumed_serial = serial;
+                return;
+            }
+            let ranges = std::mem::take(&mut fb.ranges);
+            inst_ranges = fb.w.put_pairs(&ranges);
+            fb.ranges = ranges;
+        }
+        // SAFETY: Cx does not change it before the submit (module header)
+        let list_uniforms = unsafe { Slice::of(list.draw_list_uniforms.as_slice()) };
+        let call = item.kind.draw_call().expect("a draw call");
+        let sh = &self.draw_shaders[shader_index];
+        let mut flags = 0;
+        if list.input_transparent {
+            flags |= Draw::INPUT_TRANSPARENT;
+        }
+        if call.options.depth_write {
+            flags |= Draw::DEPTH_WRITE;
+        }
+        if call.options.depth_test_greater {
+            flags |= Draw::DEPTH_GREATER;
+        }
+        if call.options.backface_culling {
+            flags |= Draw::CULL;
+        }
+        if call.options.alpha_blend {
+            flags |= Draw::BLEND;
+        }
+        if index32 {
+            flags |= Draw::INDEX_U32;
+        }
+        let scissor = call.options.scissor.map_or([f32::NAN; 4], |s| s.map(|v| v as f32));
+        let storage: Vec<_> = sh.mapping.storage_buffers.iter().map(|binding| call.storage_buffers.iter().find(|b| b.0 == binding.name).map_or(Id::NONE, |b| b.1.hal_id())).collect();
+        let storage_buffers = fb.w.put_ids(&storage);
+        let draw = Draw {
+            storage_buffers,
+            pipeline: fb.pipes[pipe_index].id,
+            vb,
+            ib,
+            index: [0, index_count as u32],
+            inst,
+            inst_ranges,
+            // SAFETY: Cx does not change it before the submit (module header)
+            uniforms: unsafe { [
+                Slice::of(call.draw_call_uniforms.as_slice()),
+                list_uniforms,
+                Slice::of(&call.dyn_uniforms),
+                Slice::of(&sh.mapping.scope_uniforms_buf),
+            ] },
+            ubufs,
+            tex: tex_range,
+            pick_tex: pick_range,
+            scissor,
+            zbias: z,
+            pick: call.pick_id,
+            flags,
+            owner,
+            list: list_id.index() as u32,
+            item: item_id as u32,
+            list_name,
+            bounds: instance_bounds(&sh.mapping, &list.draw_list_uniforms, item, slots, instances, fb.pass_px),
+            damage: self.draw_damage.get_repaint_mask(pass_id, list_id, item_id).unwrap_or(0),
+        };
+        if dump || sh.mapping.flags.debug_draw {
+            let data = item.retained_instances.as_ref().map(|v| v.data()).or(item.instances.as_deref()).unwrap_or(&[]);
+            crate::draw_shader::CxDrawShaderMapping::debug_dump_shader_draw_call("hal", item_id, sh, call, data, instances);
+        }
+        if !fb.draw_with(pipe_index) {
+            return;
+        }
+        if let Some(o) = self.draw_owners.as_mut() {
+            o.draw(list_id.index(), item_id, slots, instances);
+        }
+        // The pick repaint draws each labelled index run of a mesh with its own id;
+        // the colour frame draws the mesh once.
+        if self.pick.paint.is_some() && !self.geometries[geometry_id].pick_ranges.is_empty() {
+            for (first, count, id) in crate::pick::pick_runs(&self.geometries[geometry_id].pick_ranges, index_count as u32, call.pick_id) {
+                fb.w.draw(Draw { index: [first, count], pick: id, ..draw });
+                fb.stats.draws += 1;
+            }
+        } else {
+            if !list.input_transparent && fb.w.pass_has_native_layers() {
+                if let Some(rects) = instance_rects(&sh.mapping, &list.draw_list_uniforms, item, slots, instances, fb.pass_px) {
+                    fb.w.draw_with_input_rects(draw, rects);
+                } else {
+                    fb.w.draw(draw);
+                }
+            } else {
+                fb.w.draw(draw);
+            }
+            fb.stats.draws += 1;
+        }
+        // consumed: the encode that presents this content happened
+        let call_gen = call.uniforms_gen;
+        item.consumed_instance_id = item.retained_instance_id;
+        item.consumed_schema = item.resident_schema;
+        item.consumed_serial = serial;
+        item.consumed_uniforms_gen = call_gen;
+    }
+
+    /// The owner name of a draw: while owners are recorded, the widget or label that added most
+    /// of its instances; else (or when none was noted) the owner of its draw list.
+    fn fb_draw_owner(&self, fb: &mut FrameBuilder, list: usize, item: usize, slots: usize, instances: usize) -> StrId {
+        let Some(key) = self.draw_owners.as_ref().map(|o| o.dominant(list, item, slots, instances)).filter(|k| *k != 0) else { return fb.owner };
+        if let Some(id) = fb.owner_names.get(&key) {
+            return *id;
+        }
+        let Some(name) = self.draw_owner_name(key) else { return fb.owner };
+        let id = fb.intern(&name);
+        fb.owner_names.insert(key, id);
+        id
+    }
+
+    /// The instance source of a draw item, made resident: inline floats for an ordinary
+    /// recording, a buffer for a retained publication or a shared block.
+    fn fb_instances(&mut self, fb: &mut FrameBuilder, list_id: DrawListId, item_id: usize, slots: usize, count: usize, serial: u64) -> Option<Inst> {
+        let key = (list_id.index(), item_id);
+        let (list, _) = self.draw_lists.list_and_upload_budget(list_id);
+        let list_gen = list_id.generation();
+        let item = list.draw_items.binding_mut(item_id);
+        // a leased shared block draws from its publication's buffer
+        if let Some((block, _)) = item.shared.as_ref() {
+            let bid = block.id();
+            if !fb.shared.contains_key(&bid) {
+                let data = block.data();
+                if data.is_empty() {
+                    return None;
+                }
+                let attr = fb.attr(block.origin(), 0);
+                let id = fb.buffer_create(makepad_hal::buffer_kind::INSTANCE, (data.len() * 4) as u64, attr);
+                // SAFETY: Cx does not change it before the submit (module header)
+                unsafe { fb.w.buffer_update_borrowed(id, 0, as_bytes(data)) };
+                fb.stats.bytes_uploaded += (data.len() * 4) as u64;
+                fb.shared.insert(bid, SharedRec { id });
+                block.receipt().mark_ready();
+            }
+            let id = fb.shared[&bid].id;
+            let receipt = block.receipt();
+            receipt.mark_encoded(serial);
+            receipt.mark_submitted(serial, item.kind.draw_call().map_or(0, |c| c.uniforms_gen));
+            item.instance_upload_pending = false;
+            item.retained_gpu_evicted = false;
+            item.retained_instance_id = item.retained_instances.as_ref().map_or(0, |p| p.id());
+            item.resident_schema = item.retained_schema;
+            if let Some(call) = item.kind.draw_call_mut() {
+                call.instance_dirty = false;
+            }
+            // the buffer holds the whole block; the item's instance ranges select its slice
+            return Some(Inst::buffer(id, 0, count.min(block.count()) as u32));
+        }
+        if let Some(publication) = item.retained_instances.clone() {
+            let floats = count * slots;
+            let id = fb.inst_use(key, list_gen, (publication.id(), (floats * 4) as u64), |fb, bytes| {
+                let attr = fb.attr(publication.origin(), 0);
+                let id = fb.buffer_create(makepad_hal::buffer_kind::INSTANCE, bytes, attr);
+                for (at, part) in publication.data_slices(0..floats.min(publication.float_len())) {
+                    // SAFETY: Cx does not change it before the submit (module header)
+                    unsafe { fb.w.buffer_update_borrowed(id, (at * 4) as u64, as_bytes(part)) };
+                }
+                fb.w.buffer_evictable(id);
+                fb.stats.bytes_uploaded += bytes;
+                id
+            });
+            item.instance_upload_pending = false;
+            item.retained_gpu_evicted = false;
+            item.retained_instance_id = publication.id();
+            item.resident_schema = item.retained_schema;
+            if let Some(call) = item.kind.draw_call_mut() {
+                call.instance_dirty = false;
+            }
+            return Some(Inst::buffer(id, 0, count as u32));
+        }
+        // an item that stopped being retained lets go of its buffer
+        fb.inst_release(key);
+        let recording = item.instances.as_ref()?;
+        if recording.refused() {
+            return None;
+        }
+        let floats = &recording[..(count * slots).min(recording.len())];
+        // SAFETY: Cx does not change it before the submit (module header)
+        let inst = Inst::inline(unsafe { Slice::of(floats) }, count as u32);
+        item.instance_upload_pending = false;
+        item.retained_gpu_evicted = false;
+        item.resident_schema = item.retained_schema;
+        if let Some(call) = item.kind.draw_call_mut() {
+            call.instance_dirty = false;
+        }
+        Some(inst)
+    }
+
+    // ------------------------------------------------------------------ frees
+
+    /// Frees the HAL objects of Cx objects the pools freed: each pool queues a freed slot once, and
+    /// this drains the queues, so the cost is the number freed, not the number alive. Retained
+    /// instance buffers of freed draw items are destroyed where the draw lists retire them
+    /// (`FrameDone`), and an item that stops being retained frees its buffer when next drawn.
+    fn fb_sweep(&mut self, fb: &mut FrameBuilder) {
+        while let Some(slot) = self.textures.0.take_free_retirement() {
+            fb.texture_destroy(slot);
+            self.pick.twins.retain(|source, _| source.0 != slot);
+            fb.post_submit_retired_textures.push(slot);
+        }
+        while let Some(slot) = self.geometries.0.take_free_retirement() {
+            fb.geometry_destroy(slot);
+            fb.post_submit_retired_geometries.push(slot);
+        }
+        while let Some(slot) = self.uniform_buffers.0.take_free_retirement() {
+            if let Some(rec) = fb.ubuf.remove(&slot) {
+                fb.buffer_destroy(rec.id);
+            }
+            fb.post_submit_retired_ubufs.push(slot);
+        }
+        // shared blocks: dropped ones free their buffer once every reader completed
+        let mut drained = Vec::new();
+        self.publications.drain_retired(&mut drained);
+        fb.retiring.append(&mut drained);
+        let mut retiring = std::mem::take(&mut fb.retiring);
+        retiring.retain(|(bid, receipt)| {
+            if !receipt.retire_complete() {
+                return true;
+            }
+            if let Some(rec) = fb.shared.remove(bid) {
+                fb.buffer_destroy(rec.id);
+            }
+            false
+        });
+        fb.retiring = retiring;
+    }
+
+    /// Release CPU `Vec` backing of `discard_cpu_after_upload` textures and retired pool slots
+    /// once `hal_submit` has consumed any slices encoded in `fb.w`.
+    pub(crate) fn fb_after_submit(&mut self) {
+        self.compute_after_submit();
+        let discard = std::mem::take(&mut self.hal.frames.post_submit_discard_textures);
+        for id in discard {
+            if self.textures.0.is_live_generation(id.0, id.generation()) {
+                let tex = &mut self.textures[id];
+                if tex.discard_cpu_after_upload && tex.updated().is_empty() {
+                    tex.format.discard_cpu_data();
+                }
+            }
+        }
+        let retired_tex = std::mem::take(&mut self.hal.frames.post_submit_retired_textures);
+        for slot in retired_tex {
+            if self.textures.0.is_free(slot) {
+                self.textures.0.pool[slot].item = crate::texture::CxTexture::default();
+            }
+        }
+        let retired_geo = std::mem::take(&mut self.hal.frames.post_submit_retired_geometries);
+        for slot in retired_geo {
+            if self.geometries.0.is_free(slot) {
+                self.geometries.0.pool[slot].item = crate::geometry::CxGeometry::default();
+            }
+        }
+        let retired_ubuf = std::mem::take(&mut self.hal.frames.post_submit_retired_ubufs);
+        for slot in retired_ubuf {
+            if self.uniform_buffers.0.is_free(slot) {
+                self.uniform_buffers.0.pool[slot].item =
+                    crate::uniform_buffer::CxUniformBuffer::default();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_region() {
+        use crate::texture::{VolumeDesc, VolumeFormat, VolumeTextureError};
+        use makepad_hal::HalCmd;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let desc = VolumeDesc { extent: [23, 13, 12], format: VolumeFormat::R8Unorm };
+        let info = HalInfo { volume_formats: 1 << format::R8, max_volume_dimension: 32, ..Default::default() };
+        assert_eq!(HalInfo::from_bytes(&info.to_bytes()), Some(info));
+        cx.hal_take_info(info);
+        assert_eq!(Texture::new_volume(&mut cx, VolumeDesc { format: VolumeFormat::Rgba8Unorm, ..desc }, vec![]), Err(VolumeTextureError::UnsupportedFormat));
+        assert_eq!(Texture::new_volume(&mut cx, VolumeDesc { extent: [4, 4, 33], ..desc }, vec![]), Err(VolumeTextureError::InvalidExtent));
+        assert_eq!(Texture::new_volume(&mut cx, desc, vec![]), Err(VolumeTextureError::InvalidLayout));
+
+        let mut expected: Vec<u8> = (0..23 * 13 * 12).map(|i| (i % 251) as u8).collect();
+        let tex = Texture::new_volume(&mut cx, desc, expected.clone()).unwrap();
+        assert_eq!(tex.uploaded_texel_generation(&cx), None, "the first upload is pending");
+        let id = tex.texture_id();
+        let mut fb = FrameBuilder::default();
+        fb.open(1, info);
+        let first = cx.fb_sampled(&mut fb, id);
+        assert_ne!(first, Id::NONE);
+        let uploads = |fb: &FrameBuilder| fb.w.cmds().iter().filter_map(|cmd| match cmd.decode(fb.w.arena()) {
+            Some(HalCmd::TextureUpdate3d { xywh, z_depth, bytes, .. }) => {
+                // SAFETY: the writer and source volume are alive and unchanged while decoding.
+                Some((xywh, z_depth, unsafe { bytes.as_bytes() }.to_vec()))
+            }
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(uploads(&fb), vec![([0, 0, 23, 13], [0, 12], expected.clone())], "initial image");
+        let initial = tex.uploaded_texel_generation(&cx).expect("the whole image was uploaded");
+        fb.submitted();
+
+        // The last row has no trailing padding. Guard bytes differ from every intended texel.
+        let (row, plane) = (11, 91);
+        let mut boxes = Vec::new();
+        for (x0, seed) in [(1, 10), (12, 80)] {
+            let region = VolumeRegion { origin: [x0, 2, 3], extent: [8; 3] };
+            let mut pitched = vec![255; 7 * plane + 7 * row + 8];
+            let mut tight = Vec::new();
+            for z in 0..8 {
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let val = (seed + x + 2 * y + 3 * z) as u8;
+                        pitched[z * plane + y * row + x] = val;
+                        expected[((3 + z) * 13 + 2 + y) * 23 + x0 as usize + x] = val;
+                        tight.push(val);
+                    }
+                }
+            }
+            tex.update_volume(&mut cx, region, row, plane, &pitched).unwrap();
+            assert_eq!(tex.uploaded_texel_generation(&cx), None, "a CPU write invalidates sampled results immediately");
+            boxes.push(([x0, 2, 8, 8], [3, 8], tight));
+        }
+        let region = VolumeRegion { origin: [1, 2, 3], extent: [8; 3] };
+        for (rp, sp, bytes) in [(8, 64, 511), (7, 64, 512), (8, 63, 512), (usize::MAX, usize::MAX, 512)] {
+            assert_eq!(tex.update_volume(&mut cx, region, rp, sp, &vec![0; bytes]), Err(VolumeTextureError::InvalidLayout));
+        }
+        assert_eq!(tex.update_volume(&mut cx, VolumeRegion { origin: [0, 0, u32::MAX], ..region }, 8, 64, &[0; 512]), Err(VolumeTextureError::InvalidExtent));
+        let before = fb.stats.bytes_uploaded;
+        assert_eq!(cx.fb_sampled(&mut fb, id), first);
+        assert_eq!(uploads(&fb), boxes, "only the two valid boxes, tightly packed");
+        let edited = tex.uploaded_texel_generation(&cx).expect("both edits were uploaded");
+        assert_ne!(edited, initial);
+        assert_eq!(fb.stats.bytes_uploaded - before, 1024);
+        assert_eq!(fb.stats.texture_creates, 1);
+        fb.submitted();
+        cx.fb_sampled(&mut fb, id);
+        assert!(fb.w.cmds().is_empty(), "a clean volume emits no commands");
+        assert_eq!(tex.uploaded_texel_generation(&cx), Some(edited));
+
+        // Stage a multi-plane overwrite a row at a time, then restore the entire edited image.
+        tex.set_staged_upload(&mut cx, true);
+        let small = VolumeRegion { origin: [2, 3, 4], extent: [2, 2, 2] };
+        tex.update_volume(&mut cx, small, 2, 4, &[254; 8]).unwrap();
+        for z in 4..6 {
+            for y in 3..5 {
+                fb.staged_left = 2;
+                assert_eq!(tex.uploaded_texel_generation(&cx), None, "rows still await upload");
+                cx.fb_sampled(&mut fb, id);
+                assert_eq!(uploads(&fb), vec![([2, y, 2, 1], [z, 1], vec![254; 2])]);
+                let i = (usize::from(z) * 13 + y as usize) * 23 + 2;
+                expected[i..i + 2].fill(254);
+                fb.submitted();
+            }
+        }
+        assert!(!tex.upload_pending(&cx));
+        assert_ne!(tex.uploaded_texel_generation(&cx).expect("all rows uploaded"), edited);
+        fb.device_reset(|_, _| true);
+        tex.set_staged_upload(&mut cx, false);
+        assert_ne!(cx.fb_sampled(&mut fb, id), first);
+        assert_eq!(uploads(&fb), vec![([0, 0, 23, 13], [0, 12], expected)], "restore includes every edit");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn volume_region_allocations() {
+        use crate::{makepad_script::ScriptNew, test_alloc::measured, texture::{VolumeDesc, VolumeFormat}};
+        use makepad_hal::HalCmd;
+
+        // Four long z-runs and one tile span more than one writer chunk.
+        const K: usize = 5;
+        const DEPTH: usize = 256;
+        const ROW: usize = 8 * 4;
+        const PLANE: usize = 8 * ROW;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let info = HalInfo { volume_formats: 1 << format::RGBA8, max_volume_dimension: 512, ..Default::default() };
+        cx.hal_take_info(info);
+        let desc = VolumeDesc { extent: [(8 * K + 1) as u32, 10, DEPTH as u32 + 1], format: VolumeFormat::Rgba8Unorm };
+        let volume = Texture::new_volume(&mut cx, desc, vec![0; desc.extent.iter().product::<u32>() as usize * 4]).unwrap();
+        let mut fb = FrameBuilder::default();
+        fb.open(1, info);
+        let id = cx.fb_sampled(&mut fb, volume.texture_id());
+        assert_ne!(id, Id::NONE);
+        fb.submitted();
+        volume.set_staged_upload(&mut cx, true);
+
+        let regions: [VolumeRegion; K] = std::array::from_fn(|i| VolumeRegion {
+            origin: [(i * 8) as u32, 1, 1], extent: [8, 8, if i + 1 == K { 8 } else { DEPTH as u32 }],
+        });
+        let payloads: [Vec<u8>; K] = std::array::from_fn(|i| (0..PLANE * DEPTH)
+            .map(|n| ((i * 31 + n / PLANE * 13 + n % PLANE) % 251) as u8).collect());
+        let mut vars = cx.with_vm(|vm| crate::DrawVars::script_new(vm));
+        let mut round = |turn: usize, count: usize| {
+            vars.set_texture(0, &volume);
+            assert_eq!(vars.texture_slots[0].as_ref().unwrap().texture_id(), volume.texture_id());
+            let edits = (0..count).map(|i| {
+                let region = regions[(i + turn) % K];
+                let len = PLANE * region.extent[2] as usize;
+                (region, &payloads[(i + 2 * turn) % K][..len])
+            });
+            for (region, data) in edits.clone() {
+                volume.update_volume(&mut cx, region, ROW, PLANE, data).unwrap();
+            }
+            // With no draw passes, the normal frame build emits just the staged edits.
+            assert!(cx.fb_build(&mut fb, &[], 0.0, 0).is_empty());
+            assert_eq!(fb.w.cmds().len(), count, "one command per box, including a whole z-run");
+            for (cmd, (region, data)) in fb.w.cmds().iter().zip(edits) {
+                let Some(HalCmd::TextureUpdate3d { id: target, xywh, z_depth, bytes }) = cmd.decode(fb.w.arena()) else {
+                    panic!("expected a volume upload");
+                };
+                assert_eq!(target, id);
+                assert_eq!(xywh, [region.origin[0], 1, 8, 8]);
+                assert_eq!(z_depth, [1, region.extent[2] as u16]);
+                // SAFETY: all packed runs belong to this still-live submission.
+                assert_eq!(unsafe { bytes.as_bytes() }, data, "x-fastest rows across all z tiles");
+            }
+            fb.submitted();
+        };
+        round(0, K);
+        let mut allocations = [0; 4];
+        for (i, count) in [1, 0, 3, K].into_iter().enumerate() {
+            let turn = i + 1;
+            allocations[i] = measured(|| round(turn, count));
+            eprintln!("volume_region round {turn}: {count} boxes, {} allocations", allocations[i]);
+        }
+        assert_eq!(allocations, [0; 4], "allocations per round after warming {K} boxes");
+    }
+
+    /// Read every texel of both formats through a real Metal draw. The readback is a 2D
+    /// contact sheet: the two formats side by side and successive z slices stacked vertically.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn volume_region_metal() {
+        use crate::texture::{VolumeDesc, VolumeFormat};
+        use crate::draw_list::{CxDrawCall, CxDrawKind};
+        use crate::makepad_script::{apply::Apply, ScriptMod, ScriptNew};
+        use makepad_hal::{backend_id, open_flags, readback, EventStore, Hal, HalEvent, OpenReq};
+        let hal = Hal::new();
+        let info = hal.open(&OpenReq { backend: backend_id::METAL, flags: open_flags::OFFSCREEN_WINDOWS, ..Default::default() });
+        assert_eq!(info.backend, backend_id::METAL);
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.hal_take_info(info);
+        let mut fb = FrameBuilder::default();
+        fb.open(info.session, info);
+        const SIDE: usize = 7;
+        const DEPTH: usize = 6;
+        let r8: Vec<u8> = (0..SIDE * SIDE * DEPTH).map(|i| (i % 251) as u8).collect();
+        let rgba: Vec<u8> = r8.iter().flat_map(|&v| [v, 129, 255 - v, 255]).collect();
+        let desc = VolumeDesc { extent: [SIDE as u32, SIDE as u32, DEPTH as u32], format: VolumeFormat::R8Unorm };
+        let red = Texture::new_volume(&mut cx, desc, r8.clone()).unwrap();
+        let color = Texture::new_volume(&mut cx, VolumeDesc { format: VolumeFormat::Rgba8Unorm, ..desc }, rgba.clone()).unwrap();
+        let red_id = cx.fb_sampled(&mut fb, red.texture_id());
+        let color_id = cx.fb_sampled(&mut fb, color.texture_id());
+
+        const PROBE: &str = r#"
+use mod.pod.*
+use mod.math.*
+use mod.shader
+{
+    geom: shader.vertex_buffer(vec2f, nil)
+    z: shader.instance(0.0)
+    vertex_pos: shader.vertex_position(vec4f)
+    at: shader.fragment_position()
+    pixel: shader.fragment_output(0, vec4f)
+    red: shader.texture_3d(float)
+    color: shader.texture_3d(float)
+    empty: shader.texture_3d(float)
+    vertex: fn() { self.vertex_pos = vec4(self.geom.x, self.geom.y, self.z, 1.0) }
+    fragment: fn() {
+        let size = self.red.size()
+        let w = i32(size.x)
+        let h = i32(size.y)
+        let x = i32(self.at.x)
+        let y = i32(self.at.y)
+        if x == w * 2i {
+            if y == 0i { self.pixel = vec4(size / 255.0, 1.0) }
+            else {
+                let fallback = self.empty.load(vec3i(0i, 0i, 0i))
+                self.pixel = vec4(self.empty.size() / 255.0 + fallback.rgb, 1.0 - fallback.a)
+            }
+        } else {
+            let xyz = vec3i(x % w, y % h, y / h)
+            if x < w {
+                let r = self.red.load(xyz).r
+                self.pixel = vec4(r, r, r, 1.0)
+            } else { self.pixel = self.color.load(xyz) }
+        }
+    }
+}
+"#;
+        let (width, height) = (2 * SIDE + 1, SIDE * DEPTH);
+        let (pass, list, target) = sized_texture_pass(&mut cx, width, height);
+        let geometry = crate::geometry::Geometry::new(&mut cx);
+        geometry.update(&mut cx, vec![0, 1, 2], vec![-1., -1., 3., -1., -1., 3.]);
+        let mut vars = cx.with_vm(|vm| {
+            vm.capture_errors();
+            let value = vm.eval(ScriptMod::new("", "", "volume_probe", 0, 0, PROBE, &[]));
+            let mut vars = crate::DrawVars::script_new(vm);
+            vars.compile_shader(vm, &Apply::New, value);
+            let errors = vm.take_errors();
+            assert!(errors.is_empty(), "{errors:?}");
+            vars
+        });
+        let shader = vars.draw_shader_id.expect("Splash volume probe compiled").index;
+        vars.geometry_id = Some(geometry.geometry_id());
+        let uniforms_gen = cx.next_uniform_gen();
+        let mapping = &cx.draw_shaders[shader].mapping;
+        let slot = |name| mapping.textures.iter().position(|t| t.id == name).expect("reflected texture slot");
+        vars.set_texture(slot(id!(red)), &red);
+        vars.set_texture(slot(id!(color)), &color);
+        let call = CxDrawCall::new(mapping, &vars, 0.0, uniforms_gen);
+        let slots = call.total_instance_slots;
+        assert!(slots > 0);
+        let redraw = cx.redraw_id;
+        let recording_gen = cx.next_uniform_gen();
+        let items = &mut cx.draw_lists[list.id()];
+        items.clear_draw_items(redraw, recording_gen, uniforms_gen);
+        let item = items.draw_items.push_item(redraw, CxDrawKind::DrawCall(call));
+        item.instances.as_mut().unwrap().resize(slots, 0.0);
+        items.draw_items.finish_recording();
+
+        cx.fb_compile_shaders(&mut fb);
+        let pipeline = fb.pipes[cx.draw_shaders[shader].pipeline_id.unwrap()].id;
+        hal.submit(&fb.w.buf());
+        fb.submitted();
+
+        let mut store = EventStore::new(info.session, 64, 1 << 16);
+        let mut wait = |accept: &mut dyn FnMut(HalEvent<'_>) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                assert!(std::time::Instant::now() < deadline, "Metal volume probe timed out");
+                let mut buf = store.buf();
+                let n = hal.pump(10_000_000, &mut buf);
+                for (_, e) in store.reader(n, buf.arena_len) {
+                    if let HalEvent::PipelineFailed { log, .. } = e { panic!("Metal probe: {}", String::from_utf8_lossy(log)); }
+                    if accept(e) { return; }
+                }
+            }
+        };
+        wait(&mut |e| matches!(e, HalEvent::PipelineReady { pipeline: p } if p == pipeline));
+        fb.pipeline_ready(pipeline);
+        // The HAL also admits raw writers. Reject malformed boxes before a blit, even for
+        // an allocated volume, and preserve its untouched texels for the probe below.
+        let bad_before = hal.with_world(|world| world.session(info.session).unwrap().stats.bad_args);
+        fb.w.texture_update(red_id, 0, [0, 0, 1, 1], 0, &[255]);
+        fb.w.texture_update_3d(red_id, [0, 0, 2, 1], [0, 1], &[255]);
+        fb.w.texture_update_3d(red_id, [0, 0, 1, 1], [DEPTH as u16, 1], &[255]);
+        hal.submit(&fb.w.buf());
+        fb.submitted();
+        assert_eq!(hal.with_world(|world| world.session(info.session).unwrap().stats.bad_args) - bad_before, 3);
+        let region = VolumeRegion { origin: [1, 2, 3], extent: [3, 2, 2] };
+        red.update_volume(&mut cx, region, 3, 6, &[254; 12]).unwrap();
+        color.update_volume(&mut cx, region, 12, 24, &[4, 32, 219, 255].repeat(12)).unwrap();
+        let frames = cx.fb_build(&mut fb, &[pass.draw_pass_id()], 0.0, 0);
+        assert_eq!(frames.len(), 1);
+        for (texture, original) in [(&red, red_id), (&color, color_id)] {
+            let id = texture.texture_id();
+            assert_eq!(fb.texture_hal_id(id.0, id.generation()), Some(original), "region edits reuse the bound volume");
+        }
+        let target_id = target.texture_id();
+        let target_id = fb.texture_hal_id(target_id.0, target_id.generation()).unwrap();
+        hal.submit(&fb.w.buf());
+        wait(&mut |e| matches!(e, HalEvent::FrameDone { frame, .. } if frame == frames[0]));
+        fb.submitted();
+        fb.w.texture_readback(target_id, 1, [0, 0, width as u32, height as u32]);
+        hal.submit(&fb.w.buf());
+        wait(&mut |e| {
+            let HalEvent::Readback { req: 1, status, lease, .. } = e else { return false };
+            assert_eq!(status, readback::OK);
+            // SAFETY: this session takes its readback lease exactly once.
+            let pixels = unsafe { makepad_hal::lease::Held::from_payload(lease) }.unwrap();
+            for i in 0..r8.len() {
+                let (x, y, z) = (i % SIDE, i / SIDE % SIDE, i / (SIDE * SIDE));
+                let edited = (1..4).contains(&x) && (2..4).contains(&y) && (3..5).contains(&z);
+                let r = if edited { 254 } else { r8[i] };
+                let output = ((z * SIDE + y) * width + x) * 4;
+                assert_eq!(pixels[output..output + 4], [r, r, r, 255], "R8 ({x},{y},{z})");
+                let output = output + SIDE * 4;
+                let want = if edited { &[4, 32, 219, 255][..] } else { &rgba[i * 4..i * 4 + 4] };
+                assert_eq!(&pixels[output..output + 4], want, "RGBA8 ({x},{y},{z})");
+            }
+            let size_pixel = 2 * SIDE * 4;
+            assert_eq!(&pixels[size_pixel..size_pixel + 4], &[SIDE as u8, SIDE as u8, DEPTH as u8, 255], "volume size in xyz");
+            let empty_pixel = size_pixel + width * 4;
+            assert_eq!(&pixels[empty_pixel..empty_pixel + 4], &[1, 1, 1, 255], "unbound slot reads a transparent 1x1x1 volume");
+            true
+        });
+        assert!(hal.close(info.session));
+    }
+
+    /// A fresh Cx repaints in full: partial repainting is off until an app opts in, and opting out resets it.
+    #[test]
+    fn partial_repainting_is_off_until_an_app_opts_in() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        assert!(!cx.draw_damage.is_enabled, "a fresh Cx must not repaint partially");
+        cx.set_partial_repainting(true);
+        assert!(cx.draw_damage.is_enabled, "set_partial_repainting(true) must opt in");
+        cx.set_partial_repainting(false);
+        assert!(!cx.draw_damage.is_enabled, "set_partial_repainting(false) must opt out again");
+    }
+
+    /// A retained draw's bounds come from the item's memo only under the key they were walked
+    /// for: every key part changed alone gives exactly what a fresh walk of the contiguous rows
+    /// gives (and differs from the bounds before, so a memo that ignored that part would fail),
+    /// and a repeated key walks nothing.
+    #[test]
+    fn retained_bounds_memo_gives_the_walks_bounds_for_every_key_change() {
+        use crate::retained_instances::{InstanceSegment, RetainedInstances};
+        use std::cell::Cell;
+        // rows: rect (x, y, w, h) at 0, a second rect at 4, a clip (x0, y0, x1, y1) at 8
+        const SLOTS: usize = 12;
+        let row = |x: f32, y: f32, clip: [f32; 4]| [x, y, 10.0, 5.0, x + 1.0, y - 2.0, 4.0, 9.0, clip[0], clip[1], clip[2], clip[3]];
+        let open = [-1e9, -1e9, 1e9, 1e9];
+        let rows: Vec<[f32; SLOTS]> = vec![
+            row(0.0, 0.0, open), row(20.0, 3.0, open), row(-7.0, 40.0, [-5.0, 0.0, 1e9, 1e9]),
+            row(55.0, -9.0, open), row(30.0, 70.0, [0.0, 0.0, 34.0, 72.0]),
+        ];
+        let seg = |r: &[[f32; SLOTS]]| InstanceSegment::new(r.iter().flatten().copied().collect::<Vec<_>>().into());
+        let publication = RetainedInstances::from_segments(SLOTS, vec![seg(&rows[..3]), seg(&rows[3..])]).unwrap();
+        let other = RetainedInstances::from_segments(SLOTS, vec![seg(&rows[..4])]).unwrap();
+
+        // the walk as it was: the contiguous rows, rect, clip, list shift and clip, pass px
+        fn reference(data: &[f32], slots: usize, instances: usize, f: &RectFrame) -> [f32; 4] {
+            let (ox, oy, dpi) = f.pass_px;
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for inst in data.chunks_exact(slots).take(instances) {
+                let (mut a, mut b) = (inst[f.rect_pos], inst[f.rect_pos + 1]);
+                let (mut c, mut d) = (a + inst[f.rect_size], b + inst[f.rect_size + 1]);
+                if let Some(k) = f.draw_clip {
+                    a = a.max(inst[k]); b = b.max(inst[k + 1]);
+                    c = c.min(inst[k + 2]); d = d.min(inst[k + 3]);
+                }
+                a = (a + f.view_shift[0]).max(f.view_clip[0]);
+                b = (b + f.view_shift[1]).max(f.view_clip[1]);
+                c = (c + f.view_shift[0]).min(f.view_clip[2]);
+                d = (d + f.view_shift[1]).min(f.view_clip[3]);
+                if c > a && d > b {
+                    let r = [(a - ox) * dpi, (b - oy) * dpi, (c - a) * dpi, (d - b) * dpi];
+                    x0 = x0.min(r[0]); y0 = y0.min(r[1]);
+                    x1 = x1.max(r[0] + r[2]); y1 = y1.max(r[1] + r[3]);
+                }
+            }
+            if x1 <= x0 || y1 <= y0 { return [0.0; 4]; }
+            [x0, y0, x1 - x0, y1 - y0]
+        }
+
+        let base = RectFrame { rect_pos: 0, rect_size: 2, draw_clip: Some(8), view_shift: [0.0, 0.0], view_clip: [-1e9, -1e9, 1e9, 1e9], pass_px: (0.0, 0.0, 1.0) };
+        let segmented: Vec<&[f32]> = Records::of_publication(&publication, SLOTS, 5).collect();
+        let contiguous: Vec<&[f32]> = publication.data().chunks_exact(SLOTS).collect();
+        assert_eq!(segmented, contiguous, "segment records are the contiguous rows, in order");
+
+        let memo = Cell::new(None);
+        let walks = Cell::new(0);
+        let bounds = |p: &RetainedInstances, instances: usize, f: RectFrame| {
+            let key = RetainedBoundsKey::of(p.id(), SLOTS, instances, &f);
+            let got = memo_bounds(&memo, key, || {
+                walks.set(walks.get() + 1);
+                rects_union(f.rects(Records::of_publication(p, SLOTS, instances)))
+            });
+            (got, reference(p.data(), SLOTS, instances, &f))
+        };
+        let (first, want) = bounds(&publication, 5, base);
+        assert_eq!(first, want, "a first walk is the reference walk");
+        assert_eq!(bounds(&publication, 5, base).0, want, "a repeated key keeps the bounds");
+        assert_eq!(walks.get(), 1, "a repeated key walks nothing");
+
+        let changes: [(&str, &RetainedInstances, usize, RectFrame); 9] = [
+            ("publication", &other, 4, base),
+            ("instances", &publication, 3, base),
+            ("rect_pos", &publication, 3, RectFrame { rect_pos: 4, ..base }),
+            ("rect_size", &publication, 3, RectFrame { rect_pos: 4, rect_size: 6, ..base }),
+            ("draw_clip", &publication, 5, RectFrame { draw_clip: None, ..base }),
+            ("view_shift", &publication, 5, RectFrame { view_shift: [3.0, -4.0], ..base }),
+            ("view_clip", &publication, 5, RectFrame { view_clip: [2.0, 1.0, 60.0, 50.0], ..base }),
+            ("pass origin", &publication, 5, RectFrame { pass_px: (5.0, 6.0, 1.0), ..base }),
+            ("pass dpi", &publication, 5, RectFrame { pass_px: (0.0, 0.0, 2.0), ..base }),
+        ];
+        let mut before = want;
+        for (i, (part, p, instances, f)) in changes.into_iter().enumerate() {
+            let (got, want) = bounds(p, instances, f);
+            assert_eq!(got, want, "{part}: the memo gives the walk's bounds");
+            assert_ne!(want, before, "{part}: the change moves the bounds (the case proves the key part)");
+            assert_eq!(walks.get(), i + 2, "{part}: a changed key walks again");
+            before = want;
+        }
+    }
+
+    #[test]
+    fn a_staged_upload_sends_the_rows_its_budget_holds_and_keeps_the_rest() {
+        // a 4096-wide one-byte page, 1 MB a frame: 256 rows go, the rest waits
+        let (band, rest) = staged_band([0, 0, 4096, 4096], 1, 1 << 20);
+        assert_eq!(band, [0, 0, 4096, 256]);
+        assert_eq!(rest, Some([0, 256, 4096, 3840]));
+        // the last band fits: nothing waits
+        let (band, rest) = staged_band([0, 3840, 4096, 256], 1, 1 << 20);
+        assert_eq!(band, [0, 3840, 4096, 256]);
+        assert_eq!(rest, None);
+        // a spent budget sends nothing and keeps all of it
+        let (band, rest) = staged_band([8, 16, 128, 64], 2, 100);
+        assert_eq!(band[3], 0);
+        assert_eq!(rest, Some([8, 16, 128, 64]));
+    }
+
+    #[test]
+    fn buffer_ids_reuse_a_slot_with_a_new_generation() {
+        let mut ids = BufIds::default();
+        let a = ids.alloc();
+        let b = ids.alloc();
+        assert_ne!(a.index, b.index);
+        ids.release(a);
+        let c = ids.alloc();
+        assert_eq!(c.index, a.index);
+        assert_eq!(c.gen, a.gen + 1);
+    }
+
+    /// Two draw items drawing one publication (an app's G-buffer and lit passes, an item whose
+    /// index moved) share one upload; the buffer goes with its last user, and an eviction sends
+    /// every user back to upload it again.
+    #[test]
+    fn draw_items_drawing_one_publication_share_its_buffer() {
+        let mut fb = FrameBuilder::default();
+        let made = std::cell::Cell::new(0);
+        let make = |fb: &mut FrameBuilder, bytes: u64| {
+            made.set(made.get() + 1);
+            fb.buffer_create(makepad_hal::buffer_kind::INSTANCE, bytes, Attr::default())
+        };
+        let (aux, lit) = ((1, 7), (2, 7));
+        let a = fb.inst_use(aux, 1, (40, 64), make);
+        let b = fb.inst_use(lit, 1, (40, 64), make);
+        assert_eq!((a, made.get()), (b, 1), "the second pass draws the first one's buffer");
+        assert_eq!(fb.inst_use((2, 9), 1, (40, 64), make), a, "an item that moved keeps it too");
+        fb.inst_release((2, 9));
+        assert_ne!(fb.inst_use(aux, 1, (40, 32), make), a, "another prefix is another buffer");
+        assert_eq!(made.get(), 2);
+        assert_eq!(fb.inst[&(40, 64)].users, 1, "the aux item let go of the whole one");
+        fb.inst_release(lit);
+        assert!(!fb.inst.contains_key(&(40, 64)), "its last user freed it");
+        let c = fb.inst_use(lit, 1, (40, 32), make);
+        assert_eq!(fb.buffer_evicted(c).len(), 2, "both users upload it again");
+        assert!(fb.inst.is_empty() && fb.inst_items.is_empty() && fb.inst_by_buffer.is_empty());
+        assert_ne!(fb.inst_use(lit, 2, (40, 32), make), c, "after the eviction a new one");
+        assert_eq!(made.get(), 3);
+        assert_ne!(fb.inst_use(lit, 3, (40, 32), make), c, "a new list generation is another item");
+        assert_eq!(made.get(), 4, "its old buffer went with its only user");
+    }
+
+    #[test]
+    fn partial_rects_repack_to_tight_rows() {
+        // a 4x3 image of 2-byte texels, rect x1 y1 w2 h2
+        let img: Vec<u8> = (0..24).collect();
+        let packed = pack_rect(&img, 4, 2, [1, 1, 2, 2]);
+        assert_eq!(packed, vec![10, 11, 12, 13, 18, 19, 20, 21]);
+    }
+
+    /// A live shader edit: the pass keeps its last picture while the new pipeline compiles,
+    /// paints again when it is ready, and is not held by one that failed.
+    #[test]
+    fn a_compiling_pipeline_holds_the_picture_and_its_answer_repaints() {
+        let mut fb = FrameBuilder::default();
+        let new_id = Id::new(0, 1);
+        let bad_id = Id::new(1, 1);
+        fb.pipes.push(PipeRec::new(new_id, 0));
+        fb.pipes.push(PipeRec::new(bad_id, 1));
+        assert_eq!(fb.pipelines_pending(), 2);
+        // compiling: the pass waits for it (keeps its picture) and its answer repaints
+        assert!(fb.pipeline_waited_for(0));
+        // an app asked about it and was told "not yet" (`Cx::draw_shader_ready`)
+        fb.asked_unready();
+        assert!(!fb.take_answer(), "no answer yet: no DrawShadersReady");
+        assert!(fb.pipeline_ready(new_id), "PipelineReady repaints the held pass");
+        assert!(fb.take_answer(), "the app told not yet hears the answer");
+        assert!(!fb.take_answer(), "once");
+        assert!(!fb.pipeline_waited_for(0), "ready: nothing to wait for");
+        // a pipeline that fails: the pass that waited paints again, and nobody waits for it after
+        assert!(fb.pipeline_waited_for(1));
+        assert_eq!(fb.pipeline_failed(bad_id, "line 3: no such function"), Some((1, true)));
+        assert_eq!(fb.pipeline_failure(1), Some("line 3: no such function"), "the HAL's log stays with its pipeline");
+        assert_eq!(fb.pipeline_failure(0), None, "a pipeline that built has none");
+        assert!(!fb.take_answer(), "an answer nobody waited for sends nothing");
+        fb.asked_unready();
+        assert!(!fb.take_answer(), "a later not-yet waits for the next answer");
+        assert!(!fb.pipeline_waited_for(1), "a failed pipeline never holds a picture");
+        assert_eq!(fb.pipelines_pending(), 0);
+    }
+
+    #[test]
+    fn a_draw_whose_pipeline_compiles_leaves_the_paint_not_whole() {
+        let mut fb = FrameBuilder::default();
+        let rec = |id: Id, ready: bool, failed: bool| PipeRec { ready, failed, ..PipeRec::new(id, 0) };
+        fb.pipes.push(rec(Id::new(0, 1), true, false));
+        fb.pipes.push(rec(Id::new(1, 1), false, false));
+        fb.pipes.push(rec(Id::new(2, 1), false, true));
+        fb.pass_whole = true;
+        assert!(fb.draw_with(0));
+        assert!(fb.pass_whole);
+        assert!(!fb.draw_with(2), "a failed pipeline is never drawn");
+        assert!(fb.pass_whole, "and the picture is final without it");
+        assert!(fb.draw_with(1), "sent; the HAL skips it until it is ready");
+        assert!(!fb.pass_whole);
+        assert!(fb.pipeline_ready(Id::new(1, 1)), "its answer repaints");
+        // a draw whose shader is still queued for compilation
+        fb.pass_whole = true;
+        fb.left_out();
+        assert!(!fb.pass_whole);
+    }
+
+    #[test]
+    fn a_picture_still_to_paint_costs_no_wholeness_and_an_unfinished_one_does() {
+        use crate::os::cx_shared::SampledPicture;
+        let picture = |to_paint, unfinished| SampledPicture { to_paint, unfinished };
+        let mut fb = FrameBuilder::default();
+        fb.pass_whole = true;
+        fb.sampled(picture(false, false), true);
+        assert!(fb.pass_whole);
+        // a producer that paints after this pass (a sibling, another window's
+        // beat): what it painted last, a frame older, as before; an animating
+        // one would otherwise keep this pass from ever being whole
+        fb.sampled(picture(true, false), true);
+        assert!(fb.pass_whole);
+        // nothing there yet where a picture is still to come
+        fb.sampled(picture(true, false), false);
+        assert!(!fb.pass_whole);
+        // an unfinished picture, whether or not its producer paints again
+        for to_paint in [false, true] {
+            fb.pass_whole = true;
+            fb.sampled(picture(to_paint, true), true);
+            assert!(!fb.pass_whole);
+        }
+    }
+
+    /// A texture pass of 4 x 4 pixels with its own list, ready for `fb_pass` (no window: it
+    /// paints whenever it is built).
+    fn texture_pass(cx: &mut Cx) -> (crate::draw_pass::DrawPass, crate::draw_list::DrawList, crate::texture::Texture) {
+        sized_texture_pass(cx, 4, 4)
+    }
+
+    fn sized_texture_pass(cx: &mut Cx, width: usize, height: usize) -> (crate::draw_pass::DrawPass, crate::draw_list::DrawList, crate::texture::Texture) {
+        use crate::draw_pass::{CxDrawPassRect, DrawPassClearColor};
+        use crate::texture::{TextureFormat, TextureSize};
+        let pass = crate::draw_pass::DrawPass::new(cx);
+        let list = crate::draw_list::DrawList::new(cx);
+        let target = Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Fixed { width, height }, initial: true });
+        pass.set_color_texture(cx, &target, DrawPassClearColor::ClearWith(crate::makepad_math::vec4(0.0, 0.0, 0.0, 0.0)));
+        let id = pass.draw_pass_id();
+        cx.passes[id].main_draw_list_id = Some(list.id());
+        cx.passes[id].dpi_factor = Some(1.0);
+        cx.passes[id].pass_rect = Some(CxDrawPassRect::Size(crate::makepad_math::dvec2(width as f64, height as f64)));
+        (pass, list, target)
+    }
+
+    /// A draw shader with no code, compiled to `pipeline` (None: still queued for compilation).
+    fn shader(cx: &mut Cx, pipeline: Option<usize>) -> usize {
+        let mapping = cx.with_vm(|vm| {
+            let object = vm.new_object();
+            let source = vm.new_object_ref(object);
+            crate::draw_shader::CxDrawShaderMapping::from_desc(
+                source,
+                crate::draw_shader::CxDrawShaderCode::Combined { code: String::new() },
+                vm,
+                &crate::makepad_script::shader_reflection::DrawShaderDesc::default(),
+            )
+        });
+        let index = cx.draw_shaders.shaders.len();
+        cx.draw_shaders.shaders.push(crate::draw_shader::CxDrawShader { debug_id: LiveId(0), pipeline_id: pipeline, mapping });
+        if pipeline.is_none() {
+            cx.draw_shaders.compile_set.insert(index);
+        }
+        index
+    }
+
+    /// One draw call of `shader` recorded into `list`.
+    fn record_draw(cx: &mut Cx, list: &crate::draw_list::DrawList, shader: usize) {
+        use crate::draw_list::{CxDrawCall, CxDrawKind, DrawCallUniforms};
+        let recording_gen = cx.next_uniform_gen();
+        let uniforms_gen = cx.next_uniform_gen();
+        let redraw = cx.redraw_id;
+        let items = &mut cx.draw_lists[list.id()];
+        items.clear_draw_items(redraw, recording_gen, uniforms_gen);
+        items.draw_items.push_item(redraw, CxDrawKind::DrawCall(CxDrawCall {
+            draw_shader_id: crate::draw_shader::DrawShaderId { index: shader },
+            options: crate::draw_shader::CxDrawShaderOptions::default(),
+            append_group_id: 0,
+            total_instance_slots: 0,
+            draw_call_uniforms: DrawCallUniforms::default(),
+            geometry_id: None,
+            dyn_uniforms: vec![0.0; 4],
+            #[cfg(not(target_arch = "wasm32"))]
+            storage_buffers: Vec::new(),
+            texture_slots: Default::default(),
+            uniform_buffer_slots: Default::default(),
+            instance_dirty: true,
+            uniforms_dirty: true,
+            uniforms_gen,
+            turtle_depth: 0.0,
+            pick_id: 0,
+        }));
+        items.draw_items.finish_recording();
+    }
+
+    /// A window's first frame waits for the pipelines it draws, not for every pipeline made:
+    /// with the one it draws ready it presents while one nothing draws still compiles. The one
+    /// it draws was wanted while it compiled (it jumps the HAL's compile queue); one a caller
+    /// with a fallback asked for counts as drawn.
+    #[test]
+    fn a_first_frame_waits_only_for_the_pipelines_it_draws() {
+        use makepad_hal::{HalCmd, HalEvent};
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        let (pass, list, target) = texture_pass(&mut cx);
+        fb.pipes.push(PipeRec::new(Id::new(0, 1), 0));
+        fb.pipes.push(PipeRec::new(Id::new(1, 1), 1));
+        let drawn = shader(&mut cx, Some(0));
+        let probed = crate::draw_shader::DrawShaderId { index: shader(&mut cx, Some(1)) };
+        record_draw(&mut cx, &list, drawn);
+        assert_eq!(cx.fb_frame_pipelines_pending(&mut fb), 1, "the one it draws, compiling");
+        assert!(fb.pipes[0].wanted && !fb.pipes[1].wanted, "only what it draws jumps the queue");
+        fb.pipeline_ready(Id::new(0, 1));
+        assert_eq!(fb.pipelines_pending(), 1, "the other still compiles");
+        assert_eq!(cx.fb_frame_pipelines_pending(&mut fb), 0, "and the frame presents without it");
+        fb.probed_unready(1);
+        assert_eq!(cx.fb_frame_pipelines_pending(&mut fb), 1, "a probed one would be drawn");
+        assert!(fb.pipes[1].wanted);
+
+        fb.submitted();
+        assert!(!fb.take_answer(), "no app waited for the first pipeline");
+        cx.hal.frames = fb;
+        let pass_id = pass.draw_pass_id();
+        let hdr = Texture::new_with_format(&mut cx, TextureFormat::RenderRGBAf16 { size: crate::texture::TextureSize::Auto, initial: true });
+        pass.add_color_texture(&mut cx, &hdr, DrawPassClearColor::ClearWith(Default::default()));
+        let depth = Texture::new_with_format(&mut cx, TextureFormat::DepthD32 { size: crate::texture::TextureSize::Auto, initial: true });
+        pass.set_depth_texture(&mut cx, &depth, DrawPassClearDepth::InitWith(1.0));
+        let offscreen = crate::PassLayout::offscreen(
+            &[cx.textures[target.texture_id()].format.clone(), cx.textures[hdr.texture_id()].format.clone()],
+            Some(&cx.textures[depth.texture_id()].format),
+        );
+        assert_eq!(cx.pass_layout(pass_id), Some(offscreen), "the declared formats match the attached colour and depth targets");
+        assert!(!cx.draw_shader_ready_for(probed, &offscreen), "the explicit layout waits for the same pipeline");
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "a compiling pipeline cannot draw in the layout");
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "two probes before submit share a request");
+        cx.hal.frames.want_probed();
+        let writer = &cx.hal.frames.w;
+        let [cmd] = writer.cmds() else { panic!("expected exactly one layout request") };
+        let Some(HalCmd::PipelineWantedIn { id: pipeline, layout, window, colors, depth, samples_views }) = cmd.decode(writer.arena()) else {
+            panic!("expected PipelineWantedIn");
+        };
+        assert_eq!((pipeline, window), (Id::new(1, 1), Id::NONE));
+        assert_eq!(colors, [format::BGRA8, format::RGBA16F, PipelineLayout::ABSENT, PipelineLayout::ABSENT], "attachment order before first draw");
+        assert_eq!((depth, samples_views.to_le_bytes()), (format::DEPTH32F, [1, 1]));
+        cx.hal.frames.submitted();
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "still waiting across submits");
+        cx.hal.frames.want_probed();
+        assert!(cx.hal.frames.w.is_empty(), "the next submit sends nothing for the same pair");
+        cx.hal_intake(0, HalEvent::PipelineLayoutReady { pipeline, layout });
+        assert!(cx.hal.frames.take_answer(), "the layout answer wakes the caller");
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "the base pipeline still compiles");
+        cx.hal_intake(0, HalEvent::PipelineReady { pipeline });
+        assert!(cx.hal.frames.take_answer(), "the base answer wakes the caller again");
+        assert!(cx.draw_shader_ready_in(probed, pass_id), "both answers allow the draw");
+
+        let window = crate::window::WindowId(2, 1);
+        cx.passes[pass_id].parent = CxDrawPassParent::Window(window);
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "a ready offscreen layout cannot answer for a window");
+        cx.hal.frames.want_probed();
+        let writer = &cx.hal.frames.w;
+        let [cmd] = writer.cmds() else { panic!("expected one request for the window") };
+        let Some(HalCmd::PipelineWantedIn { layout, window, colors, .. }) = cmd.decode(writer.arena()) else { panic!("expected PipelineWantedIn") };
+        assert_eq!(window, Id::new(2, 1));
+        assert_eq!(colors, [format::WINDOW_TARGET, PipelineLayout::ABSENT, PipelineLayout::ABSENT, PipelineLayout::ABSENT]);
+        cx.hal_intake(0, HalEvent::PipelineLayoutReady { pipeline, layout });
+        assert!(cx.draw_shader_ready_in(probed, pass_id), "the window's own layout answered");
+        cx.passes[pass_id].parent = CxDrawPassParent::Window(crate::window::WindowId(2, 2));
+        let diagnostic = "Metal rejected the fragment output for this attachment";
+        cx.hal_intake(0, HalEvent::PipelineLayoutFailed {
+            pipeline, layout: PipelineLayout::UNPROBED, log: diagnostic.as_bytes(),
+        });
+        // The first draw can fail without a logical layout id. Querying
+        // its reason alone asks the HAL to match its retained driver result.
+        assert_eq!(cx.draw_shader_failure_in(probed, pass_id), None);
+        cx.hal.frames.submitted();
+        cx.hal.frames.want_probed();
+        let writer = &cx.hal.frames.w;
+        let [want] = writer.cmds() else { panic!("expected one probe of the failed variant") };
+        let Some(HalCmd::PipelineWantedIn { layout: rejected_layout, .. }) = want.decode(writer.arena()) else { panic!("expected a layout probe") };
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "a new window in the same slot needs its own state");
+        cx.hal_intake(0, HalEvent::PipelineLayoutFailed {
+            pipeline, layout: rejected_layout, log: diagnostic.as_bytes(),
+        });
+        assert!(cx.hal.frames.take_answer(), "a failure wakes the host waiting on this pass");
+        cx.hal_intake(0, HalEvent::PipelineReady { pipeline });
+        cx.hal_intake(0, HalEvent::PipelineLayoutReady { pipeline, layout: rejected_layout });
+        assert_eq!(cx.draw_shader_failure_in(probed, pass_id), Some(diagnostic));
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "later completions cannot revive a rejected layout");
+        assert_eq!(cx.draw_shader_failure(probed), None, "the base pipeline is still usable");
+        cx.passes[pass_id].parent = CxDrawPassParent::Window(crate::window::WindowId(2, 1));
+        assert_eq!(cx.draw_shader_failure_in(probed, pass_id), None);
+        assert!(cx.draw_shader_ready_in(probed, pass_id), "the original layout still draws");
+        cx.hal.frames.submitted();
+        let _ = cx.hal.frames.device_reset(|_, _| false);
+        cx.passes[pass_id].parent = CxDrawPassParent::None;
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "reset invalidates the offscreen layout too");
+        cx.hal.frames.want_probed();
+        assert_eq!(cx.hal.frames.w.cmds().len(), 1, "reset discards old wants and permits a fresh one");
+        let writer = &cx.hal.frames.w;
+        let Some(HalCmd::PipelineWantedIn { layout, .. }) = writer.cmds()[0].decode(writer.arena()) else { panic!("expected a fresh layout request") };
+        cx.hal_intake(0, HalEvent::PipelineLayoutReady { pipeline, layout });
+        assert!(!cx.draw_shader_ready_in(probed, pass_id), "the old device's base answer cannot make the new layout ready");
+        cx.hal_intake(0, HalEvent::PipelineReady { pipeline });
+        assert!(cx.draw_shader_ready_in(probed, pass_id), "both answers came from the replacement device");
+        cx.passes[pass_id].parent = CxDrawPassParent::Window(crate::window::WindowId(2, 2));
+        assert_eq!(cx.draw_shader_failure_in(probed, pass_id), None, "the old device's rejection has expired");
+        let unsupported = "volume textures aren't available on Vulkan yet";
+        assert!(cx.hal.frames.pipeline_failed(pipeline, unsupported).is_some_and(|(_, repaint)| repaint),
+            "a base refusal withdraws an earlier ready picture");
+        assert!(!cx.draw_shader_ready(probed, false), "a failed base must not remain ready");
+        assert!(!cx.draw_shader_ready_in(probed, pass_id));
+        assert_eq!(cx.draw_shader_failure_in(probed, pass_id), Some(unsupported), "every pass sees the capability reason");
+        assert!(cx.hal.frames.pipeline_layout_failed(pipeline, PipelineLayout::UNPROBED, unsupported).is_none(),
+            "the accompanying layout refusal must not trigger another repaint");
+    }
+
+    #[test]
+    fn a_pick_waits_for_its_layout_and_finishes_on_an_incomplete_replay() {
+        use makepad_hal::{readback, HalCmd};
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        let (pass, list, target) = texture_pass(&mut cx);
+        let hdr = Texture::new_with_format(&mut cx, TextureFormat::RenderRGBAf16 { size: crate::texture::TextureSize::Auto, initial: true });
+        pass.add_color_texture(&mut cx, &hdr, DrawPassClearColor::ClearWith(Default::default()));
+        let shader = shader(&mut cx, Some(0));
+        record_draw(&mut cx, &list, shader);
+        let pick = Id::new(1, 1);
+        fb.pipes.push(PipeRec::new(Id::new(0, 1), shader));
+        fb.pipes.push(PipeRec::new(pick, shader));
+        fb.pipes[0].pick = Some(1);
+        fb.pipeline_ready(pick);
+        cx.enable_pick_variants();
+        let ticket = cx.request_pick(&target);
+        cx.fb_picks(&mut fb);
+        fb.want_probed();
+        let layout = fb.w.cmds().iter().find_map(|c| match c.decode(fb.w.arena()) {
+            Some(HalCmd::PipelineWantedIn { id, layout, colors, .. }) if id == pick => {
+                assert_eq!(colors, [format::BGRA8, format::BGRA8, PipelineLayout::ABSENT, PipelineLayout::ABSENT], "pick twins determine the MRT layout");
+                Some(layout)
+            }
+            _ => None,
+        }).expect("the ready base still needs a layout probe");
+        assert_eq!(cx.pick.requests.len(), 1, "the ticket waits for the layout answer");
+        fb.pipeline_layout_ready(pick, layout);
+        cx.fb_picks(&mut fb);
+        let req = fb.w.cmds().iter().find_map(|c| match c.decode(fb.w.arena()) {
+            Some(HalCmd::TextureReadback { req, .. }) => Some(req), _ => None,
+        }).expect("layout readiness releases the replay");
+        cx.hal_readback(req, readback::INCOMPLETE, [0; 4], None);
+        assert!(matches!(cx.take_pick(ticket), Some(Err(crate::pick::PickError::Failed))), "an unencodable draw fails the ticket");
+        assert!(cx.pick.requests.is_empty(), "an incomplete readback must not schedule another replay");
+
+        fb.pipeline_layout_failed(pick, layout, "layout rejected");
+        let ticket = cx.request_pick(&target);
+        cx.fb_picks(&mut fb);
+        assert!(matches!(cx.take_pick(ticket), Some(Err(crate::pick::PickError::Failed))), "a rejected layout fails before readback");
+    }
+
+    #[test]
+    fn fb_pass_moves_painted_serial_only_when_no_draw_was_left_out() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        let (pass, list, _target) = texture_pass(&mut cx);
+        let id = pass.draw_pass_id();
+        // nothing left out: whole
+        cx.repaint_id = 4;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some());
+        assert_eq!(cx.passes[id].painted_serial, 4);
+        assert!(!cx.passes[id].incomplete);
+        // a draw whose shader is still queued for compilation: painted, not whole
+        let queued = shader(&mut cx, None);
+        record_draw(&mut cx, &list, queued);
+        cx.repaint_id = 5;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some());
+        assert_eq!(cx.passes[id].painted_serial, 4, "the paint left a draw out");
+        assert!(cx.passes[id].incomplete);
+        assert!(cx.passes[id].paint_dirty, "and paints again");
+    }
+
+    /// An offscreen XR display's pass (both eyes side by side in one target) is one pass with two
+    /// views (`Pass::view_rects`): the whole target its viewport, each eye's half a rect, each
+    /// eye's pass uniforms a block, the depth cleared once; its draw list is walked once for both.
+    #[test]
+    fn an_offscreen_xr_pass_is_one_pass_with_a_view_per_eye() {
+        use crate::texture::{TextureFormat, TextureSize};
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        cx.hal.info = Some(makepad_hal::HalInfo { flags: makepad_hal::info_flags::XR | makepad_hal::info_flags::XR_OFFSCREEN, ..Default::default() });
+        cx.hal_xr_start();
+        let window = cx.hal.xr.as_ref().expect("the XR window").window;
+        cx.windows[window].window_geom.inner_size = crate::makepad_math::dvec2(16.0, 8.0);
+        let hw = cx.hal.windows.get_mut(&window.0).expect("its HAL window");
+        (hw.confirmed, hw.credit) = (true, true);
+        let xr = cx.hal.xr.as_mut().unwrap();
+        (xr.frame, xr.msaa) = (Some(makepad_hal::XrFrame::default()), 4);
+        let (pass, _list, _target) = texture_pass(&mut cx);
+        let depth = Texture::new_with_format(&mut cx, TextureFormat::DepthD32 { size: TextureSize::Fixed { width: 16, height: 8 }, initial: true });
+        pass.set_depth_texture(&mut cx, &depth, DrawPassClearDepth::InitWith(1.0));
+        let id = pass.draw_pass_id();
+        cx.passes[id].parent = CxDrawPassParent::Xr;
+        cx.repaint_id = 3;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some(), "the XR pass was built");
+        let buf = fb.w.buf();
+        // SAFETY: the writer is not changed while the view is read
+        let view = unsafe { buf.view() }.expect("the built commands");
+        assert_eq!(view.passes.len(), 1, "both eyes in one pass");
+        let p = &view.passes[0];
+        assert_eq!(p.viewport, [0.0, 0.0, 16.0, 8.0], "the pass's viewport is the whole target");
+        let rects: Vec<[f32; 4]> = makepad_hal::buffers::read_rects(view.arena, p.view_rects).collect();
+        assert_eq!(rects, vec![[0.0, 0.0, 8.0, 8.0], [8.0, 0.0, 8.0, 8.0]], "a view per eye, side by side");
+        assert_eq!(p.uniforms.len(), 2 * std::mem::size_of::<crate::draw_pass::DrawPassUniforms>(), "a block of pass uniforms per eye");
+        assert_eq!((p.views, p.samples, p.load[4]), (0, 4, load::CLEAR), "not multiview, the XR samples, depth cleared once");
+    }
+
+    #[test]
+    fn a_one_view_offscreen_xr_pass_covers_the_whole_target() {
+        use crate::texture::{TextureFormat, TextureSize};
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        cx.hal.info = Some(makepad_hal::HalInfo { flags: makepad_hal::info_flags::XR | makepad_hal::info_flags::XR_OFFSCREEN, ..Default::default() });
+        cx.hal_xr_start();
+        cx.hal_xr_display(1, makepad_hal::xr_display_kind::WORN);
+        let window = cx.hal.xr.as_ref().expect("the XR window").window;
+        cx.windows[window].window_geom.inner_size = crate::makepad_math::dvec2(8.0, 8.0);
+        let hw = cx.hal.windows.get_mut(&window.0).expect("its HAL window");
+        (hw.confirmed, hw.credit) = (true, true);
+        let xr = cx.hal.xr.as_mut().unwrap();
+        (xr.frame, xr.msaa) = (Some(makepad_hal::XrFrame::default()), 4);
+        let (pass, _list, _target) = texture_pass(&mut cx);
+        let depth = Texture::new_with_format(&mut cx, TextureFormat::DepthD32 { size: TextureSize::Fixed { width: 8, height: 8 }, initial: true });
+        pass.set_depth_texture(&mut cx, &depth, DrawPassClearDepth::InitWith(1.0));
+        let id = pass.draw_pass_id();
+        cx.passes[id].parent = CxDrawPassParent::Xr;
+        cx.repaint_id = 3;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some(), "the XR pass was built");
+        let buf = fb.w.buf();
+        // SAFETY: the writer is not changed while the view is read
+        let view = unsafe { buf.view() }.expect("the built commands");
+        assert_eq!(view.passes.len(), 1, "one XR pass");
+        let p = &view.passes[0];
+        assert_eq!(p.viewport, [0.0, 0.0, 8.0, 8.0], "the pass's viewport is the whole target");
+        let rects: Vec<[f32; 4]> = makepad_hal::buffers::read_rects(view.arena, p.view_rects).collect();
+        assert_eq!(rects, vec![[0.0, 0.0, 8.0, 8.0]], "one full-width view");
+        assert_eq!(p.uniforms.len(), std::mem::size_of::<crate::draw_pass::DrawPassUniforms>(), "one block of pass uniforms");
+        assert_eq!((p.views, p.samples, p.load[4]), (0, 4, load::CLEAR), "one rect, the XR samples, depth cleared once");
+    }
+
+    #[test]
+    fn fb_pass_holding_its_picture_for_a_compiling_pipeline_leaves_it_unfinished() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        let (pass, list, _target) = texture_pass(&mut cx);
+        let id = pass.draw_pass_id();
+        cx.repaint_id = 4;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some());
+        assert_eq!(cx.passes[id].painted_serial, 4);
+        // recorded again with a draw whose pipeline the HAL is compiling
+        fb.pipes.push(PipeRec::new(Id::new(0, 1), 0));
+        let compiling = shader(&mut cx, Some(0));
+        record_draw(&mut cx, &list, compiling);
+        cx.passes[id].paint_dirty = true;
+        cx.repaint_id = 5;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_none(), "it keeps its picture");
+        assert!(cx.passes[id].incomplete);
+        assert!(!cx.passes[id].paint_dirty);
+        assert_eq!(cx.passes[id].painted_serial, 4);
+    }
+
+    /// A grab is of a whole paint: a window frame that left out a draw whose shader is queued, or
+    /// whose pipeline the HAL still compiles, is not grabbed (the grab waits), and the paint the
+    /// answer brings takes it.
+    #[test]
+    fn a_grab_waits_for_a_paint_that_skipped_no_draw() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        let (pass, list, _target) = texture_pass(&mut cx);
+        let id = pass.draw_pass_id();
+        let window = crate::window::WindowId(0, 0);
+        let grab = makepad_studio_protocol::ScreenshotRequest { request_id: 1, kind_id: 0 };
+        // a paint that left out a draw whose shader is still queued for compilation
+        cx.screenshot_requests.push(grab.clone());
+        let queued = shader(&mut cx, None);
+        record_draw(&mut cx, &list, queued);
+        cx.repaint_id = 4;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some(), "the paint goes ahead without the draw");
+        cx.hal_window_readbacks(&mut fb, window, 4, 4);
+        assert_eq!(cx.screenshot_requests.len(), 1, "the grab waits");
+        // the shader compiled and its pipeline is ready: the next paint is whole and is grabbed
+        cx.draw_shaders.compile_set.remove(&queued);
+        cx.draw_shaders.shaders[queued].pipeline_id = Some(0);
+        fb.pipes.push(PipeRec { ready: true, ..PipeRec::new(Id::new(0, 1), queued) });
+        cx.repaint_id = 5;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some());
+        cx.hal_window_readbacks(&mut fb, window, 4, 4);
+        assert!(cx.screenshot_requests.is_empty(), "the whole paint is grabbed");
+        // the same for a draw sent while the HAL compiles its pipeline (the HAL skips it)
+        cx.screenshot_requests.push(grab);
+        fb.pipes.push(PipeRec::new(Id::new(1, 1), queued));
+        assert!(fb.draw_with(1));
+        cx.hal_window_readbacks(&mut fb, window, 4, 4);
+        assert_eq!(cx.screenshot_requests.len(), 1, "the grab waits for the pipeline");
+        assert!(fb.pipeline_ready(Id::new(1, 1)), "its answer repaints");
+        cx.repaint_id = 6;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some());
+        cx.hal_window_readbacks(&mut fb, window, 4, 4);
+        assert!(cx.screenshot_requests.is_empty(), "the whole paint is grabbed");
+    }
+
+    /// A pass whose compute waits for a pipeline keeps its older picture, unfinished: what samples
+    /// it is not whole either, so no grab takes it. (An app's march and its grabs went on over a part's
+    /// field whose bake waited for its kernel, and the part was missing from a "whole" frame.)
+    #[test]
+    fn a_pass_waiting_for_its_compute_keeps_an_unfinished_picture() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        let (pass, _list, target) = texture_pass(&mut cx);
+        let (consumer, _consumer_list, _consumer_target) = texture_pass(&mut cx);
+        let id = pass.draw_pass_id();
+        cx.repaint_id = 4;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some());
+        cx.passes[id].paint_dirty = false;
+        assert!(!cx.passes[id].incomplete);
+        // an unattached compute pass still queued: it was held for a pipeline, and the pass
+        // attached behind it waits with it
+        crate::gpu_compute::ComputePass::new("held", None).submit(&mut cx);
+        crate::gpu_compute::ComputePass::new("bake", Some(id)).submit(&mut cx);
+        assert!(cx.fb_pass(&mut fb, id, 0).is_none(), "no paint before its compute");
+        assert!(cx.passes[id].incomplete, "the picture it keeps is not what it recorded");
+        let picture = crate::os::cx_shared::sampled_picture(&cx.passes, &cx.textures, target.texture_id(), consumer.draw_pass_id(), cx.repaint_id);
+        assert!(picture.unfinished, "and what samples it is not whole");
+    }
+
+    /// A list recorded again holds only what it draws: a slot that drew a retained publication
+    /// and now draws nothing, and a slot past a shorter recording (a spare), let go of their
+    /// buffers. (An app showed its timed preview while the live tiles it replaced stayed
+    /// resident, and two previews of one part at once.)
+    #[test]
+    fn slots_that_stop_drawing_a_publication_let_go_of_its_buffer() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut fb = FrameBuilder::default();
+        let (pass, list, _target) = texture_pass(&mut cx);
+        let id = pass.draw_pass_id();
+        fb.pipes.push(PipeRec { ready: true, ..PipeRec::new(Id::new(0, 1), 0) });
+        let ready = shader(&mut cx, Some(0));
+        // one draw of no instances, where the last recording's two slots drew publications
+        record_draw(&mut cx, &list, ready);
+        let (index, gen) = (list.id().index(), list.id().generation());
+        let make = |fb: &mut FrameBuilder, bytes: u64| fb.buffer_create(makepad_hal::buffer_kind::INSTANCE, bytes, Attr::default());
+        fb.inst_use((index, 0), gen, (40, 64), make);
+        fb.inst_use((index, 1), gen, (41, 64), make);
+        cx.repaint_id = 4;
+        assert!(cx.fb_pass(&mut fb, id, 0).is_some());
+        assert!(!fb.inst_items.contains_key(&(index, 0)), "the slot that draws nothing now let go");
+        assert!(!fb.inst_items.contains_key(&(index, 1)), "the spare let go");
+        assert!(fb.inst.is_empty() && fb.inst_by_buffer.is_empty(), "both buffers are gone");
+    }
+
+    #[test]
+    fn strings_are_defined_once() {
+        let mut fb = FrameBuilder::default();
+        let a = fb.intern("main/calculator");
+        let b = fb.intern("main/calculator");
+        let c = fb.intern("other");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(fb.intern(""), 0);
+        assert_eq!(fb.w.len(), 2, "one StrDef per distinct string");
+    }
+
+    #[test]
+    fn a_recreated_texture_slot_takes_a_newer_generation() {
+        // the HAL treats a destroyed id's generation as stale for good
+        let mut fb = FrameBuilder::default();
+        let a = fb.next_tex_id(7);
+        let b = fb.next_tex_id(7);
+        let c = fb.next_tex_id(8);
+        assert_eq!((a.index, b.index, c.index), (7, 7, 8));
+        assert!(b.gen > a.gen);
+        assert_eq!(c.gen, 1);
+    }
+}
+
+/// A recorder is due this window frame: the HAL copies it into a capture surface.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn capture_flag(window: usize) -> u32 {
+    if crate::screen_capture::capture_wants_surface(Some(window)) {
+        makepad_hal::target::CAPTURE
+    } else {
+        0
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+fn capture_flag(_window: usize) -> u32 {
+    0
+}

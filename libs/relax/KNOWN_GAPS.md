@@ -1,0 +1,357 @@
+# Relax: known gaps
+
+Open bugs with a minimal repro, ready for a contributor to take. Each one names what rustc does,
+what Relax does, and where to start. Fix one, add its repro as a test (see CONTRIBUTING.md), and
+delete its entry here in the same PR.
+
+Every repro is a standalone cargo package (`[workspace]` in its Cargo.toml). Compare
+`cargo run --release` with `relax run --quiet <package>` from the package directory.
+
+## 1. Derive and bang macros resolve by bare name across the whole graph
+
+Workspace with four members:
+
+- `a_mac` and `b_mac`: proc-macro crates, each exporting `#[proc_macro_derive(Who)]`, which emits
+  `impl <Name> { pub fn who() -> &'static str { "a" } }` (`"b"` in `b_mac`).
+- `lib_b`: depends on `b_mac`, `#[derive(b_mac::Who)] pub struct InB;`.
+- `app`: depends on `a_mac` and `lib_b`, `use a_mac::Who; #[derive(Who)] struct InApp;`, prints
+  `InApp::who()` and `lib_b::InB::who()`.
+
+- rustc: `app=a b=b`.
+- Relax: `app=a b=a`. `lib_b`'s derive, written with the full path `b_mac::Who`, expands
+  `a_mac`'s macro.
+
+The registry (libs/relax/front/src/macro_reg.rs, `derives` / `macros`) is keyed by the macro's
+bare name and the first registered entry wins silently. Real collisions: `stable` (instability and
+rustversion), `Error` (thiserror and derive_more). Attribute macros already require the macro
+crate in the invoking crate's dependency closure (`attr_macro_at`). Derives and bang macros need
+rustc's rule: resolve the path at the invocation (the `use` that brought it in, or the crate the
+path names) among the crates the invoking crate depends on.
+
+## 2. `type Error = std::fmt::Error;` in a `serde::Serializer` impl: E0277 (not reproduced)
+
+Seen in a large graph (PR #1326): "E0277: item `Error` has an incompatible type for trait" on a
+`Serializer` impl with `type Error = std::fmt::Error;`. rustc accepts it (serde has
+`impl ser::Error for fmt::Error`). A standalone serde 1.0.229 package with such a `Serializer`
+(spelled `std::fmt::Error`, or `fmt::Error` after `use std::fmt;`) type-checks and runs under Relax
+with rustc's output. A repro must find the shape that fails: the impl inside a dependency crate,
+`serde_core` without the `std` feature, or a facade re-export.
+
+## 3. One check run spun at full CPU for five minutes (not reproduced)
+
+Seen once (PR #1326) on a serde + `instability` graph: a check spun for five minutes and finished
+in 1.4 s on every repeat. If you see it, attach to the live process (`relax inspect <pid>
+why-hung`) before it ends; a stack beats a repeat.
+
+## 4. Late lints still print when the check has an error
+
+```rust
+#![allow(dead_code)]
+fn BadName() {}
+struct lower_struct;
+fn bad() -> u32 { "no" }
+fn main() {}
+```
+
+- rustc: E0308 and the `lower_struct` warning (non_camel_case_types is an early lint). No
+  `BadName` warning: rustc_interface passes.rs `analysis` stops at an error of the required analyses
+  (lint errors excluded) before `misc_checking_3`, so the late lint pass (rustc_lint::check_crate)
+  never runs.
+- Relax: E0308 and both warnings (non_snake_case is reported too).
+
+dead_code, unnameable_types and unfulfilled_lint_expectations already follow that rule
+(compiler/src/check.rs `analyses_ok`, GitHub #1328). The late lints of types/src/lint_late*.rs are
+emitted while the bodies are checked, so they need to be held back (or dropped) once an error is
+known. Start with a "late" mark on the lints rustc runs in LateLintPass.
+
+## 5. `let mut x` assigned but never used: Relax reports at `x`, rustc at `mut x`
+
+```rust
+struct WriteOnly { w: u32 }
+fn make_wo() -> u32 { let mut x = WriteOnly { w: 1 }; x.w = 2; 0 }
+fn main() { make_wo(); }
+```
+
+- rustc: `2:27: warning: variable `x` is assigned to, but never used` (the span starts at `mut`).
+- Relax: the same warning at 2:31.
+
+Start in types/src/lint_liveness.rs (the span of the binding it reports).
+
+## 6. A constant the trait solver evaluates keeps the solver's typing mode (no repro known)
+
+rustc's `try_evaluate_const` (traits/mod.rs) evaluates in the post-analysis environment whatever
+the solver's mode; Relax's `evaluate_const` (types/src/next_solver/goals.rs) passes the solver's
+own mode (Coherence in the overlap check) for every constant but a repeat count.
+
+## 7. A provided crate's `std::env` does not see its program's run-env values
+
+A package's `[package.metadata.relax.run-env]` values are read only by the program: its JIT-run
+code, and platform code reading a setting that only tunes or reports that program's own run. They
+never reach a reader that decides what the process loads, executes or opens, what the person's
+invocation decided, or what the loader hands the next image (base/src/progenv.rs `set_run_env`).
+
+A provided crate (built by rustc into the loader, such as Makepad's platform crates) has two
+reads. `relax_api::env::var` / `var_os` is the program's environment: under the loader progenv's
+program view (`program_var_os`: the program's values, then the process environment), without
+one `std::env`. `std::env` is the loader process's. Makepad's HAL reads its logs, traces,
+profilers, tuning settings and test hooks through the first; its backend, devices, paths,
+drivers, window visibility and focus, app identity, session facts and handovers through the
+second.
+
+- cargo: no run-env (Relax's own table); every crate of the program reads one environment.
+- Relax: `relax_api::env::var("APP_MODE")` gives the run-env's value in JIT-run code and in a
+  provided crate's rustc code; `std::env::var("APP_MODE")` gives it in JIT-run code and
+  `NotPresent` in a provided crate's rustc code (tools/run/fixture/modules_harness.rs
+  `a_packages_run_env_is_its_programs_and_grants_nothing`).
+
+What stays out of reach:
+- A C library in the process (the Vulkan loader, libva, GStreamer) and a third-party dependency of
+  a provided crate read libc's environment, so run-env values never reach them. That is the
+  protection: a value that names a library or a path stays the person's.
+- HAL source that JIT-run code reaches compiles from source, where `std::env` is the program's
+  environment: the app's event loop calls `OpenReq::from_env`, so a run-env's
+  `MAKEPAD_HAL_BACKEND` or `MAKEPAD_HIDE_WINDOWS` picks how the app's own window opens, as the
+  program's own `set_var` does (under cargo too). It grants nothing the program could not ask for
+  itself; the host's window, devices and paths are read by the host's code.
+- A run from the stores (`makepad run <git url>`, runner/src/lib.rs `run_spec`) starts the host
+  before it has the package's manifest, so a setting the host reads once at its start (the HAL's
+  log switch, `MAKEPAD_GPU_PROF`) is read before the run-env is applied. A run from a checkout
+  applies the run-env first.
+
+Start in libs/relax_api/src/lib.rs (`env`) for the read, and in tools/run/runner/src/lib.rs
+`run_spec` for a store run's order.
+
+## 8. `drain`, `splice` and `extract_if` of a Vec in another allocator: E0277 where rustc says E0658
+
+```rust
+use std::alloc::System;
+
+fn main() {
+    let mut v = Vec::new_in(System);
+    v.push(1u8);
+    println!("{}", v.drain(..).count());
+}
+```
+
+- rustc 1.100: E0658, use of unstable library feature `allocator_ext`, at `drain`, with the note
+  "required for `System` to implement `std::alloc::AllocatorNightly`". Vec's allocator parameter
+  is stable, Drain's, Splice's and ExtractIf's are not: these methods need `A: AllocatorNightly`, a
+  `#[marker]` trait that library/ implements for Global, and for every allocator under an
+  `#[unstable_feature_bound(allocator_ext)]` impl. rustc 1.100.0 also says E0658 for `splice` and
+  `extract_if` on such a Vec, for `drain` on a generic `A: Allocator` (the note names `A`), and for
+  `VecDeque::from(v)` of a `Vec<u8, System>` (its `From` impl needs `A: AllocatorNightly` too).
+  Only `#![feature(allocator_ext)]` makes these programs compile (the one above prints 1);
+  `#![feature(allocator_api)]` does not, although it implies `allocator_ext` for the `#[unstable]`
+  items: a feature bound takes the exact feature (and rustc warns that `allocator_api` has been
+  partially stabilized and is succeeded by `allocator_ext`).
+- Relax: E0277, the trait bound `System: AllocatorNightly` is not satisfied. Relax std has the
+  Global impl only, since Relax does not take `#[unstable_feature_bound]`: the same programs are
+  rejected on stable, under another code, and with `#![feature(allocator_ext)]` they stay rejected.
+
+Start in the trait solver (types/src/next_solver). rustc's mechanism, as we understand it (check it
+against rustc_next_trait_solver before porting): an
+`#[unstable_feature_bound(f)]` on an impl (or fn) adds a where clause that holds when the param env
+has the same clause, in post-analysis typing modes (codegen of an upstream body), or when the crate
+being solved enables exactly `f` and is not a staged-API crate; otherwise the goal is ambiguous, not
+false, and an ambiguity whose leaf is that clause is reported as E0658 with the "required for" note.
+For `Global`, the plain impl's answer wins over the ambiguous blanket one. The catch in Relax: one
+solver serves every crate of the program, and a canonical answer for a goal with no inference
+variables is shared by all of them (`CanonicalQueryInput` keeps `impl_view` only for goals with
+inference variables). This clause's answer depends on the solving crate's features, so the cache key
+has to say which crate's features apply (for instance only for a crate that enables some feature, so
+stable crates keep sharing every answer). The fix is that cache-key change, the new clause kind, the
+E0658 report, and the blanket impl in std/core/heap.rs.
+
+## 9. A confined build script reaches files, folders, its environment, pipes and `$RUSTC` only
+
+Under `makepad run` (compile-time policy Sandboxed), the build script of a package whose units
+hold a registry or git package runs confined (compiler/src/sandbox/script.rs): its program runs in
+an arena, and the only host functions it reaches are the domain's entries. It reads its package's
+source (a registry package's folder, a git package's repository in the store, a path package's
+workspace) and OUT_DIR, writes OUT_DIR, reads the environment its parent gave it, and asks
+`$RUSTC` option-led questions, answered in the host. Bare `relax` runs every script as cargo does.
+
+```rust
+// build.rs of a registry package
+fn main() {
+    let t = std::time::SystemTime::now();
+    println!("cargo:rustc-env=BUILT_AT={:?}", t);
+}
+```
+
+- cargo: the script runs with the person's rights.
+- Relax under `makepad run`: the script fails, naming the C function its code reached
+  (`clock_gettime`).
+
+Not served yet, each a refusal naming its C function unless said otherwise:
+- Windows: there are no arena windows yet; such a script is refused there with that reason.
+- threads, clocks, sockets and name lookups, and any C function a script declares itself.
+- `symlink`, hard links, `chown`, and setting file times.
+- `$CARGO` questions, and programs other than `$RUSTC`: refused as not found (NotFound).
+- A folder of the store opened as a `File`: an error.
+- A store package is read as committed: the run's edits (RELAX_EDITS) do not reach a confined
+  script.
+- A git package checked out on disk by cargo reads its own folder, not its whole repository.
+
+Its output lines act in the run with the person's rights, so they are held to what the script
+reaches (relax-front unitgraph.rs `confined_output_refusals`); a line past that fails the build,
+naming it, and none of that output is kept: `rustc-link-search` and `rerun-if-changed` paths lie
+in its folders (a `rerun-if-changed` folder is walked without following links); `rustc-link-lib`
+names a plain library of a kind the run loads, never found in the working folder; no
+`rustc-link-arg` of any form; `rustc-env` sets no name that steers the run's process or its tools
+(`script_env_refused`: the program's variables only); no `cargo::` instruction cargo does not
+know.
+
+Start in compiler/src/sandbox/script.rs (`entry`, the domain's table) and sandbox/broker.rs (the
+folders and the walk); the decision is relax-front unitgraph.rs `script_confined`.
+
+## 10. Instruction counts and timings include the JIT's own work
+
+A test that counts the instructions its code runs (a hardware counter around a call, a scaling
+check that compares N items with 2N) or that times a loop measures the JIT along with the program.
+Under Relax, code compiles when it is first called and hot functions are compiled again at a higher
+tier while the program runs, in the same process. A counter read across such a call includes that
+compile, and a timing changes when a function moves to its next tier part way through.
+
+- rustc: the binary is compiled before it starts, so its counts and timings stay put from run to
+  run.
+- Relax: the first runs of a function and the runs around a tier-up count the JIT's work too.
+
+The same goes for a program that steers glibc's choice of `memcpy` and `memset` with
+`GLIBC_TUNABLES` (for instance to count a slower variant's instructions): the JIT's code copies
+and fills memory with its own code, so the tunables do not change what runs.
+
+This is by design and stays: a JIT that tiers up cannot give rustc's counts. Run tests that pin
+instruction counts or timing ratios under cargo.
+
+## 11. A data limit the program sets counts the JIT's memory too
+
+A test that lowers its own data limit (`setrlimit(RLIMIT_DATA, ..)`) to check how the program
+behaves when memory runs out shares that limit with the JIT. Under Relax the JIT compiles in the
+program's process, so the code, arenas and caches it allocates after the limit is set count
+against it, on top of what the program itself allocates.
+
+- rustc: the limit only counts the program's own memory.
+- Relax: the limit counts the JIT's memory as well, so a limit set just above the program's own
+  use runs out sooner.
+
+This is by design: the JIT and the program are one process. A program that tests itself under a
+tight data limit needs headroom for the JIT above what it uses itself. When the JIT itself runs
+out under such a limit, it says so, names the limit, and the run stops with exit code 101.
+
+## 12. The early check of a dependency finds type errors only
+
+A test run, and a program that never presents a frame, type-check the bodies of the registry crates
+their code sees in the background, and say once, early, when one does not compile (a body that
+names a std item Relax lacks, for instance); the verdict is stored, so a warm run checks nothing
+again. That check is the type checker's: names, types, traits.
+
+- rustc: cargo compiles every body of every dependency before the program starts, so any body it
+  cannot compile stops the build.
+- Relax: a body that type-checks but that Relax then fails to lower or compile is found only when
+  the run first calls it. Its error is printed then, once, and each test that calls it fails with
+  its one-line message; the run's end names the body.
+
+Start in compiler/src/typeck_bg.rs (the background check and its stored verdicts) and jit.rs
+install_error (the report when a body's build fails).
+
+## 13. A lint in a local `macro_rules!` expansion is reported at the call, rustc in the macro
+
+```rust
+#![warn(unsafe_code)]
+pub unsafe trait Plain {}  // (in a dependency, so the trait itself is not linted)
+macro_rules! plain {
+    ($t:ident) => {
+        unsafe impl Plain for $t {}
+    };
+}
+pub struct S(pub u8);
+plain!(S);
+```
+
+- rustc: the `unsafe_code` warning points at `unsafe impl` inside the macro's body, with the
+  expansion as a note.
+- Relax: the same warning, at `plain!(S);`.
+
+Diagnostics of expanded code take the call site's position. Start where lints map a position in a
+local rules expansion back to the file (types/src/lint.rs, front/src/parser.rs expansion_kind and
+the origin tables).
+
+## 14. `unsafe_code` misses an unsafe block in a function an attribute macro passes on
+
+A proc-macro crate with `#[proc_macro_attribute] pub fn pass(_: TokenStream, item: TokenStream)
+-> TokenStream { item }`, and in a crate with `#![warn(unsafe_code)]`:
+
+```rust
+#[mac::pass]
+pub fn first(v: &[u8]) -> u8 {
+    unsafe { *v.get_unchecked(0) }
+}
+```
+
+- rustc: warns "usage of an `unsafe` block" (the tokens are the input's, written by the crate).
+- Relax: nothing; the same function without the attribute is reported.
+
+Start in types/src/lint_late2.rs (the unsafe block lint) and how lint::external and expansion_kind
+classify the tokens an attribute macro passes on from its input.
+
+## 15. On Windows, a TcpStream's vectored write sends only its first non-empty buffer
+
+`write_vectored` with several non-empty buffers on a `TcpStream`, on Windows:
+
+```rust
+use std::io::{IoSlice, Read, Write};
+use std::net::{TcpListener, TcpStream};
+fn main() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut tx = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut rx, _) = listener.accept().unwrap();
+    let parts = [IoSlice::new(b"a"), IoSlice::new(b"b")];
+    println!("{}", tx.write_vectored(&parts).unwrap());
+    drop(tx);
+    let mut got = String::new();
+    rx.read_to_string(&mut got).unwrap();
+    println!("{got}");
+}
+```
+
+- rustc: one WSASend takes every buffer, so this prints `2`, then `ab`.
+- Relax: net/socket_windows.rs has no `write_vectored`, so the trait's default writes the first
+  non-empty buffer: `1`, then `a`. A short write, not an error: `write_all` loops still work.
+
+Start in net/socket_windows.rs: a `write_vectored` that makes one WSASend of the buffers (an
+`IoSlice` is a `WSABUF` on Windows), called from net/tcp.rs as on unix (net/socket_unix.rs).
+Windows' File, stdio and pipes keep the trait's default, as in rustc's std.
+
+## 16. Std's code that inherits overflow checks follows the program's profile, not its caller's crate
+
+rustc's std marks some functions and closures `#[rustc_inherit_overflow_checks]`, and reads
+`intrinsics::overflow_checks` in others: they check for overflow as the crate they are instantiated in
+does.
+
+- rustc: the crate's own profile decides. A dependency built with
+  `[profile.dev.package.<name>] overflow-checks = false` wraps `(255u8..)` past its end in its own
+  code, while the program's crate, built with checks, panics there.
+- Relax: the program's profile decides for every crate: its root crate's `cfg(overflow_checks)`
+  (the package it runs or tests, its cargo profile resolved as cargo resolves it). Std is compiled
+  once for each setting, and both stay cached side by side. In the example above the dependency
+  panics too.
+
+This is by design: std's compiled code is shared by every crate of a run, so one value for the whole
+program compiles std once per profile rather than once per calling crate. A per-crate value comes
+back if a real program needs a dependency's own setting. In constant evaluation
+`intrinsics::overflow_checks` is true, as rustc's.
+
+## 17. A reader opened on a store-only file before the run's first write to it keeps the store copy
+
+Under a mount with an edits folder (a shared workspace, an app's repository store), a file that
+only the repository's store holds has no disk file of its own until the run writes it.
+
+- rustc: a reader that opened a file sees the program's later writes to it in place.
+- Relax: a read-only open of such a file reads from a copy. The run's first write to it copies the
+  file into the edits folder, and that reader keeps the store copy. A reader opened after that
+  write, or on a file the run already wrote, opens the disk file and follows the writer, as
+  natively.
+
+This is by design, as with an overlay's copy-up: closing it would copy every file the run opens
+for reading into the edits folder, which is the user's change set.

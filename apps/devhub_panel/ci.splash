@@ -1,0 +1,10 @@
+// CI for apps/devhub_panel: a library of widgets that devhub's app shows in its panel window. It has
+// no binary of its own; the panel's smoke test (the window on its demo fleet) is apps/devhub's.
+
+use mod.std.*
+use mod.ci;
+
+ci.step("check other platforms", fn(){
+    ci.check_targets({packages: ["makepad-app-devhub-panel"] targets: ci.host.targets})
+})
+nil

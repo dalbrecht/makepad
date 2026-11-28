@@ -1,0 +1,30 @@
+// Biased tanh at 4x. Delay the dry path to keep it aligned with the wet mix.
+latency(HALFBAND_LATENCY_4)
+let drive = param(4.0, 1, 40)
+let bias = param(0.1, -0.5, 0.5)
+let mix = param(1.0, 0, 1)
+
+var os = Oversample4{}
+var dl = OnePole{}
+var dr = OnePole{}
+var history = [vec2(0.0); 64]
+var w = int(0)
+
+fn block() {
+    onepole_set(dl, 10.0)
+    onepole_set(dr, 10.0)
+}
+
+fn shape(u) {
+    let dc = tanh(bias * drive)
+    vec2(tanh((u.x + bias) * drive) - dc, tanh((u.y + bias) * drive) - dc)
+}
+
+fn effect(l, r) {
+    let shaped = oversample(os, vec2(l, r), fn(u) { shape(u) })
+    let wet = vec2(onepole_hp(dl, shaped.x), onepole_hp(dr, shaped.y)) * (0.75 / tanh(drive))
+    let dry = history[w - int(HALFBAND_LATENCY_4)]
+    history[w] = vec2(l, r)
+    w = w + 1
+    dry + (wet - dry) * mix
+}

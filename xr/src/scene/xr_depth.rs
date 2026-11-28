@@ -1,15 +1,16 @@
 #![allow(dead_code)]
 
-use super::xr_physics::{makepad_pose, DepthQuerySource, RapierScene};
+use super::xr_physics::{DepthQuerySource, PhysicsScene};
 use super::*;
 use crate::algorithms::tsdf_query::{
     depth_query_might_need_impact_refresh, depth_query_plane_supports_body, evaluate_tsdf_query,
     DepthQuery, DepthQueryCollider, DepthQueryColliderGeometry, DepthQueryColliderRole,
     DepthQueryHit, DepthQueryResult, DepthQuerySupportPlane,
 };
-use crate::util::depth_debug_mesh::{push_debug_depth_plane, DebugDepthMeshChunk};
-use crate::util::depth_debug_mesh_worker::{
-    XrDepthDebugMeshVisibleSet, XrDepthDebugMeshWorker, XrDepthDebugMeshWorkerResult,
+use crate::util::depth_debug_mesh::push_debug_depth_plane;
+use makepad_widgets::makepad_platform::xr_tsdf::{
+    mesh::{DebugDepthMeshChunk, XR_DEBUG_TSDF_MESH_CELL_STRIDE_VOXELS, XR_DEBUG_TSDF_MESH_CHUNK_WORLD_SIZE_METERS},
+    mesh_worker::{XrDepthDebugMeshVisibleSet, XrDepthDebugMeshWorker, XrDepthDebugMeshWorkerResult},
 };
 use makepad_widgets::makepad_platform::{TsdfPublishedSnapshot, XrTsdfStore};
 
@@ -297,26 +298,25 @@ impl XrEnv {
 
     fn sync_depth_query_source(
         retained_hits: &mut HashMap<u64, RetainedDepthQueryHit>,
-        scene: &mut RapierScene,
+        scene: &mut PhysicsScene,
         source: DepthQuerySource,
         snapshot: Option<&TsdfPublishedSnapshot>,
         clear_keys: &mut Vec<u64>,
         expired_retained_keys: &mut Vec<u64>,
     ) {
-        let key = RapierScene::depth_query_key(source.set_index);
-        let Some(body) = scene.bodies.get(source.body) else {
+        let key = PhysicsScene::depth_query_key(source.set_index);
+        if !scene.body_is_valid(source.body) {
             clear_keys.push(key);
             return;
-        };
-        if !body.is_enabled() {
+        }
+        if !scene.body_is_enabled(source.body) {
             scene.sync_depth_query_surface_set(source.set_index, &std::array::from_fn(|_| None));
             clear_keys.push(key);
             return;
         }
-        let body_sleeping = body.is_sleeping();
-        let body_pose = makepad_pose(body.position());
-        let linvel = body.linvel();
-        let body_velocity = vec3f(linvel.x, linvel.y, linvel.z);
+        let body_sleeping = scene.body_is_sleeping(source.body);
+        let body_pose = scene.body_pose(source.body);
+        let body_velocity = scene.body_linvel(source.body);
         let gravity = scene.gravity_vector();
 
         let query_request = XrEnv::build_depth_query_request(
@@ -363,7 +363,7 @@ impl XrEnv {
 
     pub(super) fn sync_depth_query_surfaces(
         retained_hits: &mut HashMap<u64, RetainedDepthQueryHit>,
-        scene: Option<&mut RapierScene>,
+        scene: Option<&mut PhysicsScene>,
         cx: &mut Cx,
     ) {
         if !XR_ENABLE_DEPTH_QUERY_PHYSICS {
@@ -427,7 +427,7 @@ impl XrDepthRuntime {
 
     pub(super) fn ensure_surface_mesh_worker(&mut self) -> &mut XrDepthDebugMeshWorker {
         self.surface_mesh_worker
-            .get_or_insert_with(XrDepthDebugMeshWorker::new)
+            .get_or_insert_with(|| XrDepthDebugMeshWorker::new(XR_DEBUG_TSDF_MESH_CHUNK_WORLD_SIZE_METERS, XR_DEBUG_TSDF_MESH_CELL_STRIDE_VOXELS))
     }
 
     fn upsert_query_hit_geometry(
@@ -506,7 +506,9 @@ impl XrDepthRuntime {
         self.snapshot_grid = Some(result.snapshot_grid);
         self.visible_chunks = visible_chunks;
         self.recycle_hidden_surface_mesh_chunks();
-        self.pending_upserts.clear();
+        // queued meshes of chunks that stay visible are kept: the worker counts them as sent
+        let visible = &self.visible_chunks;
+        self.pending_upserts.retain(|(_, chunk)| visible.contains(&chunk.chunk_key));
     }
 
     fn remove_surface_mesh_chunk(&mut self, chunk_key: ChunkKey) {
@@ -525,12 +527,9 @@ impl XrDepthRuntime {
             .len()
             .min(Self::SURFACE_MESH_UPSERTS_PER_FRAME);
         for _ in 0..pending_count {
-            let Some((request_id, chunk)) = self.pending_upserts.pop_front() else {
+            let Some((_, chunk)) = self.pending_upserts.pop_front() else {
                 break;
             };
-            if request_id != self.visible_request_id {
-                continue;
-            }
             self.upsert_surface_mesh_chunk(cx, chunk);
         }
     }
@@ -557,10 +556,7 @@ impl XrDepthRuntime {
                 }
                 for chunk_key in chunk_keys {
                     self.pending_upserts
-                        .retain(|(queued_request_id, queued_chunk)| {
-                            !(*queued_request_id == request_id
-                                && queued_chunk.chunk_key == chunk_key)
-                        });
+                        .retain(|(_, queued_chunk)| queued_chunk.chunk_key != chunk_key);
                     self.remove_surface_mesh_chunk(chunk_key);
                 }
             }
@@ -628,7 +624,7 @@ impl XrDepthRuntime {
 }
 
 pub(super) fn clear_depth_query_state_for_scene(
-    scene: Option<&RapierScene>,
+    scene: Option<&PhysicsScene>,
     retained_hits: &mut HashMap<u64, RetainedDepthQueryHit>,
 ) {
     let _ = scene;
@@ -637,7 +633,7 @@ pub(super) fn clear_depth_query_state_for_scene(
 
 pub(super) fn sync_depth_query_surfaces_with_store(
     retained_hits: &mut HashMap<u64, RetainedDepthQueryHit>,
-    scene: Option<&mut RapierScene>,
+    scene: Option<&mut PhysicsScene>,
     depth_mesh: &XrTsdfStore,
     floor_y_override: Option<f32>,
 ) {

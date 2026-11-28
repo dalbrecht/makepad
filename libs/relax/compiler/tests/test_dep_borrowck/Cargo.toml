@@ -1,0 +1,10 @@
+[package]
+name = "test-dep-borrowck"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+tdb-dep = { path = "dep" }
+tdb-private = { path = "private" }

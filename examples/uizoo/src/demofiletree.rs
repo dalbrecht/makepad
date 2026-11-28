@@ -15,7 +15,7 @@ script_mod! {
     mod.widgets.DemoFileTreeBase = #(DemoFileTree::register_widget(vm))
 
     mod.widgets.DemoFileTree = set_type_default() do mod.widgets.DemoFileTreeBase{
-        file_tree: FileTree{}
+        file_tree: FileTree{drag_cursor: true}
     }
 }
 
@@ -67,6 +67,7 @@ pub struct DemoFileTree {
     #[uid]
     uid: WidgetUid,
     #[redraw]
+    #[find]
     #[live]
     pub file_tree: FileTree,
     #[rust]
@@ -195,6 +196,23 @@ impl Widget for DemoFileTree {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         match event {
+            Event::Actions(actions) => {
+                for action in actions.filter_widget_actions(self.file_tree.widget_uid()) {
+                    if let FileTreeAction::ShouldFileStartDrag(id) = action.cast() {
+                        if let Some(node) = self.file_nodes.get(&id) {
+                            self.file_tree.start_dragging_file_node(
+                                cx,
+                                id,
+                                vec![DragItem::FilePath {
+                                    path: node.name.clone(),
+                                    internal_id: Some(id),
+                                }],
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
             Event::Startup => {
                 fn get_directory_entries(
                     path: &Path,
@@ -293,8 +311,24 @@ impl Widget for DemoFileTree {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let root_path: PathBuf = PathBuf::from(".");
-                    let root = FileNodeData::Directory {
-                        entries: get_directory_entries(&root_path, false).unwrap(),
+                    let root = match get_directory_entries(&root_path, false) {
+                        Ok(entries) => FileNodeData::Directory { entries },
+                        Err(err) => {
+                            let message = match err {
+                                FileError::Unknown(s) | FileError::CannotOpen(s) => s,
+                            };
+                            log!(
+                                "DemoFileTree: cannot read `{}`: {}",
+                                root_path.display(),
+                                message
+                            );
+                            FileNodeData::Directory {
+                                entries: vec![DirectoryEntry {
+                                    name: format!("<cannot access filesystem: {}>", message),
+                                    node: FileNodeData::File { data: None },
+                                }],
+                            }
+                        }
                     };
                     let file_tree_data = FileTreeData {
                         root_path: "".into(),

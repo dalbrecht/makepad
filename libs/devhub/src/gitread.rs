@@ -1,0 +1,895 @@
+//! Every git repository devhub reads, in-process with makepad-git: no git process starts, so a
+//! loop may ask every tick (on macOS every exec is a code assessment). What changes a repo still
+//! runs git, through [`crate::git_exec`].
+//!
+//! Reads are bounded: an object is read as its compressed range of the pack, never by loading the
+//! whole pack (the makepad pack is several GB: unbounded readers took the master to 20 GB). Object
+//! and ref questions go to one repository per shared git dir, opened once per process and kept,
+//! so its pack indexes are read once ([`with`]); a worktree's own state (index, status) opens
+//! [`worktree`] per use. No other devhub code opens a repository (a test holds it to that).
+mod view;
+pub use view::Pass;
+#[cfg(feature = "checkout")]
+pub(crate) use view::store_state;
+
+use makepad_git::memory::MemoryAccount;
+use makepad_git::{refs, GitError, ObjectId, Repository, RepositoryPaths};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// What one repository may hold: pack index tables, decoded objects it keeps, the object in hand.
+const ACCOUNT_BYTES: usize = 512 << 20;
+/// Optional decoded-object retention; larger objects remain readable.
+const OBJECT_BYTES: usize = 32 << 20;
+
+fn bounded(mut repo: Repository) -> Result<Repository, GitError> {
+    repo.set_read_cache_budget(MemoryAccount::new(ACCOUNT_BYTES), OBJECT_BYTES)?;
+    Ok(repo)
+}
+
+/// The repository `dir` is in, walking up as git does.
+pub fn paths(dir: &Path) -> Option<RepositoryPaths> {
+    let mut at = dir.canonicalize().ok()?;
+    if !at.is_dir() { return None; }
+    loop {
+        match makepad_git::repository_paths(&at) {
+            Ok(Some(mut p)) => { p.common_dir = p.common_dir.canonicalize().ok()?; return Some(p); }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if !at.pop() {
+            return None;
+        }
+    }
+}
+
+/// One worktree's repository (its index, HEAD, status), bounded, opened for this use only.
+pub fn worktree(p: RepositoryPaths) -> Result<Repository, GitError> {
+    bounded(Repository::open_git_dir(p.git_dir, p.workdir)?)
+}
+
+/// The repository of the shared git dir `common`, opened once per process; opened again when its
+/// packs change (a repack or a fetch writes the pack dir).
+fn shared(common: &Path) -> Option<Arc<Mutex<Repository>>> {
+    let canonical = common.canonicalize().ok()?;
+    let common = canonical.as_path();
+    type Open = HashMap<PathBuf, (Vec<(PathBuf, Option<std::time::SystemTime>, u64)>, Arc<Mutex<Repository>>)>;
+    static OPEN: Mutex<Option<Open>> = Mutex::new(None);
+    let objects = common.join("objects");
+    let mut dirs = vec![objects.clone()];
+    let alternate_file = objects.join("info/alternates");
+    match std::fs::read_to_string(&alternate_file) {
+        Ok(text) => for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let path = PathBuf::from(line);
+            dirs.push(if path.is_absolute() { path } else { objects.join(path) });
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(_) => return None,
+    }
+    let mut sources = vec![alternate_file];
+    sources.extend(dirs.into_iter().map(|p| p.join("pack")));
+    let packs: Vec<_> = sources.into_iter().map(|p| {
+        let meta = std::fs::metadata(&p).ok();
+        let modified = meta.as_ref().and_then(|m| m.modified().ok());
+        (p, modified, meta.map_or(0, |m| m.len()))
+    }).collect();
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    let open = open.get_or_insert_with(HashMap::new);
+    if let Some((at, repo)) = open.get(common) {
+        if *at == packs {
+            return Some(repo.clone());
+        }
+    }
+    // (objects and shared refs only: a worktree's HEAD is read from its own dir, [`oid_of`])
+    let workdir = if common.file_name().is_some_and(|n| n == ".git") { common.parent().unwrap_or(common) } else { common };
+    let repo = Arc::new(Mutex::new(bounded(Repository::open_git_dir(common.to_path_buf(), workdir.to_path_buf()).ok()?).ok()?));
+    open.retain(|path, _| path.is_dir());
+    open.insert(common.to_path_buf(), (packs, repo.clone()));
+    Some(repo)
+}
+
+/// The shared repository of the git dir `common`, for a caller that asks many questions in a row
+/// (lock it per question; never across a call into this module for the same repository).
+pub fn handle(common: &Path) -> Option<Arc<Mutex<Repository>>> {
+    shared(common)
+}
+
+/// Runs `f` with the paths of the repository `dir` is in and its shared repository, locked while
+/// `f` runs (`f` asks nothing else of this module about the same repository).
+pub fn with<T>(dir: &Path, f: impl FnOnce(&RepositoryPaths, &mut Repository) -> T) -> Option<T> {
+    let p = paths(dir)?;
+    let repo = shared(&p.common_dir)?;
+    let mut repo = repo.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&p, &mut repo))
+}
+
+/// [`with`] for a shared git dir itself (a repository's `.git`, a bare store).
+pub fn with_common<T>(common: &Path, f: impl FnOnce(&mut Repository) -> T) -> Option<T> {
+    let repo = shared(common)?;
+    let mut repo = repo.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&mut repo))
+}
+
+/// The manifests a merge wrote line by line (a `Cargo.toml` that is neither side's blob) that no
+/// longer parse, each as "<path>:<line>: <error>". A textual merge passes both sides' additions of
+/// one key (a duplicate dependency in one lane's crate, 11-03), and then no build reads
+/// the lane: the merge is a conflict instead. Here, not in sync (a checkout-only module), so the
+/// land gate builds without the checkout feature too (11-15).
+pub fn broken_manifests(dir: &Path, ours: &str, theirs: &str, tree: &str) -> Result<Vec<String>, String> {
+    let id = |s: &str| ObjectId::from_hex(s).map_err(|e| format!("{s}: {e}"));
+    let (ours, theirs, tree) = (id(ours)?, id(theirs)?, id(tree)?);
+    with(dir, |_, repo| {
+        let e = |e: GitError| e.to_string();
+        let ours = repo.read_commit(&ours).map_err(e)?.tree;
+        let theirs = repo.read_commit(&theirs).map_err(e)?.tree;
+        let mut bad = Vec::new();
+        for change in repo.diff_trees(&ours, &tree).map_err(e)? {
+            let (path, oid) = match change {
+                makepad_git::TreeChange::Modified { path, new_oid, .. } => (path, new_oid),
+                makepad_git::TreeChange::Added { path, oid, .. } => (path, oid),
+                makepad_git::TreeChange::Deleted { .. } => continue,
+            };
+            if path.rsplit('/').next() != Some("Cargo.toml") || repo.entry_at(&theirs, &path).map_err(e)? == Some(oid) {
+                continue;
+            }
+            let blob = repo.read_blob(&oid).map_err(e)?;
+            let text = String::from_utf8_lossy(&blob);
+            if let Err(err) = makepad_toml_parser::parse_toml(&text) {
+                let line = text.get(..err.span.start).unwrap_or(&text).matches('\n').count() + 1;
+                bad.push(format!("{path}:{line}: {} (the merged manifest does not parse)", err.msg));
+            }
+        }
+        Ok(bad)
+    })
+    .unwrap_or_else(|| Err(format!("{} is not a git repository", dir.display())))
+}
+
+/// What `name` names, unchecked: a full commit id, `HEAD` (the worktree's own), `refs/…`, or a
+/// branch, tag or remote branch name; a `^{commit}` suffix is allowed.
+fn oid_of(p: &RepositoryPaths, name: &str) -> Option<ObjectId> {
+    let name = name.strip_suffix("^{commit}").unwrap_or(name);
+    if name.len() == 40 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        ObjectId::from_hex(name).ok()
+    } else if name == "HEAD" {
+        refs::resolve_head_in(&p.git_dir, &p.common_dir).ok()
+    } else if name.starts_with("refs/") {
+        refs::resolve_ref_in(&p.git_dir, &p.common_dir, name).ok()
+    } else {
+        ["refs/heads/", "refs/tags/", "refs/remotes/"].iter().find_map(|pre| refs::resolve_ref_in(&p.git_dir, &p.common_dir, &format!("{pre}{name}")).ok())
+    }
+}
+
+/// The commit `name` names ([`oid_of`]), when the repository has it.
+pub fn resolve(p: &RepositoryPaths, repo: &mut Repository, name: &str) -> Option<ObjectId> {
+    let oid = oid_of(p, name)?;
+    repo.read_commit(&oid).ok().map(|_| oid)
+}
+
+/// The branch the checkout at `dir` is on (its HEAD's `refs/heads/<branch>`): None when it is on
+/// no branch.
+pub fn branch(dir: &Path) -> Option<String> {
+    let p = makepad_git::repository_paths(dir).ok()??;
+    let head = std::fs::read_to_string(p.git_dir.join("HEAD")).ok()?;
+    head.trim().strip_prefix("ref: refs/heads/").map(str::to_string)
+}
+
+/// [`resolve`] in the repository of `dir`, as hex.
+pub fn rev(dir: &Path, name: &str) -> Option<String> {
+    with(dir, |p, repo| resolve(p, repo, name)).flatten().map(|o| o.to_hex())
+}
+
+/// [`rev`] in the bare store `store` (`git --git-dir <store> rev-parse -q --verify <name>^{commit}`).
+pub fn store_rev(store: &Path, name: &str) -> Option<String> {
+    let common = store.canonicalize().ok()?;
+    let p = RepositoryPaths { workdir: common.clone(), git_dir: common.clone(), common_dir: common.clone() };
+    with_common(&common, |repo| resolve(&p, repo, name)).flatten().map(|o| o.to_hex())
+}
+
+/// The tree and the parents of commit `name` ([`resolve`]), as hex (`git rev-list --parents -n 1`
+/// with its `^{tree}`). None: no such commit.
+pub fn commit_parts(dir: &Path, name: &str) -> Option<(String, Vec<String>)> {
+    with(dir, |p, repo| {
+        let oid = resolve(p, repo, name)?;
+        let c = repo.read_commit(&oid).ok()?;
+        Some((c.tree.to_hex(), c.parents.iter().map(ObjectId::to_hex).collect()))
+    })
+    .flatten()
+}
+
+/// Paths a landing returns to the versions the target's last changes replaced, with those
+/// commits' ids. `merged` is the tree of the hand-in merged onto `tip` (the landing's own
+/// merge-tree): only what that merge changes at the tip counts. A lane read an old main tree, then
+/// a newer parent, undoing 25 landed files (11-15). One first-parent walk from the tip until each
+/// path's last change is found; only that last change counts. `since_s` (the lane's start, in
+/// seconds; 0: none) ends the walk at the first commit made before it: a version that commit
+/// replaced is one the lane never saw, and without the bound a path the target never changed (a
+/// new file, a file untouched for a year) walked the whole history on every hand-in. A path the
+/// merge leaves as the tip has it is never an undo, whatever the hand-in's history held: a lane
+/// that merged a target commit setting a file back, and never touched the file, was refused as
+/// undoing the change that commit set back, its tree read against one merge base of several
+/// (EINST, 11-16); a hand-in equal to a tip a later landing set back was refused as undoing the
+/// first (#4941 then rc-e3d, 11-15).
+pub fn undone(dir: &Path, tip: &str, merged: &str, since_s: i64) -> Result<Vec<(String, String)>, String> {
+    with(dir, |p, repo| {
+        let e = |e: GitError| e.to_string();
+        let mut at = resolve(p, repo, tip).ok_or_else(|| format!("cannot read commit {tip}"))?;
+        let tree = ObjectId::from_hex(merged).map_err(|_| format!("cannot read tree {merged}"))?;
+        let mut commit = repo.read_commit(&at).map_err(e)?;
+        let mut pending = HashMap::new();
+        for change in repo.diff_trees(&commit.tree, &tree).map_err(e)? {
+            let (path, version) = match change {
+                makepad_git::TreeChange::Added { path, oid, .. } => (path, Some(oid)),
+                makepad_git::TreeChange::Modified { path, new_oid, .. } => (path, Some(new_oid)),
+                makepad_git::TreeChange::Deleted { path, .. } => (path, None),
+            };
+            pending.insert(path, version);
+        }
+        let mut out = Vec::new();
+        while !pending.is_empty() && commit.committer.timestamp >= since_s {
+            let Some(parent) = commit.first_parent() else { break };
+            let before = repo.read_commit(&parent).map_err(e)?;
+            for change in repo.diff_trees(&before.tree, &commit.tree).map_err(e)? {
+                let (path, version) = match change {
+                    makepad_git::TreeChange::Added { path, .. } => (path, None),
+                    makepad_git::TreeChange::Modified { path, old_oid, .. } => (path, Some(old_oid)),
+                    makepad_git::TreeChange::Deleted { path, oid, .. } => (path, Some(oid)),
+                };
+                if pending.remove(&path).is_some_and(|v| v == version) { out.push((path, at.to_hex())); }
+            }
+            (at, commit) = (parent, before);
+        }
+        out.sort();
+        Ok(out)
+    })
+    .unwrap_or_else(|| Err(format!("{} is not a git repository", dir.display())))
+}
+
+/// The files where commit `merge`'s tree differs from the clean merge of commits `p1` and `p2`
+/// (`git merge-tree --write-tree p1 p2`, then `git diff-tree -r --name-only` against `merge`), for
+/// the repository of `dir`, where that clean merge is plain: one merge base, and every path as the
+/// side that changed it has it. None where only git's merge decides the clean merge: several
+/// merge bases (a criss-cross: a merged base) or none, a path both sides changed differently (a
+/// content merge or a conflict), a path of the base's both sides deleted or a directory one side
+/// removed while the other changed in it (rename and directory-rename detection may move a change
+/// there), or a commit that does not read. A tree one side left as the base has it is taken whole
+/// from the other side and compared by id, not walked.
+pub fn one_sided_strays(dir: &Path, merge: &str, p1: &str, p2: &str) -> Option<Vec<String>> {
+    with(dir, |p, repo| {
+        let (m, o, t) = (resolve(p, repo, merge)?, resolve(p, repo, p1)?, resolve(p, repo, p2)?);
+        let bases = makepad_git::merge_bases(repo, o, t).ok()?;
+        let &[base] = bases.as_slice() else { return None };
+        let mut tree = |c: ObjectId| repo.read_commit(&c).ok().map(|c| Some((TREE, c.tree)));
+        let (b, o, t, m) = (tree(base)?, tree(o)?, tree(t)?, tree(m)?);
+        let mut out = Vec::new();
+        merged(repo, "", [b, o, t], m, &mut out)?;
+        out.sort();
+        out.dedup();
+        Some(out)
+    })
+    .flatten()
+}
+
+const TREE: u32 = 0o040000;
+/// A tree entry's (mode, id); None: nothing at the path.
+type Entry = Option<(u32, ObjectId)>;
+
+fn is_tree(e: Entry) -> bool {
+    e.is_some_and(|(mode, _)| mode == TREE)
+}
+
+/// The entries of a tree entry by name: none for a file or nothing.
+fn children(repo: &mut Repository, e: Entry) -> Option<HashMap<String, (u32, ObjectId)>> {
+    match e {
+        Some((TREE, oid)) => Some(repo.read_tree(&oid).ok()?.entries.into_iter().map(|e| (e.name, (e.mode, e.oid))).collect()),
+        _ => Some(HashMap::new()),
+    }
+}
+
+fn join(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") }
+}
+
+/// [`one_sided_strays`] at `path`: the clean merge of (base, side 1, side 2) against `m`. None:
+/// git's merge decides it.
+fn merged(repo: &mut Repository, path: &str, [b, o, t]: [Entry; 3], m: Entry, out: &mut Vec<String>) -> Option<()> {
+    let clean = if o == b {
+        t
+    } else if t == b {
+        o
+    } else if o == t && (b.is_none() || o.is_some() && !is_tree(o) && !is_tree(b)) {
+        // added alike on both sides, or a file changed alike: nothing of the base's is gone on both
+        o
+    } else if is_tree(o) && is_tree(t) && (b.is_none() || is_tree(b)) {
+        // both sides changed in this directory (alike too: a file of the base's both deleted is a
+        // rename source to git): each entry of it on its own
+        if m.is_some() && !is_tree(m) {
+            out.push(path.to_string());
+        }
+        let kids = [children(repo, b)?, children(repo, o)?, children(repo, t)?, children(repo, m)?];
+        let names: std::collections::BTreeSet<&str> = kids.iter().flat_map(|k| k.keys()).map(String::as_str).collect();
+        let at = |i: usize, n: &str| kids[i].get(n).copied();
+        for n in names {
+            merged(repo, &join(path, n), [at(0, n), at(1, n), at(2, n)], at(3, n), out)?;
+        }
+        return Some(());
+    } else {
+        return None;
+    };
+    differ(repo, path, clean, m, out)
+}
+
+/// The files at or below `path` that differ between entries `x` and `y` (`git diff-tree -r
+/// --name-only`).
+fn differ(repo: &mut Repository, path: &str, x: Entry, y: Entry, out: &mut Vec<String>) -> Option<()> {
+    if x == y {
+        return Some(());
+    }
+    if !is_tree(x) && !is_tree(y) || x.is_some() && !is_tree(x) || y.is_some() && !is_tree(y) {
+        out.push(path.to_string());
+    }
+    if !is_tree(x) && !is_tree(y) {
+        return Some(());
+    }
+    let kids = [children(repo, x)?, children(repo, y)?];
+    let names: std::collections::BTreeSet<&str> = kids.iter().flat_map(|k| k.keys()).map(String::as_str).collect();
+    let at = |i: usize, n: &str| kids[i].get(n).copied();
+    for n in names {
+        differ(repo, &join(path, n), at(0, n), at(1, n), out)?;
+    }
+    Some(())
+}
+
+/// Whether the repository of `dir` definitely has no commit `sha` (a read that failed for another
+/// reason, or a repository that cannot be opened, says nothing: false).
+pub fn lacks_commit(dir: &Path, sha: &str) -> bool {
+    let Ok(oid) = ObjectId::from_hex(sha) else { return false };
+    with(dir, |_, repo| matches!(repo.read_commit(&oid), Err(GitError::ObjectNotFound(_) | GitError::InvalidObject(_)))).unwrap_or(false)
+}
+
+/// `git merge-base --is-ancestor a b`: `a` is `b` or one of its ancestors. A name that resolves
+/// to no commit is no ancestor.
+pub fn is_ancestor(dir: &Path, a: &str, b: &str) -> bool {
+    with(dir, |p, repo| {
+        let (Some(a), Some(b)) = (resolve(p, repo, a), resolve(p, repo, b)) else { return false };
+        makepad_git::is_ancestor(repo, a, b).unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
+/// The object id at each of `paths` in the tree of commit `at` (`git rev-parse <at>:<path>`; ""
+/// where nothing is), for the repository of `dir`. None: no such commit.
+pub fn entries_at(dir: &Path, at: &str, paths: &[&str]) -> Option<Vec<String>> {
+    with(dir, |p, repo| {
+        let c = resolve(p, repo, at)?;
+        let tree = repo.read_commit(&c).ok()?.tree;
+        Some(paths.iter().map(|path| repo.entry_at(&tree, path.trim_end_matches('/')).ok().flatten().map_or(String::new(), |o| o.to_hex())).collect())
+    })
+    .flatten()
+}
+
+/// Every file of the tree of commit `at` (`git ls-tree -r`: blobs and symlinks, no submodule), path
+/// to object id, for the repository of `dir`.
+pub fn files_at(dir: &Path, at: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    with(dir, |p, repo| {
+        let c = resolve(p, repo, at).ok_or_else(|| format!("{}: no commit {at}", dir.display()))?;
+        let tree = repo.read_commit(&c).map_err(|e| format!("commit {at}: {e}"))?.tree;
+        let files = repo.flatten_tree_with_mode(&tree).map_err(|e| format!("tree of {at}: {e}"))?;
+        // a submodule's entry (mode 160000) names a commit of another repository
+        Ok(files.into_iter().filter(|(_, (_, mode))| *mode != 0o160000).map(|(path, (oid, _))| (path, oid.to_hex())).collect())
+    })
+    .unwrap_or_else(|| Err(format!("{}: no repository", dir.display())))
+}
+
+/// Every (path, object id) a file has had in the history of `tips` (names [`resolve`] takes), each
+/// once: for each commit reachable from a tip, what it changed against its first parent (a root
+/// commit, or one whose parent is past a shallow boundary: its whole tree). Blobs and symlinks, no
+/// submodule. It answers "was this content ever ours at this path" for a reader handed someone
+/// else's tree, without reading a blob.
+pub fn path_blobs(dir: &Path, tips: &[&str]) -> Result<std::collections::BTreeSet<(String, String)>, String> {
+    with(dir, |p, repo| {
+        let (mut trees, mut order) = (HashMap::new(), Vec::new());
+        for tip in tips {
+            let c = resolve(p, repo, tip).ok_or_else(|| format!("{}: no commit {tip}", dir.display()))?;
+            for (id, commit) in repo.log(&c, usize::MAX).map_err(|e| format!("history of {tip}: {e}"))? {
+                if trees.insert(id, commit.tree).is_none() {
+                    order.push((commit.tree, commit.parents.first().copied()));
+                }
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        for (tree, parent) in order {
+            let Some(before) = parent.and_then(|p| trees.get(&p).copied()) else {
+                let files = repo.flatten_tree_with_mode(&tree).map_err(|e| format!("tree {}: {e}", tree.to_hex()))?;
+                out.extend(files.into_iter().filter(|(_, (_, mode))| *mode != 0o160000).map(|(path, (oid, _))| (path, oid.to_hex())));
+                continue;
+            };
+            if before == tree {
+                continue;
+            }
+            for change in repo.diff_trees(&before, &tree).map_err(|e| format!("tree {}: {e}", tree.to_hex()))? {
+                match change {
+                    makepad_git::TreeChange::Added { path, oid, mode } | makepad_git::TreeChange::Modified { path, new_oid: oid, new_mode: mode, .. } if mode != 0o160000 => {
+                        out.insert((path, oid.to_hex()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(out)
+    })
+    .unwrap_or_else(|| Err(format!("{}: no repository", dir.display())))
+}
+
+/// Every commit reachable from `tips` (names [`resolve`] takes), by all parents, each once with its
+/// generation (1 for a root, or a commit whose parents are past a shallow boundary, else one more
+/// than its highest parent's) and whether the first tip holds it. A descendant always counts more
+/// than its ancestors, whatever the commits' dates, so of several commits of one history the
+/// highest is never an ancestor of another. One walk over the histories.
+pub fn generations(dir: &Path, tips: &[&str]) -> Result<HashMap<String, (u32, bool)>, String> {
+    with(dir, |p, repo| {
+        let mut parents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        let mut first: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        for (k, tip) in tips.iter().enumerate() {
+            let c = resolve(p, repo, tip).ok_or_else(|| format!("{}: no commit {tip}", dir.display()))?;
+            if parents.contains_key(&c) {
+                continue;
+            }
+            for (id, commit) in repo.log(&c, usize::MAX).map_err(|e| format!("history of {tip}: {e}"))? {
+                if k == 0 {
+                    first.insert(id);
+                }
+                parents.entry(id).or_insert(commit.parents);
+            }
+        }
+        // parents before children, with a stack of our own: a history is deeper than a thread's
+        let mut gen: HashMap<ObjectId, u32> = HashMap::with_capacity(parents.len());
+        for start in parents.keys() {
+            let mut stack = vec![*start];
+            while let Some(&id) = stack.last() {
+                if gen.contains_key(&id) {
+                    stack.pop();
+                    continue;
+                }
+                let ps = &parents[&id];
+                let before = stack.len();
+                stack.extend(ps.iter().filter(|q| parents.contains_key(q) && !gen.contains_key(q)));
+                if stack.len() == before {
+                    let g = 1 + ps.iter().filter_map(|q| gen.get(q)).max().copied().unwrap_or(0);
+                    gen.insert(id, g);
+                    stack.pop();
+                }
+            }
+        }
+        Ok(gen.into_iter().map(|(id, g)| (id.to_hex(), (g, first.contains(&id)))).collect())
+    })
+    .unwrap_or_else(|| Err(format!("{}: no repository", dir.display())))
+}
+
+/// A reader of the blobs of the repository `dir` is in, its paths and shared repository found
+/// once: [`blob`] finds them for each blob, and a gate-proof check of a landed tree reads
+/// thousands (two of its five seconds after a master restart, 11-06).
+pub fn blob_reader(dir: &Path) -> Option<impl Fn(&str) -> Result<Vec<u8>, String> + Send + Sync> {
+    let repo = shared(&paths(dir)?.common_dir)?;
+    Some(move |oid: &str| {
+        let oid = ObjectId::from_hex(oid).map_err(|e| format!("blob {oid}: {e}"))?;
+        repo.lock().unwrap_or_else(|e| e.into_inner()).read_blob(&oid).map_err(|e| format!("blob {}: {e}", oid.to_hex()))
+    })
+}
+
+/// The bytes of blob `oid` in the repository of `dir` (`git cat-file blob`).
+pub fn blob(dir: &Path, oid: &str) -> Result<Vec<u8>, String> {
+    let oid = ObjectId::from_hex(oid).map_err(|e| format!("blob {oid}: {e}"))?;
+    with(dir, |_, repo| repo.read_blob(&oid).map_err(|e| format!("blob {}: {e}", oid.to_hex())))
+        .unwrap_or_else(|| Err(format!("{}: no repository", dir.display())))
+}
+
+/// Whether HEAD of the worktree at `dir` is in no ref's history (`git rev-list -n 1 HEAD --not
+/// --glob=refs/*` prints a commit; a worktree's HEAD is not a ref): work only this checkout has.
+/// A repository, HEAD or ref that cannot be read keeps the answer "unique": the work is kept.
+pub fn head_unreferenced(dir: &Path) -> bool {
+    with(dir, |p, repo| {
+        let Some(head) = resolve(p, repo, "HEAD") else { return true };
+        let Ok(refs) = refs::list_refs_in(&p.git_dir, &p.common_dir, "refs/") else { return true };
+        let tips: Vec<ObjectId> = refs.iter().filter_map(|r| match r.target { refs::RefTarget::Direct(oid) => Some(oid), refs::RefTarget::Symbolic(_) => None }).collect();
+        if tips.contains(&head) { return false; }
+        !in_history(repo, head, &tips).unwrap_or(false)
+    })
+    .unwrap_or(true)
+}
+
+/// Whether commit `target` is in the history of any of `tips` (commits or tags of them): one walk
+/// from all of them, newest commit first, that stops a day of clock skew below `target`'s time.
+fn in_history(repo: &mut Repository, target: ObjectId, tips: &[ObjectId]) -> Result<bool, GitError> {
+    const SKEW_S: i64 = 24 * 3600;
+    let floor = repo.read_commit(&target)?.committer.timestamp - SKEW_S;
+    type Queue = std::collections::BinaryHeap<(i64, ObjectId, Vec<ObjectId>)>;
+    fn push(repo: &mut Repository, heap: &mut Queue, oid: ObjectId) -> Result<(), GitError> {
+        let c = repo.read_commit(&oid)?;
+        heap.push((c.committer.timestamp, oid, c.parents));
+        Ok(())
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut heap = Queue::new();
+    for &tip in tips {
+        let Some(commit) = peel(repo, tip) else { continue };
+        if seen.insert(commit) { push(repo, &mut heap, commit)?; }
+    }
+    while let Some((time, oid, parents)) = heap.pop() {
+        if oid == target { return Ok(true); }
+        // newest first: every commit left is older
+        if time < floor { break; }
+        for parent in parents {
+            if seen.insert(parent) { push(repo, &mut heap, parent)?; }
+        }
+    }
+    Ok(false)
+}
+
+/// The commit `oid` is or tags (None: neither).
+fn peel(repo: &mut Repository, mut oid: ObjectId) -> Option<ObjectId> {
+    for _ in 0..8 {
+        let object = repo.read_object(&oid).ok()?;
+        match object.kind {
+            makepad_git::ObjectKind::Commit => return Some(oid),
+            makepad_git::ObjectKind::Tag => {
+                let text = std::str::from_utf8(&object.data).ok()?;
+                oid = ObjectId::from_hex(text.lines().next()?.strip_prefix("object ")?).ok()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether the trees of `from` and `to` differ under any of `paths` (`git diff --quiet from to --
+/// <paths>` failing; no paths: anywhere). A commit that cannot be read counts as a difference.
+pub fn differ_under<'a>(dir: &Path, from: &str, to: &str, paths: impl IntoIterator<Item = &'a str>) -> bool {
+    let paths: Vec<&str> = paths.into_iter().collect();
+    with(dir, |p, repo| {
+        let trees = (|| {
+            let f = resolve(p, repo, from)?;
+            let t = resolve(p, repo, to)?;
+            Some((repo.read_commit(&f).ok()?.tree, repo.read_commit(&t).ok()?.tree))
+        })();
+        let Some((f, t)) = trees else { return true };
+        if paths.is_empty() {
+            return f != t;
+        }
+        paths.iter().any(|path| {
+            let path = path.trim_end_matches('/');
+            match (repo.entry_at(&f, path), repo.entry_at(&t, path)) {
+                (Ok(a), Ok(b)) => a != b,
+                _ => true,
+            }
+        })
+    })
+    .unwrap_or(true)
+}
+
+/// The files that differ between commits `from` and `to` below each of `paths` (`git diff
+/// --name-only`), as (that path, the file below it; "" when the path itself came or went), for the
+/// repository of `dir`. None: a commit is not known here.
+pub fn files_differing_under<'a>(dir: &Path, from: &str, to: &str, paths: impl IntoIterator<Item = &'a str>) -> Option<Vec<(&'a str, String)>> {
+    let paths: Vec<&str> = paths.into_iter().collect();
+    with(dir, |p, repo| {
+        let f = resolve(p, repo, from)?;
+        let t = resolve(p, repo, to)?;
+        let (f, t) = (repo.read_commit(&f).ok()?.tree, repo.read_commit(&t).ok()?.tree);
+        let mut out = Vec::new();
+        for path in paths {
+            let bare = path.trim_end_matches('/');
+            match (repo.entry_at(&f, bare), repo.entry_at(&t, bare)) {
+                (Ok(None), Ok(None)) => {}
+                (Ok(Some(a)), Ok(Some(b))) if a == b => {}
+                (Ok(Some(a)), Ok(Some(b))) => match repo.diff_trees(&a, &b) {
+                    Ok(changes) => out.extend(changes.into_iter().map(|c| match c {
+                        makepad_git::TreeChange::Added { path: file, .. } | makepad_git::TreeChange::Deleted { path: file, .. } | makepad_git::TreeChange::Modified { path: file, .. } => (path, file),
+                    })),
+                    // (a file at the path, on either side)
+                    Err(_) => out.push((path, String::new())),
+                },
+                _ => out.push((path, String::new())),
+            }
+        }
+        Some(out)
+    })
+    .flatten()
+}
+
+/// Every file that differs between commits `from` and `to` (`git diff --name-only from to`), for
+/// the repository of `dir`. None: a commit is not known here.
+pub fn files_differing(dir: &Path, from: &str, to: &str) -> Option<Vec<String>> {
+    with(dir, |p, repo| {
+        let f = resolve(p, repo, from)?;
+        let t = resolve(p, repo, to)?;
+        let (f, t) = (repo.read_commit(&f).ok()?.tree, repo.read_commit(&t).ok()?.tree);
+        if f == t { return Some(Vec::new()); }
+        let changes = repo.diff_trees(&f, &t).ok()?;
+        Some(changes.into_iter().map(|c| match c {
+            makepad_git::TreeChange::Added { path, .. } | makepad_git::TreeChange::Deleted { path, .. } | makepad_git::TreeChange::Modified { path, .. } => path,
+        }).collect())
+    })
+    .flatten()
+}
+
+/// The commit that last changed `path` in the history of `from`, as `<short id> <subject>` (`git
+/// log -1 --format='%h %s' from -- path`): down the parent whose `path` is the same (a merge's
+/// change came in from that side), to the commit no parent of which has it so. None: `path` is
+/// not in `from`'s tree, or a commit is not known here.
+pub fn last_touch(dir: &Path, from: &str, path: &str) -> Option<String> {
+    last_change(dir, from, path).map(|(commit, subject)| format!("{} {subject}", &commit[..10]))
+}
+
+/// [`last_touch`]'s commit, whole: what a name can resolve (no short ids).
+pub fn last_commit_of(dir: &Path, from: &str, path: &str) -> Option<String> {
+    last_change(dir, from, path).map(|(commit, _)| commit)
+}
+
+fn last_change(dir: &Path, from: &str, path: &str) -> Option<(String, String)> {
+    with(dir, |p, repo| {
+        let mut at = resolve(p, repo, from)?;
+        let mut commit = repo.read_commit(&at).ok()?;
+        let here = repo.entry_at(&commit.tree, path).ok().flatten()?;
+        loop {
+            let mut same = None;
+            for parent in commit.parents.clone() {
+                let c = repo.read_commit(&parent).ok()?;
+                if repo.entry_at(&c.tree, path).ok().flatten() == Some(here) { same = Some((parent, c)); break; }
+            }
+            match same {
+                Some((parent, c)) => (at, commit) = (parent, c),
+                None => return Some((at.to_hex(), commit.message.lines().next().unwrap_or("").trim().to_string())),
+            }
+        }
+    })
+    .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    fn g(dir: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    /// Only a path's last first-parent change counts, including additions and deletions (11-15),
+    /// and only what the merged tree changes at the tip (EINST, 11-16).
+    #[test]
+    fn undone_names_paths_and_their_last_changes() {
+        use makepad_git::{Commit, ObjectId, Signature, Tree, TreeEntry};
+        let d = std::env::temp_dir().join(format!("devhub-gitread-undone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        g(&d, &["init", "-q", "-b", "work"]);
+        let tree = |files: &[(&str, &str)]| super::with(&d, |_, repo| {
+            let entries = files.iter().map(|(name, text)| TreeEntry { mode: 0o100644, name: name.to_string(), oid: repo.write_blob(text.as_bytes()).unwrap() }).collect();
+            repo.write_tree(&Tree { entries }).unwrap().to_hex()
+        }).unwrap();
+        let commit = |at: i64, parents: &[&str], files: &[(&str, &str)], message: &str| {
+            let tree = tree(files);
+            super::with(&d, |_, repo| {
+                let author = Signature { name: "t".into(), email: "t@t".into(), timestamp: at, tz_offset: "+0000".into() };
+                repo.write_commit(&Commit { tree: ObjectId::from_hex(&tree).unwrap(), parents: parents.iter().map(|s| ObjectId::from_hex(s).unwrap()).collect(), author: author.clone(), committer: author, message: message.into() }).unwrap().to_hex()
+            }).unwrap()
+        };
+        let root = commit(1, &[], &[("a", "0"), ("b", "0"), ("c", "0"), ("gone", "restore")], "base");
+        let first = commit(2, &[&root], &[("a", "1"), ("added", "new"), ("b", "1"), ("c", "1")], "first");
+        let last = commit(3, &[&first], &[("a", "1"), ("added", "new"), ("b", "2"), ("c", "2")], "last");
+        let tip = commit(4, &[&last], &[("a", "3"), ("added", "new"), ("b", "2"), ("c", "2")], "later target");
+        // merged onto the tip: a and b set back, the added file gone, the deleted one back, c as the tip has it
+        let merged = tree(&[("a", "1"), ("b", "1"), ("c", "2"), ("gone", "restore"), ("own", "new")]);
+        let before = crate::git_exec::on_this_thread();
+        assert_eq!(super::undone(&d, &tip, &merged, 0).unwrap(), vec![("a".into(), tip.clone()), ("added".into(), first.clone()), ("b".into(), last.clone()), ("gone".into(), first.clone())], "each undo names its last change");
+        assert_eq!(super::undone(&d, &tip, &merged, 3).unwrap(), vec![("a".into(), tip.clone()), ("b".into(), last.clone())], "a lane started at the last change never saw what the first one replaced: the walk ends before it");
+        assert!(super::undone(&d, &tip, &merged, 5).unwrap().is_empty(), "a lane started after every change walks nothing");
+        // whatever versions the hand-in's history held, a path the merge leaves as the tip has it is no undo
+        let kept = tree(&[("a", "3"), ("added", "new"), ("b", "2"), ("c", "2"), ("own", "new")]);
+        assert!(super::undone(&d, &tip, &kept, 0).unwrap().is_empty(), "a merge that keeps the tip's files undoes nothing");
+        assert!(super::undone(&d, "refs/heads/missing", &merged, 0).is_err(), "an unreadable target must not pass");
+        assert_eq!(crate::git_exec::on_this_thread(), before, "the undo walk must not start git");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Every commit of the tips' histories, by all parents, once, a descendant above its ancestors
+    /// whatever the dates say.
+    #[test]
+    fn generations_count_every_parent_and_ignore_dates() {
+        let d = std::env::temp_dir().join(format!("devhub-gitread-gen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        g(&d, &["init", "-q", "-b", "main"]);
+        let commit = |date: &str, msg: &str| {
+            let o = std::process::Command::new("git").arg("-C").arg(&d).args(["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", msg]).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_COMMITTER_DATE", date).env("GIT_AUTHOR_DATE", date).output().unwrap();
+            assert!(o.status.success());
+            g(&d, &["rev-parse", "HEAD"])
+        };
+        let root = commit("2026-01-03T00:00:00", "root");
+        let a = commit("2026-01-01T00:00:00", "a, dated before its parent");
+        g(&d, &["checkout", "-q", "-b", "side", &root]);
+        let s1 = commit("2026-01-02T00:00:00", "s1");
+        let s2 = commit("2026-01-02T00:00:01", "s2");
+        g(&d, &["checkout", "-q", "main"]);
+        g(&d, &["-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff", "-m", "merge", "side"]);
+        let merge = g(&d, &["rev-parse", "HEAD"]);
+        g(&d, &["checkout", "-q", "-b", "other", &root]);
+        let o1 = commit("2026-01-05T00:00:00", "o1");
+        let before = crate::git_exec::on_this_thread();
+        let gens = super::generations(&d, &["main", "other"]).unwrap();
+        let at = |c: &str| gens.get(c).map(|g| g.0);
+        assert_eq!((gens.len(), at(&root), at(&a), at(&s1), at(&s2), at(&merge), at(&o1)), (6, Some(1), Some(2), Some(2), Some(3), Some(4), Some(2)), "each commit once, one above its highest parent");
+        let on_main: Vec<bool> = [&root, &a, &s1, &s2, &merge, &o1].iter().map(|c| gens[c.as_str()].1).collect();
+        assert_eq!(on_main, [true, true, true, true, true, false], "and whether the first tip holds it, by any parent");
+        assert_eq!(super::generations(&d, &["side"]).unwrap().len(), 3, "a tip's own history only");
+        assert!(super::generations(&d, &["missing"]).is_err(), "a tip that is no commit fails");
+        assert_eq!(crate::git_exec::on_this_thread(), before, "and no git starts");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A tree's files and blobs, and whether HEAD is work only this checkout has, as `git ls-tree
+    /// -r`, `cat-file` and `rev-list HEAD --not --glob=refs/*` answer, without starting git.
+    #[test]
+    fn reads_trees_and_tells_unreferenced_heads_as_git_does() {
+        let d = std::env::temp_dir().join(format!("devhub-gitread-unref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        g(&d, &["init", "-q", "-b", "main"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        std::fs::write(d.join("sub/b.txt"), "two\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", d.join("link")).unwrap();
+        g(&d, &["add", "."]);
+        g(&d, &["commit", "-q", "-m", "1"]);
+        let one = g(&d, &["rev-parse", "HEAD"]);
+        let before = crate::git_exec::on_this_thread();
+        let files = super::files_at(&d, &one).unwrap();
+        let listed: std::collections::BTreeMap<String, String> = g(&d, &["ls-tree", "-r", &one]).lines().filter_map(|l| {
+            let (meta, path) = l.split_once('\t')?;
+            (meta.split_whitespace().nth(1) == Some("blob")).then(|| (path.to_string(), meta.split_whitespace().nth(2).unwrap().to_string()))
+        }).collect();
+        assert_eq!(files, listed);
+        assert_eq!(super::blob(&d, &files["sub/b.txt"]).unwrap(), b"two\n");
+        assert!(super::files_at(&d, &"ab".repeat(20)).is_err());
+        // on its branch: the branch holds HEAD
+        assert!(!super::head_unreferenced(&d));
+        // detached, a commit ahead of every ref: only this checkout has it
+        g(&d, &["checkout", "-q", "--detach"]);
+        g(&d, &["commit", "-q", "--allow-empty", "-m", "2"]);
+        assert!(super::head_unreferenced(&d));
+        // an annotated tag of a later commit holds it too
+        g(&d, &["commit", "-q", "--allow-empty", "-m", "3"]);
+        g(&d, &["tag", "-a", "t", "-m", "t"]);
+        g(&d, &["checkout", "-q", "HEAD~1"]);
+        assert!(!super::head_unreferenced(&d));
+        assert_eq!(crate::git_exec::on_this_thread(), before, "a read started git");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The questions loops ask, answered as git answers them, without starting git, from a
+    /// packed repository whose pack is never read whole.
+    #[test]
+    fn answers_as_git_without_git_and_reads_packs_bounded() {
+        let d = std::env::temp_dir().join(format!("devhub-gitread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("libs/a")).unwrap();
+        std::fs::create_dir_all(d.join("libs/b")).unwrap();
+        g(&d, &["init", "-q", "-b", "work"]);
+        // a large incompressible blob makes the pack big: a whole-pack read would show
+        let mut noise = vec![0u8; 4 << 20];
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for b in noise.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        std::fs::write(d.join("big.bin"), &noise).unwrap();
+        std::fs::write(d.join("libs/a/x.rs"), "1").unwrap();
+        std::fs::write(d.join("libs/b/y.rs"), "1").unwrap();
+        g(&d, &["add", "."]);
+        g(&d, &["commit", "-q", "-m", "1"]);
+        let one = g(&d, &["rev-parse", "HEAD"]);
+        std::fs::write(d.join("libs/b/y.rs"), "2").unwrap();
+        g(&d, &["commit", "-q", "-am", "2"]);
+        let two = g(&d, &["rev-parse", "HEAD"]);
+        g(&d, &["checkout", "-q", "-b", "rc-x", &one]);
+        g(&d, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        g(&d, &["gc", "-q"]);
+        let pack: u64 = std::fs::read_dir(d.join(".git/objects/pack")).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "pack")).map(|e| e.metadata().unwrap().len()).sum();
+        assert!(pack > 4 << 20, "the pack holds the blob ({pack} bytes)");
+        let before = crate::git_exec::on_this_thread();
+        assert_eq!(super::rev(&d, "refs/heads/work").as_deref(), Some(two.as_str()));
+        assert_eq!(super::rev(&d, "work").as_deref(), Some(two.as_str()));
+        assert_eq!(super::rev(&d, "HEAD").as_deref(), super::rev(&d, "rc-x").as_deref());
+        assert_eq!(super::rev(&d, &format!("{one}^{{commit}}")).as_deref(), Some(one.as_str()));
+        assert_eq!(super::rev(&d, &"ab".repeat(20)), None);
+        assert_eq!(super::rev(&d, "refs/heads/nope"), None);
+        assert!(super::lacks_commit(&d, &"ab".repeat(20)) && !super::lacks_commit(&d, &one) && !super::lacks_commit(Path::new("/nonexistent-devhub-repo"), &one));
+        assert!(super::is_ancestor(&d, &one, "refs/heads/work") && super::is_ancestor(&d, &one, "rc-x"));
+        assert!(!super::is_ancestor(&d, "rc-x", "work") && !super::is_ancestor(&d, &two, &one));
+        assert!(!super::differ_under(&d, &one, &two, ["libs/a"]) && super::differ_under(&d, &one, &two, ["libs/a", "libs/b/"]));
+        assert!(super::differ_under(&d, &one, &two, []) && !super::differ_under(&d, &one, "rc-x", []));
+        assert!(super::differ_under(&d, &one, &"ab".repeat(20), ["libs/a"]));
+        assert_eq!(super::files_differing_under(&d, &one, &one, ["libs/b"]), Some(Vec::new()));
+        assert_eq!(super::files_differing_under(&d, &one, &two, ["libs/a", "libs/b"]), Some(vec![("libs/b", "y.rs".to_string())]));
+        assert_eq!(super::files_differing_under(&d, &one, &two, ["libs/new"]), Some(Vec::new()));
+        assert!(super::files_differing_under(&d, &one, &"ab".repeat(20), ["libs/a"]).is_none());
+        let e = super::entries_at(&d, &two, &["libs/b/y.rs", "nope", "big.bin"]).unwrap();
+        assert_eq!(e[0], g(&d, &["rev-parse", &format!("{two}:libs/b/y.rs")]));
+        assert_eq!((e[1].as_str(), e[2].len()), ("", 40));
+        assert_eq!(crate::git_exec::on_this_thread(), before, "a read started git");
+        // one repository for all of it, and none of its pack reads took the pack whole
+        let read = super::with(&d, |_, repo| repo.read_stats().pack_bytes_read).unwrap();
+        assert!(read < pack / 4, "{read} of the pack's {pack} bytes read");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The commit that last changed a file, as `git log -1 -- <file>` names it: through a merge,
+    /// the side commit that brought the change; and a diff's files, as `git diff --name-only`.
+    #[test]
+    fn names_the_commit_that_last_touched_a_file_as_git_log_does() {
+        let d = std::env::temp_dir().join(format!("devhub-gitread-touch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("tests/common")).unwrap();
+        g(&d, &["init", "-q", "-b", "work"]);
+        std::fs::write(d.join("tests/common/p.rs"), "fn model() {}\n").unwrap();
+        g(&d, &["add", "-A"]);
+        g(&d, &["commit", "-q", "-m", "first"]);
+        g(&d, &["checkout", "-q", "-b", "rc-lane"]);
+        std::fs::write(d.join("tests/common/p.rs"), "fn model() {}\nfn more() {}\n").unwrap();
+        g(&d, &["commit", "-q", "-am", "lane: a profile"]);
+        let side = g(&d, &["rev-parse", "HEAD"]);
+        g(&d, &["checkout", "-q", "work"]);
+        std::fs::write(d.join("other.rs"), "\n").unwrap();
+        g(&d, &["add", "-A"]);
+        g(&d, &["commit", "-q", "-m", "elsewhere"]);
+        g(&d, &["merge", "-q", "--no-ff", "-m", "Merge branch 'rc-lane' into work", "rc-lane"]);
+        let merged = g(&d, &["rev-parse", "HEAD"]);
+        std::fs::write(d.join("other.rs"), "fn x() {}\n").unwrap();
+        g(&d, &["commit", "-q", "-am", "later"]);
+        let tip = g(&d, &["rev-parse", "HEAD"]);
+        let before = crate::git_exec::on_this_thread();
+        assert_eq!(super::last_touch(&d, &tip, "tests/common/p.rs"), Some(format!("{} lane: a profile", &side[..10])));
+        assert_eq!(super::last_touch(&d, &tip, "other.rs").map(|t| t.ends_with(" later")), Some(true));
+        assert_eq!(super::last_touch(&d, &tip, "tests/common/gone.rs"), None, "not in the tree");
+        assert_eq!(super::files_differing(&d, &merged, &tip), Some(vec!["other.rs".to_string()]));
+        assert_eq!(super::files_differing(&d, &tip, &tip), Some(Vec::new()));
+        // every version of every path a history holds, each once, through the merge's side
+        let at = |p: &str, r: &str| (p.to_string(), g(&d, &["rev-parse", &format!("{r}:{p}")]));
+        let lane = [at("tests/common/p.rs", &format!("{side}~1")), at("tests/common/p.rs", &side)];
+        let work: std::collections::BTreeSet<_> = lane.iter().cloned().chain([at("other.rs", &merged), at("other.rs", &tip)]).collect();
+        assert_eq!(super::path_blobs(&d, &["work"]), Ok(work.clone()), "work's history");
+        assert_eq!(super::path_blobs(&d, &["rc-lane"]), Ok(lane.into_iter().collect()), "the lane's alone");
+        assert_eq!(super::path_blobs(&d, &["rc-lane", "work"]), Ok(work), "a commit two tips share counts once");
+        assert!(super::path_blobs(&d, &["nope"]).is_err());
+        assert_eq!(crate::git_exec::on_this_thread(), before, "a read started git");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Devhub opens repositories only here: anything else would read packs whole again.
+    #[test]
+    fn no_repository_is_opened_elsewhere() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut todo = vec![src];
+        let mut found = Vec::new();
+        while let Some(dir) = todo.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") && !path.ends_with("gitread.rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for (i, l) in text.lines().enumerate() {
+                        if l.contains("Repository::open") || l.contains("open_git_dir(") {
+                            found.push(format!("{}:{}", path.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found.is_empty(), "repositories opened outside gitread: {found:?}");
+    }
+}

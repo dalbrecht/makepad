@@ -1,4 +1,4 @@
-use super::xr_physics::{capsule_pose, makepad_pose, HandCollider, HandColliderBody, RapierScene};
+use super::xr_physics::{capsule_pose, sync_hand_bodies, HandCollider, PhysicsScene};
 use super::*;
 use makepad_widgets::makepad_platform::event::XrController;
 
@@ -191,62 +191,6 @@ impl XrHandSystem {
         colliders
     }
 
-    #[allow(dead_code)]
-    pub(super) fn collect_live_hand_colliders(
-        &self,
-        scene: &RapierScene,
-        slots: &[HandColliderBody],
-    ) -> Vec<HandCollider> {
-        let mut colliders = Vec::with_capacity(slots.len());
-        for slot in slots {
-            let Some(collider) = scene.colliders.get(slot.collider) else {
-                continue;
-            };
-            if !collider.is_enabled() {
-                continue;
-            }
-
-            let pose = makepad_pose(collider.position());
-            let shape = collider.shape();
-            if let Some(capsule) = shape.as_capsule() {
-                colliders.push(HandCollider::Capsule {
-                    a: Self::pose_point_world(
-                        pose,
-                        vec3f(
-                            capsule.segment.a.x,
-                            capsule.segment.a.y,
-                            capsule.segment.a.z,
-                        ),
-                    ),
-                    b: Self::pose_point_world(
-                        pose,
-                        vec3f(
-                            capsule.segment.b.x,
-                            capsule.segment.b.y,
-                            capsule.segment.b.z,
-                        ),
-                    ),
-                    radius: capsule.radius,
-                });
-            } else if let Some(ball) = shape.as_ball() {
-                colliders.push(HandCollider::Ball {
-                    center: pose.position,
-                    radius: ball.radius,
-                });
-            } else if let Some(cuboid) = shape.as_cuboid() {
-                colliders.push(HandCollider::Box {
-                    pose,
-                    half_extents: vec3f(
-                        cuboid.half_extents.x,
-                        cuboid.half_extents.y,
-                        cuboid.half_extents.z,
-                    ),
-                });
-            }
-        }
-        colliders
-    }
-
     fn hand_influence_tip_world(&self, hand: &XrHand, tip: usize) -> Option<Vec3f> {
         if !hand.in_view() || !hand.tip_active(tip) {
             return None;
@@ -334,14 +278,7 @@ impl XrEnv {
             match collider {
                 HandCollider::Capsule { a, b, radius } => {
                     let (pose, half_height) = capsule_pose(*a, *b);
-                    self.draw_pbr_capsule(
-                        cx,
-                        makepad_pose(&pose),
-                        *radius,
-                        half_height,
-                        color,
-                        0.58,
-                    );
+                    self.draw_pbr_capsule(cx, pose, *radius, half_height, color, 0.58);
                 }
                 HandCollider::Ball { center, radius } => {
                     self.draw_pbr_sphere(cx, *center, *radius, color, 0.56);
@@ -389,6 +326,12 @@ impl XrEnv {
     }
 }
 
+/// The colliders the physics gives this hand (or its controller) at this pose: exactly what the
+/// hand pushes bodies with (a debug view draws them).
+pub fn xr_hand_colliders(hand: &XrHand, controller: &XrController) -> Vec<HandCollider> {
+    XrHandSystem.build_hand_colliders(hand, controller)
+}
+
 pub(super) fn build_hand_colliders_for_physics(
     hand: &XrHand,
     controller: &XrController,
@@ -396,31 +339,43 @@ pub(super) fn build_hand_colliders_for_physics(
     XrHandSystem.build_hand_colliders(hand, controller)
 }
 
-pub(super) fn sync_hands_on_scene(
-    scene: Option<&mut RapierScene>,
+/// Every player's hands into the scene: their colliders and grabs. A player the scene has
+/// hands of who is not in `players` any more has untracked hands (their holds let go).
+pub(super) fn sync_hands_on_scene(scene: Option<&mut PhysicsScene>, players: &[XrPlayerHands]) {
+    if !XR_ENABLE_HAND_PHYSICS {
+        return;
+    }
+    let Some(scene) = scene else {
+        return;
+    };
+    for player in scene.rig_players() {
+        if !players.iter().any(|p| p.player == player) {
+            let gone = XrPlayerHands { player, ..Default::default() };
+            scene.with_rig(player, |s| sync_player_hands(s, &gone.left_hand, &gone.right_hand, &gone.left_controller, &gone.right_controller));
+        }
+    }
+    for p in players {
+        scene.with_rig(p.player, |s| sync_player_hands(s, &p.left_hand, &p.right_hand, &p.left_controller, &p.right_controller));
+    }
+}
+
+fn sync_player_hands(
+    scene: &mut PhysicsScene,
     left_hand: &XrHand,
     right_hand: &XrHand,
     left_controller: &XrController,
     right_controller: &XrController,
 ) {
-    if !XR_ENABLE_HAND_PHYSICS {
-        return;
-    }
-
-    let Some(scene) = scene else {
-        return;
-    };
-
     let left = build_hand_colliders_for_physics(left_hand, left_controller);
     let right = build_hand_colliders_for_physics(right_hand, right_controller);
-    let RapierScene {
-        bodies,
-        colliders,
+    let dt = scene.simulation_dt();
+    let PhysicsScene {
+        world,
         left_hand: left_slots,
         right_hand: right_slots,
         ..
     } = scene;
-    RapierScene::sync_hand_bodies(left_slots, &left, bodies, colliders);
-    RapierScene::sync_hand_bodies(right_slots, &right, bodies, colliders);
+    sync_hand_bodies(world, left_slots, &left, dt);
+    sync_hand_bodies(world, right_slots, &right, dt);
     scene.sync_tracked_hands(left_hand, right_hand, left_controller, right_controller);
 }

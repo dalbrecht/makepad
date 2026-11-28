@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+"""A restart-rung edit restarts the app in place: one process, the same window and GPU device, the
+app's state kept, no leftover threads.
+
+usage: restart_in_place.py [--visible]   (run from the workspace root; the JIT runs through
+  `cargo run --profile host`; RELAX_STD in the environment, default libs/relax/compiler/std)
+
+Copies live_kinds/ to a temporary dir and runs it with its window (`--features window`: a HAL app,
+hidden and muted unless --visible). Once it ticks, a layout edit of the app struct is saved: a field
+added (its `#[rust(..)]` initial value code naming the derive's `vm`), which the app struct's value
+the running app holds cannot take: the Restart rung. It passes when:
+  - the run ends in this process ("relax: run end:") and no window is made for the next one;
+  - the process is the same pid afterwards and is the only one the run left;
+  - the app's state came back ("out restored <tick>" at or past the tick before the edit, the
+    platform's "restart (..): kept .. app state kept") and the new code runs (later=123);
+  - the restarted run has the edit's save time (handed over in the process, not through its
+    environment): its save -> back on screen is in the session log (`restart_present`);
+  - the restarted run has no more threads than the first one had at the same point;
+  - no panic, internal compiler error or fault line appears.
+The restart is offered (the Restart rung) and taken as a person would, by `session relaunch`.
+Then the app panics for real and `resume P<n> restart` starts the next run: same process and window,
+its state not kept. The same for a stale access. An enum edit while a thread loops in the first
+version of a fn the edit rebuilds does not install over it: the restart is offered naming that fn
+and thread, nothing is held or parked, the app keeps ticking, and `session relaunch` is the next
+run with the app's state. A failed hot load (a call of a fn whose build fails)
+parks the call and never restarts the app by itself; `resume P<n> restart` is the next run, in the
+same process and window, nothing left parked, both on the ledger.
+GPU work in flight at a run's end (a compute job of about a second) leaves the next run in the same
+process and window with a GPU that does its work right, and the ended run's read unanswered.
+Then ROUNDS more relaunches: what a run's end leaves in the process's statics
+(RELAX_LEFTOVERS: a heap that went stays unmapped, so a word still pointing there is a fault
+too) must be a row of process_statics.tsv, and threads and owned memory must not grow: on Linux
+what the allocators handed out plus the anonymous memory outside their mappings (`memory`'s owned
+nodes, from glibc's mapping names), each part too, so a drop in one cannot hide a rise in another;
+elsewhere the resident size.
+A relaunched run whose build fails before the app starts (a syntax error in the sibling dependency) holds
+the host though the window is hidden; the fix's save in that folder, made as soon as the hold shows,
+starts the next run.
+A restarted run whose app check finds an error (a derive's bound, which no lazy compile reaches)
+ends in place: the same process and window, no fault, its end without the program's grace, no app
+code running and the restart pending; the edit's outcome a refusal, never the restart's failure nor
+a JIT error. The fix's save starts the next run with the state the failed run was started with; bad
+and good saves in the sibling dependency and the app on alternate rounds, CHECK_ROUNDS times,
+and the threads do not grow.
+A relaunch that lands after the next run's boot but before the app's first event is through (the
+app's start takes seconds on cue) brings the run after it up with the state that run was started
+with. Last, a relaunch that lands while the next run boots (no unit in yet) waits the boot out: the
+run after it comes up in this process and window, with the state the booting run was started with.
+Last, a SIGTERM while a stale access's report pauses the app ends the process; while it pauses
+the app, the host's UI thread (the window's) is not held.
+Prints the restart's times (the run's end to the new run's first frame, the relaunch request to it)
+and "restart_in_place: OK ..." or "restart_in_place: FAIL ..."; exit 1 on FAIL.
+"""
+import atexit, json, os, re, shutil, signal, subprocess, sys, tempfile, threading, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+JIT = ["cargo", "run", "--profile", "host", "-q", "--manifest-path", os.path.abspath("Cargo.toml"), "-p", "makepad-run", "--bin", "makepad", "--"]
+BAD = ("panicked", "panic parked", "stale access parked", "internal compiler error", "FATAL", "Segmentation", "SIGSEGV", "SIGBUS",
+       "retaining mapping", "fault outside JIT code", "fault in host code")
+os.environ.setdefault("RELAX_STD", os.path.abspath("libs/relax/compiler/std"))
+visible = "--visible" in sys.argv
+ROUNDS = 8
+CHECK_ROUNDS = 3
+# a leak of a run's worth grows the last rounds past the first by more than this per round; owned
+# memory moves by a few MB from round to round (resident memory by tens: allocators keep freed
+# pages, the driver's come and go)
+ROUND_GROWTH_KB = 4 * 1024
+
+ROOT = os.path.abspath(os.path.join(HERE, "../../.."))
+# under the workspace, as lazy_typeck's copies: cargo reads .cargo/config.toml from the folder it
+# runs in, and a copy outside it built makepad again without its rustflags (294 s of a 308 s run)
+os.makedirs(os.path.join(ROOT, "target"), exist_ok=True)
+tmp = tempfile.mkdtemp(prefix="restart-in-place-", dir=os.path.join(ROOT, "target"))
+ws = os.path.join(tmp, "ws")
+pkg = os.path.join(ws, "app")
+dep = os.path.join(ws, "dep")
+shutil.copytree(os.path.join(HERE, "live_kinds"), pkg)
+manifest = os.path.join(pkg, "Cargo.toml")
+text = open(manifest).read().replace('"../../../../widgets"', json.dumps(os.path.relpath(os.path.join(ROOT, "widgets"), pkg)))
+open(manifest, "w").write(text.replace("[workspace]", '[dependencies.restart-dep]\npath = "../dep"'))
+os.makedirs(os.path.join(dep, "src"))
+open(os.path.join(dep, "Cargo.toml"), "w").write('[package]\nname = "restart-dep"\nversion = "0.1.0"\nedition = "2021"\n')
+dep_src = os.path.join(dep, "src", "lib.rs")
+open(dep_src, "w").write("pub const LATER: u64 = 123;\n")
+# the workspace's [patch.crates-io] (third-party crates carried in libs/): the copy is a workspace
+# of its own, and without them its window's dependencies would be looked up in the registry
+# (nodes run offline)
+patch, on = [], False
+for line in open(os.path.join(ROOT, "Cargo.toml")):
+    if line.startswith("["):
+        on = line.strip() == "[patch.crates-io]"
+    elif on and 'path = "' in line:
+        name, rest = line.split("=", 1)
+        path = rest.split('path = "', 1)[1].split('"', 1)[0]
+        patch.append("%s = { path = %s }" % (name.strip(), json.dumps(os.path.relpath(os.path.join(ROOT, path), ws))))
+open(os.path.join(ws, "Cargo.toml"), "w").write('[workspace]\nmembers = ["app", "dep"]\nresolver = "2"\n\n[patch.crates-io]\n' + "\n".join(patch) + "\n")
+app_src = os.path.join(pkg, "src", "window.rs")
+ready = os.path.join(tmp, "ready")
+home = os.path.join(tmp, "home")
+env = dict(os.environ, RELAX_LIVE_READY=ready, RELAX_HOME=home, RELAX_CACHE_DIR=os.path.join(home, "cache"),
+           RELAX_TARGET_DIR=os.path.join(home, "target"), MAKEPAD_MUTE="1",
+           RELAX_LIVE_TRACE="1", RELAX_LIVE_LOG=os.path.join(tmp, "live.jsonl"))
+if not visible:
+    env["MAKEPAD_HIDE_WINDOWS"] = "1"
+panic_file = os.path.join(tmp, "panic-now")
+leftovers_file = os.path.join(tmp, "leftovers")
+stale_file = os.path.join(tmp, "stale-now")
+hold_file = os.path.join(tmp, "hold-now")
+gpu_file = os.path.join(tmp, "gpu-now")
+ledger_dir = os.path.join(tmp, "makepad", "devhub", "hot-outbox")
+env["RESTART_PANIC_FILE"] = panic_file
+env["RESTART_STALE_FILE"] = stale_file
+env["RESTART_HOLD_FILE"] = hold_file
+slow_file = os.path.join(tmp, "slow-start")
+env["RESTART_SLOW_START_FILE"] = slow_file
+env["RESTART_GPU_FILE"] = gpu_file
+env["RELAX_PANIC_PARK"] = "600"
+# the panic and stale stages park on purpose and the fixture resumes each park itself: the parks
+# are the test's own (RELAX_EXPECTED_CRASH), which a devhub node's watch leaves for it, as it does
+# not one in the run of a lease nobody attends (released at once: "panic-not-parked", 11-21)
+env["RELAX_EXPECTED_CRASH"] = "restart_in_place.py parks its panics and resumes them itself"
+env["RELAX_STALE_PARK"] = "1"
+# where a quit that does not end stops (the term stage prints it)
+env["RELAX_QUIT_TRACE"] = "1"
+env["RELAX_LEFTOVERS"] = leftovers_file
+# glibc names its mappings (2.39 on): `memory` splits malloc's from the rest, its owned nodes
+env["GLIBC_TUNABLES"] = ":".join(x for x in (os.environ.get("GLIBC_TUNABLES"), "glibc.mem.decorate_maps=1") if x)
+env["RELAX_TEST_HOT_BUILD_ERROR"] = "hot_fail_target"
+env["MAKEPAD_HOME"] = os.path.join(tmp, "makepad")
+def owned():
+    """Linux: the run dies with this script (PR_SET_PDEATHSIG), so
+    a script that is killed never leaves it holding the node."""
+    if sys.platform.startswith("linux"):
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
+# makepad itself first: a fresh tree's build is not on the clock of the run below
+subprocess.check_call(["cargo", "build", "--profile", "host", "-q", "--manifest-path", os.path.join(ROOT, "Cargo.toml"), "-p", "makepad-run", "--bin", "makepad"], cwd=ROOT)
+t_launch = time.time()
+p = subprocess.Popen(JIT + ["run", "--ahead=minimal", "--allow-host-modules", "relax-live-kinds", "--features", "window"], cwd=pkg, env=env,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, preexec_fn=owned)
+
+def stop():
+    """The run ends with the script, however it ends (an app left running holds the node's updates)."""
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        p.wait(20)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+atexit.register(stop)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+out, err = [], []
+def pump(f, acc):
+    for line in f:
+        acc.append((time.time(), line.rstrip("\n")))
+pumps = [threading.Thread(target=pump, args=(f, acc), daemon=True) for f, acc in ((p.stdout, out), (p.stderr, err))]
+for t in pumps:
+    t.start()
+
+def wait(pred, secs):
+    t = time.time()
+    while time.time() - t < secs:
+        if pred():
+            return True
+        if p.poll() is not None:
+            return pred()
+        time.sleep(0.02)
+    return False
+
+def ticks(since=0):
+    return [(t, l) for t, l in out[since:] if l.startswith("out ") and not l.startswith("out restored")]
+
+def tick_of(line):
+    return int(line.split()[1])
+
+def processes():
+    """{pid: (ppid, command name)} of every process (ps: Linux and macOS)."""
+    rows = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True).stdout.splitlines()
+    procs = {}
+    for r in rows:
+        w = r.split(None, 2)
+        if len(w) == 3:
+            procs[int(w[0])] = (int(w[1]), w[2])
+    return procs
+
+def descendants(root):
+    procs = processes()
+    out, todo = [], [root]
+    while todo:
+        q = todo.pop()
+        for pid, (ppid, _) in procs.items():
+            if ppid == q:
+                out.append(pid)
+                todo.append(pid)
+    return out, procs
+
+def app_pid():
+    """The app's process: the pid its run last announced on stderr, while
+    it is `cargo run` itself (unix: exec) or a process under it. (Its command name does not say: on
+    Linux a run takes its program's name, selfexe.rs name_process.)"""
+    said = [int(m.group(1)) for _, l in err if (m := re.match(r"\[\S+-remote\] pid=(\d+) app=", l))]
+    if not said:
+        return None
+    kids, procs = descendants(p.pid)
+    return said[-1] if said[-1] in [p.pid] + kids and said[-1] in procs else None
+
+def threads(pid):
+    if os.path.isdir("/proc/%d/task" % pid):
+        return len(os.listdir("/proc/%d/task" % pid))
+    rows = subprocess.run(["ps", "-M", "-p", str(pid)], capture_output=True, text=True).stdout.splitlines()
+    return max(len(rows) - 1, 0)
+
+def thread_names(pid):
+    """Each thread's name: a thread count that grew says which (Linux: /proc; elsewhere the app's
+    own list, `inspect threads`)."""
+    if not os.path.isdir("/proc/%d/task" % pid):
+        # (the OS's threads: the registry's rows of gone and ended ones come after them)
+        rows = re.findall(r'\{"id":"[^"]*","name":"((?:[^"\\]|\\.)*)","role":"[^"]*","state":"([^"]*)"', ask(pid, ["threads"]))
+        return [n for n, state in rows if state not in ("gone", "ended")]
+    names = []
+    for t in os.listdir("/proc/%d/task" % pid):
+        try:
+            names.append(open("/proc/%d/task/%s/comm" % (pid, t)).read().strip())
+        except OSError:
+            pass
+    return names
+
+def settled_threads(pid, secs=1.0):
+    """The thread count once what a run's start or end, or a remote call, has running is over: the
+    lowest of the samples over `secs` (a thread being started or joined, or answering a call, is in
+    some samples; a thread that stays is in every one), with the names at that sample."""
+    low, names = None, []
+    end = time.time() + secs
+    while True:
+        n = threads(pid)
+        if low is None or n < low:
+            low, names = n, thread_names(pid)
+        if time.time() >= end:
+            return low, names
+        time.sleep(0.05)
+
+def outside_pool(n, names):
+    """`n` threads less the ones others size among `names`: the JIT's compile pool (its workers
+    are as many as a section's peak of tasks in flight, kept until it retires them, so the pool
+    after a restart's compile is as large as that compile was wide), and on macOS the system's
+    unnamed dispatch workers (made and retired by the OS; Linux names every thread)."""
+    return n - sum(1 for x in names if x.startswith("run-jit-") or not x)
+
+def grown(before, after):
+    """What changed in the threads, by name with its numbers left out (a run's main and pool
+    threads are named by number, and a new run's replace the last run's)."""
+    from collections import Counter
+    norm = lambda names: Counter(re.sub(r"\d+", "#", n) for n in names)
+    a, b = norm(before), norm(after)
+    return ", ".join(["%s +%d" % kv for kv in sorted((b - a).items())] + ["%s -%d" % kv for kv in sorted((a - b).items())]) or "none named"
+
+def wrong(lines):
+    return next((l.strip()[:240] for _, l in lines if any(b in l for b in BAD)), None)
+
+def stuck(pid):
+    """What a run that does not come back is doing: its own answer (`why-hung`) and, on Linux,
+    each thread's state and kernel wait."""
+    makepad = os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "host", "makepad")
+    def ask(words):
+        try:
+            r = subprocess.run([makepad, "inspect", str(pid)] + words, cwd=pkg, env=env, capture_output=True, text=True, timeout=60)
+            return (r.stdout + r.stderr).strip()
+        except subprocess.TimeoutExpired:
+            return "no reply"
+    for words in (["why-hung"], ["session", "view"]):
+        print("restart_in_place: %s: %s" % (" ".join(words), ask(words).replace("\n", " | ")[:3000]))
+    # what the app and its JIT said last (a run that did not come back in CI said nothing here)
+    for t, l in err[-60:]:
+        print("restart_in_place: app: %.1f %s" % (t - t_launch, l[:300]))
+    # the boot's threads, each stack in full
+    import re
+    for name, tid in re.findall(r"(run-compile|run-open-window|run-window) \((T\d+)\)", ask(["stacks"])):
+        print("restart_in_place: stack %s %s: %s" % (name, tid, ask(["stacks", "thread=" + tid]).replace("\n", " | ")[:3000]))
+    tasks = "/proc/%d/task" % pid
+    if os.path.isdir(tasks):
+        rows = {}
+        for t in sorted(os.listdir(tasks), key=int):
+            try:
+                comm = open("%s/%s/comm" % (tasks, t)).read().strip()
+                state = open("%s/%s/stat" % (tasks, t)).read().rsplit(")", 1)[1].split()[0]
+                wchan = open("%s/%s/wchan" % (tasks, t)).read().strip()
+            except OSError:
+                continue
+            rows.setdefault("%s %s %s" % (comm, state, wchan), []).append(t)
+        for k, v in sorted(rows.items()):
+            print("restart_in_place: thread x%d %s" % (len(v), k))
+        status = open("/proc/%d/status" % pid).read().splitlines()
+        print("restart_in_place: " + " ".join(l.replace("\t", "") for l in status if l.startswith(("SigBlk", "SigIgn"))))
+
+def ask(pid, words):
+    makepad = os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "host", "makepad")
+    return subprocess.run([makepad, "inspect", str(pid)] + words + ["as=json"], cwd=pkg, env=env, capture_output=True, text=True, timeout=60).stdout
+
+def resident(pid):
+    return int(subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip() or 0)
+
+def owned_mb(pid):
+    """`memory`'s owned figure and the parts the rounds judge, MB: the total, malloc in use, Relax's
+    arenas live, the domain heaps in use, and each node of the anonymous memory outside every
+    allocator's mappings (a part under 1 MB is left out: none then). Empty where `memory` has no
+    owned figure (not Linux, or a glibc that does not name its mappings)."""
+    parts = {}
+    for line in ask(pid, ["memory", "n=400"]).splitlines():
+        try:
+            j = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(j, dict):
+            continue
+        # (the total is the totals line's; the tree lists the nodes of 1 MB or more)
+        if "owned_mb" in j:
+            parts["owned"] = float(j["owned_mb"])
+        k = j.get("node", "")
+        if k in ("owned/malloc in use", "owned/Relax arenas live", "owned/domain heaps in use") or k.startswith("owned/outside allocators/"):
+            parts[k] = float(j["mb"])
+    return parts
+
+def grew(series):
+    """The rounds' formula: the least of the last three past the least of the first three by more
+    than the bar."""
+    return len(series) > 2 and min(series[-3:]) > min(series[:3]) + ROUND_GROWTH_KB * ROUNDS
+
+def demangled(name):
+    """`_ZN14relax_compiler3jit4UNIT17h0123456789abcdefE` -> relax_compiler::jit::UNIT"""
+    if not name.startswith("_ZN"):
+        return name
+    i, parts = 3, []
+    while i < len(name) and name[i].isdigit():
+        j = i
+        while name[j].isdigit():
+            j += 1
+        n = int(name[i:j])
+        parts.append(name[j:j + n])
+        i = j + n
+    if parts and re.fullmatch(r"h[0-9a-f]{16}", parts[-1]):
+        parts.pop()
+    return "::".join(parts)
+
+def leftovers(path):
+    """What the run's ends left that no row of process_statics.tsv names (the crates of this repo:
+    the system's and the standard library's own statics are the process's)."""
+    rows = {l.split("\t", 1)[0] for l in open(os.path.join(HERE, "process_statics.tsv")) if "\t" in l}
+    found = set()
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        return ["no leftovers file: the runs' ends did not report"]
+    for line in lines:
+        if line.startswith("-> a heap that went: "):
+            found.add("points into a heap that went: " + demangled(line.split()[-2]))
+        elif line != "--":
+            name = demangled(line.split()[0])
+            if name.startswith(("relax_", "makepad_")) and name not in rows and not any(name.startswith(r + "::") for r in rows):
+                found.add(name)
+    return sorted(found)
+
+def windows(pid):
+    """How many native windows the process's HAL has made so far, and the ids it has them under (the
+    WM's): a restart in the process adds none. (Hidden on a box with no display it has none at all.)"""
+    r = subprocess.run([os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "host", "makepad"), "inspect", str(pid), "hal", "shell", "as=json"], cwd=pkg, env=env, capture_output=True, text=True, timeout=60)
+    for line in r.stdout.splitlines():
+        try:
+            shell = json.loads(line)
+        except ValueError:
+            continue
+        if "backend" in shell:
+            return shell.get("windows_made"), sorted(w["window"] for w in shell.get("windows", []))
+    return None
+
+fails = []
+started = wait(lambda: os.path.exists(ready) and len(ticks()) >= 20 and any("watcher gate open" in l for _, l in err), 600)
+if not started:
+    fails.append("no-start")
+pid = app_pid()
+if started and pid is None:
+    fails.append("no-app-process")
+if not fails:
+    time.sleep(2.0)
+    threads0, names0 = settled_threads(pid)
+    windows0 = windows(pid)
+    procs0 = len(descendants(p.pid)[0])
+    before = tick_of(ticks()[-1][1])
+    n_out, n_err = len(out), len(err)
+    src = open(app_src).read()
+    for a, b in (("    #[rust]\n    state: Option<crate::kinds::State>,\n", "    #[rust]\n    state: Option<crate::kinds::State>,\n    #[rust(later_of(vm))]\n    later: u64,\n"),
+                 ("impl AppMain for App {", "fn later_of(_vm: &mut ScriptVm) -> u64 { restart_dep::LATER }\n\nimpl AppMain for App {"),
+                 ('println!("out {} main_loop={} inlined={} {} {}", self.tick, 1,', 'println!("out {} main_loop={} later={} inlined={} {} {}", self.tick, 1, self.later,')):
+        assert src.count(a) == 1, a
+        src = src.replace(a, b)
+    with open(app_src + ".new", "w") as f:
+        f.write(src)
+    os.rename(app_src + ".new", app_src)
+    # the Restart rung offers the restart; the person takes it (the ring's Update ready, the WM's
+    # toast, or what this does: `session relaunch`)
+    offered = lambda: any("a restart applies it; offered" in l for _, l in err[n_err:])
+    t_ask = None
+    if not wait(offered, 120):
+        fails.append("no-restart-offered")
+    else:
+        t_ask = time.time()
+        # the built makepad (the run's own binary), not another cargo run
+        makepad = os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "host", "makepad")
+        try:
+            asked = subprocess.run([makepad, "inspect", str(pid), "session", "relaunch"], cwd=pkg, env=env, capture_output=True, text=True, timeout=60)
+            print("restart_in_place: session relaunch: " + (asked.stdout + asked.stderr).strip().replace("\n", " | ")[:300])
+        except subprocess.TimeoutExpired:
+            fails.append("relaunch-no-reply")
+    restarting = lambda: next((t for t, l in err[n_err:] if "relax live: restarting (" in l), None)
+    if t_ask and not wait(lambda: restarting() is not None, 120):
+        fails.append("no-restart")
+    t_end = restarting()
+    restored = lambda: [(t, int(l.split()[2])) for t, l in out[n_out:] if l.startswith("out restored ")]
+    new_code = lambda: any("later=123" in l for _, l in ticks(n_out))
+    if not wait(lambda: restored() and new_code(), 300):
+        fails.append("no-new-code" if restored() else "no-restored-state")
+        stuck(pid)
+    elif restored()[-1][1] < before:
+        fails.append("state-lost(%d<%d)" % (restored()[-1][1], before))
+    report = lambda: next((l for _, l in err[n_err:] + out[n_out:] if "restart (" in l and ": kept " in l), None)
+    wait(lambda: report() is not None, 30)
+    if report() is None or "app state kept" not in report():
+        fails.append("no-restart-report")
+    # the app's first tick can come before its first present
+    first = lambda: next((t for t, l in err[n_err:] + out[n_out:] if "first frame at" in l and t_end and t >= t_end), None)
+    wait(lambda: first() is not None, 30)
+    t_first = first()
+    if t_first is None:
+        fails.append("no-first-frame")
+    time.sleep(2.0)
+    try:
+        presents = [l for l in open(env["RELAX_LIVE_LOG"]) if '"event":"restart_present"' in l]
+    except OSError:
+        presents = []
+    if not presents:
+        fails.append("no-restart-present-logged")
+    pid1 = app_pid()
+    procs1 = len(descendants(p.pid)[0])
+    threads1, names1 = settled_threads(pid1) if pid1 else (0, [])
+    if pid1 != pid:
+        fails.append("pid-changed(%s->%s)" % (pid, pid1))
+    if procs1 != procs0:
+        fails.append("processes(%d->%d)" % (procs0, procs1))
+    # (the first restart against the start: what grew once, not counted the pool, whose size is
+    # the width of the last compile; the rounds below catch what grows with each restart)
+    if outside_pool(threads1, names1) > outside_pool(threads0, names0) + 2:
+        fails.append("threads(%d->%d)" % (threads0, threads1))
+        print("restart_in_place: threads grew: %s" % grown(names0, names1))
+    if not any("relax: run end:" in l for _, l in err[n_err:]):
+        fails.append("no-run-end")
+    windows1 = windows(pid1) if pid1 else None
+    if not windows0 or windows1 != windows0:
+        fails.append("window-changed(%s->%s)" % (windows0, windows1))
+    bad = wrong(err[n_err:] + out[n_out:])
+    if bad:
+        fails.append("bad-line")
+        print("restart_in_place: " + bad)
+    if fails:
+        # what the run said after the edit (backtrace frames left out)
+        print("---- after the edit")
+        print("\n".join([l[:300] for _, l in err[n_err:] if not l.startswith("  ") and "watch round" not in l][:60]))
+    times = "run end->first frame %s ms, relaunch asked->first frame %s ms" % (
+        "%.0f" % ((t_first - t_end) * 1e3) if t_first and t_end else "-", "%.0f" % ((t_first - t_ask) * 1e3) if t_first and t_ask else "-")
+    print("restart_in_place: %s; threads %d -> %d; processes %d -> %d; %s" % (times, threads0, threads1, procs0, procs1, report() or "no report"))
+    if visible:
+        # the window system's side of the reopening (MAKEPAD_HAL_LOG): when the new window's first frame was on glass
+        for t, l in [x for x in err[n_err:] if "[hal" in x[1]][:12]:
+            print("restart_in_place: +%.0f ms %s" % ((t - t_end) * 1e3 if t_end else 0, l[:200]))
+def stayed(stage, n_err):
+    """A stage's restart was the next run in this process and window, and nothing broke."""
+    if app_pid() != pid:
+        fails.append(stage + "-pid-changed")
+    if windows(pid) != windows0:
+        fails.append(stage + "-window-changed")
+    if not any("run's threads stayed" in l for _, l in err[n_err:]):
+        fails.append(stage + "-no-run-end")
+    # (each of these stages means to panic, or to fail a build)
+    for _, l in err[n_err:]:
+        if any(b in l for b in BAD[4:]):
+            fails.append(stage + "-broke")
+            print("restart_in_place: %s: %s" % (stage, l.strip()[:240]))
+            print("\n".join(x[:260] for _, x in err[n_err:][-30:]))
+            break
+
+def parked():
+    return next(iter(re.findall(r'"id":"(P\d+)"', ask(pid, ["panics"]))), None)
+
+def host_runs(stage):
+    """While a report pauses the app, the host's UI thread (`threads` role "host": the process's main
+    thread, the window's) runs on: the pause holds the program's threads only. Held, the window stops
+    drawing and taking input (macOS suspended AppKit's main thread for a stale access, 11-08)."""
+    rows = []
+    for line in ask(pid, ["threads"]).splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass
+    host = [r for r in rows if r.get("role") == "host"]
+    held = [r for r in rows if r.get("held")]
+    print("restart_in_place: %s: the pause holds %d thread(s); the host's: %s" % (stage, len(held), ", ".join("%s %s%s" % (r.get("id"), r.get("state"), " held" if r.get("held") else "") for r in host) or "none"))
+    if not host:
+        fails.append(stage + "-no-host-thread")
+    elif any(r.get("held") for r in host):
+        fails.append(stage + "-host-held")
+    if not held:
+        fails.append(stage + "-nothing-held")
+
+def park_and_restart(stage, trigger):
+    """What parks (a panic, a stale access) and is told `resume P<n> restart`: the next run, its state fresh."""
+    n_out, n_err = len(out), len(err)
+    open(trigger, "w").close()
+    wait(lambda: parked() is not None, 60)
+    panic = parked()
+    if panic is None:
+        fails.append(stage + "-not-parked")
+        print("restart_in_place: %s: panics: %s" % (stage, ask(pid, ["panics"])[:600]))
+        print("\n".join(l[:300] for _, l in err[n_err:][-40:] if not l.startswith("relax live: a change")))
+        print("\n".join(l[:160] for _, l in out[n_out:][-3:]))
+        return
+    reply = ask(pid, ["resume", panic, "restart"])
+    print("restart_in_place: %s: resume %s restart: %s" % (stage, panic, reply[:200]))
+    if '"as":"restart"' not in reply or '"window_kept":true' not in reply or '"state_kept":false' not in reply:
+        fails.append(stage + "-resume-reply")
+    if not wait(lambda: any(tick_of(l) < 5 for _, l in ticks(n_out)), 120):
+        fails.append(stage + "-no-next-run")
+        stuck(pid)
+    time.sleep(1.0)
+    stayed(stage, n_err)
+    if any(l.startswith("out restored") for _, l in out[n_out:]):
+        fails.append(stage + "-state-kept")
+    if parked() is not None:
+        fails.append(stage + "-still-listed")
+
+# a real panic of the app's, and a stale access (a call into a module gone): the next run, in the
+# same process and window
+if not fails:
+    park_and_restart("panic", panic_file)
+if not fails:
+    park_and_restart("stale", stale_file)
+# an enum's variants change while a thread loops in code built for the old ones (a pool job in a
+# fn the edit rebuilds): the patch does not install over it. The restart is offered, naming the fn
+# and its thread; nothing is held or parked and nothing waits for a decision; the app keeps
+# ticking; the relaunch the person asks for keeps the app's state. (The patch installed and held
+# the thread for good; its report paused the whole app, the Run panel showed nothing, and a quit
+# waited for the paused main forever, 11-08.)
+if not fails:
+    n_out, n_err = len(out), len(err)
+    open(hold_file, "w").close()
+    if not wait(lambda: any(l == "held: the thread runs" for _, l in out[n_out:]), 60):
+        fails.append("held-thread-not-started")
+    else:
+        src = open(app_src).read()
+        for a, b in (("pub enum Held {\n    A,\n}", "pub enum Held {\n    A,\n    B,\n}"),
+                     ("            Held::A => {}\n", "            Held::A | Held::B => {}\n")):
+            assert src.count(a) == 1, a
+            src = src.replace(a, b)
+        with open(app_src + ".new", "w") as f:
+            f.write(src)
+        os.rename(app_src + ".new", app_src)
+        # the offer's line, once the reason under it named the looping thread
+        offer = lambda: next((t for t, l in err[n_err:] if "a restart applies it; offered" in l), None) if any("hold_loop` is running on thread" in l for _, l in err[n_err:]) else None
+        if not wait(lambda: offer() is not None, 120):
+            fails.append("held-no-restart-offered")
+            print("\n".join(l[:300] for _, l in err[n_err:][-40:] if not l.startswith("  ")))
+        else:
+            # the app runs on: half a second of ticks after the offer
+            if not wait(lambda: len([1 for t, _ in ticks(n_out) if t > offer()]) >= 20, 30):
+                fails.append("held-app-stopped")
+                stuck(pid)
+            if any("thread(s) with a frame in the first-version code" in l or "stale access on a stack" in l for _, l in err[n_err:]):
+                fails.append("held-thread-held")
+            if parked() is not None:
+                fails.append("held-parked")
+            hung = ask(pid, ["why-hung"])
+            print("restart_in_place: held: why-hung: %s" % hung.strip()[:300])
+            if '"verdict":"paused"' in hung or '"verdict":"held"' in hung or '"verdict":"parked panic"' in hung:
+                fails.append("held-why-hung")
+            n_ask = len(out)
+            print("restart_in_place: held: session relaunch: %s" % ask(pid, ["session", "relaunch"]).strip()[:300])
+            if not wait(lambda: any(l.startswith("out restored") for _, l in out[n_ask:]) and len(ticks(n_ask)) > 5, 120):
+                fails.append("held-no-next-run")
+                stuck(pid)
+            time.sleep(1.0)
+            stayed("held", n_err)
+            # the looping thread left with its run (Linux: its task is gone), nothing kept it
+            tid = next((m.group(1) for _, l in err[n_err:] for m in [re.search(r"hold_loop` is running on thread .*\(tid (\d+)\)", l)] if m), None)
+            if tid is None:
+                fails.append("held-no-tid")
+            elif os.path.isdir("/proc/%d/task" % pid) and not wait(lambda: not os.path.exists("/proc/%d/task/%s" % (pid, tid)), 30):
+                fails.append("held-thread-stayed")
+# a failed hot load (the app's main thread calls a fn whose build fails, so it cannot hand over its
+# state): the call parks for the person, and the app is never restarted by itself (a landing
+# restarted the person's app in place); `resume P<n> restart` is the next run, in the same process
+# and window; nothing stays parked; the ledger has the failure and its restart
+if not fails:
+    n_out, n_err = len(out), len(err)
+    src = open(app_src).read()
+    for a, b in (("                self.tick += 1;\n", "                self.tick += hot_fail_target();\n"),
+                 ("impl AppMain for App {", "#[inline(never)]\nfn hot_fail_target() -> u64 { 1 }\n\nimpl AppMain for App {")):
+        assert src.count(a) == 1, a
+        src = src.replace(a, b)
+    with open(app_src + ".new", "w") as f:
+        f.write(src)
+    os.rename(app_src + ".new", app_src)
+    wait(lambda: parked() is not None, 120)
+    panic = parked()
+    if panic is None:
+        fails.append("hot-fail-not-parked")
+        stuck(pid)
+    else:
+        if any("run's threads stayed" in l for _, l in err[n_err:]):
+            fails.append("hot-fail-restarted-by-itself")
+        reply = ask(pid, ["resume", panic, "restart"])
+        print("restart_in_place: hot-fail: resume %s restart: %s" % (panic, reply[:200]))
+        if not wait(lambda: any(tick_of(l) < 5 for _, l in ticks(n_out)), 120):
+            fails.append("hot-fail-no-next-run")
+            stuck(pid)
+    def outcomes():
+        found = []
+        for name in os.listdir(ledger_dir) if os.path.isdir(ledger_dir) else []:
+            try:
+                found.append(json.load(open(os.path.join(ledger_dir, name))).get("outcome"))
+            except ValueError:
+                pass
+        return found
+    if not fails and not wait(lambda: "restarted" in outcomes() and "panic" in outcomes(), 60):
+        fails.append("hot-fail-ledger(%s)" % outcomes())
+    if not fails:
+        stayed("hot-fail", n_err)
+    if parked() is not None:
+        fails.append("hot-fail-parked")
+# GPU work in flight at the run's end (a compute job of seconds): the next run in the same process and
+# window, its GPU work right; the ended run's read is never answered into it
+GPU_LONG = 400_000_000
+def gpu_cue(iters):
+    with open(gpu_file + ".new", "w") as f:
+        f.write(str(iters))
+    os.rename(gpu_file + ".new", gpu_file)
+gpu_lines = lambda since: [l for _, l in out[since:] if l.startswith("gpu: ")]
+if not fails:
+    n_out, n_err = len(out), len(err)
+    gpu_cue(GPU_LONG)
+    if not wait(lambda: gpu_lines(n_out), 60) or not gpu_lines(n_out)[0].startswith("gpu: in flight"):
+        fails.append("gpu-not-started")
+        print("restart_in_place: gpu: %s" % (gpu_lines(n_out) or "no answer"))
+    else:
+        time.sleep(0.3)
+        ask(pid, ["session", "relaunch"])
+        if not wait(lambda: any(l.startswith("out restored") for _, l in out[n_out:]), 120):
+            fails.append("gpu-no-next-run")
+            stuck(pid)
+    if not fails:
+        long_done = [l for l in gpu_lines(n_out) if l.startswith("gpu: done %d" % GPU_LONG)]
+        if long_done:
+            # (the job ended before the run did: nothing was in flight)
+            fails.append("gpu-not-in-flight")
+            print("restart_in_place: gpu: " + long_done[0])
+        n_next = len(out)
+        gpu_cue(16)
+        answer = lambda: next((l for l in gpu_lines(n_next) if re.match(r"gpu: (done|failed|read failed) 16 ", l)), None)
+        wait(lambda: answer() is not None, 60)
+        short = answer()
+        print("restart_in_place: gpu: after a run ended in a job: %s" % short)
+        if short is None or not short.startswith("gpu: done 16 ok"):
+            fails.append("gpu-next-run")
+        stayed("gpu", n_err)
+        lost = next((l for _, l in err[n_err:] if "device lost" in l.lower() or "device_lost" in l.lower()), None)
+        if lost:
+            fails.append("gpu-device-lost")
+            print("restart_in_place: gpu: " + lost.strip()[:240])
+# rounds of relaunches: nothing grows, nothing of a run stays in the process's statics
+if not fails:
+    time.sleep(1.0)
+    rss, nthreads, owned_rounds = [], [], []
+    for round in range(ROUNDS):
+        n_out, n_err = len(out), len(err)
+        ask(pid, ["session", "relaunch"])
+        if not wait(lambda: any(l.startswith("out restored") for _, l in out[n_out:]) and len(ticks(n_out)) > 5, 60):
+            fails.append("round-%d-no-next-run" % round)
+            stuck(pid)
+            break
+        time.sleep(0.5)
+        rss.append(resident(pid))
+        # (owned nodes are Linux's)
+        owned_rounds.append(owned_mb(pid) if sys.platform.startswith("linux") else {})
+        n, names_r = settled_threads(pid)
+        nthreads.append(outside_pool(n, names_r))
+        names_first = names_first if nthreads[1:] else names_r
+    print("restart_in_place: rounds: resident MB %s; threads outside the compile pool %s" % ([r >> 10 for r in rss], nthreads))
+    if nthreads:
+        # (the threads a process starts once, at its first run end or remote call, and keeps)
+        print("restart_in_place: rounds: threads since the start: %s" % grown(names0, names_r))
+    # (each round against the first: the same restart each time, its compile as wide)
+    if len(nthreads) > 1 and max(nthreads[1:]) > nthreads[0] + 2:
+        fails.append("threads-grew")
+        print("restart_in_place: rounds: threads grew: %s" % grown(names_first, names_r))
+    if owned_rounds and all("owned" in o for o in owned_rounds):
+        # (a node a round lacks held nothing then)
+        keys = sorted(set(k for o in owned_rounds for k in o), key=lambda k: (k != "owned", k))
+        series = {k: [o.get(k, 0.0) for o in owned_rounds] for k in keys}
+        print("restart_in_place: rounds: owned MB %s" % series["owned"])
+        up = [k for k in keys if grew([x * 1024 for x in series[k]])]
+        if up:
+            fails.append("owned-grew")
+            for k in up:
+                print("restart_in_place: rounds: %s grew: %s MB" % (k, series[k]))
+    elif grew(rss):
+        fails.append("resident-grew")
+    # (RELAX_LEFTOVERS is Linux's: run_end::leftovers)
+    left = leftovers(leftovers_file) if sys.platform.startswith("linux") else []
+    if left:
+        fails.append("leftovers")
+        print("restart_in_place: left of a run in statics no row of process_statics.tsv names:\n  " + "\n  ".join(left))
+# a build that fails before the app starts, in a run a relaunch started (a syntax error in the sibling
+# dependency: the parse fails the build, no app check runs), holds the host even with a hidden window,
+# and the fix's save in that folder (not the package's own) starts the next run: no relaunch after
+# it. The fix is saved as soon as `inputs` says the host holds, with no wait for the watcher the
+# failure starts: a save in that gap is not lost.
+if pid is not None and app_pid() == pid:
+    def save_dep(text):
+        with open(dep_src + ".new", "w") as f:
+            f.write(text)
+        os.rename(dep_src + ".new", dep_src)
+    n_out, n_err = len(out), len(err)
+    dep_good = open(dep_src).read()
+    save_dep(dep_good + "\npub fn broken( {\n")
+    ask(pid, ["session", "relaunch"])
+    def prestart_held():
+        try:
+            # ("held: no run" is HELD_NO_RUN, which `inputs` answers while the host waits for a fix)
+            return "held: no run" in ask(pid, ["inputs"])
+        except subprocess.TimeoutExpired:
+            return False
+    if not wait(prestart_held, 180):
+        fails.append("prestart-not-held")
+        print("\n".join("restart_in_place: prestart: " + l[:260] for _, l in err[n_err:][-25:]))
+    else:
+        n_out = len(out)
+        save_dep(dep_good)
+        if not wait(lambda: len(ticks(n_out)) > 5, 180):
+            fails.append("prestart-not-retried")
+            print("\n".join("restart_in_place: prestart: " + l[:260] for _, l in err[n_err:][-25:]))
+        elif app_pid() != pid:
+            fails.append("prestart-pid-changed")
+        else:
+            print("restart_in_place: prestart: the build failed before the app started, held, and the dependency's save started the next run")
+# a restarted run whose app check fails ends in place and waits for the fix's save (the check's
+# thread ended the process under a GPU driver's threads, W15586): bad and good saves in turn
+if not fails:
+    def save(path, text):
+        with open(path + ".new", "w") as f:
+            f.write(text)
+        os.rename(path + ".new", path)
+    check_bad = "\n#[derive(PartialEq, Eq)]\npub struct CheckBad {\n    x: f32,\n}\n"
+    def ledger():
+        found = []
+        for name in os.listdir(ledger_dir) if os.path.isdir(ledger_dir) else []:
+            try:
+                found.append(json.load(open(os.path.join(ledger_dir, name))).get("outcome"))
+            except ValueError:
+                pass
+        return found
+    ledger0 = ledger()
+    n_check = len(err)
+    check_threads, check_names = [], []
+    for round in range(CHECK_ROUNDS):
+        path = dep_src if round % 2 == 0 else app_src
+        good = open(path).read()
+        n_out, n_err = len(out), len(err)
+        before = tick_of(ticks()[-1][1])
+        save(path, good + check_bad)
+        relaunched = time.time()
+        ask(pid, ["session", "relaunch"])
+        held = lambda: next((t for t, l in err[n_err:] if "relax live: the run ends in place: its app check found" in l), None)
+        ends = lambda: [t for t, l in err[n_err:] if "run's threads stayed" in l]
+        if not wait(lambda: held() is not None and len(ends()) >= 2, 180):
+            fails.append("check-%d-no-end-in-place" % round)
+            stuck(pid)
+            break
+        # Both lines come from stderr. The previous run finished teardown at ends()[0].
+        frame = next((t for t, l in err[n_err:] if t >= ends()[0] and "first frame at" in l), None)
+        verdict = next((l for _, l in err[n_err:] if "relax: app check:" in l and " errors," in l), None)
+        print("restart_in_place: check %d: %s; first frame %s, end in place %.3f s after relaunch" %
+              (round, verdict, "unseen" if frame is None else "%.3f s" % (frame - relaunched), held() - relaunched))
+        # (the order is reported, not required: the fixture's small app check can end before its
+        # first present; a large app's ends after it)
+        # The failed run should finish teardown before the program's 5 s grace expires.
+        if ends()[1] - held() > 4.0:
+            fails.append("check-%d-end-took-%.1fs" % (round, ends()[1] - held()))
+        time.sleep(2.0)
+        if any(t > ends()[1] for t, _ in ticks(n_out)):
+            fails.append("check-%d-app-runs" % round)
+        live = next((json.loads(l) for l in ask(pid, ["live"]).splitlines() if l.startswith("{") and "restart_pending" in l), {})
+        if not live.get("restart_pending"):
+            fails.append("check-%d-not-pending(%s)" % (round, live.get("restart_pending")))
+        # the host has no run and waits for the fix: `live` says so, and `inputs` answers at once
+        # (a save shipped by devhub read "watches no sources" as the session's end, W15724)
+        if live.get("held") != 1:
+            fails.append("check-%d-not-held(%s)" % (round, live.get("held")))
+        inputs = ask(pid, ["inputs"])
+        if "held: no run" not in inputs:
+            fails.append("check-%d-inputs(%s)" % (round, inputs.strip().replace("\n", " | ")[:120]))
+        if app_pid() != pid:
+            fails.append("check-%d-pid-changed" % round)
+            break
+        n_out, n_fix = len(out), len(err)
+        save(path, good)
+        restored = lambda: [int(l.split()[2]) for _, l in out[n_out:] if l.startswith("out restored ")]
+        if not wait(lambda: restored() and len(ticks(n_out)) > 5, 180):
+            fails.append("check-%d-no-next-run" % round if not restored() else "check-%d-no-ticks" % round)
+            stuck(pid)
+            break
+        if restored()[-1] < before:
+            fails.append("check-%d-state-lost(%d<%d)" % (round, restored()[-1], before))
+        n, names_c = settled_threads(pid)
+        check_threads.append(outside_pool(n, names_c))
+        check_names.append(names_c)
+    found = ledger()
+    print("restart_in_place: check: threads outside the compile pool %s; ledger %s" % (check_threads, sorted(set(found))))
+    if found.count("restart_failed") > ledger0.count("restart_failed") or any("verdict: jit-error" in l for _, l in err[n_check:]):
+        fails.append("check-jit-error")
+    # (each round against the first: a thread a failed check starts once is up from then on, and
+    # every later round must end its run's threads; one thread more is a once-started one's room)
+    if len(check_threads) > 1 and max(check_threads[1:]) > check_threads[0] + 1:
+        fails.append("check-threads-grew")
+        print("restart_in_place: check: threads grew: %s" % grown(check_names[0], check_names[-1]))
+    stayed("check", n_check)
+# a relaunch after the next run's boot, before the app's first event is through (where the app says
+# it restarts with its state): the run after it comes up with the state the run was started with
+# (the relaunch took it for a program that has no state, and dropped it, 11-08). On cue the app's
+# first event takes seconds, so the relaunch lands there.
+if not fails:
+    n_out, n_err = len(out), len(err)
+    ends = lambda: [t for t, l in err[n_err:] if "run's threads stayed" in l]
+    open(slow_file, "w").close()
+    ask(pid, ["session", "relaunch"])
+    if not wait(lambda: len(ends()) >= 1 and any(l == "slow start: the first event waits" for _, l in out[n_out:]), 60):
+        fails.append("gap-no-slow-start")
+        stuck(pid)
+    else:
+        print("restart_in_place: gap: session relaunch: %s" % ask(pid, ["session", "relaunch"]).strip()[:300])
+        restored_after = lambda: len(ends()) >= 2 and any(t > ends()[1] and l.startswith("out restored") for t, l in out[n_out:])
+        if not wait(lambda: restored_after() and len(ticks(n_out)) > 5, 120):
+            fails.append("gap-state-lost" if len(ends()) >= 2 else "gap-no-run-end")
+            stuck(pid)
+        stayed("gap", n_err)
+# a relaunch that comes while the next run boots, before its unit is in (the restart's end read
+# that missing unit and the process died, 11-07): the end waits the boot out, and the run after it
+# comes up in this process and window with the state the booting run was started with. Asked
+# again until one relaunch lands in a boot.
+if not fails:
+    hit = False
+    n_boot = len(err)
+    for attempt in range(3):
+        n_out, n_err = len(out), len(err)
+        ends = lambda: [t for t, l in err[n_err:] if "run's threads stayed" in l]
+        ask(pid, ["session", "relaunch"])
+        if not wait(lambda: len(ends()) >= 1, 60):
+            fails.append("boot-no-run-end")
+            stuck(pid)
+            break
+        ask(pid, ["session", "relaunch"])
+        restored_after = lambda: len(ends()) >= 2 and any(t > ends()[1] and l.startswith("out restored") for t, l in out[n_out:])
+        if not wait(lambda: restored_after() and len(ticks(n_out)) > 5, 120):
+            fails.append("boot-no-next-run" if len(ends()) >= 2 else "boot-relaunch-lost")
+            stuck(pid)
+            break
+        hit = any("the restart waits for the run's boot" in l for _, l in err[n_err:])
+        if hit:
+            break
+    if not fails:
+        print("restart_in_place: boot: a relaunch %s the next run's boot" % ("landed in" if hit else "never landed in"))
+        if not hit:
+            fails.append("boot-not-hit")
+        stayed("boot", n_boot)
+# last, a quit while a stale access's report pauses the app (nobody decided): the quit goes on,
+# the paused program with it, and the process ends on the first SIGTERM (it waited for the paused
+# main forever and needed SIGKILL, 11-08)
+if not fails:
+    n_err = len(err)
+    open(stale_file, "w").close()
+    wait(lambda: parked() is not None, 60)
+    if parked() is None:
+        fails.append("term-not-parked")
+    else:
+        host_runs("term")
+        t_term = time.time()
+        os.kill(pid, signal.SIGTERM)
+        if not wait(lambda: p.poll() is not None or app_pid() is None, 60):
+            fails.append("term-ignored")
+            # the quit's steps (RELAX_QUIT_TRACE) and the rest of what it said
+            print("\n".join("restart_in_place: term: " + l[:300] for t, l in err[n_err:] if t >= t_term and not l.startswith("relax live: ")))
+            stuck(pid)
+        else:
+            print("restart_in_place: term: the paused app quit %.1f s after SIGTERM" % (time.time() - t_term))
+            # what the app said before it ended is in `err` once the pumps have read its pipes to
+            # their end: the exit can be seen first (a pump slowed after the SIGTERM missed the
+            # line every time)
+            for t in pumps:
+                t.join(10)
+            if not any("the paused program goes on so that it can quit" in l for _, l in err[n_err:]):
+                fails.append("term-not-resumed")
+stop()
+if fails:
+    if "no-start" in fails:
+        print("---- stderr tail")
+        print("\n".join(l[:300] for _, l in err[-40:]))
+    print("restart_in_place: FAIL %s (dir %s)" % (" ".join(fails), tmp))
+    sys.exit(1)
+shutil.rmtree(tmp, ignore_errors=True)
+print("restart_in_place: OK")

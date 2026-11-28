@@ -55,7 +55,41 @@ unsafe impl Send for MidiInput {}
 
 impl MidiInput {
     pub fn receive(&mut self) -> Option<(MidiPortId, MidiData)> {
-        self.0.as_mut().unwrap().receive()
+        self.receive_timed().map(|(port, data, _)| (port, data))
+    }
+
+    /// A message with how long ago it arrived (seconds, by the time stamp the
+    /// platform gave it on arrival): a player subtracts it from its own clock
+    /// to place the message on its sample.
+    pub fn receive_timed(&mut self) -> Option<(MidiPortId, MidiData, f64)> {
+        // Injected messages first, and before the device is touched at all,
+        // so a run with no hardware still exercises everything downstream of
+        // here. Inert — one relaxed load — until something arms it.
+        if let Some((port, data)) = crate::midi_inject::take_incoming() {
+            return Some((port, data, 0.0));
+        }
+        // A handle that was never given a backend yields nothing rather than
+        // panicking. `MidiInput` derives Default, so one exists from the
+        // moment a struct holding it is built until the app fills it in.
+        self.0.as_mut()?.receive_timed()
+    }
+
+    /// The next message, waiting up to `timeout` for one: for a thread that
+    /// forwards MIDI to an audio engine as it arrives. Injected messages are
+    /// seen at the next wake; a handle without a backend waits the timeout.
+    pub fn wait(&mut self, timeout: std::time::Duration) -> Option<(MidiPortId, MidiData, f64)> {
+        if let Some((port, data)) = crate::midi_inject::take_incoming() {
+            return Some((port, data, 0.0));
+        }
+        match self.0.as_mut() {
+            Some(input) => input.wait(timeout),
+            None => {
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::sleep(timeout);
+                let _ = timeout;
+                None
+            }
+        }
     }
 }
 
@@ -65,7 +99,10 @@ unsafe impl Send for MidiOutput {}
 
 impl MidiOutput {
     pub fn send(&self, port: Option<MidiPortId>, data: MidiData) {
-        let output = self.0.as_ref().unwrap();
+        // Recorded before it goes, so what the app sends to a controller can
+        // be read back by a test with no controller to look at.
+        crate::midi_inject::record_outgoing(port.unwrap_or_default(), data);
+        let Some(output) = self.0.as_ref() else { return };
         output.send(port, data);
     }
 }
@@ -183,6 +220,8 @@ impl Into<MidiData> for MidiProgramChange {
     }
 }
 
+/// Channel pressure. Unlike polyphonic aftertouch this is a TWO-byte message:
+/// one 7-bit pressure value, so only the first data byte is part of it.
 #[derive(Clone, Copy, Debug)]
 pub struct MidiChannelAftertouch {
     pub channel: u8,
@@ -192,15 +231,14 @@ pub struct MidiChannelAftertouch {
 impl Into<MidiData> for MidiChannelAftertouch {
     fn into(self) -> MidiData {
         MidiData {
-            data: [
-                0xD0 | self.channel,
-                (((self.value as u32) >> 7) & 0x7f) as u8,
-                ((self.value as u32) & 0x7f) as u8,
-            ],
+            data: [0xD0 | self.channel, (self.value & 0x7f) as u8, 0],
         }
     }
 }
 
+/// 14-bit pitch bend, 0..=16383 with 8192 as centre. On the wire the two data
+/// bytes are LSB FIRST (status, LSB, MSB) — the opposite of the order they are
+/// usually written in, and the classic way this message gets encoded backwards.
 #[derive(Clone, Copy, Debug)]
 pub struct MidiPitchBend {
     pub channel: u8,
@@ -212,8 +250,8 @@ impl Into<MidiData> for MidiPitchBend {
         MidiData {
             data: [
                 0xE0 | self.channel,
-                (((self.bend as u32) >> 7) & 0x7f) as u8,
                 ((self.bend as u32) & 0x7f) as u8,
+                (((self.bend as u32) >> 7) & 0x7f) as u8,
             ],
         }
     }
@@ -256,6 +294,43 @@ impl MidiEvent {
 }
 
 impl MidiData {
+    /// How many of the three bytes are actually part of the message.
+    ///
+    /// A `MidiData` is always three bytes wide, but the wire is not: the
+    /// status byte names the length, and everything after it is somebody
+    /// else's business. A clock tick is ONE byte; sending three puts two
+    /// zeroes on the wire after it, and because a system-realtime byte does
+    /// not clear running status, a receiver reads them as another message
+    /// under whatever status came last -- a note-off for note 0, twenty-four
+    /// times a beat, on a port that is also carrying lamp writes.
+    ///
+    /// A first byte below 0x80 is not a status at all (it is running status,
+    /// or a caller that built a message by hand); nothing here can tell how
+    /// long that is, so all three go, exactly as they always did.
+    pub fn wire_len(&self) -> usize {
+        match self.data[0] {
+            // Program change and channel pressure carry ONE data byte.
+            0xc0..=0xdf => 2,
+            // Note, aftertouch, control change and pitch bend carry two.
+            0x80..=0xbf | 0xe0..=0xef => 3,
+            // System common: one data byte for quarter-frame and song
+            // select, two for song position, none for the rest.
+            0xf1 | 0xf3 => 2,
+            0xf2 => 3,
+            // System realtime and everything else in 0xf4..=0xff: the
+            // status IS the message. 0xf0 cannot be a whole system-exclusive
+            // message in three bytes, so it is left alone.
+            0xf0 => 3,
+            0xf4..=0xff => 1,
+            _ => 3,
+        }
+    }
+
+    /// The bytes to put on the wire.
+    pub fn wire(&self) -> &[u8] {
+        &self.data[..self.wire_len()]
+    }
+
     pub fn status(&self) -> u8 {
         self.data[0] >> 4
     }
@@ -298,11 +373,11 @@ impl MidiData {
             }),
             0xD => MidiEvent::ChannelAftertouch(MidiChannelAftertouch {
                 channel,
-                value: ((self.data[1] as u16) << 7) | self.data[2] as u16,
+                value: self.data[1] as u16,
             }),
             0xE => MidiEvent::PitchBend(MidiPitchBend {
                 channel,
-                bend: ((self.data[1] as u16) << 7) | self.data[2] as u16,
+                bend: ((self.data[2] as u16) << 7) | self.data[1] as u16,
             }),
             0xF => MidiEvent::System(MidiSystem {
                 channel,
@@ -310,6 +385,91 @@ impl MidiData {
                 lo: self.data[2],
             }),
             _ => MidiEvent::Unknown(*self),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pitch bend is little-endian on the wire: status, LSB, MSB. Encoding it
+    /// MSB-first still round-trips through our own decoder, so only a check
+    /// against the actual bytes catches it.
+    #[test]
+    fn pitch_bend_data_bytes_are_lsb_then_msb() {
+        let data: MidiData = MidiPitchBend { channel: 0, bend: 8192 }.into();
+        assert_eq!(data.data, [0xE0, 0x00, 0x40]);
+
+        // One step above centre moves the LSB only.
+        let data: MidiData = MidiPitchBend { channel: 3, bend: 8193 }.into();
+        assert_eq!(data.data, [0xE3, 0x01, 0x40]);
+
+        // Full range end points.
+        let data: MidiData = MidiPitchBend { channel: 0, bend: 0 }.into();
+        assert_eq!(data.data, [0xE0, 0x00, 0x00]);
+        let data: MidiData = MidiPitchBend { channel: 0, bend: 16383 }.into();
+        assert_eq!(data.data, [0xE0, 0x7f, 0x7f]);
+    }
+
+    #[test]
+    fn pitch_bend_round_trips_through_the_wire_bytes() {
+        for bend in [0u16, 1, 8191, 8192, 8193, 16383] {
+            let data: MidiData = MidiPitchBend { channel: 5, bend }.into();
+            match data.decode() {
+                MidiEvent::PitchBend(pb) => {
+                    assert_eq!(pb.bend, bend);
+                    assert_eq!(pb.channel, 5);
+                }
+                other => panic!("expected pitch bend, got {:?}", other),
+            }
+        }
+    }
+
+    /// The length the status byte names. Getting this wrong is not a
+    /// cosmetic fault: two zero bytes after a clock tick are read under
+    /// whatever status came last, so a port carrying both a clock and lamp
+    /// writes gets a stream of note-offs it never asked for.
+    #[test]
+    fn the_status_byte_says_how_much_of_the_message_is_real() {
+        let len = |bytes: [u8; 3]| MidiData { data: bytes }.wire_len();
+        // Three-byte messages, one per status.
+        assert_eq!(len([0x80, 60, 0]), 3, "note off");
+        assert_eq!(len([0x9f, 60, 100]), 3, "note on, channel 15");
+        assert_eq!(len([0xa0, 60, 100]), 3, "polyphonic aftertouch");
+        assert_eq!(len([0xb0, 7, 100]), 3, "control change");
+        assert_eq!(len([0xe0, 0, 64]), 3, "pitch bend");
+        assert_eq!(len([0xf2, 0, 1]), 3, "song position");
+        // Two-byte messages.
+        assert_eq!(len([0xc0, 5, 0]), 2, "program change");
+        assert_eq!(len([0xd0, 64, 0]), 2, "channel pressure");
+        assert_eq!(len([0xf1, 0x21, 0]), 2, "quarter frame");
+        assert_eq!(len([0xf3, 2, 0]), 2, "song select");
+        // One-byte messages: the whole reason this exists.
+        for status in [0xf6u8, 0xf7, 0xf8, 0xfa, 0xfb, 0xfc, 0xfe, 0xff] {
+            assert_eq!(len([status, 0, 0]), 1, "status {status:#04x} is one byte");
+        }
+        assert_eq!(MidiData { data: [0xf8, 0, 0] }.wire(), &[0xf8]);
+        assert_eq!(MidiData { data: [0x90, 60, 100] }.wire(), &[0x90, 60, 100]);
+        // Not a status byte at all: nothing can be assumed, so nothing is.
+        assert_eq!(len([0x40, 0x50, 0x60]), 3, "running status stays whole");
+        // Three bytes cannot hold a whole system-exclusive message, so it is
+        // passed through rather than truncated to its opening byte.
+        assert_eq!(len([0xf0, 0x7e, 0x00]), 3, "sysex is not ours to cut");
+    }
+
+    /// Channel pressure carries one 7-bit value, so the third byte is not part
+    /// of the message and must not be folded into the value.
+    #[test]
+    fn channel_aftertouch_is_a_two_byte_message() {
+        let data: MidiData = MidiChannelAftertouch { channel: 2, value: 64 }.into();
+        assert_eq!(data.data, [0xD2, 64, 0]);
+
+        // A stale third byte must not leak into the decoded value.
+        let data = MidiData { data: [0xD2, 64, 0x7f] };
+        match data.decode() {
+            MidiEvent::ChannelAftertouch(at) => assert_eq!(at.value, 64),
+            other => panic!("expected channel aftertouch, got {:?}", other),
         }
     }
 }

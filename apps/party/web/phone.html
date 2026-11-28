@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<link rel="icon" href="data:,">
+<title>Party</title>
+<style>
+  :root { color-scheme: dark; font: 16px/1.3 system-ui, sans-serif; background: #000; color: #fff; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  /* Nothing scrolls: the keyboard only lifts the dock (visualViewport). */
+  html, body { position: fixed; inset: 0; margin: 0; overflow: hidden; overscroll-behavior: none; background: #000; }
+  button, input { font: inherit; color: inherit; }
+  button { padding: 0; border: 0; cursor: pointer; touch-action: manipulation; }
+  button:focus-visible, input:focus-visible { outline: 2px solid #c2b0ff; outline-offset: 3px; }
+  /* The camera is the whole background. */
+  #view { position: fixed; inset: 0; background: #000; display: block; }
+  #view video, #view canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #status { position: absolute; left: 50%; top: max(14px, env(safe-area-inset-top)); transform: translateX(-50%);
+    max-width: calc(100vw - 120px); padding: 6px 12px; border-radius: 16px; background: rgb(0 0 0 / 45%);
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+  #status:empty { display: none; }
+  #flip { position: absolute; top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right));
+    width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; font-size: 20px;
+    background: rgb(0 0 0 / 40%); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
+  /* The dock: the record button over a blurred prompt pill, riding above the keyboard. */
+  #dock { position: fixed; left: 0; right: 0; bottom: 0; display: grid; justify-items: center; gap: 14px;
+    padding: 0 max(12px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left));
+    transform: translateY(calc(0px - var(--lift, 0px))); pointer-events: none; }
+  #dock > * { pointer-events: auto; }
+  /* While typing only a compact prompt rides on the keyboard's top edge (sideways
+     Safari leaves ~40 px between its bars and the keyboard); Enter sends. */
+  body.typing #flip, body.typing #status, body.typing #prompt button { display: none; }
+  body.typing #dock { padding-bottom: 2px; }
+  body.typing #prompt { padding: 2px; }
+  body.typing #wish { height: 36px; }
+  /* The party's earlier prompts over the camera while typing; a tap fills the input. */
+  #history { display: none; width: 100%; max-width: 560px; max-height: calc(var(--room, 260px) - 64px); overflow-y: auto;
+    border-radius: 18px; background: rgb(20 18 24 / 55%); -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); }
+  body.typing #history:not(:empty) { display: block; }
+  #history button { display: block; width: 100%; padding: 10px 16px; text-align: left; font-size: 15px; background: transparent;
+    border-bottom: 1px solid rgb(255 255 255 / 10%); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #record { position: relative; width: 74px; height: 74px; border-radius: 50%; background: rgb(255 255 255 / 22%);
+    border: 3px solid #fff; color: #fff; font-size: 11px; line-height: 1.1; font-weight: 650;
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
+  #record:disabled { cursor: default; }
+  #record::before { content: ""; position: absolute; inset: -3px; border-radius: inherit;
+    background: conic-gradient(#ff5d73 var(--progress, 0turn), transparent 0); }
+  #record span { position: absolute; inset: 5px; border-radius: inherit; display: grid; align-content: center;
+    padding: 4px; background: rgb(255 70 95 / 85%); }
+  #prompt { width: 100%; max-width: 560px; display: flex; gap: 6px; padding: 5px; border-radius: 28px;
+    background: rgb(20 18 24 / 45%); border: 1px solid rgb(255 255 255 / 18%);
+    -webkit-backdrop-filter: blur(16px) saturate(1.4); backdrop-filter: blur(16px) saturate(1.4); }
+  #wish { flex: 1; min-width: 0; height: 44px; padding: 0 14px; border: 0; border-radius: 22px; background: transparent;
+    font-size: 16px; outline: none; }
+  #wish::placeholder { color: rgb(255 255 255 / 70%); }
+  #prompt button { width: 44px; height: 44px; border-radius: 50%; background: #fff; color: #111; font-size: 22px; flex: none; }
+</style>
+</head>
+<body>
+<button type="button" id="view" aria-label="Camera. Tap to go live." aria-describedby="status">
+  <video id="camera" playsinline muted autoplay></video>
+  <canvas id="result" width="512" height="512" hidden></canvas>
+  <span id="status" role="status"></span>
+  <span id="flip" role="button" tabindex="0" aria-label="Switch camera">⟲</span>
+</button>
+<div id="dock">
+  <div id="history" role="listbox" aria-label="Earlier prompts"></div>
+  <form id="prompt">
+    <input id="wish" type="text" maxlength="300" enterkeyhint="send" autocomplete="off" placeholder="Describe a style…" aria-label="Style prompt">
+    <button type="submit" aria-label="Send prompt">↑</button>
+  </form>
+</div>
+
+<script>
+"use strict";
+const base = location.pathname.replace(/\/+$/, "") + "/";
+const FPS = 8, SECONDS = 3, SIDE = 512, SEND_SIDE = 1024;
+const video = document.getElementById("camera"), canvas = document.getElementById("result");
+const view = document.getElementById("view");
+const status = document.getElementById("status"), recordButton = document.getElementById("record");
+const bar = document.getElementById("prompt"), input = document.getElementById("wish");
+const dock = document.getElementById("dock");
+const tapToLive = "Tap the camera to go live";
+const bumped = "Someone else took the screen. Tap to go back on.";
+const redrawing = "Redrawing your loop…";
+const textType = "text/plain; charset=utf-8";
+let live = null, current = null, showingLoop = false, recording = false;
+// The back camera points at the room; the flip in the view's corner swaps.
+let facing = "environment";
+
+function liftBar() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  dock.style.setProperty("--lift", Math.max(0, window.innerHeight - vv.height - vv.offsetTop) + "px");
+  dock.style.setProperty("--room", vv.height + "px");
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", liftBar);
+  window.visualViewport.addEventListener("scroll", liftBar);
+  liftBar();
+}
+try { if (navigator.virtualKeyboard) navigator.virtualKeyboard.overlaysContent = true; } catch (e) {}
+input.addEventListener("focus", () => { document.body.classList.add("typing"); window.scrollTo(0, 0); liftBar(); showHistory(); });
+input.addEventListener("blur", () => { document.body.classList.remove("typing"); liftBar(); sendDraft(""); });
+
+// The party's earlier prompts, newest first, above the input while typing.
+const historyList = document.getElementById("history");
+async function showHistory() {
+  try {
+    const prompts = (await (await call("GET", "history")).json()).prompts || [];
+    historyList.replaceChildren(...prompts.slice(0, 8).map(text => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = text;
+      // Keep the keyboard up: the tap fills the input without a blur.
+      b.addEventListener("pointerdown", e => e.preventDefault());
+      b.onclick = () => { input.value = text; input.focus(); sendDraft(text); };
+      return b;
+    }));
+  } catch (e) { /* No history yet, or the box is busy: the input works without it. */ }
+}
+
+// What the guest is typing shows on the big screen as they type (a few times a second).
+let draftTimer = null, draftSent = "";
+function sendDraft(text) {
+  clearTimeout(draftTimer);
+  draftTimer = null;
+  if (text === draftSent) return;
+  draftSent = text;
+  call("POST", "draft", { body: text, type: textType }).catch(() => {});
+}
+input.addEventListener("input", () => {
+  if (!draftTimer) draftTimer = setTimeout(() => { draftTimer = null; sendDraft(input.value.trim()); }, 300);
+});
+// Some iOS versions pause the camera's video when the phone turns.
+function keepPlaying() { if (video.srcObject && video.paused) video.play().catch(() => {}); liftBar(); }
+window.addEventListener("orientationchange", keepPlaying);
+window.addEventListener("resize", keepPlaying);
+
+const session = "p" + Math.random().toString(36).slice(2, 8);
+function report(test, ok, detail, withBrowser) {
+  const body = { session, test, ok, detail: String(detail).slice(0, 400) };
+  if (withBrowser) body.ua = navigator.userAgent.slice(0, 400);
+  fetch(base + "camtest/report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => {});
+}
+function why(e) { return (e.name || "Error") + ": " + (e.message || String(e)); }
+function secondsSince(t) { return ((performance.now() - t) / 1000).toFixed(1) + " s"; }
+window.addEventListener("error", e => report("error", false, (e.message || "error") + " at line " + (e.lineno || "?")));
+window.addEventListener("unhandledrejection", e => report("error", false, why(e.reason || "unknown")));
+report("page", true, window.innerWidth + " px wide at " + (window.devicePixelRatio || 1) + "x" +
+  (window.visualViewport ? "" : ", no visualViewport") + (window.isSecureContext ? "" : ", not a secure context"), true);
+
+let token = null, joining = null;
+try { token = localStorage.getItem("party-token"); } catch (e) {}
+function saveToken(value) {
+  token = value;
+  try {
+    if (value) localStorage.setItem("party-token", value);
+    else localStorage.removeItem("party-token");
+  } catch (e) {}
+}
+
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    function cancel() { clearTimeout(timer); reject(new DOMException("Cancelled", "AbortError")); }
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener("abort", cancel);
+      resolve();
+    }, ms);
+    if (signal && signal.aborted) cancel();
+    else if (signal) signal.addEventListener("abort", cancel, { once: true });
+  });
+}
+
+// Finish a POST already on the wire so a later leave or replacement upload can
+// account for it. Cancelling its owner still cancels any Retry-After wait.
+async function request(method, path, bearer, { body, type, signal, onBusy } = {}) {
+  const headers = {};
+  if (bearer) headers.Authorization = "Bearer " + bearer;
+  if (type) headers["Content-Type"] = type;
+  for (;;) {
+    if (signal && signal.aborted) throw new DOMException("Cancelled", "AbortError");
+    const r = await fetch(base + path, { method, headers, body, signal: method === "GET" ? signal : undefined });
+    if (r.status !== 429 && r.status !== 503) return r;
+    await r.text();
+    if (onBusy) onBusy();
+    await delay(1000 * Math.max(0.2, Number(r.headers.get("Retry-After")) || 1), signal);
+  }
+}
+async function checked(r) {
+  if (!r.ok) {
+    const e = new Error((await r.text()) || ("The box answered " + r.status));
+    e.status = r.status;
+    throw e;
+  }
+  return r;
+}
+// The box restarted with another party: this page's address is gone.
+const moved = "This party moved: scan the QR code on the big screen again";
+function notLive(e) { return e && e.status === 404 ? moved : tapToLive; }
+async function join() {
+  if (!token) {
+    if (!joining) joining = request("POST", "join").then(checked).then(r => r.json())
+      .then(a => saveToken(a.token)).finally(() => { joining = null; });
+    await joining;
+  }
+  return token;
+}
+async function call(method, path, options) {
+  const used = await join();
+  let r = await request(method, path, used, options);
+  if (r.status === 401) {
+    if (token === used) saveToken(null);
+    r = await request(method, path, await join(), options);
+  }
+  return checked(r);
+}
+
+let openingCamera = null;
+function camera() {
+  if (!openingCamera) openingCamera = startCamera().finally(() => { openingCamera = null; });
+  return openingCamera;
+}
+async function startCamera() {
+  const asked = performance.now();
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("no getUserMedia");
+    if (!video.srcObject || !video.srcObject.active) {
+      video.srcObject = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+      });
+    }
+    await video.play();
+    const track = video.srcObject.getVideoTracks()[0];
+    track.onended = () => {
+      if (live) {
+        status.textContent = tapToLive;
+        leaveLive().catch(() => {});
+      }
+    };
+    report("camera", true, facing + " " + video.videoWidth + "x" + video.videoHeight + ", up in " + secondsSince(asked));
+    return track;
+  } catch (e) {
+    report("camera", false, facing + " " + why(e));
+    throw e;
+  }
+}
+
+// Both streams use [u32 length][kind][payload]. Live uses the local preview,
+// so skip the box's live JPEGs without allocating or decoding a picture.
+async function messages(path, signal, receive) {
+  const r = await call("GET", path, { signal });
+  const reader = r.body.getReader(), header = new Uint8Array(5);
+  let filled = 0, left = 0, payload = null;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return false;
+      let at = 0;
+      while (at < value.length && !signal.aborted) {
+        if (filled < 5) {
+          const n = Math.min(5 - filled, value.length - at);
+          header.set(value.subarray(at, at + n), filled);
+          filled += n;
+          at += n;
+          if (filled < 5) continue;
+          left = new DataView(header.buffer).getUint32(0) - 1;
+          if (left < 0) throw new Error("Invalid stream message");
+          payload = header[4] === 1 || header[4] === 2 ? new Uint8Array(left) : null;
+        }
+        const n = Math.min(left, value.length - at);
+        if (payload) payload.set(value.subarray(at, at + n), payload.length - left);
+        at += n;
+        left -= n;
+        if (!left) {
+          if (header[4] === 3) return true;
+          if (payload) await receive(header[4], payload);
+          filled = 0;
+        }
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+}
+const decoder = new TextDecoder();
+
+// Order changes to the slot even when the guest taps record during queue or offer.
+let changingSlot = Promise.resolve();
+function livePost(path, options) {
+  const next = changingSlot.then(() => call("POST", "live/" + path, options));
+  changingSlot = next.catch(() => {});
+  return next;
+}
+function closeLive() {
+  if (!live) return;
+  const turn = live;
+  live = null;
+  turn.controller.abort();
+  if (turn.pc) turn.pc.close();
+}
+function leaveLive() {
+  closeLive();
+  return livePost("leave");
+}
+// How long going live takes, stage by stage, for the box's log.
+function mark(turn, what) {
+  turn.marks.push(what + " " + Math.round(performance.now() - turn.t0));
+}
+async function goLive(reopening = false, how = "tap") {
+  if (recording || live) return;
+  showCamera();
+  const turn = live = { controller: new AbortController(), state: "joining", pc: null, wish: input.value.trim() || null,
+    t0: performance.now(), marks: [how] };
+  const signal = turn.controller.signal;
+  status.textContent = "Starting the camera…";
+  try {
+    await Promise.all([camera(), join()]);
+    if (signal.aborted) return;
+    mark(turn, "camera");
+    call("POST", "warm", { signal }).catch(() => {});
+    status.textContent = "Going live…";
+    if (reopening) {
+      // A reload can reuse a token whose old peer still holds the slot.
+      const before = await (await call("GET", "live", { signal })).json();
+      if (!before.available || (before.state === "out" && before.bumped)) return applyLive(turn, before);
+      if (before.state === "live" || before.state === "starting") await livePost("leave", { signal });
+    }
+    const queued = await (await livePost("queue?screen=1", { signal })).json();
+    mark(turn, "queued");
+    applyLive(turn, queued);
+    if (signal.aborted) return;
+    pollLive(turn);
+    streamLive(turn);
+  } catch (e) {
+    if (signal.aborted) return;
+    report("live", false, why(e));
+    closeLive();
+    status.textContent = notLive(e);
+  }
+}
+async function streamLive(turn) {
+  const signal = turn.controller.signal;
+  while (!signal.aborted && window.ReadableStream) {
+    try {
+      await messages("live/stream", signal, (kind, payload) => {
+        if (kind === 1) applyLive(turn, JSON.parse(decoder.decode(payload)));
+      });
+    } catch (e) { /* GET live also carries the state. */ }
+    if (!signal.aborted) await delay(1000, signal).catch(() => {});
+  }
+}
+async function pollLive(turn) {
+  const signal = turn.controller.signal;
+  while (!signal.aborted) {
+    try {
+      if (!document.hidden) applyLive(turn, await (await call("GET", "live", { signal })).json());
+    } catch (e) { /* A missed heartbeat is retried. */ }
+    if (!signal.aborted) await delay(3000, signal).catch(() => {});
+  }
+}
+function applyLive(turn, s) {
+  if (turn !== live) return;
+  if (!s.available || s.state === "out") {
+    closeLive();
+    status.textContent = !s.available ? "" : s.bumped ? bumped : tapToLive;
+    return;
+  }
+  if (turn.state !== s.state) {
+    turn.state = s.state;
+    status.textContent = s.state === "live" ? "Live on the big screen" : "Going live…";
+    if (s.state === "live") {
+      mark(turn, "live");
+      report("live", true, "went live in ms: " + turn.marks.join(", "));
+    }
+  }
+  if (s.state === "up" && !turn.pc && !turn.failing) startCall(turn);
+  if (s.state !== "waiting") sendWish(turn);
+}
+async function startCall(turn) {
+  const signal = turn.controller.signal;
+  try {
+    const track = video.srcObject.getVideoTracks()[0];
+    const pc = turn.pc = new RTCPeerConnection({ iceServers: [] });
+    pc.addTransceiver(track, { direction: "sendonly", streams: [video.srcObject] });
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") mark(turn, "connected");
+      if (pc.connectionState === "failed") callFailed(turn, new Error("WebRTC connection failed"));
+    };
+    await pc.setLocalDescription(await pc.createOffer());
+    mark(turn, "offer");
+    const size = video.videoWidth ? { width: video.videoWidth, height: video.videoHeight } : (track.getSettings ? track.getSettings() : {});
+    const r = await livePost("offer?w=" + (size.width || 0) + "&h=" + (size.height || 0), {
+      signal, body: pc.localDescription.sdp, type: "application/sdp"
+    });
+    if (signal.aborted) return;
+    mark(turn, "answer");
+    await pc.setRemoteDescription({ type: "answer", sdp: await r.text() });
+    report("live", true, "call offered at " + size.width + "x" + size.height);
+  } catch (e) { await callFailed(turn, e); }
+}
+async function callFailed(turn, e) {
+  if (live !== turn || turn.failing) return;
+  turn.failing = true;
+  report("live", false, why(e));
+  try {
+    const s = await (await call("GET", "live", { signal: turn.controller.signal })).json();
+    if (!s.available || s.state === "out") return applyLive(turn, s);
+  } catch (e) {}
+  if (turn !== live) return;
+  status.textContent = tapToLive;
+  await leaveLive().catch(() => {});
+}
+
+function frameSet(blobs) {
+  const parts = [];
+  for (const b of blobs) {
+    const length = new Uint8Array(4);
+    new DataView(length.buffer).setUint32(0, b.size);
+    parts.push(length, b);
+  }
+  return new Blob(parts, { type: "application/x-party-frames" });
+}
+function square(side) {
+  const c = document.createElement("canvas");
+  c.width = c.height = side;
+  return c;
+}
+
+let playTimer = null;
+function stopPlayback() {
+  clearInterval(playTimer);
+  playTimer = null;
+}
+function showCamera() {
+  showingLoop = false;
+  stopPlayback();
+  stopWatch();
+  canvas.hidden = true;
+  view.setAttribute("aria-label", "Camera preview. Tap to go live.");
+  if (current) {
+    releaseFrames(current.frames);
+    current.frames = current.drawn = [];
+  }
+}
+function releaseFrames(frames) {
+  for (const frame of frames || []) {
+    if (frame.close) frame.close();
+    else frame.width = frame.height = 0;
+  }
+}
+function play(mine, frames) {
+  if (mine.frames !== frames) releaseFrames(mine.frames);
+  mine.frames = frames;
+  if (!showingLoop || mine !== current || document.hidden) return;
+  stopPlayback();
+  const context = canvas.getContext("2d");
+  let i = 0;
+  function draw() {
+    context.drawImage(frames[i], 0, 0, canvas.width, canvas.height);
+    i = (i + 1) % frames.length;
+  }
+  draw();
+  canvas.hidden = false;
+  playTimer = setInterval(draw, 1000 / FPS);
+}
+async function record() {
+  if (recording) return;
+  recording = recordButton.disabled = true;
+  showCamera();
+  status.textContent = "Getting ready…";
+  let ready = false;
+  try {
+    // Ask for playback within the tap if the phone needs a gesture.
+    await Promise.all([leaveLive(), camera()]);
+    if (!video.videoWidth || !video.videoHeight) throw new Error("The camera is not ready");
+    ready = true;
+    const count = SECONDS * FPS, shots = [], jpegs = [];
+    const full = square(SEND_SIDE), context = full.getContext("2d");
+    const started = performance.now();
+    status.textContent = "Recording…";
+    for (let i = 0; i < count; i++) {
+      const wait = started + i * 1000 / FPS - performance.now();
+      if (wait > 0) await delay(wait);
+      const w = video.videoWidth, h = video.videoHeight, side = Math.min(w, h);
+      context.drawImage(video, (w - side) / 2, (h - side) / 2, side, side, 0, 0, SEND_SIDE, SEND_SIDE);
+      const shot = square(SIDE);
+      shot.getContext("2d").drawImage(full, 0, 0, SIDE, SIDE);
+      shots.push(shot);
+      jpegs.push(new Promise(resolve => full.toBlob(resolve, "image/jpeg", 0.85)));
+      recordButton.style.setProperty("--progress", (i + 1) / count + "turn");
+    }
+    const recorded = performance.now(), blobs = await Promise.all(jpegs);
+    if (blobs.includes(null)) throw new Error("The phone made no picture");
+    full.width = full.height = 0;
+    if (current) current.controller.abort();
+    const mine = current = {
+      controller: new AbortController(), set: frameSet(blobs), count, recorded,
+      wish: input.value.trim() || null, source: null, take: null, drawn: []
+    };
+    showingLoop = true;
+    view.setAttribute("aria-label", "Recorded loop. Tap to go live.");
+    play(mine, shots);
+    uploadLoop(mine);
+  } catch (e) {
+    report("loop", false, why(e));
+    status.textContent = ready ? e.message : tapToLive;
+  } finally {
+    recording = recordButton.disabled = false;
+    recordButton.style.removeProperty("--progress");
+  }
+}
+function loopNote(mine, text) {
+  if (current === mine && showingLoop) status.textContent = text;
+}
+let previousSource = null;
+async function uploadLoop(mine) {
+  const signal = mine.controller.signal;
+  loopNote(mine, "Sending your loop…");
+  try {
+    const r = await call("POST", "loop?fps=" + FPS + "&keep=wall", {
+      signal, body: mine.set, type: "application/x-party-frames",
+      onBusy: () => loopNote(mine, "Box busy. Retrying your loop…")
+    });
+    const answer = await r.json();
+    report("loop", true, "source " + answer.source + ": " + mine.count + " frames, " + Math.round(mine.set.size / 1024) +
+      " KB, sent " + secondsSince(mine.recorded) + " after recording");
+    if (signal.aborted) {
+      call("POST", "delete?source=" + answer.source).catch(() => {});
+      return;
+    }
+    if (previousSource && previousSource.token === token) call("POST", "delete?source=" + previousSource.id).catch(() => {});
+    previousSource = { id: answer.source, token };
+    mine.source = answer.source;
+    mine.token = token;
+    mine.take = answer.take;
+    mine.askedAt = mine.recorded;
+    mine.asked = "the recording";
+    loopNote(mine, redrawing);
+    sendWish(mine);
+    watch();
+  } catch (e) {
+    if (signal.aborted) return;
+    report("loop", false, why(e));
+    loopNote(mine, "Loop upload failed. Tap to record again.");
+  }
+}
+
+// Serialize wishes per turn or loop. A send during queueing or upload is
+// remembered until the slot or source exists, including an explicit empty wish.
+async function sendWish(target) {
+  const isLive = target === live;
+  if (target.sending || target.wish == null || (isLive ? !["up", "starting", "live"].includes(target.state) : target.source == null)) return;
+  const signal = target.controller.signal;
+  target.sending = true;
+  try {
+    while (target.wish != null && !signal.aborted) {
+      const text = target.wish, asked = performance.now();
+      target.wish = null;
+      const options = { signal, type: textType, body: text };
+      try {
+        const r = isLive ? await livePost("wish", options) : await call("POST", "wish?source=" + target.source, options);
+        const answer = await r.json();
+        if (signal.aborted) return;
+        report(isLive ? "live wish" : "prompt", true, text ? text.length + " characters" : "empty: the box picks");
+        if (isLive) applyLive(target, answer);
+        else {
+          target.prompt = text;
+          target.take = answer.take;
+          target.asked = "the prompt";
+          target.askedAt = asked;
+          loopNote(target, redrawing);
+          watch();
+        }
+      } catch (e) {
+        if (signal.aborted) return;
+        report(isLive ? "live wish" : "prompt", false, why(e));
+        if (isLive) status.textContent = e.message;
+        else if (target.token !== token) {
+          if (target.wish == null) target.wish = text;
+          resend(target);
+          return;
+        } else loopNote(target, e.message);
+      }
+    }
+  } finally { target.sending = false; }
+}
+function resend(mine) {
+  if (mine.source == null) return;
+  stopWatch();
+  mine.source = mine.take = mine.drawnTake = null;
+  mine.drawn = [];
+  if (mine.wish == null) mine.wish = mine.prompt;
+  report("loop", true, "sending again, the box had lost it");
+  uploadLoop(mine);
+}
+
+let observer = null;
+function stopWatch() {
+  if (observer) observer.abort();
+  observer = null;
+}
+function takeState(mine, me) {
+  const source = me.sources.find(s => s.id === mine.source);
+  if (!source) {
+    if (mine.token !== token) resend(mine);
+    else { stopWatch(); loopNote(mine, "Loop gone. Tap to record again."); }
+    return null;
+  }
+  const latest = source.takes[source.takes.length - 1];
+  // The stream sends the newest playable take even while a later one is queued.
+  mine.playable = source.takes.slice().reverse().find(t => t.frames && (t.state === "done" || t.state === "running"));
+  if (!latest || latest.id < mine.take) return null;
+  mine.take = latest.id;
+  if (latest.state === "failed" && mine.failed !== latest.id) {
+    mine.failed = latest.id;
+    report("take", false, "take " + latest.id + ": " + (latest.error || "failed"));
+    loopNote(mine, "Redraw failed. Try another prompt.");
+  }
+  mine.latest = latest;
+  takeComplete(mine);
+  return latest;
+}
+async function addFrame(mine, take, index, jpeg, signal) {
+  if (!mine.playable || take !== mine.playable.id || (mine.drawnTake === take && index < mine.drawn.length)) return;
+  const frame = await createImageBitmap(jpeg);
+  if (signal.aborted) { frame.close(); return; }
+  if (mine.drawnTake !== take) { mine.drawnTake = take; mine.drawn = []; }
+  if (index !== mine.drawn.length) { frame.close(); throw new Error("Missing loop frame"); }
+  mine.drawn.push(frame);
+  if (!index) {
+    play(mine, mine.drawn);
+    if (mine.askedAt != null && take === mine.take) report("take", true, "take " + take + ": first frame playing " + secondsSince(mine.askedAt) + " after " + mine.asked);
+  }
+  takeComplete(mine);
+}
+function takeComplete(mine) {
+  const t = mine.latest;
+  if (!t || t.id !== mine.take || t.id !== mine.drawnTake || t.state !== "done" || mine.drawn.length !== t.frames) return;
+  if (mine.askedAt != null) {
+    report("take", true, "take " + t.id + ": all " + t.frames + " frames " + secondsSince(mine.askedAt) + " after " + mine.asked);
+    mine.askedAt = null;
+  }
+  loopNote(mine, "");
+}
+
+// One reader at a time, resuming after the last decoded frame. Phones that
+// cannot read a streaming response get the same state and JPEGs by polling.
+async function watch() {
+  const mine = current;
+  if (!showingLoop || !mine || mine.source == null || observer || document.hidden) return;
+  const owner = observer = new AbortController(), signal = owner.signal;
+  let retry = true;
+  try {
+    if (window.ReadableStream && window.Response && "body" in Response.prototype) {
+      const from = mine.drawnTake == null ? "" : "?take=" + mine.drawnTake + "&have=" + mine.drawn.length;
+      const bye = await messages("stream" + from, signal, (kind, data) => {
+        if (kind === 1) takeState(mine, JSON.parse(decoder.decode(data)));
+        else if (kind === 2) {
+          const at = new DataView(data.buffer);
+          return addFrame(mine, at.getUint32(0), at.getUint16(4), new Blob([data.subarray(6)], { type: "image/jpeg" }), signal);
+        }
+      });
+      retry = !bye || !mine.latest || mine.latest.id !== mine.take || ["queued", "running"].includes(mine.latest.state);
+    } else {
+      const t = takeState(mine, await (await call("GET", "me", { signal })).json());
+      if (t) {
+        const shown = mine.playable;
+        if (shown) {
+          for (let i = mine.drawnTake === shown.id ? mine.drawn.length : 0; i < shown.frames; i++) {
+            const r = await call("GET", "frame?take=" + shown.id + "&i=" + i, { signal });
+            await addFrame(mine, shown.id, i, await r.blob(), signal);
+          }
+        }
+        retry = t.id !== mine.take || ["queued", "running"].includes(t.state);
+      }
+    }
+  } catch (e) { /* Resume from the last whole frame. */ }
+  finally {
+    if (observer === owner) {
+      observer = null;
+      if (retry) setTimeout(watch, 1000);
+    }
+  }
+}
+
+view.onclick = () => goLive();
+// The other camera, live calls included (the box follows the new picture's size).
+document.getElementById("flip").onclick = async event => {
+  event.stopPropagation();
+  if (recording) return;
+  facing = facing === "environment" ? "user" : "environment";
+  const old = video.srcObject;
+  video.srcObject = null;
+  if (old) old.getTracks().forEach(t => t.stop());
+  try {
+    const track = await camera();
+    const sender = live && live.pc && live.pc.getSenders()[0];
+    if (sender) await sender.replaceTrack(track);
+  } catch (e) {
+    report("camera", false, "flip " + why(e));
+    status.textContent = "The camera did not switch";
+  }
+};
+bar.onsubmit = event => {
+  event.preventDefault();
+  input.blur();
+  const target = showingLoop ? current : live;
+  if (target) { target.wish = input.value.trim(); sendWish(target); }
+};
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { stopWatch(); stopPlayback(); }
+  else if (showingLoop && current) { play(current, current.frames); watch(); }
+});
+// Alone at the party a phone goes live by itself; with others here a tap on
+// the camera takes the lead. Every open page polls, so the box knows who is here.
+async function arrive() {
+  showCamera();
+  try {
+    const s = await (await call("GET", "live")).json();
+    const holding = s.state === "live" || s.state === "starting" || s.state === "up";
+    if (holding || (s.available && !s.bumped && !s.others)) return goLive(!!token, "auto");
+    status.textContent = !s.available ? "" : s.bumped ? bumped : tapToLive;
+  } catch (e) {
+    status.textContent = notLive(e);
+  }
+  camera().catch(() => {});
+}
+setInterval(() => {
+  if (live || document.hidden) return;
+  call("GET", "live").then(r => r.json()).then(s => {
+    if (!live && s.bumped) status.textContent = bumped;
+  }).catch(() => {});
+}, 4000);
+arrive();
+</script>
+</body>
+</html>

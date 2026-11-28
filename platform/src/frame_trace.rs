@@ -1,0 +1,442 @@
+//! The frame clock, measured: `MAKEPAD_TRACE=frames` prints a histogram every
+//! two seconds of what paced each beat of the HAL loop and how evenly frames
+//! land, on every backend (the gaps read the same on each).
+//!
+//! Three gaps matter for smooth animation and each has its own clock: the
+//! gap between the beats that DISPATCH `NextFrame` (the app steps its
+//! animations here), the gap between window frames the backend presented
+//! (what the compositor receives), and — for a display-paced beat — how far
+//! ahead of the beat the flip it is aimed at lies. Every beat also says what
+//! woke it: a window's display announcing a frame, the loop's own period
+//! when no display paces it, or a host's turn. A judder that shows as an even
+//! present histogram and an uneven next-frame histogram is the app clock's;
+//! the reverse is the compositor's.
+//!
+//! A person waits on the frames that took their input (a pointer move, a key, a drag): of
+//! those the line counts the gaps apart, and the wait from the input to the present, with the
+//! first such frame after frames that took none (the person starts to act) on a line of its own.
+//!
+//! A present's gap counts only time a frame was due. An idle app presents
+//! nothing, and that is no stall: a rest runs from a turn of the loop that left
+//! no work for a frame and none on its way to the screen, to when the loop next
+//! started on something that left one (an input it took, or its wake), and the
+//! gap leaves it out. A NextFrame request alone is no frame's work: the wait
+//! for the beat that dispatches it rests if that beat draws nothing, and counts
+//! if it draws (an animation's frames count whole). A handler's time is not
+//! rest. The line says so.
+//!
+//! Off, each call is one atomic load.
+
+use crate::makepad_error_log::trace_enabled;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Window frames handed to the compositor since start, always counted (one
+/// relaxed add per present). An app's frame clock can run on beats whose
+/// repaint the GPU backpressure gate withheld: comparing this with its own
+/// drawn frames is how an app sees it is GPU-bound (and scales its render
+/// resolution) without a governor inside the platform.
+static PRESENTED: AtomicU64 = AtomicU64::new(0);
+
+/// A window frame was presented (backends call this at the present).
+pub fn note_presented() {
+    PRESENTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Window frames presented since start, all windows.
+pub fn presented_frames() -> u64 {
+    PRESENTED.load(Ordering::Relaxed)
+}
+
+/// Draw events dispatched since start (one per drawn frame, every platform): the frame clock
+/// input record / replay and the flight recorder pin input events to.
+static DRAWN: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_drawn() {
+    DRAWN.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Draw events dispatched since start.
+pub fn drawn_frames() -> u64 {
+    DRAWN.load(Ordering::Relaxed)
+}
+
+/// What a turn of the HAL loop left for a frame.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Left {
+    /// Work for a frame, or a frame on its way to the screen.
+    Frame,
+    /// NextFrame requests alone: the beat that dispatches them draws only if a handler asks.
+    NextFrame,
+    /// Nothing.
+    Nothing,
+}
+
+/// What woke a beat of the HAL loop.
+#[derive(Clone, Copy)]
+pub enum TickSource {
+    /// A window's display announced a frame (`FrameReady`): the flip it aims at is known.
+    Display,
+    /// The loop's own period: no display paces this app (offscreen windows, none yet).
+    Cadence,
+    /// A host's turn: the window manager's `Tick` for a hosted app, an embedder's turn.
+    Host,
+}
+
+const EDGES_MS: [f64; 9] = [4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 18.0, 25.0, 40.0];
+
+#[derive(Default, Clone, Copy)]
+struct Hist {
+    buckets: [u32; 10],
+    count: u32,
+    sum_ms: f64,
+    max_ms: f64,
+}
+
+impl Hist {
+    fn add(&mut self, ms: f64) {
+        let slot = EDGES_MS.iter().position(|e| ms < *e).unwrap_or(EDGES_MS.len());
+        self.buckets[slot] += 1;
+        self.count += 1;
+        self.sum_ms += ms;
+        if ms > self.max_ms {
+            self.max_ms = ms;
+        }
+    }
+
+    fn line(&self, name: &str) -> String {
+        if self.count == 0 {
+            return format!("{name}: none");
+        }
+        let mut s = format!(
+            "{name}: n={} mean={:.2}ms max={:.1}ms |",
+            self.count,
+            self.sum_ms / self.count as f64,
+            self.max_ms
+        );
+        let mut lo = 0.0;
+        for (i, b) in self.buckets.iter().enumerate() {
+            let label = if i < EDGES_MS.len() {
+                format!("{lo:.0}-{:.0}", EDGES_MS[i])
+            } else {
+                format!("{lo:.0}+")
+            };
+            if *b > 0 {
+                s.push_str(&format!(" {label}:{b}"));
+            }
+            if i < EDGES_MS.len() {
+                lo = EDGES_MS[i];
+            }
+        }
+        s
+    }
+}
+
+pub struct FrameTrace {
+    last_print: Option<f64>,
+    sources: [u32; 3],
+    next_frame: Hist,
+    present: Hist,
+    /// How far ahead of the wake the beat's target flip lies.
+    flip_lead: Hist,
+    last_next_frame: Option<f64>,
+    last_present: Option<f64>,
+    /// When the loop started on this turn's work: its oldest input, or its wake.
+    turn_from: Option<f64>,
+    /// No frame has been due since this time.
+    resting: Option<f64>,
+    /// Seconds of rest since the last present.
+    rested: f64,
+    /// A turn left NextFrame requests alone at this time: the wait to the next turn rests if the
+    /// beat that dispatches them draws nothing (`tick_rest` until then).
+    ticking: Option<f64>,
+    tick_rest: f64,
+    /// NextFrame was dispatched in this turn.
+    dispatched: bool,
+    /// The frames (HAL frame ids) built by a repaint that took input, with that input's time.
+    acted: Vec<(u64, f64)>,
+    /// The last present was of a frame that took input.
+    acting: bool,
+    /// Present gaps of the frames that took input.
+    acted_present: Hist,
+    /// From a frame's oldest input to its present.
+    input_wait: Hist,
+    /// The same, for the first frame that took input after one that took none.
+    first_wait: Hist,
+}
+
+pub(crate) fn on() -> bool {
+    trace_enabled("frames")
+}
+
+impl FrameTrace {
+    pub fn new() -> Self {
+        FrameTrace {
+            last_print: None,
+            sources: [0; 3],
+            next_frame: Hist::default(),
+            present: Hist::default(),
+            flip_lead: Hist::default(),
+            last_next_frame: None,
+            last_present: None,
+            turn_from: None,
+            resting: None,
+            rested: 0.0,
+            ticking: None,
+            tick_rest: 0.0,
+            dispatched: false,
+            acted: Vec::new(),
+            acting: false,
+            acted_present: Hist::default(),
+            input_wait: Hist::default(),
+            first_wait: Hist::default(),
+        }
+    }
+
+    /// A repaint that took input at `input` (seconds) built these frames (HAL frame ids).
+    pub fn built(&mut self, frames: &[u64], input: f64) {
+        if on() {
+            self.acted.extend(frames.iter().map(|frame| (*frame, input)));
+        }
+    }
+
+    /// A beat woke; `wake` and `flip` are seconds of one clock (the flip is the
+    /// beat's target present time, `None` for a beat no display paced).
+    pub fn tick(&mut self, source: TickSource, wake: f64, flip: Option<f64>) {
+        if !on() {
+            return;
+        }
+        self.sources[source as usize] += 1;
+        if let Some(flip) = flip {
+            self.flip_lead.add((flip - wake) * 1000.0);
+        }
+    }
+
+    /// The app clock stepped: `NextFrame` was dispatched with this time.
+    pub fn next_frame(&mut self, time: f64) {
+        if !on() {
+            return;
+        }
+        if let Some(prev) = self.last_next_frame {
+            self.next_frame.add((time - prev) * 1000.0);
+        }
+        self.last_next_frame = Some(time);
+        self.dispatched = true;
+    }
+
+    /// The loop started on something at this time: an input it took, or a wake. A turn's oldest
+    /// counts.
+    pub fn work_from(&mut self, at: f64) {
+        if on() {
+            self.turn_from.get_or_insert(at);
+        }
+    }
+
+    /// The loop's turn is over at `now`, leaving `left`. A rest ends when the loop started on
+    /// what left something. While NextFrame requests alone are left, the waits between turns
+    /// rest once a beat dispatches them and leaves no frame (it drew nothing), and count once one
+    /// leaves a frame.
+    pub fn turn_over(&mut self, left: Left, now: f64) {
+        let from = self.turn_from.take().unwrap_or(now);
+        let dispatched = std::mem::take(&mut self.dispatched);
+        if let Some(since) = self.ticking.take() {
+            let since = self.last_present.map_or(since, |prev| since.max(prev));
+            self.tick_rest += (from - since).max(0.0);
+        }
+        if left == Left::Frame {
+            self.tick_rest = 0.0;
+        } else if dispatched || left == Left::Nothing {
+            self.rested += std::mem::take(&mut self.tick_rest);
+        }
+        if left == Left::Nothing {
+            self.resting.get_or_insert(now);
+        } else if let Some(rest) = self.resting.take() {
+            let rest = self.last_present.map_or(rest, |prev| rest.max(prev));
+            self.rested += (from - rest).max(0.0);
+        }
+        if left == Left::NextFrame {
+            self.ticking = Some(now);
+        }
+    }
+
+    /// The gap in ms this present counts: since the one before, less the rests between them.
+    fn gap(&mut self, now: f64) -> Option<f64> {
+        let rested = std::mem::take(&mut self.rested);
+        let prev = self.last_present.replace(now)?;
+        Some(((now - prev - rested) * 1000.0).max(0.0))
+    }
+
+    /// Window frame `frame` (its HAL frame id) was presented at this time (seconds of the
+    /// backend's clock).
+    pub fn present(&mut self, now: f64, frame: u64) {
+        if on() {
+            self.presented(now, frame);
+        }
+    }
+
+    fn presented(&mut self, now: f64, frame: u64) {
+        // frames finish in order: a frame listed before this one was never presented
+        let input = self.acted.iter().find(|(id, _)| *id == frame).map(|(_, input)| *input);
+        self.acted.retain(|(id, _)| *id > frame);
+        if let Some(ms) = self.gap(now) {
+            self.present.add(ms);
+            if input.is_some() {
+                self.acted_present.add(ms);
+            }
+        }
+        if let Some(input) = input {
+            let wait = ((now - input) * 1000.0).max(0.0);
+            self.input_wait.add(wait);
+            if !self.acting {
+                self.first_wait.add(wait);
+            }
+        }
+        self.acting = input.is_some();
+    }
+
+    /// Print and reset every two seconds of wall time.
+    pub fn maybe_print(&mut self, now: f64) {
+        if !on() {
+            return;
+        }
+        let Some(start) = self.last_print else {
+            self.last_print = Some(now);
+            return;
+        };
+        if now - start < 2.0 {
+            return;
+        }
+        let [display, cadence, host] = self.sources;
+        crate::trace!("frames", "ticks/2s: display={display} cadence={cadence} host={host}");
+        crate::trace!("frames", "{}", self.next_frame.line("next_frame gap"));
+        crate::trace!("frames", "{} (only while a frame was due)", self.present.line("present gap"));
+        crate::trace!("frames", "{}", self.flip_lead.line("flip lead"));
+        crate::trace!("frames", "{} (frames that took input)", self.acted_present.line("acted present gap"));
+        crate::trace!("frames", "{}", self.input_wait.line("input to present"));
+        crate::trace!("frames", "{} (after frames that took none)", self.first_wait.line("first input to present"));
+        self.sources = [0; 3];
+        self.next_frame = Hist::default();
+        self.present = Hist::default();
+        self.flip_lead = Hist::default();
+        self.acted_present = Hist::default();
+        self.input_wait = Hist::default();
+        self.first_wait = Hist::default();
+        self.last_print = Some(now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn near(got: Option<f64>, ms: f64) -> bool {
+        got.is_some_and(|g| (g - ms).abs() < 1e-6)
+    }
+
+    #[test]
+    fn a_present_gap_leaves_out_a_rest_and_nothing_else() {
+        let mut t = FrameTrace::new();
+        assert_eq!(t.gap(1.0), None, "the first has nothing to count from");
+        // frames that run on count whole
+        t.turn_over(Left::Frame, 1.002);
+        assert!(near(t.gap(1.008), 8.0));
+        // a rest, a wake that asked for nothing, then an input: from the input
+        t.turn_over(Left::Nothing, 1.008);
+        t.turn_over(Left::Nothing, 2.0);
+        t.turn_from = Some(4.0);
+        t.turn_over(Left::Frame, 4.001);
+        assert!(near(t.gap(4.04), 40.0));
+        // a stall with a frame due counts whole
+        t.turn_over(Left::Frame, 5.0);
+        assert!(near(t.gap(8.04), 4000.0));
+        // a stall in the handler the rest ended for counts whole
+        t.turn_over(Left::Nothing, 8.04);
+        t.turn_from = Some(9.0);
+        t.turn_over(Left::Frame, 12.0);
+        assert!(near(t.gap(12.01), 3010.0));
+        // a wake's work counts from the wake
+        t.turn_over(Left::Nothing, 12.01);
+        t.turn_from = Some(13.0);
+        t.turn_over(Left::Frame, 13.1);
+        assert!(near(t.gap(13.11), 110.0));
+        // an animation: the wait for a beat that dispatched NextFrame and drew counts whole
+        t.turn_over(Left::NextFrame, 13.112);
+        t.turn_from = Some(13.127);
+        t.dispatched = true;
+        t.turn_over(Left::Frame, 13.128);
+        assert!(near(t.gap(13.129), 19.0));
+        // beats that dispatch NextFrame and draw nothing rest but for their own time; the wait
+        // for the one that draws counts
+        t.turn_over(Left::NextFrame, 13.13);
+        for wake in [13.15, 13.17] {
+            t.turn_from = Some(wake);
+            t.dispatched = true;
+            t.turn_over(Left::NextFrame, wake + 0.001);
+        }
+        t.turn_from = Some(13.19);
+        t.dispatched = true;
+        t.turn_over(Left::Frame, 13.191);
+        assert!(near(t.gap(13.2), 32.0));
+    }
+
+    #[test]
+    fn a_present_gap_adds_up_its_rests_and_never_rests_before_the_present() {
+        let mut t = FrameTrace::new();
+        let _ = t.gap(1.0);
+        // two rests between two presents
+        t.turn_over(Left::Nothing, 1.0);
+        t.turn_from = Some(2.0);
+        t.turn_over(Left::Frame, 2.0);
+        t.turn_over(Left::Nothing, 2.1);
+        t.turn_from = Some(3.1);
+        t.turn_over(Left::Frame, 3.1);
+        assert!(near(t.gap(3.12), 120.0));
+        // a present heard after a turn found nothing due: the rest is from the present
+        t.turn_over(Left::Nothing, 3.11);
+        assert!(near(t.gap(3.13), 10.0));
+        t.turn_from = Some(5.0);
+        t.turn_over(Left::Frame, 5.0);
+        assert!(near(t.gap(5.01), 10.0));
+    }
+
+    #[test]
+    fn a_frame_that_took_input_counts_its_gap_and_its_wait_and_the_first_one_apart() {
+        let mut t = FrameTrace::new();
+        t.presented(1.0, 1);
+        // a repaint that took input at 1.010 built an offscreen frame (2) and a window frame (3)
+        t.acted.extend([(2, 1.010), (3, 1.010)]);
+        t.presented(1.030, 3);
+        assert_eq!((t.acted_present.count, t.input_wait.count, t.first_wait.count), (1, 1, 1), "the first acted frame");
+        assert!((t.first_wait.max_ms - 20.0).abs() < 1e-6, "its wait runs from the input: {}", t.first_wait.max_ms);
+        assert!(t.acted.is_empty(), "a presented frame and the ones before it leave the list");
+        // the next frame that took input is no longer the first
+        t.acted.push((4, 1.040));
+        t.presented(1.050, 4);
+        assert_eq!((t.acted_present.count, t.input_wait.count, t.first_wait.count), (2, 2, 1), "a second acted frame");
+        // a frame that took none counts only as a present
+        t.presented(1.067, 5);
+        assert_eq!((t.present.count, t.acted_present.count, t.input_wait.count), (3, 2, 2), "a still frame");
+        // a listed frame that was never presented is dropped; the next acted frame is a first again
+        t.acted.extend([(6, 1.070), (8, 1.080)]);
+        t.presented(1.090, 7);
+        assert_eq!((t.input_wait.count, t.acted.len()), (2, 1), "frame 6 never presented, frame 8 still to come");
+        t.presented(1.110, 8);
+        assert_eq!((t.input_wait.count, t.first_wait.count), (3, 2), "after frame 7 took none, frame 8 is a first");
+        assert!((t.first_wait.max_ms - 30.0).abs() < 1e-6, "{}", t.first_wait.max_ms);
+    }
+
+    #[test]
+    fn gaps_fall_in_their_buckets_and_print_the_populated_ones() {
+        let mut h = Hist::default();
+        for ms in [3.0, 8.3, 8.4, 16.7, 50.0] {
+            h.add(ms);
+        }
+        assert_eq!(h.count, 5);
+        assert_eq!(h.buckets[0], 1, "3 ms is under 4");
+        assert_eq!(h.buckets[3], 2, "8.3 and 8.4 are in 8-10");
+        assert_eq!(h.buckets[6], 1, "16.7 is in 15-18");
+        assert_eq!(h.buckets[9], 1, "50 is 40+");
+        let line = h.line("x");
+        assert!(line.contains("n=5") && line.contains("0-4:1") && line.contains("8-10:2") && line.contains("40+:1"), "{line}");
+        assert_eq!(Hist::default().line("y"), "y: none");
+    }
+}

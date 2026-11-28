@@ -1,0 +1,742 @@
+//! Stale accesses: memory the JIT gave up and never reuses (an unloaded module's window, code
+//! made inaccessible) stays reserved and PROT_NONE for the life of the process, so a late access
+//! through a stale pointer traps instead of reaching other data. Such a fault is never contained
+//! and never unwound (the user's decision, 2026-10-23: a stale pointer is a bug to look at, not a
+//! module error to recover from):
+//! - the faulting thread is parked where it is, in the fault handler (its stack stays intact, no
+//!   frame unwinds, no recovery point is used even inside a guard);
+//! - the `run-stale` watcher reports it (stderr, the flight recorder, an inspect event that the Run
+//!   panel shows like a parked panic), pauses the program's threads so the state stays inspectable,
+//!   and waits for a decision: `restart` (the process starts again) or `stop` (the process ends by
+//!   the fault's signal). With nobody who could decide (no Run panel, no inspect
+//!   watcher or agent; a test run's or an unattended run's is its own: events::can_decide;
+//!   RELAX_STALE_PARK=1 forces the park) the report is followed by `stop`.
+//!   A quit (a signal, the app's own quit) ends the wait as its domain's stop does: the program
+//!   goes on so its quit runs to the end (inspect::events::quit_releases).
+//!
+//! A layout patch can also find a frame in replaced code before the thread returns there. The
+//! watcher reports it and offers a restart. Only a fault parks the thread.
+//!
+//! Ranges are registered by whoever retires the memory (sandbox::free_arena; code invalidation).
+//! The table is append-only (ranges are never reused), so the fault handler's lookup is lock-free.
+
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+/// One retired range [lo, hi): what it was, and whose.
+pub struct Range {
+    pub lo: u64,
+    pub hi: u64,
+    /// "unloaded module", "invalidated code", ...
+    pub kind: &'static str,
+    /// the module / fn it held
+    pub name: String,
+    /// its version when retired (a code version, a module generation; 0: none)
+    pub version: u64,
+    /// why it was retired
+    pub reason: String,
+    /// when (wall clock ns): also the time of its `stale.retire` flight-recorder event
+    pub retired_ns: u64,
+    /// The code of a run that ended (`register_run_end`): a thread found running it leaves.
+    pub run_end: bool,
+}
+
+/// `register_run_end`s so far: none, and a thread's exit asks nothing of the table.
+static RUN_ENDS: AtomicUsize = AtomicUsize::new(0);
+/// Threads of the run parked at a stale access (`on_fault`): the program is paused for the report.
+static STUCK: AtomicUsize = AtomicUsize::new(0);
+
+/// How many threads of the run are parked at a stale access. While one is, the program is paused
+/// for its report and never reaches the point that hands its state over to a restart. A frame reported before
+/// it returns into replaced code does not count.
+pub fn stuck_threads() -> usize {
+    STUCK.load(Ordering::Acquire)
+}
+/// The registered ranges in order, in segments: segment `s` holds `SEG0 << s` entries, made by the
+/// first `add` that reaches it and never freed, so the table grows with the run and an access into
+/// any range of it reports by name. (A fixed table of 16384 entries left a stale access past it
+/// to the fault policy's generic crash, unnamed: a session of layout patches had 29k groups.)
+const SEG0: usize = 1 << 10;
+const SEGS: usize = 40;
+static RANGES: [AtomicPtr<AtomicPtr<Range>>; SEGS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; SEGS];
+/// Entries published: each is stored before N counts it (`add`).
+static N: AtomicUsize = AtomicUsize::new(0);
+/// One `add` at a time (the segments' writer; readers take no lock).
+static ADDING: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
+
+/// Entry `k`'s segment and its place in it.
+fn seg_of(k: usize) -> (usize, usize) {
+    let s = (k / SEG0 + 1).ilog2() as usize;
+    (s, k - SEG0 * ((1 << s) - 1))
+}
+
+/// Entry `k` (signal-safe: atomic loads only). None: its segment is not made.
+fn entry(k: usize) -> Option<&'static AtomicPtr<Range>> {
+    let (s, off) = seg_of(k);
+    let seg = RANGES.get(s)?.load(Ordering::Acquire);
+    (!seg.is_null()).then(|| unsafe { &*seg.add(off) })
+}
+
+/// The range of entry `k` (signal-safe).
+fn range_at(k: usize) -> Option<&'static Range> {
+    let p = entry(k)?.load(Ordering::Acquire);
+    (!p.is_null()).then(|| unsafe { &*p })
+}
+
+/// The first of the first `n` entries' ranges that `f` picks (signal-safe: a segment at a time).
+fn find(n: usize, f: impl Fn(&Range) -> bool) -> Option<&'static Range> {
+    let mut start = 0;
+    for (s, seg) in RANGES.iter().enumerate() {
+        if start >= n {
+            break;
+        }
+        let len = (SEG0 << s).min(n - start);
+        let seg = seg.load(Ordering::Acquire);
+        if !seg.is_null() {
+            for off in 0..len {
+                let p = unsafe { &*seg.add(off) }.load(Ordering::Acquire);
+                // (freed a whole run after it leaves the table)
+                if !p.is_null() && f(unsafe { &*p }) {
+                    return Some(unsafe { &*p });
+                }
+            }
+        }
+        start += SEG0 << s;
+    }
+    None
+}
+
+/// Registers a retired range (before it turns inaccessible). Entries go only with a run's end. Also
+/// a `stale.retire` flight-recorder event (`a` = lo, `b` = hi), found again by `retired_ns`.
+pub fn register(lo: u64, hi: u64, kind: &'static str, name: String, version: u64, reason: String) {
+    add(lo, hi, kind, name, version, reason, false);
+}
+
+/// Registers the code of a run that ended (domain.rs end_run): a thread found fetching from it ends
+/// (jit.rs end_on_fault); nobody is asked anything.
+pub fn register_run_end(lo: u64, hi: u64, name: String) {
+    add(lo, hi, "ended run", name, 0, "the run ended".to_string(), true);
+    RUN_ENDS.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Whether the code at `addr` belongs to a run that ended (signal-safe: atomic loads only).
+pub fn in_ended_run(addr: u64) -> bool {
+    RUN_ENDS.load(Ordering::Acquire) != 0 && lookup(addr).is_some_and(|r| r.run_end)
+}
+
+fn add(lo: u64, hi: u64, kind: &'static str, name: String, version: u64, reason: String, run_end: bool) {
+    start_watcher();
+    let retired_ns = crate::clock::wall_ns();
+    crate::inspect::flightrec::event("stale.retire", &format!("{} {} v{}: {}", kind, name, version, reason), lo, hi);
+    let _adding = ADDING.lock().unwrap_or_else(|e| e.into_inner());
+    let k = N.load(Ordering::Acquire);
+    let (s, off) = seg_of(k);
+    let mut seg = RANGES[s].load(Ordering::Acquire);
+    if seg.is_null() {
+        let made: Box<[AtomicPtr<Range>]> = crate::zone_alloc::kept_with(|| (0..SEG0 << s).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect());
+        seg = Box::into_raw(made) as *mut AtomicPtr<Range>;
+        RANGES[s].store(seg, Ordering::Release);
+    }
+    let r = crate::zone_alloc::kept_with(|| Box::into_raw(Box::new(Range { lo, hi, kind, name, version, reason, retired_ns, run_end })));
+    unsafe { &*seg.add(off) }.store(r, Ordering::Release);
+    N.store(k + 1, Ordering::Release);
+}
+
+/// The retired range holding `addr` (signal-safe: atomic loads only).
+pub fn lookup(addr: u64) -> Option<&'static Range> {
+    find(N.load(Ordering::Acquire), |r| addr >= r.lo && addr < r.hi)
+}
+
+/// Whether [lo, hi) touches a retired range (code readers -- disassembly, stub following -- skip
+/// such bytes: reading them faults like any stale access).
+pub fn overlaps(lo: u64, hi: u64) -> bool {
+    find(N.load(Ordering::Acquire), |r| lo < r.hi && hi > r.lo).is_some()
+}
+
+/// Retired ranges registered.
+pub fn count() -> usize {
+    N.load(Ordering::Acquire)
+}
+
+// ------------------------------------------------------------------ the fault side
+
+const FRAMES: usize = 32;
+
+/// One stale fault, written by the handler (signal-safe plain stores), taken by the watcher.
+struct Rec {
+    /// 0 free, 1 being written, 2 ready, 3 taken
+    state: AtomicU32,
+    sig: AtomicI32,
+    pc: AtomicU64,
+    addr: AtomicU64,
+    os_id: AtomicU64,
+    domain_base: AtomicU64,
+    range: AtomicPtr<Range>,
+    /// a fetch from retired code (pc in the range): the words at [sp] and [sp - 8] (x86-64: a
+    /// call's return address, the address a `ret` just popped) and the link register (arm64)
+    sp_top: AtomicU64,
+    sp_below: AtomicU64,
+    lr: AtomicU64,
+    n: AtomicUsize,
+    raw: [AtomicU64; FRAMES],
+}
+
+const RECS: usize = 16;
+static REC: [Rec; RECS] = [const {
+    Rec {
+        state: AtomicU32::new(0),
+        sig: AtomicI32::new(0),
+        pc: AtomicU64::new(0),
+        addr: AtomicU64::new(0),
+        os_id: AtomicU64::new(0),
+        domain_base: AtomicU64::new(0),
+        range: AtomicPtr::new(std::ptr::null_mut()),
+        sp_top: AtomicU64::new(0),
+        sp_below: AtomicU64::new(0),
+        lr: AtomicU64::new(0),
+        n: AtomicUsize::new(0),
+        raw: [const { AtomicU64::new(0) }; FRAMES],
+    }
+}; RECS];
+
+/// The watcher's wake-up pipe (unix: write end, read end); -1 before it runs.
+#[cfg(unix)]
+static WAKE_W: AtomicI32 = AtomicI32::new(-1);
+#[cfg(unix)]
+static WAKE_R: AtomicI32 = AtomicI32::new(-1);
+/// The watcher's wake-up event (Windows, auto-reset); 0 before it runs.
+#[cfg(windows)]
+static WAKE: AtomicUsize = AtomicUsize::new(0);
+
+/// Wakes the watcher. Signal-safe: write(2) on unix; on Windows SetEvent, a system call that takes
+/// no lock of this process's (a vectored exception handler may call it).
+fn wake(why: &'static [u8; 1]) {
+    #[cfg(unix)]
+    {
+        let w = WAKE_W.load(Ordering::Acquire);
+        if w >= 0 {
+            let _ = unsafe { write(w, why.as_ptr().cast(), 1) };
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = why;
+        let e = WAKE.load(Ordering::Acquire);
+        if e != 0 {
+            unsafe { crate::os::win32::SetEvent(e as crate::os::win32::HANDLE) };
+        }
+    }
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn pipe(fds: *mut i32) -> i32;
+    fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
+    fn read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
+}
+
+/// In the fault handler: records the fault, wakes the watcher, writes the first report line, then
+/// parks this thread until its run ends (nothing it was doing goes on, nothing unwinds); it leaves
+/// the run when this returns. A thread of no run stays parked.
+/// Signal-safe: atomic stores and loads, write(2), nanosleep(2).
+pub unsafe fn on_fault(f: &crate::os::fault::Fault, r: &'static Range, walk: impl FnOnce(&mut [u64]) -> usize) {
+    STUCK.fetch_add(1, Ordering::AcqRel);
+    let os_id = crate::inspect::threads::self_os_id();
+    let base = if crate::jit::current_unit().is_null() { 0 } else { crate::domain::current() };
+    if let Some(rec) = REC.iter().find(|x| x.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()) {
+        rec.sig.store(f.sig, Ordering::Relaxed);
+        rec.pc.store(f.pc, Ordering::Relaxed);
+        rec.addr.store(f.addr, Ordering::Relaxed);
+        rec.os_id.store(os_id, Ordering::Relaxed);
+        rec.domain_base.store(base, Ordering::Relaxed);
+        rec.range.store(r as *const Range as *mut Range, Ordering::Relaxed);
+        // (the faulting thread's own stack: both words were just written or read by the call or
+        // `ret` that led here)
+        let code = f.pc >= r.lo && f.pc < r.hi && f.sp >= 8;
+        rec.sp_top.store(if code { std::ptr::read_volatile(f.sp as *const u64) } else { 0 }, Ordering::Relaxed);
+        rec.sp_below.store(if code { std::ptr::read_volatile((f.sp - 8) as *const u64) } else { 0 }, Ordering::Relaxed);
+        rec.lr.store(f.lr, Ordering::Relaxed);
+        let mut raw = [0u64; FRAMES];
+        let n = walk(&mut raw);
+        for (k, w) in raw[..n].iter().enumerate() {
+            rec.raw[k].store(*w, Ordering::Relaxed);
+        }
+        rec.n.store(n, Ordering::Relaxed);
+        rec.state.store(2, Ordering::Release);
+    }
+    first_line(f, r);
+    wake(b"s");
+    leave_when(crate::domain::current_is_ending);
+}
+
+/// Parks the faulted thread until `ending` says its run ends, then counts it out of
+/// [`stuck_threads`]: once it leaves, the program can hand its state over again.
+fn leave_when(ending: impl Fn() -> bool) {
+    while !ending() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    STUCK.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// "relax: stale access ..." on stderr from the handler (a stack buffer, write(2)).
+fn first_line(f: &crate::os::fault::Fault, r: &Range) {
+    let mut buf = [0u8; 384];
+    let mut n = 0;
+    let mut put = |b: &[u8]| {
+        let k = b.len().min(buf.len() - n);
+        buf[n..n + k].copy_from_slice(&b[..k]);
+        n += k;
+    };
+    let hex = |v: u64| {
+        let mut h = [0u8; 18];
+        h[0] = b'0';
+        h[1] = b'x';
+        for i in 0..16 {
+            let d = ((v >> (60 - 4 * i)) & 15) as u8;
+            h[2 + i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        }
+        h
+    };
+    put(b"relax: stale access into the ");
+    put(r.kind.as_bytes());
+    put(b" `");
+    put(r.name.as_bytes());
+    put(b"` at ");
+    put(&hex(f.addr));
+    put(b" (pc ");
+    put(&hex(f.pc));
+    put(b"): its memory is never reused; the thread is parked, the app pauses\n");
+    crate::os::fault::raw_stderr(&buf[..n]);
+}
+
+// ------------------------------------------------------------------ the watcher
+
+fn start_watcher() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(unix)]
+        unsafe {
+            let mut fds = [-1i32; 2];
+            if pipe(fds.as_mut_ptr()) == 0 {
+                WAKE_R.store(fds[0], Ordering::Release);
+                WAKE_W.store(fds[1], Ordering::Release);
+            } else {
+                eprintln!("relax: the stale-access watcher has no wake-up pipe ({}): it looks every 250 ms instead", std::io::Error::last_os_error());
+            }
+        }
+        // (auto-reset: a wake-up wakes the one waiter once)
+        #[cfg(windows)]
+        {
+            let e = unsafe { crate::os::win32::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            if e != 0 {
+                WAKE.store(e as usize, Ordering::Release);
+            } else {
+                eprintln!("relax: the stale-access watcher has no wake-up event ({}): it looks every 250 ms instead", std::io::Error::last_os_error());
+            }
+        }
+        let _k = crate::zone_alloc::kept();
+        let spawned = std::thread::Builder::new().name("run-stale".into()).spawn(|| {
+            crate::inspect::heap::exclude_this_thread();
+            loop {
+                wait();
+                let _at_the_run = crate::run_threads::process_work();
+                for rec in REC.iter() {
+                    if rec.state.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                        handle(rec);
+                    }
+                }
+                let held = std::mem::take(&mut *HELD.lock().unwrap_or_else(|e| e.into_inner()));
+                for h in held {
+                    handle_held(h);
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            eprintln!("relax: the stale-access watcher did not start ({}): a stale access ends the process without a report", e);
+        }
+    });
+}
+
+/// Until a wake-up; every 250 ms only when the watcher could make no way to be woken.
+fn wait() {
+    #[cfg(unix)]
+    {
+        let r = WAKE_R.load(Ordering::Acquire);
+        if r >= 0 {
+            let mut b = [0u8; 16];
+            unsafe { read(r, b.as_mut_ptr().cast(), b.len()) };
+            return;
+        }
+    }
+    #[cfg(windows)]
+    {
+        const INFINITE: u32 = u32::MAX;
+        let e = WAKE.load(Ordering::Acquire);
+        if e != 0 {
+            unsafe { crate::os::win32::WaitForSingleObject(e as crate::os::win32::HANDLE, INFINITE) };
+            return;
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+}
+
+/// Somebody can answer a parked stale access: the Run panel, an inspect watcher or agent, devhub
+/// (not for a test run or an unattended run).
+fn decidable() -> bool {
+    std::env::var_os("RELAX_STALE_PARK").is_some_and(|v| v != "0") || crate::inspect::events::can_decide()
+}
+
+/// A frame in first code retired by a layout patch, waiting for the watcher's report.
+struct Held {
+    os_id: u64,
+    /// its stack: pc, then return addresses (inspect capture order)
+    frames: Vec<u64>,
+    /// the frame that is in retired code (index into `frames`; usize::MAX: the word at sp)
+    at: usize,
+    /// "slot #12 `work::step` v1 code [0x.., 0x..)"
+    what: String,
+    /// why that code never runs again
+    reason: String,
+}
+
+static HELD: relax_session::sync::Mutex<Vec<Held>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// Queue the stack captured by a layout patch. The watcher reports the frame and offers the
+/// restart while the program runs. A return to the trap-filled bytes takes the normal fault path.
+pub fn park_held(os_id: u64, frames: Vec<u64>, at: usize, what: String, reason: String) {
+    start_watcher();
+    crate::inspect::flightrec::event("stale.held", &format!("tid {}: frame in {}: {}", os_id, what, reason), os_id, frames.get(at).copied().unwrap_or(0));
+    crate::zone_alloc::kept_with(|| HELD.lock().unwrap_or_else(|e| e.into_inner()).push(Held { os_id, frames, at, what, reason }));
+    wake(b"h");
+}
+
+fn handle_held(h: Held) {
+    let pc = h.frames.first().copied().unwrap_or(0);
+    let raw: Vec<u64> = h.frames.iter().skip(1).copied().collect();
+    let frames = crate::jit::stale_frames(pc, &raw);
+    let thread = crate::inspect::threads::list().into_iter().find(|t| t.os_id == h.os_id).map(|t| t.name.clone()).unwrap_or_else(|| h.os_id.to_string());
+    let frame = if h.at == usize::MAX { "the return address at its sp".to_string() } else { format!("frame #{}", h.at) };
+    let message = format!(
+        "stale access on a stack (no fault): thread `{}` (tid {}) has {} in {}: code that never runs again ({}); the thread parks when it returns there",
+        thread, h.os_id, frame, h.what, h.reason
+    );
+    let report = crate::jit::stale_report(&message, &frames, frames.get(h.at.min(frames.len().saturating_sub(1))).copied().unwrap_or(0));
+    eprintln!("relax: {}\n  report: {}", message, report);
+    crate::inspect::flightrec::fault_dump(&format!("stale.held tid {} {}", h.os_id, h.what));
+    let verdict = format!(
+        "stale access on a stack: thread `{}` (tid {}) has {} in {} ({}). The layout patch trap-filled that code. The thread parks when it returns there. The restart is offered",
+        thread, h.os_id, frame, h.what, h.reason
+    );
+    eprintln!("relax: {}", verdict);
+    crate::zone_alloc::kept_with(|| ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push((verdict.clone(), report.clone())));
+    // Publish the one-line stack report after its restart offer is available.
+    let line = format!("thread `{}` (tid {}) has a frame in {} ({}) and parks when it returns there -- restart the app", thread, h.os_id, h.what, h.reason);
+    crate::reload::offer_restart(&line);
+    crate::zone_alloc::kept_with(|| HELD_NOW.lock().unwrap_or_else(|e| e.into_inner()).push(line));
+}
+
+/// Frames observed at layout patches, one line per thread and patch (`why-hung`).
+static HELD_NOW: relax_session::sync::Mutex<Vec<String>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The stack reports of layout patches (`why-hung`).
+pub fn held_now() -> Vec<String> {
+    HELD_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn handle(rec: &Rec) {
+    let r: &Range = unsafe { &*rec.range.load(Ordering::Relaxed) };
+    let (pc, addr, sig) = (rec.pc.load(Ordering::Relaxed), rec.addr.load(Ordering::Relaxed), rec.sig.load(Ordering::Relaxed));
+    let mut raw: Vec<u64> = rec.raw[..rec.n.load(Ordering::Relaxed)].iter().map(|w| w.load(Ordering::Relaxed)).collect();
+    // a fetch from retired code: how the thread got there and who stored the address (jit.rs)
+    let code = pc >= r.lo && pc < r.hi;
+    let how = if code {
+        let (how, caller) = crate::jit::stale_code_how(pc, rec.sp_top.load(Ordering::Relaxed), rec.sp_below.load(Ordering::Relaxed), rec.lr.load(Ordering::Relaxed));
+        // entering the code: the caller's frame is not on the frame-pointer chain yet
+        if let Some(c) = caller.filter(|c| raw.first() != Some(c)) {
+            raw.insert(0, c);
+        }
+        Some(how)
+    } else {
+        None
+    };
+    let frames = crate::jit::stale_frames(pc, &raw);
+    // decided once: what the lines say is what happens
+    let parks = decidable();
+    let fate = if parks { "the thread is parked, nothing unwound" } else { "the process ends, nothing unwound" };
+    let message = match &how {
+        Some(_) => format!("stale access into the {} `{}` at {:#x}: code that never runs again (it was invalidated: {}); {fate}", r.kind, r.name, addr, r.reason),
+        None => format!("stale access into the {} `{}` at {:#x}: its memory is never reused (a stale pointer); {fate}", r.kind, r.name, addr),
+    };
+    let report = crate::jit::stale_report(&message, &frames, addr);
+    eprintln!("relax: {}\n  report: {}", message, report);
+    crate::inspect::flightrec::fault_dump(&format!("stale.access {} {} at {:#x} pc {:#x}", r.kind, r.name, addr, pc));
+    let domain = crate::domain::id_of_base(rec.domain_base.load(Ordering::Relaxed));
+    let os_id = rec.os_id.load(Ordering::Relaxed);
+    // the thread leaves at its run's end only: a stop (a quit) does not wait for it
+    crate::domain::held_for_good(os_id);
+    let thread = crate::inspect::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name.clone()).unwrap_or_else(|| os_id.to_string());
+    let into = where_in(r, addr);
+    let age_ms = crate::clock::wall_ns().saturating_sub(r.retired_ns) / 1_000_000;
+    let site = site_of(&frames);
+    let then = if parks { "its thread is parked, the app paused" } else { "the process ends" };
+    let verdict = match &how {
+        Some(how) => format!(
+            "stale access: thread `{}` (tid {}) ran code at {:#x} = {} `{}` v{} + {:#x} ({}) in {site}, invalidated {} ms before ({}; flightrec stale.retire at {} ns). HOW: {}; {then}",
+            thread, os_id, pc, r.kind, r.name, r.version, pc - r.lo, into, age_ms, r.reason, r.retired_ns, how
+        ),
+        None => format!(
+            "stale access: thread `{}` (tid {}) read/wrote {:#x} = {} `{}` v{} + {:#x} ({}) in {site}, retired {} ms before ({}; flightrec stale.retire at {} ns); the faulting frame is the first of the report's backtrace (fn, tier, code version); {then}",
+            thread, os_id, addr, r.kind, r.name, r.version, addr - r.lo, into, age_ms, r.reason, r.retired_ns
+        ),
+    };
+    if let Some(h) = &how {
+        eprintln!("relax: stale access: {}", h);
+    }
+    crate::zone_alloc::kept_with(|| ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push((verdict.clone(), report.clone())));
+    if !parks {
+        // (nobody asks `stale` or `stacks` after this: the module, its version, what was touched
+        // and the access site are all on this line)
+        eprintln!("relax: {verdict}");
+        eprintln!("relax: nobody can decide on the stale access (no Run panel, inspect watcher or agent, or a test or unattended run; RELAX_STALE_PARK=1 parks): the process ends");
+        crate::os::fault::die_by(sig);
+    }
+    // (a paused process must answer: `makepad test` and hosted runs may not have started inspect)
+    crate::inspect::start("stale-access");
+    let paused = crate::inspect::instrument::pause_program();
+    eprintln!("relax: the app is paused ({} threads held) -- decide: {tool} inspect {} resume <id> restart | stop (the Run panel offers both)", paused, std::process::id(), tool = crate::tool_name());
+    let decision = crate::inspect::events::park_stale(rec.os_id.load(Ordering::Relaxed), domain, &message, &frames);
+    decided(decision, sig, "stale access");
+}
+
+/// Where a stale access happened: its first frame, "`fn` at file:line:col".
+fn site_of(frames: &[u64]) -> String {
+    let Some(&pc) = frames.first() else { return "an unknown frame".to_string() };
+    let mut partial = Vec::new();
+    let first = crate::zone_alloc::kept_with(|| crate::inspect::symbolise_within(&[vec![pc]], &mut partial, 500)).into_iter().next().and_then(|f| f.into_iter().next());
+    match first {
+        Some(f) if !f.at.is_empty() => format!("`{}` at {}", f.name, f.at),
+        Some(f) if !f.name.is_empty() => format!("`{}` ({:#x})", f.name, pc),
+        _ => format!("an unnamed frame ({:#x})", pc),
+    }
+}
+
+/// What the watcher told, for `makepad inspect <pid> stale`: (verdict line, report JSON).
+static ANSWERS: relax_session::sync::Mutex<Vec<(String, String)>> = relax_session::sync::Mutex::new(Vec::new());
+
+/// The faults the handler recorded so far, as (thread, retired range's name): signal-safe stores
+/// made before any report line, so a test sees its fault however long the report takes. (Its
+/// one test runs on the Apple OSes and Linux: elsewhere it was an unused-function warning.)
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
+pub(crate) fn recorded() -> Vec<(u64, String)> {
+    REC.iter()
+        .filter(|r| r.state.load(Ordering::Acquire) >= 2)
+        .map(|r| (r.os_id.load(Ordering::Relaxed), unsafe { &*r.range.load(Ordering::Relaxed) }.name.clone()))
+        .collect()
+}
+
+/// The verdicts of the stale accesses reported so far (a test waits for its access's).
+#[cfg(test)]
+pub(crate) fn verdicts() -> Vec<String> {
+    ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|a| a.0.clone()).collect()
+}
+
+/// Where in a retired range `addr` was (what kind of data the stale pointer pointed to; for
+/// code, which fn's code version and what invalidated it: invalid.rs).
+fn where_in(r: &Range, addr: u64) -> String {
+    if let Some(s) = crate::invalid::why_at(addr, |w| {
+        let i = w.installs.iter().rev().find(|i| addr >= i.at && addr < i.at + i.len as u64).copied();
+        let what = match i {
+            Some(i) => format!("code of slot #{} `{}` v{} +{:#x}", i.slot, crate::jit::slot_name(i.slot).unwrap_or_default(), i.version, addr - i.at),
+            None if matches!(w.group, crate::invalid::Group::Patch { gen: 0, .. }) => format!("first-generation code of `{}` +{:#x}", r.name, addr - w.lo),
+            None => format!("{:?} chunk +{:#x} (between code bodies)", w.group, addr - w.lo),
+        };
+        let made = match w.group {
+            crate::invalid::Group::Patch { gen, .. } | crate::invalid::Group::Module { gen, .. } if gen > 0 => {
+                crate::invalid::patch_event_of(gen).map(|(t, e)| format!("; made by flightrec reload.patch at {} ns: {}", t, e)).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        let by = if w.by_gen > 0 { crate::invalid::patch_event_of(w.by_gen).map(|(t, e)| format!("; invalidated by flightrec reload.patch at {} ns: {}", t, e)).unwrap_or_default() } else { String::new() };
+        format!("{} [{:?}]{}{}", what, w.group, made, by)
+    }) {
+        return s;
+    }
+    match r.kind {
+        "unloaded module" => crate::sandbox::describe_window_offset(addr - r.lo),
+        _ => format!("{:#x} bytes in", addr - r.lo),
+    }
+}
+
+/// What the person decided on a parked stale access: stop ends the process by the fault's signal,
+/// restart starts the next run. A run that ends meanwhile (a restart or stop taken elsewhere: the
+/// ring, the WM's toast, its domain stopping) gets no second restart: its paused threads run again
+/// so that its end reaches them, and the faulting thread stays parked until the end takes it.
+fn decided(decision: crate::inspect::events::StaleDecision, sig: i32, what: &str) {
+    use crate::inspect::events::StaleDecision;
+    match decision {
+        StaleDecision::Stop => {
+            eprintln!("relax: {what}: stopped");
+            crate::os::fault::die_by(sig);
+        }
+        StaleDecision::Restart => restart_run(),
+        StaleDecision::Ending => {
+            crate::inspect::instrument::resume_program();
+        }
+    }
+}
+
+/// The run starts again (its sources as they are now, its state not carried over) after the inspect
+/// reply went out. The paused threads run again first (the run's end stops the compiles they may be
+/// in); the faulting thread stays parked until the run's end takes it. On a failed start of the
+/// restart the process ends by the fault's signal.
+fn restart_run() {
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    crate::inspect::instrument::resume_program();
+    if let Err(e) = crate::reload::restart_run("stale access") {
+        eprintln!("relax: stale access: {e}");
+        crate::os::fault::die_by(11);
+    }
+}
+
+/// `stale`: answer first -- the parked stale accesses (verdict, then the report), then the retired
+/// ranges (newest last, at most `n`, default 8).
+pub fn cmd(req: &crate::inspect::Req, out: &mut crate::inspect::Out) {
+    let answers = ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if answers.is_empty() {
+        out.line("no stale access so far");
+    }
+    for (v, rep) in &answers {
+        out.line(v);
+        out.line(&format!("  report: {}", rep));
+    }
+    // a parked access into code: every thread's stack with the tier and version per frame (an
+    // INVALIDATED frame is code that parks at its next instruction)
+    if answers.iter().any(|(v, _)| v.contains(" HOW: ")) {
+        out.line("every thread's stack (frames: fn, tier, code version; a parked thread shows its recorded frames):");
+        crate::inspect::cmd_stacks(req, out);
+    }
+    let n = req.num("n", 8) as usize;
+    let total = count();
+    out.line(&format!("retired ranges: {} (never reused){}", total, if total > n { format!(", the last {}", n) } else { String::new() }));
+    for r in (total.saturating_sub(n)..total).filter_map(range_at) {
+        out.line(&format!("  [{:#x}, {:#x}) {} `{}` v{}: {} (at {} ns)", r.lo, r.hi, r.kind, r.name, r.version, r.reason, r.retired_ns));
+    }
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&REC, [const {
+        Rec {
+            state: AtomicU32::new(0),
+            sig: AtomicI32::new(0),
+            pc: AtomicU64::new(0),
+            addr: AtomicU64::new(0),
+            os_id: AtomicU64::new(0),
+            domain_base: AtomicU64::new(0),
+            range: AtomicPtr::new(std::ptr::null_mut()),
+            sp_top: AtomicU64::new(0),
+            sp_below: AtomicU64::new(0),
+            lr: AtomicU64::new(0),
+            n: AtomicUsize::new(0),
+            raw: [const { AtomicU64::new(0) }; FRAMES],
+        }
+    }; RECS]);
+    reset(&HELD, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&HELD_NOW, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&STUCK, AtomicUsize::new(0));
+    reset(&ANSWERS, relax_session::sync::Mutex::new(Vec::new()));
+    // Of the ended runs each stays one range, its code as a whole: what was retired of it, as of
+    // anything else that went with its Unit, is inside or gone.
+    // (A thread that stayed in a native call can be reading the table in a fault handler: a range
+    // is freed one run's end later.)
+    let mut gone = GONE.lock().unwrap_or_else(|e| e.into_inner());
+    for p in gone.drain(..) {
+        drop(Box::from_raw(p.0));
+    }
+    let _adding = ADDING.lock().unwrap_or_else(|e| e.into_inner());
+    let n = N.load(Ordering::Acquire);
+    let mut kept = 0;
+    for k in 0..n {
+        let Some(e) = entry(k) else { continue };
+        let p = e.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if p.is_null() {
+            continue;
+        }
+        if (*p).run_end {
+            // (entry `kept` is at or before `k`: its segment is made)
+            entry(kept).expect("an earlier entry's segment").store(p, Ordering::Release);
+            kept += 1;
+        } else {
+            gone.push(GoneRange(p));
+        }
+    }
+    N.store(kept, Ordering::Release);
+}
+
+/// Ranges no longer in the table (`reset_statics`).
+struct GoneRange(*mut Range);
+unsafe impl Send for GoneRange {}
+static GONE: relax_session::sync::Mutex<Vec<GoneRange>> = relax_session::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+mod tests {
+    /// Reporting a frame in first code retired by a layout patch stops
+    /// nothing else: the program is not paused, nothing is parked for a decision, the restart is
+    /// offered and `why-hung` names the thread in one line. (Its report paused the whole app and
+    /// parked a decision nobody was shown, 11-08.)
+    #[test]
+    fn reporting_a_frame_at_a_layout_patch_stops_nothing_else() {
+        isolated_test!(reporting_a_frame_at_a_layout_patch_stops_nothing_else);
+        std::env::set_var("RELAX_STALE_PARK", "1");
+        let what = "slot #7 `work::step` first-version code [0x1000, 0x1100) (+0x10)".to_string();
+        let reason = "layout-changing patch gen 2 (fields or variants of Mode) replaced it: code built for the old layout never runs again".to_string();
+        super::park_held(42, vec![0x1010, 0x2000], 0, what, reason);
+        let t0 = std::time::Instant::now();
+        while super::held_now().is_empty() && t0.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let held = super::held_now();
+        assert_eq!(held.len(), 1, "the watcher reported the thread with a stale frame");
+        assert!(held[0].contains("tid 42") && held[0].contains("`work::step`") && held[0].contains("Mode") && held[0].contains("parks when it returns there") && held[0].ends_with("restart the app"), "{held:?}");
+        assert!(!crate::inspect::instrument::paused(), "the program runs on");
+        assert!(crate::inspect::events::parked_now().is_empty(), "nothing waits for a decision");
+        assert_eq!(super::stuck_threads(), 0, "the app can still hand its state over");
+        assert!(crate::reload::restart_pending().iter().any(|p| p == &held[0]), "the restart is offered: {:?}", crate::reload::restart_pending());
+    }
+
+    /// A stale access past 16384 retired ranges still reports by name: the table grows (a fixed
+    /// table of 16384 left it to the generic crash, unnamed; a session of layout patches had 29k
+    /// groups).
+    #[test]
+    fn a_range_past_16384_still_reports_by_name() {
+        isolated_test!(a_range_past_16384_still_reports_by_name);
+        let n = (1usize << 14) + 100;
+        let at = |k: usize| 0x7f00_0000_0000u64 + k as u64 * 0x100;
+        for k in 0..n {
+            super::register(at(k), at(k) + 0x80, "invalidated code", format!("fn{k}"), 1, "a test".to_string());
+        }
+        assert_eq!(super::count(), n, "every range is counted");
+        let last = n - 1;
+        assert_eq!(super::lookup(at(last) + 0x10).map(|r| r.name.clone()), Some(format!("fn{last}")), "the last range is found by name");
+        assert!(super::lookup(at(last) + 0x90).is_none(), "the gap after a range is no range");
+        assert!(super::overlaps(at(last), at(last) + 1), "overlaps reaches past 16384 ranges");
+        assert!(!super::overlaps(at(n), at(n) + 0x80), "and past the last range there is none");
+    }
+
+    /// A thread parked at a stale access blocks the handover while it waits, and no longer once
+    /// its run ended: the count was never undone, so the handover stayed blocked for the rest of
+    /// the process (11-08).
+    #[test]
+    fn a_parked_thread_blocks_the_handover_only_while_it_waits() {
+        isolated_test!(a_parked_thread_blocks_the_handover_only_while_it_waits);
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ENDED: AtomicBool = AtomicBool::new(false);
+        // (as `on_fault` counts the thread in when it faults)
+        super::STUCK.fetch_add(1, Ordering::AcqRel);
+        let parked = std::thread::spawn(|| super::leave_when(|| ENDED.load(Ordering::Acquire)));
+        assert_eq!(super::stuck_threads(), 1, "parked: the handover waits");
+        ENDED.store(true, Ordering::Release);
+        parked.join().unwrap();
+        assert_eq!(super::stuck_threads(), 0, "its run ended: the state can be handed over");
+    }
+}

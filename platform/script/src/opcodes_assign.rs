@@ -37,29 +37,72 @@ impl<'a> ScriptVm<'a> {
         let value = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         let id = self.bx.threads.cur().pop_stack_value();
         if let Some(id) = id.as_id() {
-            let old_value = self.bx.threads.cur().scope_value(&self.bx.heap, id);
-            if old_value.is_err() {
-                self.bx.threads.cur().push_stack_unchecked(old_value);
-            } else if old_value.is_string_like() || value.is_string_like() {
-                let str = self.bx.heap.new_string_with(|heap, out| {
-                    heap.cast_to_string(old_value, out);
-                    heap.cast_to_string(value, out);
-                });
-                self.bx
-                    .threads
-                    .cur()
-                    .set_scope_value(&mut self.bx.heap, id, str.into());
-                self.bx.threads.cur().push_stack_unchecked(NIL);
-            } else {
-                let ip = self.bx.threads.cur_ref().trap.ip;
-                let fa = self.bx.heap.cast_to_f64(old_value, ip);
-                let fb = self.bx.heap.cast_to_f64(value, ip);
-                let value = self.bx.threads.cur().set_scope_value(
-                    &mut self.bx.heap,
-                    id,
-                    ScriptValue::from_f64_traced_nan(fa + fb, ip),
-                );
-                self.bx.threads.cur().push_stack_unchecked(value);
+            let key: ScriptValue = id.into();
+            let Some(&scope) = self.bx.threads.cur_ref().scopes.last() else {
+                self.bail("scopes empty in handle_assign_add");
+                return;
+            };
+            // Single chain walk for the read+write pair; the two-walk path
+            // only remains for vec2-vec hits and the not-found error.
+            match self.bx.heap.scope_map_owner(scope, key) {
+                Ok((owner, old_value)) => {
+                    if old_value.is_err() {
+                        self.bx.threads.cur().push_stack_unchecked(old_value);
+                    } else if old_value.is_string_like() || value.is_string_like() {
+                        let str = self.bx.heap.new_string_concat(old_value, value);
+                        self.bx.heap.scope_write_in_map(
+                            owner,
+                            key,
+                            str.into(),
+                            self.bx.threads.cur().trap.pass(),
+                        );
+                        self.bx.threads.cur().push_stack_unchecked(NIL);
+                    } else {
+                        let ip = self.bx.threads.cur_ref().trap.ip;
+                        let fa = self.bx.heap.cast_to_f64(old_value, ip);
+                        let fb = self.bx.heap.cast_to_f64(value, ip);
+                        let value = self.bx.heap.scope_write_in_map(
+                            owner,
+                            key,
+                            ScriptValue::from_f64_traced_nan(fa + fb, ip),
+                            self.bx.threads.cur().trap.pass(),
+                        );
+                        self.bx.threads.cur().push_stack_unchecked(value);
+                    }
+                }
+                Err(true) => {
+                    // visible only via a vec2 vec: preserve read-ok/write-error
+                    let old_value = self.bx.threads.cur().scope_value(&self.bx.heap, id);
+                    if old_value.is_err() {
+                        self.bx.threads.cur().push_stack_unchecked(old_value);
+                    } else if old_value.is_string_like() || value.is_string_like() {
+                        let str = self.bx.heap.new_string_concat(old_value, value);
+                        self.bx
+                            .threads
+                            .cur()
+                            .set_scope_value(&mut self.bx.heap, id, str.into());
+                        self.bx.threads.cur().push_stack_unchecked(NIL);
+                    } else {
+                        let ip = self.bx.threads.cur_ref().trap.ip;
+                        let fa = self.bx.heap.cast_to_f64(old_value, ip);
+                        let fb = self.bx.heap.cast_to_f64(value, ip);
+                        let value = self.bx.threads.cur().set_scope_value(
+                            &mut self.bx.heap,
+                            id,
+                            ScriptValue::from_f64_traced_nan(fa + fb, ip),
+                        );
+                        self.bx.threads.cur().push_stack_unchecked(value);
+                    }
+                }
+                Err(false) => {
+                    let value = script_err_not_found!(
+                        self.bx.threads.cur_ref().trap,
+                        "variable {} not found in scope{}",
+                        id,
+                        crate::suggest::suggest_scope_var(&self.bx.heap, scope, id)
+                    );
+                    self.bx.threads.cur().push_stack_unchecked(value);
+                }
             }
         } else {
             let value = script_err_immutable!(
@@ -139,10 +182,7 @@ impl<'a> ScriptVm<'a> {
                 .heap
                 .value(obj, field, self.bx.threads.cur().trap.pass());
             if old_value.is_string_like() || value.is_string_like() {
-                let str = self.bx.heap.new_string_with(|heap, out| {
-                    heap.cast_to_string(old_value, out);
-                    heap.cast_to_string(value, out);
-                });
+                let str = self.bx.heap.new_string_concat(old_value, value);
                 let value = self.bx.heap.set_value(
                     obj,
                     field,
@@ -223,12 +263,12 @@ impl<'a> ScriptVm<'a> {
                     .set_value(obj, index, value, self.bx.threads.cur().trap.pass());
             self.bx.threads.cur().push_stack_unchecked(value);
         } else if let Some(arr) = object.as_array() {
-            self.bx.heap.set_array_index(
-                arr,
-                index.as_index(),
-                value,
-                self.bx.threads.cur().trap.pass(),
-            );
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
+            self.bx
+                .heap
+                .set_array_index(arr, index, value, self.bx.threads.cur().trap.pass());
             self.bx.threads.cur().push_stack_unchecked(value);
         } else {
             let value = script_err_wrong_value!(
@@ -252,10 +292,7 @@ impl<'a> ScriptVm<'a> {
                 .heap
                 .value(obj, index, self.bx.threads.cur().trap.pass());
             if old_value.is_string_like() || value.is_string_like() {
-                let str = self.bx.heap.new_string_with(|heap, out| {
-                    heap.cast_to_string(old_value, out);
-                    heap.cast_to_string(value, out);
-                });
+                let str = self.bx.heap.new_string_concat(old_value, value);
                 let value = self.bx.heap.set_value(
                     obj,
                     index,
@@ -276,16 +313,15 @@ impl<'a> ScriptVm<'a> {
                 self.bx.threads.cur().push_stack_unchecked(value);
             }
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let old_value = self
                 .bx
                 .heap
                 .array_index(arr, index, self.bx.threads.cur().trap.pass());
             if old_value.is_string_like() || value.is_string_like() {
-                let str = self.bx.heap.new_string_with(|heap, out| {
-                    heap.cast_to_string(old_value, out);
-                    heap.cast_to_string(value, out);
-                });
+                let str = self.bx.heap.new_string_concat(old_value, value);
                 let value = self.bx.heap.set_array_index(
                     arr,
                     index,
@@ -336,7 +372,9 @@ impl<'a> ScriptVm<'a> {
                 self.bx.threads.cur().push_stack_unchecked(NIL);
             }
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let old_value = self
                 .bx
                 .heap
@@ -434,12 +472,7 @@ impl<'a> ScriptVm<'a> {
                 }
                 ScriptMe::Object(obj) => {
                     let obj = *obj;
-                    self.bx.heap.set_value_vec(
-                        obj,
-                        field,
-                        value,
-                        self.bx.threads.cur().trap.pass(),
-                    );
+                    self.set_named_child(obj, field, value);
                 }
                 ScriptMe::Pod { pod, .. } => {
                     let pod = *pod;
@@ -458,6 +491,56 @@ impl<'a> ScriptVm<'a> {
                     );
                 }
             }
+        }
+        self.bx.threads.cur().trap.goto_next();
+    }
+
+    /// `object.name := value`: replace the named child in place, else append it. An object
+    /// (a widget, a template instance) under the name of a declared property of a typed object
+    /// is refused instead of being appended where the type never reads it; a plain value
+    /// (string, number, @id) stays a named entry beside the children, which hosts read as
+    /// metadata (Stage faces: `bind := "node.port"` on a Slider that has its own `bind`).
+    fn set_named_child(&mut self, obj: ScriptObject, field: ScriptValue, value: ScriptValue) {
+        if let Some(id) = field.unescape_id().as_id() {
+            if value.as_object().is_some() && self.bx.heap.field_type_from_type_check(obj, id).is_some() {
+                let type_name = self
+                    .bx
+                    .heap
+                    .object_type_name_in_chain(obj)
+                    .and_then(|t| t.as_string(|s| s.map(|s| s.to_string())))
+                    .unwrap_or_else(|| "its type".to_string());
+                script_err_not_allowed!(
+                    self.bx.threads.cur_ref().trap,
+                    "`{}` is a property of {}, not a child: write `{}: ...` or `{} +: {{...}}`",
+                    id,
+                    type_name,
+                    id,
+                    id
+                );
+                return;
+            }
+        }
+        self.bx
+            .heap
+            .set_value_vec(obj, field, value, self.bx.threads.cur().trap.pass());
+    }
+
+    /// `parent.name := value` through a path: the stack holds [parent, name, value].
+    pub(crate) fn handle_assign_field_vec(&mut self) {
+        let value = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
+        let field = self.bx.threads.cur().pop_stack_value();
+        let object = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
+        if let Some(obj) = object.as_object() {
+            self.set_named_child(obj, field, value);
+            self.bx.threads.cur().push_stack_unchecked(NIL);
+        } else {
+            let value = script_err_wrong_value!(
+                self.bx.threads.cur_ref().trap,
+                "cannot assign child {:?} on {:?} (not an object)",
+                field,
+                object.value_type()
+            );
+            self.bx.threads.cur().push_stack_unchecked(value);
         }
         self.bx.threads.cur().trap.goto_next();
     }
@@ -537,6 +620,63 @@ impl<'a> ScriptVm<'a> {
 
     // Generic assignment operation handlers
 
+    /// Shared fused read-modify-write for numeric compound scope assigns.
+    /// One chain walk locates the slot; the old two-walk path remains as
+    /// fallback for vec2-vec visibility and produces identical errors.
+    fn scope_rmw_numeric<F>(&mut self, value: ScriptValue, id: crate::makepad_live_id::LiveId, f: F)
+    where
+        F: FnOnce(f64, f64) -> f64,
+    {
+        let key: ScriptValue = id.into();
+        let Some(&scope) = self.bx.threads.cur_ref().scopes.last() else {
+            self.bail("scopes empty in scope_rmw_numeric");
+            return;
+        };
+        match self.bx.heap.scope_map_owner(scope, key) {
+            Ok((owner, va)) => {
+                if va.is_err() {
+                    self.bx.threads.cur().push_stack_unchecked(va);
+                } else {
+                    let ip = self.bx.threads.cur_ref().trap.ip;
+                    let fa = self.bx.heap.cast_to_f64(va, ip);
+                    let fb = self.bx.heap.cast_to_f64(value, ip);
+                    let value = self.bx.heap.scope_write_in_map(
+                        owner,
+                        key,
+                        ScriptValue::from_f64_traced_nan(f(fa, fb), ip),
+                        self.bx.threads.cur().trap.pass(),
+                    );
+                    self.bx.threads.cur().push_stack_unchecked(value);
+                }
+            }
+            Err(true) => {
+                let va = self.bx.threads.cur().scope_value(&self.bx.heap, id);
+                if va.is_err() {
+                    self.bx.threads.cur().push_stack_unchecked(va);
+                } else {
+                    let ip = self.bx.threads.cur_ref().trap.ip;
+                    let fa = self.bx.heap.cast_to_f64(va, ip);
+                    let fb = self.bx.heap.cast_to_f64(value, ip);
+                    let value = self.bx.threads.cur().set_scope_value(
+                        &mut self.bx.heap,
+                        id,
+                        ScriptValue::from_f64_traced_nan(f(fa, fb), ip),
+                    );
+                    self.bx.threads.cur().push_stack_unchecked(value);
+                }
+            }
+            Err(false) => {
+                let value = script_err_not_found!(
+                    self.bx.threads.cur_ref().trap,
+                    "variable {} not found in scope{}",
+                    id,
+                    crate::suggest::suggest_scope_var(&self.bx.heap, scope, id)
+                );
+                self.bx.threads.cur().push_stack_unchecked(value);
+            }
+        }
+    }
+
     pub fn handle_f64_scope_assign_op<F>(&mut self, f: F)
     where
         F: FnOnce(f64, f64) -> f64,
@@ -544,20 +684,7 @@ impl<'a> ScriptVm<'a> {
         let value = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         let id = self.bx.threads.cur().pop_stack_value();
         if let Some(id) = id.as_id() {
-            let va = self.bx.threads.cur().scope_value(&self.bx.heap, id);
-            if va.is_err() {
-                self.bx.threads.cur().push_stack_unchecked(va);
-            } else {
-                let ip = self.bx.threads.cur_ref().trap.ip;
-                let fa = self.bx.heap.cast_to_f64(va, ip);
-                let fb = self.bx.heap.cast_to_f64(value, ip);
-                let value = self.bx.threads.cur().set_scope_value(
-                    &mut self.bx.heap,
-                    id,
-                    ScriptValue::from_f64_traced_nan(f(fa, fb), ip),
-                );
-                self.bx.threads.cur().push_stack_unchecked(value);
-            }
+            self.scope_rmw_numeric(value, id, f);
         } else {
             let value = script_err_immutable!(
                 self.bx.threads.cur_ref().trap,
@@ -576,20 +703,7 @@ impl<'a> ScriptVm<'a> {
         let value = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         let id = self.bx.threads.cur().pop_stack_value();
         if let Some(id) = id.as_id() {
-            let old_value = self.bx.threads.cur().scope_value(&self.bx.heap, id);
-            if old_value.is_err() {
-                self.bx.threads.cur().push_stack_unchecked(old_value);
-            } else {
-                let ip = self.bx.threads.cur_ref().trap.ip;
-                let ua = self.bx.heap.cast_to_f64(old_value, ip) as u64;
-                let ub = self.bx.heap.cast_to_f64(value, ip) as u64;
-                let value = self.bx.threads.cur().set_scope_value(
-                    &mut self.bx.heap,
-                    id,
-                    ScriptValue::from_f64_traced_nan(f(ua, ub) as f64, ip),
-                );
-                self.bx.threads.cur().push_stack_unchecked(value);
-            }
+            self.scope_rmw_numeric(value, id, |a, b| f(a as u64, b as u64) as f64);
         } else {
             let value = script_err_immutable!(
                 self.bx.threads.cur_ref().trap,
@@ -690,7 +804,9 @@ impl<'a> ScriptVm<'a> {
             );
             self.bx.threads.cur().push_stack_unchecked(value);
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let old_value = self
                 .bx
                 .heap
@@ -739,7 +855,9 @@ impl<'a> ScriptVm<'a> {
             );
             self.bx.threads.cur().push_stack_unchecked(value);
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let old_value = self
                 .bx
                 .heap

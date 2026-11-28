@@ -8,6 +8,17 @@ pub type AudioInputFn = Box<dyn FnMut(AudioInfo, &AudioBuffer) + Send + 'static>
 #[derive(Clone, Debug, Default, Eq, Hash, Copy, PartialEq, FromLiveId)]
 pub struct AudioDeviceId(pub LiveId);
 
+/// Options for `use_audio_inputs_with_options`. Best-effort per platform:
+/// a platform without the capability captures plain audio instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AudioInputOptions {
+    /// Route capture through the OS voice-processing path (echo
+    /// cancellation / feedback suppression), so device playback — e.g. the
+    /// app's own TTS — is removed from the mic signal. Apple: the input
+    /// unit becomes VoiceProcessingIO (system-wide AEC; typically mono).
+    pub echo_cancellation: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AudioInfo {
     pub device_id: AudioDeviceId,
@@ -48,22 +59,47 @@ pub struct AudioDevicesEvent {
 }
 
 impl AudioDevicesEvent {
+    /// The device to record from: the default device, or if that one failed to
+    /// open, the default device anyway.
+    ///
+    /// Deliberately does *not* fall back to some other microphone the way
+    /// [`Self::default_output`] falls back to another speaker. Capture devices
+    /// are not interchangeable - the next input in the list is typically a
+    /// monitor source, which is a loopback of everything the machine is
+    /// playing, so silently recording from it instead would be a privacy
+    /// breach. Which microphone to use when the default one is unavailable is
+    /// the app's decision to make, from `descs`.
     pub fn default_input(&self) -> Vec<AudioDeviceId> {
+        // Real microphones only: the loopback device captures SYSTEM AUDIO
+        // (via screen-recording privileges on macOS) and must never be
+        // selected implicitly — apps opt into it by explicit device id.
         for d in &self.descs {
-            if d.is_default && d.device_type.is_input() && !d.has_failed {
+            if d.is_default && matches!(d.device_type, AudioDeviceType::Input) && !d.has_failed {
                 return vec![d.device_id];
             }
         }
         for d in &self.descs {
-            if d.is_default && d.device_type.is_input() {
+            if d.is_default && matches!(d.device_type, AudioDeviceType::Input) {
                 return vec![d.device_id];
             }
         }
         Vec::new()
     }
+    /// The device to play to, as a fallback chain: the default device, then any
+    /// other device that has not failed to open, and only if everything has
+    /// failed the default anyway.
+    ///
+    /// Handing back a device that is already known to have failed is what makes
+    /// an app ask for it again on every device change, so it is the last resort
+    /// rather than the first fallback.
     pub fn default_output(&self) -> Vec<AudioDeviceId> {
         for d in &self.descs {
             if d.is_default && d.device_type.is_output() && !d.has_failed {
+                return vec![d.device_id];
+            }
+        }
+        for d in &self.descs {
+            if d.device_type.is_output() && !d.has_failed {
                 return vec![d.device_id];
             }
         }
@@ -73,6 +109,26 @@ impl AudioDevicesEvent {
             }
         }
         Vec::new()
+    }
+
+    /// The loopback devices to capture the machine's own output from, the
+    /// one mirroring the default output first.
+    ///
+    /// They are listed in whatever order the platform enumerated them,
+    /// and an app that takes the first one it is handed can end up
+    /// capturing an endpoint nothing is playing to: that capture simply
+    /// never fires a callback, so it looks exactly like listening to
+    /// silence. The default output is the one the machine is actually
+    /// playing through, so its loopback goes first. Devices known to have
+    /// failed are left out; the rest keep the platform's order.
+    pub fn loopback_capture_order(&self) -> Vec<AudioDeviceId> {
+        let mut devices: Vec<&AudioDeviceDesc> = self
+            .descs
+            .iter()
+            .filter(|d| d.device_type.is_loopback() && !d.has_failed)
+            .collect();
+        devices.sort_by_key(|d| !d.is_default);
+        devices.iter().map(|d| d.device_id).collect()
     }
 
     pub fn match_outputs(&self, outputs: &[&str]) -> Vec<AudioDeviceId> {
@@ -147,11 +203,104 @@ impl AudioDeviceType {
     }
 }
 
+/// What to do when a stream write or read comes back with an error: the
+/// three answers a stream can give a callback that is late, asleep, or
+/// gone. Decided here, on the error number alone, so the decision is the
+/// same on every backend that answers with these numbers and can be
+/// tested where no stream exists.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StreamRecovery {
+    /// The stream ran dry, an underrun or an overrun: make it ready again
+    /// and carry on with the next buffer. The one case every backend
+    /// already handled.
+    Prepare,
+    /// The stream was suspended under the callback, by the machine
+    /// sleeping or the device powering down: bring it back rather than
+    /// abandoning it. Resuming may have to be asked more than once, and a
+    /// driver that cannot resume is prepared instead; see [`resume_step`].
+    Resume,
+    /// Anything else: the device is gone or the handle is no good. The
+    /// caller reports it and the sound moves elsewhere.
+    Fail,
+}
+
+/// One attempt at resuming a suspended stream, read from its return.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResumeStep {
+    /// Resumed: write the next buffer.
+    Done,
+    /// Not yet: the driver asks to be asked again.
+    Again,
+    /// This driver cannot resume: prepare the stream instead.
+    PrepareInstead,
+    /// Gone.
+    Fail,
+}
+
+/// The error numbers the stream backends answer with, as the Linux kernel
+/// defines them; the ALSA write and read calls return them negated.
+pub mod stream_errno {
+    /// Try again.
+    pub const EAGAIN: i32 = 11;
+    /// The stream ran dry.
+    pub const EPIPE: i32 = 32;
+    /// The driver has no such call.
+    pub const ENOSYS: i32 = 38;
+    /// The handle is not in a usable state.
+    pub const EBADFD: i32 = 77;
+    /// The stream is suspended.
+    pub const ESTRPIPE: i32 = 86;
+}
+
+/// The recovery for a failed stream write or read, from the error number
+/// it came back with (either sign).
+pub fn stream_recovery(errno: i32) -> StreamRecovery {
+    match errno.abs() {
+        stream_errno::EPIPE => StreamRecovery::Prepare,
+        stream_errno::ESTRPIPE => StreamRecovery::Resume,
+        _ => StreamRecovery::Fail,
+    }
+}
+
+/// What one resume attempt's return means. Zero or better is resumed; the
+/// driver may ask to be asked again, or say it has no resume at all.
+pub fn resume_step(result: i32) -> ResumeStep {
+    if result >= 0 {
+        return ResumeStep::Done;
+    }
+    match result.abs() {
+        stream_errno::EAGAIN => ResumeStep::Again,
+        stream_errno::ENOSYS => ResumeStep::PrepareInstead,
+        _ => ResumeStep::Fail,
+    }
+}
+
+/// When a block meets the device: for an output, when its first frame is heard.
 #[derive(Copy, Clone, Debug)]
 pub struct AudioTime {
+    /// The block's first frame on the device's sample counter.
     pub sample_time: f64,
+    /// When that frame is presented, on the backend's host clock: Apple's is the host
+    /// time base (`mach_absolute_time` ticks); the web's is nanoseconds of the page's
+    /// monotonic clock (`Cx::monotonic_now`, performance.now()).
     pub host_time: u64,
     pub rate_scalar: f64,
+}
+
+impl AudioTime {
+    /// Seconds from now until the block's first frame is presented, where this
+    /// build can read the backend's host clock (the web); `None` elsewhere. An
+    /// output's latency: what it renders now is heard this much later.
+    pub fn presented_in(&self) -> Option<f64> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Some(self.host_time as f64 * 1e-9 - crate::Cx::monotonic_now())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,8 +351,8 @@ impl AudioBuffer {
         out.resize(self.data.len(), 0);
         for i in 0..self.data.len() {
             let f = (self.data[i] * 32767.0)
-                .max(std::i16::MIN as f32)
-                .min(std::i16::MAX as f32);
+                .max(i16::MIN as f32)
+                .min(i16::MAX as f32);
             out[i] = f as i16;
         }
         out
@@ -305,5 +454,85 @@ impl AudioBuffer {
                 interleaved[i * self.channel_count + j] = self.data[i + j * self.frame_count];
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::makepad_live_id::LiveId;
+
+    fn desc(n: u64, kind: AudioDeviceType, is_default: bool, has_failed: bool) -> AudioDeviceDesc {
+        AudioDeviceDesc {
+            device_id: AudioDeviceId(LiveId(n)),
+            device_type: kind,
+            is_default,
+            has_failed,
+            channel_count: 2,
+            name: format!("device {n}"),
+        }
+    }
+
+    /// A capture of an endpoint nothing is playing to never fires, which
+    /// looks exactly like listening to silence -- so the loopback that
+    /// mirrors the default output is the one to ask for first.
+    #[test]
+    fn the_loopback_that_mirrors_the_default_output_is_asked_for_first() {
+        let event = AudioDevicesEvent {
+            descs: vec![
+                desc(1, AudioDeviceType::Loopback, false, false),
+                desc(2, AudioDeviceType::Loopback, true, false),
+                desc(3, AudioDeviceType::Loopback, false, false),
+                desc(4, AudioDeviceType::Output, true, false),
+                desc(5, AudioDeviceType::Input, false, false),
+            ],
+        };
+        let order = event.loopback_capture_order();
+        assert_eq!(order.len(), 3, "the loopbacks and nothing else");
+        assert_eq!(order[0], AudioDeviceId(LiveId(2)), "the default's, first");
+        assert_eq!(
+            order[1..],
+            [AudioDeviceId(LiveId(1)), AudioDeviceId(LiveId(3))],
+            "and the rest in the order they were enumerated",
+        );
+    }
+
+    /// A stream that ran dry is prepared, one that was suspended is
+    /// resumed, and only what is neither counts as a dead device. The
+    /// suspended case used to be reported as dead, which handed the room
+    /// to another output every time the machine woke.
+    #[test]
+    fn a_suspended_stream_is_resumed_and_only_the_rest_is_a_dead_device() {
+        use stream_errno::*;
+        assert_eq!(stream_recovery(-EPIPE), StreamRecovery::Prepare);
+        assert_eq!(stream_recovery(EPIPE), StreamRecovery::Prepare, "either sign");
+        assert_eq!(stream_recovery(-ESTRPIPE), StreamRecovery::Resume);
+        assert_eq!(stream_recovery(-EBADFD), StreamRecovery::Fail);
+        assert_eq!(stream_recovery(-19), StreamRecovery::Fail, "no such device");
+        assert_eq!(stream_recovery(0), StreamRecovery::Fail, "not an error number at all");
+    }
+
+    /// Resuming is asked until the driver answers: again on EAGAIN, a
+    /// prepare when the driver has no resume, and done at zero.
+    #[test]
+    fn resuming_retries_and_falls_back_to_a_prepare() {
+        use stream_errno::*;
+        assert_eq!(resume_step(0), ResumeStep::Done);
+        assert_eq!(resume_step(-EAGAIN), ResumeStep::Again);
+        assert_eq!(resume_step(-ENOSYS), ResumeStep::PrepareInstead);
+        assert_eq!(resume_step(-EBADFD), ResumeStep::Fail);
+    }
+
+    #[test]
+    fn a_loopback_that_failed_to_open_is_not_asked_for_again() {
+        let event = AudioDevicesEvent {
+            descs: vec![
+                desc(1, AudioDeviceType::Loopback, true, true),
+                desc(2, AudioDeviceType::Loopback, false, false),
+            ],
+        };
+        assert_eq!(event.loopback_capture_order(), vec![AudioDeviceId(LiveId(2))]);
+        let none = AudioDevicesEvent { descs: Vec::new() };
+        assert!(none.loopback_capture_order().is_empty());
     }
 }

@@ -1,5 +1,6 @@
 use crate::digest::{base64_encode, Sha1};
-use std::time::{SystemTime, UNIX_EPOCH};
+use makepad_live_id::LiveId;
+use std::collections::TryReserveError;
 
 #[derive(Debug, PartialEq)]
 enum State {
@@ -44,7 +45,9 @@ pub enum WebSocketMessage<'a> {
     Ping(&'a [u8]),
     Pong(&'a [u8]),
     Text(&'a str),
-    Binary(&'a [u8]),
+    /// The parser's buffer of the whole message: read it, or take it (`std::mem::take`) to own it
+    /// without a copy.
+    Binary(&'a mut Vec<u8>),
     Close,
 }
 
@@ -149,11 +152,11 @@ impl WebSocketMessageHeader {
 
     // TODO Improve this using a proper random number generator
     fn random_byte() -> u8 {
-        let num = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("duration_since failed")
-            .subsec_nanos();
-        num as u8
+        let mut value = LiveId::unique().0.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        (value.wrapping_mul(0x94d0_49bb_1331_11eb) >> 56) as u8
     }
 }
 
@@ -176,27 +179,6 @@ impl WebSocketParser {
         }
     }
 
-    pub fn message_to_frame(msg: WebSocketMessage) -> Vec<u8> {
-        match &msg {
-            WebSocketMessage::Text(data) => {
-                let header = WebSocketMessageHeader::from_len(
-                    data.len(),
-                    WebSocketMessageFormat::Text,
-                    false,
-                );
-                WebSocketParser::build_message(header, &data.to_string().into_bytes())
-            }
-            WebSocketMessage::Binary(data) => {
-                let header = WebSocketMessageHeader::from_len(
-                    data.len(),
-                    WebSocketMessageFormat::Binary,
-                    false,
-                );
-                WebSocketParser::build_message(header, &data)
-            }
-            _ => panic!(),
-        }
-    }
 
     pub fn create_upgrade_response(key: &str) -> String {
         let to_hash = format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
@@ -205,8 +187,9 @@ impl WebSocketParser {
         let out_bytes = sha1.finalise();
         let base64 = base64_encode(&out_bytes);
         let response_ack = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-            base64
+            "HTTP/1.1 101 Switching Protocols\r\n{}Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            crate::utils::LOW_LEVEL_SECURITY_HEADERS,
+            base64,
         );
         response_ack
     }
@@ -241,6 +224,12 @@ impl WebSocketParser {
             State::Data => {
                 self.mask_counter = 0;
                 self.data.clear();
+                // The message's length is the peer's word, so it is reserved only when it can
+                // be (a bad frame must not abort the process): then the message fills one buffer,
+                // with no copies as it grows; else it grows as its bytes arrive.
+                if let Err(e) = reserve(&mut self.data, self.data_len) {
+                    eprintln!("websocket: a message of {} bytes could not be reserved ({e}): it grows as its bytes arrive", self.data_len);
+                }
             }
             State::Opcode => {
                 self.is_ping = false;
@@ -366,7 +355,7 @@ impl WebSocketParser {
                                 result(Err(WebSocketError::TextNotUTF8(&self.data)))
                             }
                         } else {
-                            result(Ok(WebSocketMessage::Binary(&self.data)));
+                            result(Ok(WebSocketMessage::Binary(&mut self.data)));
                         }
 
                         self.to_state(State::Opcode);
@@ -377,8 +366,68 @@ impl WebSocketParser {
     }
 }
 
+/// `len` more bytes reserved in `data` (`Vec::try_reserve_exact`); a test can refuse it.
+fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), TryReserveError> {
+    #[cfg(test)]
+    if tests::REFUSE_RESERVE.with(std::cell::Cell::get) {
+        return Vec::<u8>::new().try_reserve_exact(usize::MAX);
+    }
+    data.try_reserve_exact(len)
+}
+
 impl Default for WebSocketParser {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WebSocketMessage, WebSocketMessageFormat, WebSocketMessageHeader, WebSocketParser};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// The parser's reservations refused on this thread (only this test's thread sets it).
+        pub(super) static REFUSE_RESERVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[test]
+    fn upgrade_response_and_messages() {
+        let response = WebSocketParser::create_upgrade_response("dGhlIHNhbXBsZSBub25jZQ==");
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        assert!(response.contains("Cross-Origin-Opener-Policy: same-origin\r\n"));
+        assert!(response.contains("Cross-Origin-Embedder-Policy: require-corp\r\n"));
+
+        // Masked binary messages around the 2- and 8-byte lengths, fed in pieces, each taken
+        // whole; then one whose declared length cannot be reserved: it grows as its bytes come.
+        let feed = |parser: &mut WebSocketParser, bytes: &[u8], got: &mut Vec<Vec<u8>>| {
+            for piece in bytes.chunks(1000) {
+                parser.parse(piece, |m| match m {
+                    Ok(WebSocketMessage::Binary(data)) => got.push(std::mem::take(data)),
+                    _ => panic!("not a binary message"),
+                });
+            }
+        };
+        let message = |len: usize| -> Vec<u8> { (0..len).map(|i| (i * 7) as u8).collect() };
+        let frame = |data: &[u8]| WebSocketParser::build_message(WebSocketMessageHeader::from_len(data.len(), WebSocketMessageFormat::Binary, true), data);
+        let sizes = [0, 125, 126, 65535, 65536, 200_000];
+        let mut parser = WebSocketParser::new();
+        let mut got = Vec::new();
+        feed(&mut parser, &sizes.iter().flat_map(|&n| frame(&message(n))).collect::<Vec<u8>>(), &mut got);
+        assert!(got.iter().map(Vec::len).eq(sizes), "every message whole, in order");
+        assert!(got.iter().all(|m| *m == message(m.len())), "every message's bytes");
+        REFUSE_RESERVE.with(|r| r.set(true));
+        got.clear();
+        feed(&mut parser, &[frame(&message(70_000)), frame(&message(3))].concat(), &mut got);
+        REFUSE_RESERVE.with(|r| r.set(false));
+        assert!(got == [message(70_000), message(3)], "an unreserved message, and the next");
+        // A declared length no allocator gives (4 EiB, past any address space: the allocation
+        // fails for real): no abort, the parser waits for its bytes.
+        let mut parser = WebSocketParser::new();
+        let mut huge = vec![0x82, 127];
+        huge.extend_from_slice(&(1u64 << 62).to_be_bytes());
+        huge.extend_from_slice(&[1, 2, 3]);
+        feed(&mut parser, &huge, &mut got);
+        assert_eq!(got.len(), 2, "no message before its bytes");
     }
 }

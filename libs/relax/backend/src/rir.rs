@@ -1,0 +1,3202 @@
+//! RIR: Relax's low-level IR. A CFG of blocks over typed virtual registers
+//! (mutable, not SSA, like wasm locals), explicit memory, explicit traps.
+//! Every instruction carries a source position for the PC -> source map.
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cls {
+    /// 64-bit integer / pointer register
+    I,
+    F32,
+    F64,
+    /// 128-bit vector of four 32-bit lanes (f32 or i32 by op); lives in float registers
+    V128,
+    /// 256-bit vector (x64 AVX ymm): made only by `pair256` after optimisation, from V128
+    /// pairs that are the two halves of one value; every op on it is the V128 op on both halves
+    V256,
+}
+
+impl Cls {
+    /// a vector class (lives in a float register, saved and spilled whole)
+    pub fn is_vec(self) -> bool {
+        matches!(self, Cls::V128 | Cls::V256)
+    }
+    /// bytes of a spill slot of this class (vector slots 16-aligned)
+    pub fn spill_bytes(self) -> u32 {
+        match self {
+            Cls::V128 => 16,
+            Cls::V256 => 32,
+            _ => 8,
+        }
+    }
+}
+
+/// Lane width of a lane-typed vector op (`Inst::VX`): 8, 16, 32 or 64 bits (float ops: S = f32,
+/// D = f64).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum VW {
+    B,
+    H,
+    S,
+    D,
+}
+
+impl VW {
+    pub fn bits(self) -> u32 {
+        match self {
+            VW::B => 8,
+            VW::H => 16,
+            VW::S => 32,
+            VW::D => 64,
+        }
+    }
+}
+
+/// Which NaN a float vector op produces when an input is NaN (the other bits are IEEE-exact).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum NanBits {
+    /// the host instruction's NaN (Rust leaves the payload unspecified)
+    Host,
+    /// SSE: the first NaN operand, quieted; the negative default NaN otherwise
+    Intel,
+    /// NEON: signaling NaNs first; the positive default NaN otherwise
+    Neon,
+}
+
+/// Rounding of `VX::FRound`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RoundTo {
+    Floor,
+    Ceil,
+    Trunc,
+    /// half away from zero
+    Away,
+    /// to nearest, ties to even (roundps/roundpd imm 0, frintn)
+    Even,
+}
+
+/// Lane-typed 128-bit vector ops (`Inst::VX(op, d, a, b)`): the core::arch intrinsics'
+/// operations (NEON / SSE2..SSE4.1 semantics; each backend picks its instructions).
+/// Unary ops ignore `b` (it repeats `a`). `d` is a V128 unless noted; scalar operands and
+/// results are I vregs (lanes zero-extended).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum VX {
+    // ---- binary, V128 x V128 -> V128, lane-wise
+    /// float lanes (S: f32, D: f64)
+    FAdd(VW, NanBits),
+    FSub(VW, NanBits),
+    FMul(VW, NanBits),
+    FDiv(VW, NanBits),
+    /// `a < b ? a : b` per lane
+    FMinLt(VW),
+    /// `a > b ? a : b` per lane
+    FMaxGt(VW),
+    /// NEON propagating min/max, including signed-zero ordering
+    FMinNeon(VW),
+    FMaxNeon(VW),
+    /// all ones / zero per lane, the scalar compare's meaning (`Ne` is true for unordered lanes)
+    FCmp(Cond, VW),
+    /// signed integer compare, all ones / zero per lane
+    ICmp(Cond, VW),
+    /// shifts by per-lane amounts (each in 0..lane bits)
+    ShlV(VW),
+    ShrSV(VW),
+    ShrUV(VW),
+    /// unsigned integer compare, all ones / zero per lane
+    UCmp(Cond, VW),
+    /// IEEE minNum / maxNum: a NaN lane takes the other operand (both NaN: a quiet NaN); the
+    /// sign of a zero result is unspecified (Rust's `simd_minimum_number_nsz`)
+    FMinNum(VW),
+    FMaxNum(VW),
+    /// lanes of a then b truncated to half their width (wrapping; lane = the source width)
+    Narrow(VW),
+    /// the two f64 lanes of a then of b rounded to f32 (four f32 lanes)
+    FCvtNarrow,
+    Add(VW),
+    Sub(VW),
+    /// low half of the product (H, S)
+    MulLo(VW),
+    MinS(VW),
+    MaxS(VW),
+    MinU(VW),
+    MaxU(VW),
+    /// all ones / zero per lane
+    CmpEq(VW),
+    CmpGtS(VW),
+    AddSatU(VW),
+    SubSatU(VW),
+    AddSatS(VW),
+    SubSatS(VW),
+    /// (a + b + 1) >> 1 unsigned (B, H)
+    AvgU(VW),
+    And,
+    Or,
+    Xor,
+    /// a & !b
+    AndNot,
+    /// interleave the low halves: a0 b0 a1 b1 ... (unpacklo / zip1)
+    ZipLo(VW),
+    /// interleave the high halves (unpackhi / zip2)
+    ZipHi(VW),
+    /// i16 x i16 products, adjacent pairs summed into i32 (pmaddwd)
+    MaddH,
+    /// u8 (a) x i8 (b) products, adjacent pairs summed with i16 saturation (pmaddubsw)
+    MaddUbs,
+    /// per 8-byte half: sum of |a - b| over u8 lanes, as u64 (psadbw)
+    SadU8,
+    /// i16 lanes of a then b -> u8 with unsigned saturation (packuswb)
+    PackUsH,
+    /// i16 lanes of a then b -> i8 with signed saturation (packsswb)
+    PackSsH,
+    /// i32 lanes of a then b -> i16 with signed saturation (packssdw)
+    PackSsS,
+    /// i32 lanes of a then b -> u16 with unsigned saturation (packusdw)
+    PackUsS,
+    /// d[i] = b[i] & 0x80 ? 0 : a[b[i] & 15] (pshufb)
+    ByteShuffle,
+    /// carry-less product of one 64-bit lane of a and one of b, 128 bits (x64 `pclmulqdq`, Arm
+    /// `pmull` .1q): bit 0 of the selector picks a's high lane, bit 1 b's high lane (the x86
+    /// immediate's bits 0 and 4)
+    Clmul(u8),
+    // SHA instruction semantics are architecture-specific (not interchangeable lane orders).
+    X86Sha1Rnds4(u8),
+    X86Sha1NextE,
+    X86Sha1Msg1,
+    X86Sha1Msg2,
+    X86Sha256Msg1,
+    X86Sha256Msg2,
+    ArmSha1Su1,
+    ArmSha256Su0,
+    // Unary: SHA1H reads/writes lane 0, with the rest of the result zero.
+    ArmSha1H,
+    // Ternary: Inst::VX3, all operands/results V128; SHA1C/P/M read b.s[0].
+    X86Sha256Rnds2,
+    ArmSha1C,
+    ArmSha1P,
+    ArmSha1M,
+    ArmSha1Su0,
+    ArmSha256H,
+    ArmSha256H2,
+    ArmSha256Su1,
+    /// shift by the signed amount in each lane (NEON USHL / SSHL): left by n >= 0, right by -n
+    /// (logical / arithmetic) for n < 0, |n| below the lane bits. Made by the arm64 back end only
+    /// (a right shift by `y + c` is `ushl` by `-c - y`: one `sub`, no `neg`).
+    ArmUShl(VW),
+    ArmSShl(VW),
+    // ---- unary, V128 -> V128
+    FNeg(VW),
+    FAbs(VW),
+    FSqrt(VW, NanBits),
+    FRound(VW, RoundTo),
+    /// float -> integer of the same width, truncating, saturating, NaN -> 0 (Rust `as`)
+    FToI(VW),
+    /// signed integer -> float of the same width, round to nearest
+    IToF(VW),
+    /// wrapping integer negation
+    Neg(VW),
+    /// f32 lanes 0 and 1 widened to two f64 lanes (exact)
+    FCvtLo,
+    Abs(VW),
+    ShlI(VW, u8),
+    ShrUI(VW, u8),
+    ShrSI(VW, u8),
+    /// 32-bit lane shuffle by an 8-bit selector (pshufd)
+    ShufS(u8),
+    /// whole-register byte shift right / left, zero fill (psrldq / pslldq)
+    BytesShrI(u8),
+    BytesShlI(u8),
+    /// low / high half widened to 2x lane width, zero / sign extended (lane = source width)
+    WidenLoU(VW),
+    WidenHiU(VW),
+    WidenLoS(VW),
+    WidenHiS(VW),
+    /// adjacent pairs added into 2x-wide lanes, unsigned (uaddlp; lane = source width)
+    PairAddLongU(VW),
+    // ---- scalar <-> vector
+    /// I -> V128: every lane = the scalar's low bits
+    Splat(VW),
+    /// V128 -> I: lane `k`, zero-extended
+    Extract(VW, u8),
+    /// (V128 a, I b) -> V128: a with lane `k` = b
+    Insert(VW, u8),
+    /// V128 -> I: the top bit of each byte (pmovmskb)
+    MoveMaskB,
+    /// V128 -> I: the top bit of each lane of width w, lane i at bit i
+    MoveMask(VW),
+    /// V128 -> I: wrapping sum of all lanes, zero-extended from the lane width
+    AddAcross(VW),
+    /// V128 -> I: unsigned maximum of all lanes
+    MaxAcrossU(VW),
+    /// I -> V128: the scalar in the low 64 bits, upper bits zero
+    FromLo64,
+    // ---- 256-bit halves (made only by `pair256`)
+    /// (V128 lo, V128 hi) -> V256
+    Join,
+    /// V256 -> V128: the low (false) or high (true) half
+    Half(bool),
+}
+
+impl VX {
+    /// Operands read: 1 (unary, scalar-from), 2, or 3 (Inst::VX3).
+    pub fn arity(self) -> usize {
+        match self {
+            VX::ArmSha1H | VX::FCvtLo | VX::MoveMask(_) | VX::FNeg(_) | VX::FAbs(_) | VX::FSqrt(..) | VX::FRound(..) | VX::FToI(_) | VX::IToF(_) | VX::Neg(_) | VX::Abs(_) | VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) | VX::ShufS(_) | VX::BytesShrI(_) | VX::BytesShlI(_) | VX::WidenLoU(_) | VX::WidenHiU(_) | VX::WidenLoS(_) | VX::WidenHiS(_) | VX::PairAddLongU(_) | VX::Splat(_) | VX::Extract(..) | VX::MoveMaskB | VX::AddAcross(_) | VX::MaxAcrossU(_) | VX::FromLo64 | VX::Half(_) => 1,
+            VX::X86Sha256Rnds2 | VX::ArmSha1C | VX::ArmSha1P | VX::ArmSha1M
+            | VX::ArmSha1Su0 | VX::ArmSha256H | VX::ArmSha256H2 | VX::ArmSha256Su1 => 3,
+            _ => 2,
+        }
+    }
+    /// the result is an I vreg
+    /// Extract, MoveMaskB, AddAcross, MaxAcrossU: an I result, the lane zero-extended to 64 bits
+    pub fn scalar_result(self) -> bool {
+        matches!(self, VX::Extract(..) | VX::MoveMaskB | VX::MoveMask(_) | VX::AddAcross(_) | VX::MaxAcrossU(_))
+    }
+}
+
+/// Bit operations on a 64-bit integer (`IBit`): counts are 0..=64 (clz/ctz of 0 = 64);
+/// narrower types are masked/shifted around them by the front end.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum BitOp {
+    Popcnt,
+    Clz,
+    Ctz,
+    Bswap,
+    /// bit reverse
+    Rev,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct VReg(pub u32);
+
+/// Integer type of an operation: width in bits and signedness. Narrow values are
+/// kept extended to 64 bits in registers (sign- or zero-extended by type).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct IntTy {
+    pub bits: u8,
+    pub signed: bool,
+}
+
+pub const I64: IntTy = IntTy { bits: 64, signed: true };
+pub const U64: IntTy = IntTy { bits: 64, signed: false };
+pub const I32: IntTy = IntTy { bits: 32, signed: true };
+pub const U32: IntTy = IntTy { bits: 32, signed: false };
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum IOp {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Div,
+    Rem,
+    /// high 64 bits of the 128-bit product of the 64-bit operands (signed by IntTy.signed);
+    /// IntTy.bits is 64
+    MulHi,
+    /// rotate left by the second operand (mod the width); made by the optimiser from
+    /// `x << k | x >> (w - k)` for unsigned 32-bit and 64-bit values only
+    Rotl,
+    /// `a & ((1 << (b mod 64)) - 1)`: the low `b mod 64` bits of a (IntTy is U64); made by the
+    /// optimiser from that mask idiom (bit readers' `bitbuf & bitmask(n)`): x64 BMI2 `bzhi`,
+    /// arm64 `lsl` of all ones + `bic`
+    Bzhi,
+    /// CRC-32 (IEEE 802.3, reflected polynomial 0xEDB88320) of the low 8 / 16 / 32 / 64 bits of
+    /// b folded into the 32-bit crc in a, no pre/post inversion: Arm's `__crc32b/h/w/d`
+    /// (`crc32b/h/w/x`); the result is the u32, zero-extended. IntTy is U64, so no pass takes
+    /// either operand for a narrow one (crc32x reads all of b). Arm only: x64 has no instruction
+    /// for this polynomial (std's aarch64 module computes it in software elsewhere)
+    Crc32B,
+    Crc32H,
+    Crc32W,
+    Crc32X,
+    /// CRC-32C (Castagnoli, reflected polynomial 0x82F63B78), otherwise as Crc32B/H/W/X: Arm's
+    /// `__crc32cb/h/w/d` (`crc32cb/h/w/x`), x86's `_mm_crc32_u8/16/32/64` (SSE4.2 `crc32`)
+    Crc32CB,
+    Crc32CH,
+    Crc32CW,
+    Crc32CX,
+}
+
+impl IOp {
+    /// a Crc32 / Crc32C op: its payload bits (8, 16, 32, 64) and whether it is CRC-32C
+    pub fn crc32(self) -> Option<(u8, bool)> {
+        match self {
+            IOp::Crc32B => Some((8, false)),
+            IOp::Crc32H => Some((16, false)),
+            IOp::Crc32W => Some((32, false)),
+            IOp::Crc32X => Some((64, false)),
+            IOp::Crc32CB => Some((8, true)),
+            IOp::Crc32CH => Some((16, true)),
+            IOp::Crc32CW => Some((32, true)),
+            IOp::Crc32CX => Some((64, true)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cond {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Cond {
+    /// The condition that holds exactly when this one does not (on integers; of float compares only
+    /// `==` and `!=`: `!=` is true when unordered)
+    pub fn not(self) -> Cond {
+        match self {
+            Cond::Eq => Cond::Ne,
+            Cond::Ne => Cond::Eq,
+            Cond::Lt => Cond::Ge,
+            Cond::Ge => Cond::Lt,
+            Cond::Le => Cond::Gt,
+            Cond::Gt => Cond::Le,
+        }
+    }
+}
+
+/// The compare a branch or a select reads in place (`Term::BranchCmp`, `Inst::SelCmp`): the
+/// condition is the compare's flags and never lives in a register. Backend-only, made by
+/// `regalloc::compares_into_readers` just before register allocation, from the `ICmp` / `ICmpI` /
+/// `FCmp` (and `c ^ 1` of one) a `Branch` or `Sel` read; the optimiser passes never see it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cmp {
+    /// `ICmp(cond, signed, _, a, b)`
+    R(Cond, bool, VReg, VReg),
+    /// `ICmpI(cond, signed, _, a, k)`
+    K(Cond, bool, VReg, i64),
+    /// `FCmp(cond, f64, _, a, b)`
+    F(Cond, bool, VReg, VReg),
+    /// `a op b` overflows the signed type (Add, Sub or Mul at 32 or 64 bits): rustc's checked
+    /// arithmetic, branched on the op's own overflow flag. Made by
+    /// `regalloc::overflows_into_branches` for a `Term::BranchCmp` only, after every pass that
+    /// turns a compare back into an instruction (`inst`) or reads its condition (`cond`).
+    O(IOp, IntTy, VReg, VReg),
+}
+
+impl Cmp {
+    /// The compare an instruction makes, and its result.
+    pub fn of(i: &Inst) -> Option<(VReg, Cmp)> {
+        match *i {
+            Inst::ICmp(c, s, d, a, b) => Some((d, Cmp::R(c, s, a, b))),
+            Inst::ICmpI(c, s, d, a, k) => Some((d, Cmp::K(c, s, a, k))),
+            Inst::FCmp(c, w, d, a, b) => Some((d, Cmp::F(c, w, a, b))),
+            _ => None,
+        }
+    }
+    /// The instruction that makes this compare's 0 / 1 in d.
+    pub fn inst(self, d: VReg) -> Inst {
+        match self {
+            Cmp::R(c, s, a, b) => Inst::ICmp(c, s, d, a, b),
+            Cmp::K(c, s, a, k) => Inst::ICmpI(c, s, d, a, k),
+            Cmp::F(c, w, a, b) => Inst::FCmp(c, w, d, a, b),
+            Cmp::O(..) => unreachable!("an overflow branch is made after every pass that makes a compare's instruction"),
+        }
+    }
+    pub fn cond(self) -> Cond {
+        match self {
+            Cmp::R(c, ..) | Cmp::K(c, ..) | Cmp::F(c, ..) => c,
+            Cmp::O(..) => unreachable!("an overflow branch is made after every pass that reads a compare's condition"),
+        }
+    }
+    /// The compare that is true exactly when this one is false (None: an ordered float compare,
+    /// false both ways when unordered).
+    pub fn not(self) -> Option<Cmp> {
+        match self {
+            Cmp::R(c, s, a, b) => Some(Cmp::R(c.not(), s, a, b)),
+            Cmp::K(c, s, a, k) => Some(Cmp::K(c.not(), s, a, k)),
+            Cmp::F(c @ (Cond::Eq | Cond::Ne), w, a, b) => Some(Cmp::F(c.not(), w, a, b)),
+            Cmp::F(..) => None,
+            // (no Cond says "does not overflow")
+            Cmp::O(..) => None,
+        }
+    }
+    /// Whether it reads v.
+    pub fn reads(self, v: VReg) -> bool {
+        let mut r = false;
+        self.uses(|u| r |= u == v);
+        r
+    }
+    /// The registers it reads.
+    pub fn uses(self, mut f: impl FnMut(VReg)) {
+        match self {
+            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) | Cmp::O(_, _, a, b) => {
+                f(a);
+                f(b);
+            }
+            Cmp::K(_, _, a, _) => f(a),
+        }
+    }
+    pub fn vregs_mut(&mut self, mut f: impl FnMut(&mut VReg)) {
+        match self {
+            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) | Cmp::O(_, _, a, b) => {
+                f(a);
+                f(b);
+            }
+            Cmp::K(_, _, a, _) => f(a),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    /// Rust `f64::min`/`max`: if one operand is NaN the other is returned (IEEE minNum)
+    Min,
+    Max,
+    /// `a < b ? a : b` (a NaN or equal operands give b: minss/fcmp+fcsel; Splash kernels)
+    MinLt,
+    /// `a > b ? a : b`
+    MaxGt,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FUn {
+    Neg,
+    Abs,
+    Sqrt,
+    Floor,
+    Ceil,
+    Trunc,
+    RoundEven,
+    /// round half away from zero (Rust `round`)
+    RoundAway,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Conv {
+    /// re-extend an integer to a (narrower or wider) integer type
+    IntToInt(IntTy),
+    IntToF(IntTy, bool),   // from, to f64?
+    FToInt(bool, IntTy),   // from f64?, to (saturating, NaN -> 0)
+    F32ToF64,
+    F64ToF32,
+    BitsToF(bool),
+    FToBits(bool),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Mem {
+    /// integer load/store of `bytes` (load extends by signedness)
+    Int(u8, bool),
+    F32,
+    F64,
+}
+
+/// A value the embedder resolves at link time: entry `id` of its symbol value table (`Env::syms`,
+/// u64 per entry) plus `off`. Code never embeds the value as an immediate, only through a
+/// relocation, so the embedder can move code between runs (Relax's disk cache) by rewriting the
+/// relocated words; freshly compiled code already holds the current values.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+pub struct Sym {
+    pub id: u32,
+    pub off: i64,
+}
+
+impl Sym {
+    pub fn new(id: u32) -> Sym {
+        Sym { id, off: 0 }
+    }
+    pub fn plus(self, k: i64) -> Sym {
+        Sym { id: self.id, off: self.off.wrapping_add(k) }
+    }
+    /// The value from a symbol table (`table` = address of the embedder's u64 array).
+    ///
+    /// # Safety
+    /// `table` must point to at least `id + 1` readable u64s.
+    pub unsafe fn value(self, table: u64) -> u64 {
+        std::ptr::read((table as *const u64).add(self.id as usize)).wrapping_add(self.off as u64)
+    }
+}
+
+/// How a backend may encode a symbol's value (`Env::sym_class`, one byte per `Sym::id`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SymClass {
+    /// an address inside the embedder's code/data reservation: pc-relative
+    Near = 0,
+    /// an address anywhere (host or C symbols): an 8-byte pool word
+    Far = 1,
+    /// a per-run number, not an address (fits in 32 bits): an immediate field
+    Imm = 2,
+    /// an offset into the running thread's domain static block (fits in 32 bits): `Inst::Addr`
+    /// of it is the thread's domain base (slot 0 of its thread-local block) + the symbol's value
+    Domain = 3,
+}
+
+impl SymClass {
+    pub fn of(table: u64, id: u32) -> SymClass {
+        if table == 0 {
+            return SymClass::Far;
+        }
+        match unsafe { std::ptr::read((table as *const u8).add(id as usize)) } {
+            0 => SymClass::Near,
+            2 => SymClass::Imm,
+            3 => SymClass::Domain,
+            _ => SymClass::Far,
+        }
+    }
+}
+
+/// How one relocated field of a function's code is encoded (`RelocAt::kind`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RelocKind {
+    /// the 8-byte word at `at` = value (Far symbols; cold glue targets)
+    Pool64,
+    /// x64: the disp32 at `at`, which ends its instruction: value - (base + at + 4)
+    X64Rel32,
+    /// arm64 adrp at `at`: page(value) - page(base + at), in pages
+    A64Adrp,
+    /// arm64 add (immediate) at `at`: value & 0xfff
+    A64AddLo12,
+    /// arm64 ldr x (unsigned offset, scale 8) at `at`: (value & 0xfff) / 8 (value 8-aligned)
+    A64LdrLo12X,
+    /// the 4 bytes at `at` = value (must fit in 32 bits)
+    Imm32,
+    /// arm64 movz at `at` and movk (lsl 16) at `at + 4`: the low 32 bits of value (must fit)
+    A64MovzMovk,
+    /// An arm64 coverage probe's leading NOP. `target` is the bitmap word;
+    /// after bit `bit` is set, the embedder may atomically replace the NOP
+    /// with a branch over `words` instructions. Not a cached fixup.
+    A64CoverageBit { bit: u8, words: u32 },
+    /// x64: the disp32 of a `call`/`jmp` at `at` (ends the instruction): value - (base + at + 4);
+    /// a target out of reach is branched to through a veneer (`link_with`)
+    X64Branch32,
+    /// arm64 `b`/`bl` at `at`: (value - pc) / 4 in imm26 (+-128 MB); out of reach: a veneer
+    A64Branch26,
+    /// An embedder note with no code effect. `at` is zero and `target` names a symbol from
+    /// `Func::notes`. Relax uses these notes for the call sites of its real-time reach.
+    Note,
+}
+
+/// Reach of a pc-relative branch field from the branch's own pc (`RelocKind::X64Branch32`: from
+/// the end of the disp32, `A64Branch26`: from the instruction).
+pub fn branch_reaches(kind: RelocKind, pc: u64, target: u64) -> bool {
+    let d = target.wrapping_sub(pc) as i64;
+    match kind {
+        RelocKind::X64Branch32 => d >= i32::MIN as i64 && d <= i32::MAX as i64,
+        RelocKind::A64Branch26 => d & 3 == 0 && (-(1i64 << 27)..1i64 << 27).contains(&d),
+        _ => false,
+    }
+}
+
+/// One relocated field: where, how, and what value goes there.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RelocAt {
+    pub at: u32,
+    pub kind: RelocKind,
+    pub target: Reloc,
+}
+
+/// Where the function slots live. A slot (u32 id) owns a thunk (its permanent callable
+/// address), a lazy stub, a table word (two when an entry wraps its body) and a tier record; they sit in segments that are
+/// reserved when the ids first reach them, so the number of functions has no fixed bound
+/// (ids are u32; the rest is address space). Segment 0 holds ids `0..2^18`, segment k >= 1 the
+/// ids `2^(17+k)..2^(18+k)`: doubling, so 4G ids take 15 reservations. Nothing needs the
+/// segments to be near each other or near the code: code reaches a slot through a full 64-bit
+/// address (a literal in its pool), thunks and stubs hold absolute addresses.
+pub struct SlotTable {
+    /// per kind (thunk, stub, table, tier), per segment: the segment's first byte (0 = none yet)
+    bases: [[std::sync::atomic::AtomicU64; SLOT_SEGS]; 4],
+    /// bytes per slot of each kind
+    stride: [u64; 4],
+    /// the embedder's hook for the address C code gets for a slot (`callable`): 0 = none
+    callable_hook: std::sync::atomic::AtomicUsize,
+    callable_ctx: std::sync::atomic::AtomicUsize,
+}
+
+pub const SLOT_SEGS: usize = 15;
+const SK_THUNK: usize = 0;
+const SK_STUB: usize = 1;
+const SK_TABLE: usize = 2;
+const SK_TIER: usize = 3;
+
+impl SlotTable {
+    pub fn new(thunk: u64, stub: u64, table: u64, tier: u64) -> Self {
+        SlotTable {
+            bases: [const { [const { std::sync::atomic::AtomicU64::new(0) }; SLOT_SEGS] }; 4],
+            stride: [thunk, stub, table, tier],
+            callable_hook: std::sync::atomic::AtomicUsize::new(0),
+            callable_ctx: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Slots in segment `seg`.
+    pub fn seg_slots(seg: usize) -> usize {
+        if seg == 0 { 1 << 18 } else { 1 << (17 + seg) }
+    }
+
+    /// (segment, index in it) of a slot id.
+    pub fn locate(id: u32) -> (usize, usize) {
+        if id < 1 << 18 {
+            (0, id as usize)
+        } else {
+            let bits = 32 - id.leading_zeros() as usize;
+            (bits - 18, (id - (1u32 << (bits - 1))) as usize)
+        }
+    }
+
+    /// First id of a segment.
+    pub fn seg_first(seg: usize) -> u64 {
+        if seg == 0 { 0 } else { 1 << (17 + seg) }
+    }
+
+    pub fn has_seg(&self, seg: usize) -> bool {
+        self.bases[SK_TABLE][seg].load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    /// Records a segment's four arrays (published last: a set table base means all are set).
+    pub fn install(&self, seg: usize, thunk: u64, stub: u64, table: u64, tier: u64) {
+        use std::sync::atomic::Ordering::*;
+        self.bases[SK_THUNK][seg].store(thunk, Relaxed);
+        self.bases[SK_STUB][seg].store(stub, Relaxed);
+        self.bases[SK_TIER][seg].store(tier, Relaxed);
+        self.bases[SK_TABLE][seg].store(table, Release);
+    }
+
+    /// The first byte of each installed segment's thunk array.
+    pub fn seg_base(&self, kind: usize, seg: usize) -> u64 {
+        self.bases[kind][seg].load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn addr(&self, kind: usize, id: u32) -> u64 {
+        let (seg, ix) = Self::locate(id);
+        self.bases[kind][seg].load(std::sync::atomic::Ordering::Acquire) + ix as u64 * self.stride[kind]
+    }
+    pub fn thunk(&self, id: u32) -> u64 { self.addr(SK_THUNK, id) }
+    /// The embedder decides what address a slot has as a value (a function pointer): `hook(ctx,
+    /// id, thunk)` answers it. Android: a C-ABI function handed to a system library is called
+    /// through a stub inside the host library, as those libraries check indirect calls
+    /// (CFI) against the code they know.
+    pub fn set_callable_hook(&self, hook: fn(usize, u32, u64) -> u64, ctx: usize) {
+        self.callable_ctx.store(ctx, std::sync::atomic::Ordering::Relaxed);
+        self.callable_hook.store(hook as usize, std::sync::atomic::Ordering::Release);
+    }
+    /// The embedder answers slot addresses as values (set_callable_hook).
+    pub fn has_callable_hook(&self) -> bool {
+        self.callable_hook.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+    /// The address of the slot as a value: its thunk, unless the embedder's hook says otherwise.
+    pub fn callable(&self, id: u32) -> u64 {
+        let thunk = self.thunk(id);
+        let h = self.callable_hook.load(std::sync::atomic::Ordering::Acquire);
+        if h == 0 {
+            return thunk;
+        }
+        let hook: fn(usize, u32, u64) -> u64 = unsafe { std::mem::transmute(h) };
+        hook(self.callable_ctx.load(std::sync::atomic::Ordering::Relaxed), id, thunk)
+    }
+    pub fn stub(&self, id: u32) -> u64 { self.addr(SK_STUB, id) }
+    /// The function table word of a slot.
+    pub fn table(&self, id: u32) -> u64 { self.addr(SK_TABLE, id) }
+    /// The replaceable target. With two words per slot, `table` holds a permanent entry
+    /// wrapper and this second word holds its body; with one word they are the same address.
+    pub fn body(&self, id: u32) -> u64 { self.table(id) + self.stride[SK_TABLE] - 8 }
+    pub fn table_stride(&self) -> u64 { self.stride[SK_TABLE] }
+    pub fn tier(&self, id: u32) -> u64 { self.addr(SK_TIER, id) }
+
+    /// The id whose entry of `kind` (0 thunk, 1 stub, 2 table, 3 tier) starts at or contains
+    /// `addr`, with the offset into the entry.
+    pub fn find(&self, kind: usize, addr: u64) -> Option<(u32, u64)> {
+        for seg in 0..SLOT_SEGS {
+            let base = self.bases[kind][seg].load(std::sync::atomic::Ordering::Acquire);
+            if base == 0 {
+                continue;
+            }
+            let len = Self::seg_slots(seg) as u64 * self.stride[kind];
+            if addr >= base && addr < base + len {
+                let k = addr - base;
+                return Some(((Self::seg_first(seg) + k / self.stride[kind]) as u32, k % self.stride[kind]));
+            }
+        }
+        None
+    }
+}
+
+/// The unit's slot table as the backends' `Env` holds it (the unit owns the table and outlives
+/// every compile that uses the env).
+#[derive(Clone, Copy)]
+pub struct SlotsPtr(pub *const SlotTable);
+unsafe impl Send for SlotsPtr {}
+unsafe impl Sync for SlotsPtr {}
+
+impl SlotsPtr {
+    /// no table (backend tests that never relocate a slot)
+    pub const NONE: SlotsPtr = SlotsPtr(std::ptr::null());
+    pub fn table(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).table(id) } }
+    }
+    pub fn thunk(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).thunk(id) } }
+    }
+    /// The slot's address as a value (SlotTable::callable).
+    pub fn callable(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).callable(id) } }
+    }
+    /// The slot's replaceable target word (SlotTable::body).
+    pub fn body(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).body(id) } }
+    }
+    /// The table word names an entry wrapper and a second word the body (a live test session's
+    /// reach marks): a call through the body word goes past the wrapper (`Reloc::Body`).
+    pub fn wrapped(&self) -> bool {
+        !self.0.is_null() && unsafe { (*self.0).table_stride() } > 8
+    }
+}
+
+/// Writes every relocated field of `code`, to run at address `base`. Backends emit the fields
+/// zeroed, so emitted code is independent of where and in which run it runs; the embedder
+/// links it here (fresh and cached code alike). Err: a value does not fit its field at `base`
+/// (a branch field out of reach included: `link_with` takes veneers for those).
+pub fn link(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(Reloc) -> u64) -> Result<(), String> {
+    link_with(code, base, relocs, value, &|_, _, _| None)
+}
+
+/// `link`, where a branch field (`X64Branch32`, `A64Branch26`) whose target is out of reach
+/// branches to `veneer(kind, target, pc)` instead: code in reach of `pc` that jumps to `target`
+/// (None: no veneer, the link fails).
+pub fn link_with(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(Reloc) -> u64, veneer: &dyn Fn(RelocKind, u64, u64) -> Option<u64>) -> Result<(), String> {
+    for r in relocs {
+        if r.kind == RelocKind::Note {
+            continue;
+        }
+        let at = r.at as usize;
+        let mut v = value(r.target);
+        if matches!(r.kind, RelocKind::X64Branch32 | RelocKind::A64Branch26) {
+            let pc = base + at as u64 + if r.kind == RelocKind::X64Branch32 { 4 } else { 0 };
+            if !branch_reaches(r.kind, pc, v) {
+                v = match veneer(r.kind, v, pc) {
+                    Some(t) if branch_reaches(r.kind, pc, t) => t,
+                    _ => return Err(format!("branch out of reach ({:#x} from {:#x}) and no veneer", v, pc)),
+                };
+            }
+        }
+        let rd32 = |c: &[u8], o: usize| -> Result<u32, String> {
+            c.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok_or_else(|| format!("relocation at {} past the code", o))
+        };
+        let wr32 = |c: &mut [u8], o: usize, w: u32| c[o..o + 4].copy_from_slice(&w.to_le_bytes());
+        match r.kind {
+            RelocKind::Note => {}
+            RelocKind::A64CoverageBit { bit, words } => {
+                if bit >= 64 || words == 0 || words >= 1 << 25 || at % 4 != 0 || at + words as usize * 4 > code.len() || rd32(code, at)? != 0xD503_201F {
+                    return Err(format!("invalid coverage probe at {}", at));
+                }
+            }
+            RelocKind::Pool64 => {
+                let w = code.get_mut(at..at + 8).ok_or_else(|| format!("relocation at {} past the code", at))?;
+                w.copy_from_slice(&v.to_le_bytes());
+            }
+            RelocKind::X64Branch32 => {
+                rd32(code, at)?;
+                wr32(code, at, v.wrapping_sub(base + at as u64 + 4) as i64 as i32 as u32);
+            }
+            RelocKind::A64Branch26 => {
+                let d = (v.wrapping_sub(base + at as u64) as i64 >> 2) as u32;
+                let w = rd32(code, at)? & !0x03FF_FFFF;
+                wr32(code, at, w | (d & 0x03FF_FFFF));
+            }
+            RelocKind::X64Rel32 => {
+                let d = v.wrapping_sub(base + at as u64 + 4) as i64;
+                if d < i32::MIN as i64 || d > i32::MAX as i64 {
+                    return Err(format!("rel32 out of range ({:#x} from {:#x})", v, base + at as u64));
+                }
+                rd32(code, at)?;
+                wr32(code, at, d as i32 as u32);
+            }
+            RelocKind::A64Adrp => {
+                let pc = base + at as u64;
+                let d = ((v & !0xfff) as i64).wrapping_sub((pc & !0xfff) as i64) >> 12;
+                if d < -(1 << 20) || d >= 1 << 20 {
+                    return Err(format!("adrp out of range ({:#x} from {:#x})", v, pc));
+                }
+                let w = rd32(code, at)? & !((3 << 29) | (0x7FFFF << 5));
+                let d = d as u32;
+                wr32(code, at, w | (d & 3) << 29 | ((d >> 2) & 0x7FFFF) << 5);
+            }
+            RelocKind::A64AddLo12 => {
+                let w = rd32(code, at)? & !(0xFFF << 10);
+                wr32(code, at, w | ((v & 0xfff) as u32) << 10);
+            }
+            RelocKind::A64LdrLo12X => {
+                if v & 7 != 0 {
+                    return Err(format!("ldr lo12 of an unaligned address {:#x}", v));
+                }
+                let w = rd32(code, at)? & !(0xFFF << 10);
+                wr32(code, at, w | (((v & 0xfff) >> 3) as u32) << 10);
+            }
+            RelocKind::Imm32 => {
+                if v > u32::MAX as u64 {
+                    return Err(format!("imm32 value {:#x} does not fit", v));
+                }
+                rd32(code, at)?;
+                wr32(code, at, v as u32);
+            }
+            RelocKind::A64MovzMovk => {
+                if v > u32::MAX as u64 {
+                    return Err(format!("movz/movk value {:#x} does not fit 32 bits", v));
+                }
+                let lo = rd32(code, at)? & !(0xFFFF << 5);
+                let hi = rd32(code, at + 4)? & !(0xFFFF << 5);
+                wr32(code, at, lo | ((v & 0xffff) as u32) << 5);
+                wr32(code, at + 4, hi | (((v >> 16) & 0xffff) as u32) << 5);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The target of a relocated field (`RelocAt::target`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Reloc {
+    /// a symbol's value + offset
+    Sym(Sym),
+    /// the function table word of a slot (`SlotTable::table`)
+    Slot(u32),
+    /// a slot's permanent callable address (`SlotTable::callable`): a value (fn pointers, vtables)
+    Thunk(u32),
+    /// a slot as a call target: its thunk (`SlotTable::thunk`), which jumps to the slot's current
+    /// code (a direct branch the runtime keeps in step with the table word)
+    Call(u32),
+    /// a slot's body word (`SlotTable::body`): a hot call site of O3 code calls through it
+    /// (`call [word]`), past the entry wrapper a live test session's table word names (its reach
+    /// mark). The embedder counts the slot as reached by the calling code. Without a wrapper it
+    /// is the table word.
+    Body(u32),
+    /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it;
+    /// x64 Windows: `x64::win_tls_key`; Linux under Relax also has a two-load key, `x64::TLS_TWO_LOAD`,
+    /// as Android under Relax has, `arm64::TLS_TWO_LOAD`)
+    TlsKey,
+    /// `Env::tls_slow`
+    TlsSlow,
+    /// `Env::resume`
+    Resume,
+    /// a value resolved by the embedder (linking code from a cache); never emitted by a backend
+    Value(u64),
+}
+
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub enum Callee {
+    /// through the function table slot (live mode) / direct (AOT)
+    Fn(u32),
+    Indirect(VReg),
+    /// runtime function at a symbol's address (scalar arguments and results only)
+    Host(Sym),
+    /// foreign (C ABI) function at a symbol's address
+    CHost(Sym, Box<CSig>),
+    /// call through an `extern "C" fn` pointer
+    CIndirect(VReg, Box<CSig>),
+    /// direct call of a Relax `extern "C" fn` (function table slot)
+    CFn(u32, Box<CSig>),
+    /// an inline assembly block (`asm!`; `--no-asm` blocks it): the call's arguments are its
+    /// inputs and its results its outputs, each in the block's register. Every pass sees it as a
+    /// call (side effects, memory, no motion); the register allocator keeps all other values out
+    /// of its registers over it (`AsmBlock::regs`); the backend emits the bytes in place.
+    Asm(Box<AsmBlock>),
+    /// Direct call to this native build's outlined part, with the Relax calling convention.
+    /// The joiner resolves it within the body. It may capture arguments, access memory and unwind.
+    /// `Some(id)` calls an outlined exit with the record as its only RIR argument. The backend
+    /// passes `id` in the next integer argument register, as the part's second parameter.
+    /// `None` is the whole-body stub: it forwards the host's arguments and passes no exit ID.
+    Part(Option<u32>),
+}
+
+/// The options of an inline assembly block (Reference [asm.options]) that the backend reads.
+pub const ASM_NORETURN: u32 = 1;
+pub const ASM_NOSTACK: u32 = 2;
+pub const ASM_NOMEM: u32 = 4;
+pub const ASM_READONLY: u32 = 8;
+pub const ASM_PURE: u32 = 16;
+pub const ASM_PRESERVES_FLAGS: u32 = 32;
+
+/// An `asm!` block assembled at lowering (`asm` module): its machine code, with its operands
+/// in fixed registers.
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub struct AsmBlock {
+    pub code: Vec<u8>,
+    /// fields that hold a symbol's value: (offset in `code`, encoding, symbol)
+    pub fixups: Vec<(u32, crate::asm::FixKind, Sym)>,
+    /// the register of each input (the call's argument vregs, in order)
+    pub ins: Vec<crate::asm::PReg>,
+    /// the register of each output (the call's result vregs, in order)
+    pub outs: Vec<crate::asm::PReg>,
+    /// every register the block reads or may write (`PReg::bit`): inputs, outputs, discarded
+    /// outputs, clobbers. No other value is held in them over the block.
+    pub regs: u64,
+    /// the registers it may write: callee-saved ones among them are saved by the prologue
+    pub writes: u64,
+    /// ASM_* bits
+    pub opts: u32,
+}
+
+impl AsmBlock {
+    /// The empty block rustc makes `black_box` of (rustc_codegen_llvm intrinsic.rs: an empty
+    /// `asm!` with the value's address as its input and a memory clobber; for a ZST the clobber
+    /// alone): it runs no instruction, but every pass sees a call that may read and write any
+    /// memory, the input's included, so none sees through it.
+    pub fn opaque(ins: Vec<crate::asm::PReg>) -> AsmBlock {
+        let regs = ins.iter().fold(0u64, |m, r| m | 1 << r.bit());
+        AsmBlock { code: Vec::new(), fixups: Vec::new(), ins, outs: Vec::new(), regs, writes: 0, opts: ASM_NOSTACK | ASM_PRESERVES_FLAGS }
+    }
+
+    /// A block of no instructions (`opaque`): code that cannot run inline assembly (wasm,
+    /// sandboxed code) keeps it as the barrier it is to the passes and emits nothing for it.
+    pub fn is_empty(&self) -> bool {
+        self.code.is_empty() && self.fixups.is_empty() && self.outs.is_empty()
+    }
+}
+
+/// An aggregate passed or returned by value under the C ABI.
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub struct CAgg {
+    pub size: u32,
+    pub align: u32,
+    /// scalar fields in offset order (nested structs and arrays flattened); empty when
+    /// unknown or very large (the aggregate is then classified as memory)
+    pub fields: Vec<(u32, Mem)>,
+}
+
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub enum CArg {
+    /// the vreg holds the value (integers extended to 64 bits as everywhere in RIR)
+    Scalar(Mem),
+    /// the vreg holds the address of a private copy of the aggregate
+    Agg(CAgg),
+}
+
+/// C-family calling convention, separate from ABI identity and unwinding.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum CConv { Host, SysV64, Win64 }
+
+impl CConv {
+    pub fn target(self) -> crate::cabi::Target {
+        match self {
+            Self::Host => crate::cabi::HOST,
+            Self::SysV64 => crate::cabi::Target::SysV,
+            Self::Win64 => crate::cabi::Target::Win64,
+        }
+    }
+}
+
+/// C-family ABI shape of a call or function body; the backend lowers it.
+/// ABI argument vregs: [result address if `ret` is Some] then one per `args` entry.
+/// With an aggregate return the result is written through that address and the call
+/// has no result vregs; scalar results come back in the call's result vregs as usual.
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub struct CSig {
+    pub conv: CConv,
+    pub args: Vec<CArg>,
+    pub ret: Option<CAgg>,
+    /// variadic: the number of fixed arguments in `args`; u32::MAX when not variadic
+    pub n_fixed: u32,
+    /// a narrow integer result (i8..i32, u8..u32, bool): C leaves the register's upper bits
+    /// undefined, so the backend re-extends it after the call
+    pub ret_narrow: Option<IntTy>,
+    /// the callee's `-unwind` ABI lets a panic unwind through the call (rustc FnAbi::can_unwind):
+    /// the call has an unwind edge, as a Rust call does. Other C-family ABIs abort a panic
+    /// leaving their body.
+    pub unwinds: bool,
+    /// a math function as Relax's core declares it for the float methods (`f64::sin` calls
+    /// core's libm `sin`), where rustc emits an LLVM math intrinsic (`llvm.sin`: no memory read
+    /// or written, so loads merge across it and a sin and a cos of one value pair:
+    /// passes::fuse_sincos). A C function the program declares itself (`extern "C" { fn sin }`)
+    /// stays a call that may write errno for LLVM, never paired.
+    pub math: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AtomOrd {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+    /// a volatile access (`read_volatile` / `write_volatile`): an ordinary load or store
+    /// instruction that no pass may remove, merge, forward or reorder with other volatile or
+    /// atomic accesses -- the guarantees every AtomicLoad / AtomicStore already has
+    Volatile,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RmwOp {
+    Xchg,
+    Add,
+    Sub,
+    And,
+    Nand,
+    Or,
+    Xor,
+    Max,
+    Min,
+    UMax,
+    UMin,
+}
+
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub enum Inst {
+    /// Set bits in an embedder-owned coverage bitmap. The aligned atomic word
+    /// must outlive the code and must not alias program memory. This is an
+    /// observable trace effect, but does not invalidate program loads. Native
+    /// backends lower it after optimisation; it is never persisted in a cache.
+    /// `disabled` names a thread-local u64: zero during runtime execution,
+    /// all ones while the compiler evaluates an initializer on this thread.
+    Coverage { word: u64, mask: u64, disabled: Sym },
+    Iconst(VReg, i64),
+    Fconst(VReg, u64, bool),
+    Mov(VReg, VReg),
+    IBin(IOp, IntTy, VReg, VReg, VReg),
+    /// `d = a op imm` (imm fits in i32)
+    IBinI(IOp, IntTy, VReg, VReg, i64),
+    INeg(IntTy, VReg, VReg),
+    INot(IntTy, VReg, VReg),
+    /// 64-bit bit operation (popcount, leading/trailing zeros, byte swap, bit reverse)
+    IBit(BitOp, VReg, VReg),
+    ICmp(Cond, bool, VReg, VReg, VReg), // signed?, d, a, b
+    ICmpI(Cond, bool, VReg, VReg, i64),
+    FBin(FOp, bool, VReg, VReg, VReg),  // f64?
+    FUnary(FUn, bool, VReg, VReg),
+    FCmp(Cond, bool, VReg, VReg, VReg),
+    Conv(Conv, VReg, VReg),
+    Load(Mem, VReg, VReg, i32),  // d, base, offset
+    Store(Mem, VReg, i32, VReg), // base, offset, src
+    /// backend-only (made by `opt::addr_modes` just before codegen):
+    /// d = [base + (idx << shift) + offset]
+    LoadX(Mem, VReg, VReg, VReg, u8, i32),
+    /// [base + (idx << shift) + offset] = src
+    StoreX(Mem, VReg, VReg, u8, i32, VReg),
+    SlotAddr(VReg, u32),
+    /// a symbol's value (an address of data / a host object, or an embedder index such as a
+    /// panic site) plus its offset: code holds it only through a relocation (`Reloc::Sym`)
+    Addr(VReg, Sym),
+    FnAddr(VReg, u32),
+    Call(Callee, Vec<VReg>, Vec<VReg>),
+    /// memcpy of a constant size
+    Copy(VReg, VReg, u32),
+    /// d = c != 0 ? a : b (c an integer vreg; a, b, d of one class)
+    Sel(VReg, VReg, VReg, VReg), // d, c, a, b
+    /// backend-only (`Cmp`): d = cmp ? a : b
+    SelCmp(VReg, Cmp, VReg, VReg), // d, cmp, a, b
+    /// fused multiply-add, one rounding: d = (neg_prod ? -a : a) * b + (neg_add ? -c : c), the
+    /// negations those of the operands (a NaN's sign flips: `(-a).mul_add(b, c)`). A NaN result
+    /// is [`fma_nan_f32`] / [`fma_nan_f64`] of the negated operands on every tier and register
+    /// assignment (each back end keeps one operand placement).
+    /// The only fusion RIR has (the optimiser never fuses).
+    FMulAdd(bool, bool, bool, VReg, VReg, VReg, VReg), // neg_prod, neg_add, f64?, d, a, b, c
+    /// atomic load (Mem::Int only; the value is extended by signedness)
+    AtomicLoad(Mem, AtomOrd, VReg, VReg), // d, addr
+    AtomicStore(Mem, AtomOrd, VReg, VReg), // addr, src
+    /// d = old value; [addr] = old op src
+    AtomicRmw(RmwOp, Mem, AtomOrd, VReg, VReg, VReg), // d, addr, src
+    /// compare-exchange: d = old value; stores `new` iff old == expected
+    AtomicCas(Mem, AtomOrd, AtomOrd, VReg, VReg, VReg, VReg), // ok ord, fail ord, d, addr, expected, new
+    /// memory fence; `true` = compiler-only (single-thread) fence
+    Fence(AtomOrd, bool),
+    /// In a coroutine body before its transform only (lower.rs): every borrow of what lived in
+    /// this slot has ended (the end of its local's or its temporary's scope). It does not say the
+    /// slot's bytes are dead to lowering's own by-value uses. The coroutine transform reads and
+    /// removes every one, so no pass after it and no backend sees one.
+    StorageDead(u32),
+    /// the thread's floating-point control register: `FpEnv(false, d)` reads it into d,
+    /// `FpEnv(true, x)` writes x to it (x64: MXCSR, 32 bits; arm64: FPCR). Flush-to-zero,
+    /// denormals-are-zero, rounding: an effect, ordered like a call
+    FpEnv(bool, VReg),
+    /// x86 CPUID: four zero-extended u32 results, leaf and subleaf.
+    Cpuid([VReg; 4], VReg, VReg),
+    /// x86 XGETBV: u64 result and u32 XCR index. Caller checks OSXSAVE.
+    Xgetbv(VReg, VReg),
+    /// d = address of this thread's copy of the thread-local block at the offset a symbol holds
+    TlsAddr(VReg, Sym),
+    /// d = the thread pointer + the symbol's value: a variable in the executable's static TLS
+    /// (x86-64 Linux: fs:0 + offset, rustc's local-exec model). Pure within a thread, like TlsAddr
+    /// never moved (a coroutine may resume on another thread).
+    TlsStatic(VReg, Sym),
+    // ---- 128-bit vectors (Cls::V128; four 32-bit lanes)
+    /// d = bitwise m ? a : b (m: lane masks)
+    VSel(VReg, VReg, VReg, VReg), // d, m, a, b
+    /// float lanes (`w`: f64, else f32), one rounding: (neg_prod ? -a : a) * b + (neg_add ? -c : c)
+    /// (operand negations and NaN lanes as `FMulAdd`). `keep_nan`: a negation leaves a NaN operand
+    /// as it is, the x86 rule (vfmsub / vfnmadd / vfnmsub negate the product or addend inside the
+    /// fused op, so the NaN passes on with its own sign; without it a NaN's sign flips, as NEON's
+    /// fmls).
+    VFma(bool, bool, bool, bool, VReg, VReg, VReg, VReg), // neg_prod, neg_add, keep_nan, w, d, a, b, c
+    /// every lane = the low 32 bits of s (an I or F32 vreg)
+    VSplat(VReg, VReg),
+    /// every lane = a 32-bit constant (a constant-pool load: cheap to rematerialise)
+    VConst(VReg, u32),
+    /// d = lane `lane` of v: an I vreg gets it sign-extended (i32), an F32 vreg as f32
+    VExtract(VReg, VReg, u8),
+    /// d = v with lane `lane` replaced by the low 32 bits of s (I or F32)
+    VInsert(VReg, VReg, u8, VReg), // d, v, lane, s
+    /// 16 bytes at [base + off] (no alignment needed)
+    VLoad(VReg, VReg, i32),
+    VStore(VReg, i32, VReg), // base, off, src
+    /// 16 bytes at [base + (idx << sh) + off] (made by `passes::addr_modes`; sh <= 3, arm64 <= 4)
+    VLoadX(VReg, VReg, VReg, u8, i32), // d, base, idx, sh, off
+    VStoreX(VReg, VReg, u8, i32, VReg), // base, idx, sh, off, src
+    /// d (I) = 1 if any lane of v is nonzero, else 0
+    VAny(VReg, VReg),
+    /// lane l = the 32-bit word at [base + 4 * idx.lane(l)] (idx lanes as u32, in range)
+    VGather(VReg, VReg, VReg), // d, base, idx
+    /// d byte k = the byte at [base + bidx.byte(k)] of a small table: n words (n <= 16) at base,
+    /// every byte index below 4n (a kernel's constant table read at varying word indices i: bytes
+    /// 4i .. 4i + 3; NEON: one ld1 of the table and one TBL)
+    VTbl(VReg, VReg, VReg, u8), // d, base, bidx, n
+    /// d byte i = (a ++ b) byte idx[i] for idx[i] < 32, else 0 (a constant two-source shuffle;
+    /// lane shuffles are their byte indices)
+    VShuffle(VReg, VReg, VReg, [u8; 16]), // d, a, b, idx
+    /// lane-typed vector op (see `VX`): d, a, b (b repeats a for unary ops)
+    VX(VX, VReg, VReg, VReg),
+    /// Pure ternary vector op; a is the destructive hardware input, c is explicit in RIR.
+    VX3(VX, VReg, VReg, VReg, VReg),
+}
+
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub enum Term {
+    Jump(u32),
+    Branch(VReg, u32, u32),
+    /// backend-only (`Cmp`): to the first block when the compare holds, else the second
+    BranchCmp(Cmp, u32, u32),
+    Ret(Vec<VReg>),
+    Unreachable,
+    /// (normal, unwind): the block's last instruction is a call (Callee::Fn / Indirect / Host)
+    /// that continues at `normal` when it returns and at `unwind` when a panic unwinds out of
+    /// it (rustc's `Call { target, unwind: Cleanup(bb) }`). The unwind block (a cleanup pad)
+    /// runs drops and ends in a call that resumes unwinding; the call's results are defined on
+    /// the normal edge only. The call stays an instruction, so instruction-level passes see it
+    /// as any call; passes must keep it last in its block.
+    Invoke(u32, u32),
+    /// end of a cleanup pad: continue unwinding into the caller (rustc's `UnwindResume`)
+    Resume,
+    /// Jump table: `targets[x - min]` when `x - min` (wrapping) is below `targets.len()` as an
+    /// unsigned number, else `default`. Made by `switch::lower_switches` from a dense integer
+    /// match, just before register allocation; the optimiser passes never see it.
+    Switch(VReg, std::sync::Arc<SwitchTable>),
+}
+
+/// The table of a `Term::Switch`.
+#[derive(Clone, Debug, PartialEq, Hash)]
+pub struct SwitchTable {
+    pub min: i64,
+    pub targets: Vec<u32>,
+    pub default: u32,
+    /// the distinct targets (table entries and default), default last
+    pub succ: Vec<u32>,
+}
+
+impl SwitchTable {
+    pub fn new(min: i64, targets: Vec<u32>, default: u32) -> SwitchTable {
+        let mut t = SwitchTable { min, targets, default, succ: Vec::new() };
+        t.refresh();
+        t
+    }
+    /// Recomputes `succ` after the targets changed.
+    pub fn refresh(&mut self) {
+        let mut s: Vec<u32> = Vec::new();
+        for &c in &self.targets {
+            if c != self.default && !s.contains(&c) {
+                s.push(c);
+            }
+        }
+        s.push(self.default);
+        self.succ = s;
+    }
+}
+
+/// A terminator's distinct successor blocks (in order: taken first)
+pub struct Succs {
+    a: [u32; 2],
+    n: u8,
+    // as wide as a switch table is long: an 8-bit position wrapped to 0 after a table's 256th
+    // successor and the iterator never ended (a derived `Debug` on a 256-variant enum is one
+    // switch with that many distinct arms; whoever collected the successors grew without bound)
+    i: u32,
+    sw: Option<std::sync::Arc<SwitchTable>>,
+}
+
+impl Iterator for Succs {
+    type Item = u32;
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        if let Some(t) = &self.sw {
+            let r = t.succ.get(self.i as usize).copied();
+            self.i += 1;
+            return r;
+        }
+        if self.i < self.n as u32 {
+            self.i += 1;
+            Some(self.a[self.i as usize - 1])
+        } else {
+            None
+        }
+    }
+}
+
+impl Inst {
+    /// The registers this instruction writes (its results), conservatively: where a register
+    /// is both read and written (a vector lane insert, the FP control register, Xgetbv) it
+    /// counts as written.
+    pub fn defs(&self, mut f: impl FnMut(VReg)) {
+        match self {
+            Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) | Inst::VConst(d, _) => f(*d),
+            Inst::Mov(d, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::FUnary(_, _, d, _) | Inst::Conv(_, d, _) | Inst::IBinI(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::Load(_, d, _, _) | Inst::VSplat(d, _) | Inst::VExtract(d, _, _) | Inst::VLoad(d, _, _) | Inst::VAny(d, _) | Inst::AtomicLoad(_, _, d, _) => f(*d),
+            Inst::IBin(_, _, d, _, _) | Inst::ICmp(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) | Inst::VGather(d, _, _) | Inst::VTbl(d, _, _, _) | Inst::VShuffle(d, _, _, _) | Inst::VX(_, d, _, _) | Inst::AtomicRmw(_, _, _, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::VLoadX(d, _, _, _, _) => f(*d),
+            Inst::Sel(d, _, _, _) | Inst::SelCmp(d, _, _, _) | Inst::VX3(_, d, _, _, _) | Inst::VSel(d, _, _, _) | Inst::VFma(_, _, _, _, d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicCas(_, _, _, d, _, _, _) => f(*d),
+            Inst::VInsert(d, _, _, _) => f(*d),
+            Inst::Call(_, _, rets) => rets.iter().for_each(|r| f(*r)),
+            Inst::FpEnv(_, v) => f(*v),
+            Inst::Cpuid(ds, a, b) => { ds.iter().for_each(|d| f(*d)); f(*a); f(*b); }
+            Inst::Xgetbv(d, a) => { f(*d); f(*a); }
+            Inst::Store(..) | Inst::Copy(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::AtomicStore(..) | Inst::StoreX(..) | Inst::Fence(..) | Inst::Coverage { .. } | Inst::StorageDead(..) => {}
+        }
+    }
+
+    /// Every vreg operand and result, in place (renaming without rebuilding the instruction).
+    pub fn vregs_mut(&mut self, mut f: impl FnMut(&mut VReg)) {
+        match self {
+            Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) | Inst::VConst(d, _) => f(d),
+            Inst::Mov(d, a) | Inst::INeg(_, d, a) | Inst::INot(_, d, a) | Inst::IBit(_, d, a) | Inst::FUnary(_, _, d, a) | Inst::Conv(_, d, a) | Inst::IBinI(_, _, d, a, _) | Inst::ICmpI(_, _, d, a, _) | Inst::Load(_, d, a, _) | Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VAny(d, a) | Inst::AtomicLoad(_, _, d, a) => {
+                f(d);
+                f(a);
+            }
+            Inst::Store(_, a, _, b) | Inst::Copy(a, b, _) | Inst::VStore(a, _, b) | Inst::AtomicStore(_, _, a, b) => {
+                f(a);
+                f(b);
+            }
+            Inst::IBin(_, _, d, a, b) | Inst::ICmp(_, _, d, a, b) | Inst::FBin(_, _, d, a, b) | Inst::FCmp(_, _, d, a, b) | Inst::VGather(d, a, b) | Inst::VTbl(d, a, b, _) | Inst::VShuffle(d, a, b, _) | Inst::VX(_, d, a, b) | Inst::AtomicRmw(_, _, _, d, a, b) | Inst::LoadX(_, d, a, b, _, _) | Inst::VLoadX(d, a, b, _, _) => {
+                f(d);
+                f(a);
+                f(b);
+            }
+            Inst::StoreX(_, a, b, _, _, c) | Inst::VStoreX(a, b, _, _, c) | Inst::VInsert(a, b, _, c) => {
+                f(a);
+                f(b);
+                f(c);
+            }
+            Inst::Sel(d, a, b, c) | Inst::VX3(_, d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, _, _, d, a, b, c) | Inst::FMulAdd(_, _, _, d, a, b, c) | Inst::AtomicCas(_, _, _, d, a, b, c) => {
+                f(d);
+                f(a);
+                f(b);
+                f(c);
+            }
+            Inst::SelCmp(d, c, a, b) => {
+                f(d);
+                c.vregs_mut(&mut f);
+                f(a);
+                f(b);
+            }
+            Inst::Call(c, args, rets) => {
+                if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
+                    f(v);
+                }
+                args.iter_mut().for_each(&mut f);
+                rets.iter_mut().for_each(&mut f);
+            }
+            Inst::Fence(..) | Inst::Coverage { .. } | Inst::StorageDead(..) => {}
+            Inst::FpEnv(_, v) => f(v),
+            Inst::Cpuid(ds, a, b) => {
+                ds.iter_mut().for_each(&mut f);
+                f(a);
+                f(b);
+            }
+            Inst::Xgetbv(d, a) => { f(d); f(a); }
+        }
+    }
+}
+
+impl Term {
+    /// Every CFG successor, each once. Passes that enumerate edges go through this (and
+    /// `map_succs`), so a new terminator kind is one edit here.
+    #[inline]
+    pub fn succs(&self) -> Succs {
+        match *self {
+            Term::Jump(t) => Succs { a: [t, 0], n: 1, i: 0, sw: None },
+            Term::Branch(_, t, e) | Term::BranchCmp(_, t, e) | Term::Invoke(t, e) => Succs { a: [t, e], n: if t == e { 1 } else { 2 }, i: 0, sw: None },
+            Term::Ret(_) | Term::Unreachable | Term::Resume => Succs { a: [0, 0], n: 0, i: 0, sw: None },
+            Term::Switch(_, ref t) => Succs { a: [0, 0], n: 0, i: 0, sw: Some(t.clone()) },
+        }
+    }
+    /// Rewrites every successor block index.
+    #[inline]
+    pub fn map_succs(&mut self, mut f: impl FnMut(u32) -> u32) {
+        match self {
+            Term::Jump(t) => *t = f(*t),
+            Term::Branch(_, t, e) | Term::BranchCmp(_, t, e) | Term::Invoke(t, e) => {
+                *t = f(*t);
+                *e = f(*e);
+            }
+            Term::Ret(_) | Term::Unreachable | Term::Resume => {}
+            Term::Switch(_, t) => {
+                let t = std::sync::Arc::make_mut(t);
+                for c in &mut t.targets {
+                    *c = f(*c);
+                }
+                t.default = f(t.default);
+                t.refresh();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Block {
+    pub insts: Vec<Inst>,
+    /// source position per inst: (file << 32) | byte offset
+    pub pos: Vec<u64>,
+    pub term: Term,
+    pub term_pos: u64,
+    /// how often the block ran in the slot's counted build (PGO: the counted tier's exact
+    /// count of the O3 input block this one came from; copies keep it), negative = unknown.
+    /// A frequency for layout and register allocation only: never a correctness fact.
+    pub count: f32,
+}
+
+#[derive(Clone)]
+pub struct Slot {
+    pub size: u32,
+    pub align: u32,
+    /// made by lowering as one call's by-value argument copy (Relax ABI: an aggregate argument
+    /// goes by pointer to a private copy the callee owns): the call keeps no pointer to it past
+    /// its return. Only a lowering fact -- passes may give the slot other uses, so its readers
+    /// check that the slot is still that (frame::slot_sets)
+    pub arg: bool,
+    /// made by lowering with its one SlotAddr where its value begins (a temporary, a `let`, a
+    /// call's result buffer or argument copy): its earlier contents are dead whenever that
+    /// SlotAddr runs (rustc: StorageLive). True of lowering's output only -- passes move and
+    /// duplicate SlotAddrs -- so only a baseline body's slots are read as such (opt::slot_colors)
+    pub born: bool,
+    /// made by lowering as a call's result buffer (a result returned in memory), of the result
+    /// type's size: that call writes all of it (opt::slot_colors checks it is still passed to
+    /// one call only). Every call handed the slot as its result buffer writes all of it: a slot
+    /// joined along a whole copy keeps the flag of either side, one that a smaller result buffer
+    /// becomes the start of loses it (opt::coalesce_slot_copies).
+    pub ret: bool,
+}
+
+/// The bytes a callee may read and the bytes it may write through a pointer argument, relative
+/// to that pointer: `[lo, hi)` each (`lo == hi`: none). LLVM gets the same from FunctionAttrs'
+/// memory effects (`readonly` / `writeonly` params) and `dereferenceable`: `Arc::drop_slow` only
+/// reads `[0, 8)` of the `&mut Arc` it gets, so the caller's bytes of a value around that field,
+/// and that field itself, stay as they were (coalesce_slot_copies).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Access {
+    pub read: (i32, i32),
+    pub write: (i32, i32),
+}
+
+/// A callee's `Access` through a pointer argument; None when not known (anywhere it can reach,
+/// read and written).
+pub type Extent = Option<Access>;
+
+#[derive(Clone)]
+pub struct Func {
+    pub name: String,
+    pub blocks: Vec<Block>,
+    pub vregs: Vec<Cls>,
+    pub slots: Vec<Slot>,
+    /// parameters in ABI order
+    pub params: Vec<VReg>,
+    /// classes of returned values in ABI order
+    pub rets: Vec<Cls>,
+    pub file: u32,
+    /// parameters holding pointers no other pointer of this function aliases
+    /// (`&mut T` params, by-pointer aggregate copies); used by load/store forwarding
+    pub noalias: Vec<VReg>,
+    /// SPEC-V: the `noalias` parameters of a body built without a clean borrow-check verdict
+    /// (`noalias` is empty then): they come back when its verdict is clean and the body is promoted
+    pub withheld_noalias: Vec<VReg>,
+    /// SPEC-V: the body was lowered as unverified code and sends calls to unverified-mode twins:
+    /// once its verdict is clean it is lowered again (verified code calls the slots themselves)
+    pub plain_calls: bool,
+    /// parameters pointing to at least this many dereferenceable bytes for the whole call
+    /// (rustc `dereferenceable(N)` on `&T` / `&mut T` / by-pointer aggregates): loads from
+    /// them may be executed speculatively (LICM hoists them out of loops without stores)
+    pub deref: Vec<(VReg, u32)>,
+    /// Some for an `extern "C" fn` body: params/returns follow the C ABI (see CSig)
+    pub cabi: Option<Box<CSig>>,
+    /// the parameter holding the caller's result buffer (a result returned in memory): noalias
+    /// and nocapture by construction -- the source language cannot name it, only the final
+    /// copy or the stores of the result write it (rustc marks it sret noalias nocapture)
+    pub sret: Option<VReg>,
+    /// callees this function calls with a result buffer as the first argument (their result is
+    /// returned in memory): the callee only writes it (noalias, nocapture -- see `sret`), so a
+    /// slot passed there is written by the call, not read (forward_slot_dests_x builds such a
+    /// result straight where it is copied to)
+    pub sret_callees: Vec<u32>,
+    /// Symbols the embedder attaches to this body for Relax's real-time call-site notes.
+    /// `relax_codegen::native::compile_freq` emits them as `RelocKind::Note` after the code's
+    /// relocations. A caller that inlines this body takes its notes too (opt.rs).
+    pub notes: Vec<Sym>,
+    /// (callee, argument index, may return it) of calls whose callee keeps no copy of that
+    /// pointer argument (codegen opt::param_escape over its body): a frame address passed there
+    /// does not escape for sibling calls (tail.rs), the call's result is one when it may be
+    /// returned. Filled by the front end for bodies with tail-shaped calls. The fourth field is
+    /// the callee's access extent through that pointer (`Extent`).
+    pub nocapture: Vec<(Callee, u32, bool, Extent)>,
+    /// Nounwind query answers consulted by this body's optimization, including false.
+    /// They travel with the immutable O1 body, not with a mutable function slot.
+    pub nounwind_inputs: Vec<(u32, bool)>,
+    /// This O1 body needs only mandatory legalization before direct codegen.
+    /// Retained with the RIR across the startup boundary; O3 clears it.
+    pub baseline: bool,
+    /// A baseline body's own lowering (before its inlining and passes): the JIT builds the
+    /// slot's normal body from it later, so that body does not depend on how the slot was first
+    /// built. Carried from the preparation to the slot, which takes it off when it stores the
+    /// body; not compared or hashed, not renamed (the back-end memo drops it from its copies).
+    pub lowering: Option<std::sync::Arc<Func>>,
+    /// The slots whose final body this one could not take in yet: inline candidates its build
+    /// left out because their verdict was pending (SPEC-V: unverified code is not inlined into
+    /// verified code), and candidates offered with a body that was itself provisional (inlined
+    /// or not: the inliner priced that body). Build inputs
+    /// like `inl_slots`: a body with any is provisional (its cache record ranks below complete
+    /// code; the JIT builds it once more when every one of them is final). Compared, hashed and
+    /// renamed.
+    pub pending: Vec<u32>,
+    /// O1 as it runs without O3 (full opt pipeline, Relax core inlined, thorough
+    /// register allocation): code marked `// relax: hot`, whose first code is its only code
+    /// until O3 replaces it
+    pub full: bool,
+    /// by-pointer aggregate params (each also in `noalias`): the private copy of a by-value
+    /// argument that the callee owns (Relax ABI). Nobody reads it after the call returns or unwinds
+    /// out of it (the caller moved it; a cleanup that drops it runs in this function, behind an
+    /// Invoke), so a value promoted to a register needs no store before a plain call
+    pub owned: Vec<VReg>,
+    /// values loaded from a field whose type cannot be null (references, Box, NonNull: the
+    /// layout's niche excludes 0) -- the Load that defines each is non-null; other definitions
+    /// of the same vreg prove nothing (fold_nonnull checks every definition)
+    pub nonnull: Vec<VReg>,
+    /// parameters of a declared integer or pointer type: (vreg, bytes, signed) -- the value is
+    /// that type's, extended to the register (a wasm32 usize or pointer is 4 zero-extended bytes),
+    /// whatever any caller computed it from (the wasm backend's signature narrowing)
+    pub param_ints: Vec<(VReg, u8, bool)>,
+    /// values loaded from a scalar whose type restricts its valid values (`char`, `bool`, enum
+    /// tags: the layout's niche, rustc's `!range` load metadata): (vreg, load bytes, lo, hi) --
+    /// the zero-extending Load of that width defining the vreg yields a value in lo..=hi; other
+    /// definitions of the same vreg prove nothing (value ranges check the defining instruction)
+    pub ranged: Vec<(VReg, u8, u64, u64)>,
+    /// a `#[unsafe(naked)]` fn: its one block is its `naked_asm!` (a noreturn Callee::Asm) and
+    /// the backend emits no prologue, no epilogue, nothing but the block
+    pub naked: bool,
+    /// Every call keeps its frame: no sibling calls (tail.rs). A constant-evaluation twin's body
+    /// (the JIT's ctfe_twin.rs): a constant's endless recursion ends in the stack overflow the
+    /// evaluation reports, as rustc's interpreter ends at its frame limit.
+    pub keep_frames: bool,
+    /// The inline stack (`pos_ctx`): context k (1-based) is entry k-1, (the call's position -- its
+    /// own context is the parent's --, a position inside the inlined fn naming it). Machine code
+    /// carries it in its pc map (`inline_pc_entries`).
+    pub inl: Vec<(u64, u64)>,
+    /// Exact function instance copied at each inline context, parallel to `inl`.
+    /// Source positions alone cannot distinguish generic instances. This is body
+    /// provenance, not a call edge or an observation that the body executed.
+    pub inl_slots: Vec<u32>,
+    /// Where the source's named locals live (makepad inspect `locals`): side metadata only --
+    /// no pass reads it to decide anything, passes that rename vregs or slots map it, and the
+    /// back end turns it into per-call-site locations in the pc map (`vars_pc_entries`).
+    pub dbg: Vec<DbgVar>,
+    /// (low, high) V128 vregs that are the two halves of one 256-bit value, as a front end that
+    /// computes values in halves made them (compute's eight-lane kernels): `pair256` seeds.
+    /// A hint only (pair256 checks every pairing itself); `compact_vregs` renames it.
+    pub halves: Vec<(VReg, VReg)>,
+    /// A live session (hot reload): the byte a patch of this fn sets (`SlotTable::patch` of its
+    /// slot). An inlined copy of the body runs only while it reads 0; once a patch sets it, the
+    /// copy's site calls the slot, which holds the patched body (`guard_calls`). Side metadata of
+    /// the callee for its callers' inliner: the body's own code does not read it.
+    pub patch_flag: Option<Sym>,
+    /// The calls a guarded inline copy falls back to (call position, with `POS_GUARD`; slot): never
+    /// inlined again.
+    pub guard_calls: Vec<(u64, u32)>,
+    /// A live session: the patch flags of the copies this body inlined unguarded (no call and no
+    /// loop on any path from its entry to the site: a frame there cannot wait for a patch; the
+    /// patch rebuilds the callers that inlined the body). A guarded copy of this body elsewhere
+    /// reads them with its own (`opt::inline_site`). Side metadata, like `patch_flag`.
+    pub unguarded_flags: Vec<Sym>,
+    /// A live session: the copy version of the slot this body is built for (a word of its tier
+    /// record) and the value the build read. The guards its inliner makes compare the word with
+    /// the value before they read their flags: the word moves once a flag the slot's code reads
+    /// is set (`opt::inline_site`). Side metadata of the build, like `patch_flag`.
+    pub copy_ver: Option<(Sym, u64)>,
+    /// A live session: the size of the guards of the copies this body inlined (`opt::inline_site`):
+    /// code only a patch runs, which a caller's inliner prices the body without, so a live session
+    /// inlines what a run without patches does. Every session: the made cells' sets of the trait
+    /// objects it makes (the compiler's lowering; a load and a branch, the store once), priced out
+    /// alike: a body inlines as it would without them.
+    pub guard_size: GuardSize,
+    /// A live session's root build split after its first inlining round (`opt::split_patched_path`):
+    /// its copy-version compares are exits, each leaving for the patched path (a copy of the rest of
+    /// the fn whose copies keep their guards) once a patch moved the version, and never coming back.
+    /// Its fast blocks hold no guard and no slow call.
+    pub patched_path: bool,
+    /// The digest gate (JITPERF): the digest of this body's own lowering, before inlining and
+    /// passes (`lowering_digest`), carried through the passes. None: not taken (unknown).
+    pub digest: Option<std::sync::Arc<BodyDigest>>,
+    /// Parallel to `inl_slots`: the digest of the body each inline context took in (that body's
+    /// `digest`; None unknown), so a host's record says what it copied even of a callee that has
+    /// no code of its own.
+    pub inl_digest: Vec<Option<std::sync::Arc<BodyDigest>>>,
+    /// Parallel to `inl_slots`: the body each context took in held a call or a cycle, so a frame
+    /// can wait inside the copy (`opt::inline_site`).
+    pub inl_waits: Vec<bool>,
+}
+
+/// A body's digest as lowered (the digest gate, JITPERF): a hash of what its code does, with the
+/// function slots and the symbols it names numbered by first occurrence, plus those slots and
+/// symbol ids in that order. Equal raw hashes and the same instances and objects in the lists
+/// are the same code. Positions are out (a moved fn is the same code); a panic's location is in,
+/// through its symbol. The session resolves the lists to identities (a slot's instance identity,
+/// a data object's content), giving a digest that holds across runs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BodyDigest {
+    pub raw: u128,
+    pub slots: Vec<u32>,
+    pub syms: Vec<u32>,
+}
+
+/// Numbers by first occurrence (`Func::lowering_digest`).
+#[derive(Default)]
+struct FirstSeen {
+    ix: std::collections::HashMap<u32, u32, std::hash::BuildHasherDefault<IdHash>>,
+    order: Vec<u32>,
+}
+
+/// FirstSeen's hasher: its keys are slot and symbol ids, looked up at each occurrence in a body
+/// (a digest is taken of every body lowered); the multiply-rotate mix of rustc's FxHasher.
+#[derive(Default)]
+struct IdHash(u64);
+
+impl std::hash::Hasher for IdHash {
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.write_u64(x as u64);
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, x: u32) {
+        self.write_u64(x as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0xf135_7aea_2e62_a9c5);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl FirstSeen {
+    fn get(&mut self, x: u32) -> u32 {
+        let n = self.order.len() as u32;
+        *self.ix.entry(x).or_insert_with(|| {
+            self.order.push(x);
+            n
+        })
+    }
+}
+
+/// The share of a body its callers' inliner prices it without (`Func::guard_size`): the guards'
+/// compares at the sites (the check and slow blocks they branch to are found from the slow calls:
+/// `opt::guard_blocks`), and the made cells' sets with their blocks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GuardSize {
+    pub insts: u32,
+    /// their rustc inline cost (`opt::rustc_inline_cost`; the sites' branches included)
+    pub cost: u32,
+    /// blocks no slow call tells: a made cell's set and the join after it
+    pub blocks: u32,
+}
+
+impl GuardSize {
+    pub fn add(&mut self, o: GuardSize) {
+        self.insts += o.insts;
+        self.cost += o.cost;
+        self.blocks += o.blocks;
+    }
+
+    pub fn sub(&mut self, o: GuardSize) {
+        self.insts = self.insts.saturating_sub(o.insts);
+        self.cost = self.cost.saturating_sub(o.cost);
+        self.blocks = self.blocks.saturating_sub(o.blocks);
+    }
+}
+
+/// A named local of the source and its storage (`Func::dbg`).
+#[derive(Clone, Debug, PartialEq, Hash)]
+pub struct DbgVar {
+    /// its fn's inline context (`pos_ctx`): 0 the function itself, k an inlined copy
+    pub ctx: u16,
+    /// the local's index in its fn's checked body (`Body::locals`)
+    pub local: u32,
+    pub loc: DbgLoc,
+    /// (leaf, value) of `Regs` leaves the optimiser found constant (their vreg folded away)
+    pub k: Vec<(u32, i64)>,
+}
+
+/// Storage of a `DbgVar`.
+#[derive(Clone, Debug, PartialEq, Hash)]
+pub enum DbgLoc {
+    /// one vreg per layout leaf (in leaf order); `DBG_NONE` = that leaf is no longer held
+    Regs(Vec<VReg>),
+    /// the bytes of stack slot `slot` from offset `off`
+    Slot(u32, i32),
+    /// the bytes at the address a vreg holds, plus `off` (a by-pointer argument copy)
+    Mem(VReg, i32),
+}
+
+/// A `DbgLoc::Regs` leaf whose value no vreg holds any more.
+pub const DBG_NONE: VReg = VReg(u32::MAX);
+
+/// A function slot an `Inst` names (`Callee::Fn` / `Callee::CFn` / `FnAddr`), in place.
+pub fn inst_fn_slot_mut(i: &mut Inst) -> Option<&mut u32> {
+    match i {
+        Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) => Some(c),
+        _ => None,
+    }
+}
+
+impl Func {
+    /// Every function-slot id the body names, in place: calls and fn addresses, `sret_callees`,
+    /// the `nocapture` facts' callees and the `nounwind_inputs`. Symbols (`Sym`) are not slots,
+    /// even those whose value is a slot's thunk. Relax's back-end memo renames slots through this
+    /// (a body equal to another one up to a renaming of its slots compiles to the same code with
+    /// the same renaming of its relocations).
+    pub fn fn_slots_mut(&mut self, f: &mut dyn FnMut(&mut u32)) {
+        for b in &mut self.blocks {
+            for i in &mut b.insts {
+                if let Some(c) = inst_fn_slot_mut(i) {
+                    f(c);
+                }
+            }
+        }
+        for c in &mut self.sret_callees {
+            f(c);
+        }
+        for (c, _, _, _) in &mut self.nocapture {
+            if let Callee::Fn(c) | Callee::CFn(c, _) = c {
+                f(c);
+            }
+        }
+        for (c, _) in &mut self.nounwind_inputs {
+            f(c);
+        }
+        for c in &mut self.inl_slots {
+            f(c);
+        }
+        for c in &mut self.pending {
+            f(c);
+        }
+        for (_, c) in &mut self.guard_calls {
+            f(c);
+        }
+    }
+
+    /// Structural equality of everything but `name`, with the function slots each side names
+    /// compared through its own map (`ma` for self, `mb` for `o`; block counts by bits). With
+    /// injective maps: the bodies are equal up to a renaming of their slots.
+    pub fn same_body_mapped(&self, ma: &mut dyn FnMut(u32) -> u32, o: &Func, mb: &mut dyn FnMut(u32) -> u32) -> bool {
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, notes, nocapture, nounwind_inputs, baseline, lowering: _, pending, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size, patched_path, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
+        let callee_eq = |a: &Callee, ma: &mut dyn FnMut(u32) -> u32, b: &Callee, mb: &mut dyn FnMut(u32) -> u32| match (a, b) {
+            (Callee::Fn(x), Callee::Fn(y)) => ma(*x) == mb(*y),
+            (Callee::CFn(x, xs), Callee::CFn(y, ys)) => ma(*x) == mb(*y) && xs == ys,
+            (Callee::Fn(_) | Callee::CFn(..), _) | (_, Callee::Fn(_) | Callee::CFn(..)) => false,
+            _ => a == b,
+        };
+        let inst_eq = |a: &Inst, ma: &mut dyn FnMut(u32) -> u32, b: &Inst, mb: &mut dyn FnMut(u32) -> u32| match (a, b) {
+            (Inst::Call(x, xa, xr), Inst::Call(y, ya, yr)) => xa == ya && xr == yr && callee_eq(x, ma, y, mb),
+            (Inst::FnAddr(v, x), Inst::FnAddr(w, y)) => v == w && ma(*x) == mb(*y),
+            (Inst::FnAddr(..), _) | (_, Inst::FnAddr(..)) => false,
+            _ => a == b,
+        };
+        blocks.len() == o.blocks.len()
+            && blocks.iter().zip(&o.blocks).all(|(a, b)| {
+                let Block { insts, pos, term, term_pos, count } = a;
+                insts.len() == b.insts.len()
+                    && insts.iter().zip(&b.insts).all(|(x, y)| inst_eq(x, ma, y, mb))
+                    && *pos == b.pos && *term == b.term && *term_pos == b.term_pos && count.to_bits() == b.count.to_bits()
+            })
+            && *vregs == o.vregs
+            && slots.len() == o.slots.len()
+            && slots.iter().zip(&o.slots).all(|(a, b)| {
+                let Slot { size, align, arg, born, ret } = a;
+                (*size, *align, *arg, *born, *ret) == (b.size, b.align, b.arg, b.born, b.ret)
+            })
+            && *params == o.params
+            && *rets == o.rets
+            && *file == o.file
+            && *noalias == o.noalias
+            && *withheld_noalias == o.withheld_noalias
+            && *plain_calls == o.plain_calls
+            && *deref == o.deref
+            && *cabi == o.cabi
+            && *sret == o.sret
+            && sret_callees.len() == o.sret_callees.len()
+            && sret_callees.iter().zip(&o.sret_callees).all(|(x, y)| ma(*x) == mb(*y))
+            && *notes == o.notes
+            && nocapture.len() == o.nocapture.len()
+            && nocapture.iter().zip(&o.nocapture).all(|(x, y)| x.1 == y.1 && x.2 == y.2 && x.3 == y.3 && callee_eq(&x.0, ma, &y.0, mb))
+            && nounwind_inputs.len() == o.nounwind_inputs.len()
+            && nounwind_inputs.iter().zip(&o.nounwind_inputs).all(|(x, y)| x.1 == y.1 && ma(x.0) == mb(y.0))
+            && *baseline == o.baseline
+            && *full == o.full
+            && *owned == o.owned
+            && *nonnull == o.nonnull
+            && *param_ints == o.param_ints
+            && *ranged == o.ranged
+            && *naked == o.naked
+            && *inl == o.inl
+            && inl_slots.len() == o.inl_slots.len()
+            && inl_slots.iter().zip(&o.inl_slots).all(|(x, y)| ma(*x) == mb(*y))
+            && pending.len() == o.pending.len()
+            && pending.iter().zip(&o.pending).all(|(x, y)| ma(*x) == mb(*y))
+            && *dbg == o.dbg
+            && *halves == o.halves
+            && guard_calls.len() == o.guard_calls.len()
+            && guard_calls.iter().zip(&o.guard_calls).all(|(x, y)| x.0 == y.0 && ma(x.1) == mb(y.1))
+            && *guard_size == o.guard_size
+            && *patched_path == o.patched_path
+            && *keep_frames == o.keep_frames
+    }
+
+    /// The digest gate's digest of this body as lowered (`BodyDigest`): everything that changes what
+    /// the code does, its slots and symbols numbered by first occurrence. Left out: positions
+    /// (`pos`, `term_pos`, `inl`, `dbg`, `file`), block counts, the coverage probes' words, and
+    /// what a build sets after lowering (tier flags, pending slots, guards, copy versions). The
+    /// noalias facts count as one set, withheld or not (SPEC-V moves them by verdict, not text).
+    pub fn lowering_digest(&self) -> BodyDigest {
+        use std::hash::Hash;
+        let Func { name: _, blocks, vregs, slots, params, rets, file: _, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, notes, nocapture, nounwind_inputs, baseline: _, lowering: _, pending: _, full: _, owned, nonnull, param_ints, ranged, naked, inl: _, inl_slots: _, dbg: _, halves, patch_flag: _, guard_calls: _, unguarded_flags: _, copy_ver: _, guard_size: _, patched_path: _, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
+        fn sym(s: &Sym, h: &mut relax_session::sip::Sip128, sy: &mut FirstSeen) {
+            sy.get(s.id).hash(h);
+            s.off.hash(h);
+        }
+        fn callee(c: &Callee, h: &mut relax_session::sip::Sip128, sl: &mut FirstSeen, sy: &mut FirstSeen) {
+            std::mem::discriminant(c).hash(h);
+            match c {
+                Callee::Part(id) => id.hash(h),
+                Callee::Fn(x) => sl.get(*x).hash(h),
+                Callee::CFn(x, g) => {
+                    sl.get(*x).hash(h);
+                    g.hash(h);
+                }
+                Callee::Host(s) => sym(s, h, sy),
+                Callee::CHost(s, g) => {
+                    sym(s, h, sy);
+                    g.hash(h);
+                }
+                Callee::Asm(a) => {
+                    let AsmBlock { code, fixups, ins, outs, regs, writes, opts } = &**a;
+                    (code, ins, outs, regs, writes, opts).hash(h);
+                    fixups.len().hash(h);
+                    for (o, k, s) in fixups {
+                        (o, k).hash(h);
+                        sym(s, h, sy);
+                    }
+                }
+                Callee::Indirect(_) | Callee::CIndirect(..) => c.hash(h),
+            }
+        }
+        let mut h = relax_session::sip::Sip128::new();
+        let (mut sl, mut sy) = (FirstSeen::default(), FirstSeen::default());
+        blocks.len().hash(&mut h);
+        for b in blocks {
+            b.insts.len().hash(&mut h);
+            for i in &b.insts {
+                std::mem::discriminant(i).hash(&mut h);
+                match i {
+                    // (a probe's counter word is this run's address; the probe itself is kept)
+                    Inst::Coverage { .. } => {}
+                    Inst::Addr(v, s) | Inst::TlsAddr(v, s) | Inst::TlsStatic(v, s) => {
+                        v.hash(&mut h);
+                        sym(s, &mut h, &mut sy);
+                    }
+                    Inst::FnAddr(v, x) => {
+                        v.hash(&mut h);
+                        sl.get(*x).hash(&mut h);
+                    }
+                    Inst::Call(c, a, r) => {
+                        callee(c, &mut h, &mut sl, &mut sy);
+                        a.hash(&mut h);
+                        r.hash(&mut h);
+                    }
+                    _ => i.hash(&mut h),
+                }
+            }
+            b.term.hash(&mut h);
+        }
+        vregs.hash(&mut h);
+        slots.len().hash(&mut h);
+        for Slot { size, align, arg, born, ret } in slots {
+            (size, align, arg, born, ret).hash(&mut h);
+        }
+        let mut na: Vec<u32> = noalias.iter().chain(withheld_noalias.iter()).map(|v| v.0).collect();
+        na.sort_unstable();
+        na.dedup();
+        (params, rets, na, plain_calls, deref, cabi, sret).hash(&mut h);
+        sret_callees.len().hash(&mut h);
+        for x in sret_callees {
+            sl.get(*x).hash(&mut h);
+        }
+        notes.len().hash(&mut h);
+        for note in notes {
+            sym(note, &mut h, &mut sy);
+        }
+        nocapture.len().hash(&mut h);
+        for (c, i, r, e) in nocapture {
+            callee(c, &mut h, &mut sl, &mut sy);
+            (i, r, e).hash(&mut h);
+        }
+        nounwind_inputs.len().hash(&mut h);
+        for (x, v) in nounwind_inputs {
+            sl.get(*x).hash(&mut h);
+            v.hash(&mut h);
+        }
+        (owned, nonnull, param_ints, ranged, naked, halves, keep_frames).hash(&mut h);
+        BodyDigest { raw: h.finish128(), slots: sl.order, syms: sy.order }
+    }
+
+    /// A hash of what `same_body_mapped` compares, the function slots replaced by `m(slot)`.
+    pub fn hash_body_mapped<H: std::hash::Hasher>(&self, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
+        use std::hash::Hash;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, notes, nocapture, nounwind_inputs, baseline, lowering: _, pending, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size, patched_path, keep_frames, digest: _, inl_digest: _, inl_waits: _ } = self;
+        fn callee<H: std::hash::Hasher>(c: &Callee, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
+            match c {
+                Callee::Fn(x) => {
+                    0xf1u8.hash(h);
+                    m(*x).hash(h);
+                }
+                Callee::CFn(x, s) => {
+                    0xf2u8.hash(h);
+                    m(*x).hash(h);
+                    s.hash(h);
+                }
+                _ => c.hash(h),
+            }
+        }
+        blocks.len().hash(h);
+        for Block { insts, pos, term, term_pos, count } in blocks {
+            insts.len().hash(h);
+            for i in insts {
+                match i {
+                    Inst::Call(c, a, r) => {
+                        0xf0u8.hash(h);
+                        callee(c, h, m);
+                        a.hash(h);
+                        r.hash(h);
+                    }
+                    Inst::FnAddr(v, x) => {
+                        0xf3u8.hash(h);
+                        v.hash(h);
+                        m(*x).hash(h);
+                    }
+                    _ => i.hash(h),
+                }
+            }
+            pos.hash(h);
+            term.hash(h);
+            term_pos.hash(h);
+            count.to_bits().hash(h);
+        }
+        vregs.hash(h);
+        slots.len().hash(h);
+        for Slot { size, align, arg, born, ret } in slots {
+            (size, align, arg, born, ret).hash(h);
+        }
+        (params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret).hash(h);
+        sret_callees.len().hash(h);
+        for x in sret_callees {
+            m(*x).hash(h);
+        }
+        notes.hash(h);
+        nocapture.len().hash(h);
+        for (c, i, r, e) in nocapture {
+            callee(c, h, m);
+            (i, r, e).hash(h);
+        }
+        nounwind_inputs.len().hash(h);
+        for (x, v) in nounwind_inputs {
+            m(*x).hash(h);
+            v.hash(h);
+        }
+        (baseline, full, owned, nonnull, ranged, naked, inl, dbg).hash(h);
+        inl_slots.len().hash(h);
+        for x in inl_slots {
+            m(*x).hash(h);
+        }
+        if !pending.is_empty() {
+            pending.len().hash(h);
+            for x in pending {
+                m(*x).hash(h);
+            }
+        }
+        // (only when present, as `halves` below)
+        if !param_ints.is_empty() {
+            param_ints.hash(h);
+        }
+        // (only when present: bodies without the hint keep the hash they had before it existed)
+        if !halves.is_empty() {
+            halves.hash(h);
+        }
+        if !guard_calls.is_empty() {
+            guard_calls.len().hash(h);
+            for (p, x) in guard_calls {
+                (p, m(*x)).hash(h);
+            }
+            guard_size.hash(h);
+        }
+        if *patched_path {
+            patched_path.hash(h);
+        }
+        if *keep_frames {
+            keep_frames.hash(h);
+        }
+    }
+
+    /// Maps the debug table through a vreg renaming (`map(v)` None: v is gone).
+    pub fn dbg_map_vregs(&mut self, map: &dyn Fn(VReg) -> Option<VReg>) {
+        for d in self.dbg.iter_mut() {
+            match &mut d.loc {
+                DbgLoc::Regs(r) => {
+                    for v in r.iter_mut() {
+                        if *v != DBG_NONE {
+                            *v = map(*v).unwrap_or(DBG_NONE);
+                        }
+                    }
+                }
+                DbgLoc::Mem(v, _) => *v = map(*v).unwrap_or(DBG_NONE),
+                DbgLoc::Slot(..) => {}
+            }
+        }
+    }
+    /// Live-range splits (register allocation): each (piece, original) pair is a vreg made to
+    /// hold the original's value over part of the function. Every debug entry naming the
+    /// original gets a twin naming the piece; where a local is looked up, the leaf's vreg live
+    /// there (original or piece) holds it.
+    pub fn dbg_add_pieces(&mut self, pairs: &[(VReg, VReg)]) {
+        if self.dbg.is_empty() || pairs.is_empty() {
+            return;
+        }
+        let mut of: std::collections::HashMap<u32, Vec<VReg>> = std::collections::HashMap::new();
+        for &(p, o) in pairs {
+            of.entry(o.0).or_default().push(p);
+        }
+        let mut more = Vec::new();
+        for d in &self.dbg {
+            if let DbgLoc::Regs(r) = &d.loc {
+                for (k, v) in r.iter().enumerate() {
+                    for p in of.get(&v.0).map(|x| x.as_slice()).unwrap_or(&[]) {
+                        let mut leaves = vec![DBG_NONE; r.len()];
+                        leaves[k] = *p;
+                        more.push(DbgVar { ctx: d.ctx, local: d.local, loc: DbgLoc::Regs(leaves), k: Vec::new() });
+                    }
+                }
+            }
+        }
+        self.dbg.extend(more);
+    }
+    /// A pass proved, for vregs the debug table may name, `d == s` everywhere (`copies`: both
+    /// single-definition, d a copy of s) or `d == k` (`consts`: single-definition constants)
+    /// before d goes away: its leaves name s, or hold the constant.
+    pub fn dbg_salvage(&mut self, copies: &[(VReg, VReg)], consts: &[(VReg, i64)]) {
+        if self.dbg.is_empty() || copies.is_empty() && consts.is_empty() {
+            return;
+        }
+        let copies: std::collections::HashMap<u32, VReg> = copies.iter().map(|c| (c.0 .0, c.1)).collect();
+        let consts: std::collections::HashMap<u32, i64> = consts.iter().map(|c| (c.0 .0, c.1)).collect();
+        for d in self.dbg.iter_mut() {
+            match &mut d.loc {
+                DbgLoc::Regs(r) => {
+                    for (leaf, v) in r.iter_mut().enumerate() {
+                        if *v == DBG_NONE {
+                            continue;
+                        }
+                        // (a chain of removed copies: to its end)
+                        for _ in 0..64 {
+                            match copies.get(&v.0) {
+                                Some(&s) if s != *v => *v = s,
+                                _ => break,
+                            }
+                        }
+                        if let Some(&k) = consts.get(&v.0) {
+                            *v = DBG_NONE;
+                            d.k.push((leaf as u32, k));
+                        }
+                    }
+                }
+                DbgLoc::Mem(v, _) => {
+                    if let Some(&s) = copies.get(&v.0) {
+                        *v = s;
+                    }
+                }
+                DbgLoc::Slot(..) => {}
+            }
+        }
+    }
+
+    /// The vregs the debug table names (sorted, deduplicated): passes check removals against it.
+    pub fn dbg_vregs(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.dbg.iter().flat_map(|d| match &d.loc {
+            DbgLoc::Regs(r) => r.clone(),
+            DbgLoc::Mem(a, _) => vec![*a],
+            DbgLoc::Slot(..) => Vec::new(),
+        }).filter(|v| *v != DBG_NONE).map(|v| v.0).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Maps the debug table through a slot renumbering (`map(s)` None: s is gone).
+    pub fn dbg_map_slots(&mut self, map: &dyn Fn(u32) -> Option<u32>) {
+        for d in self.dbg.iter_mut() {
+            if let DbgLoc::Slot(s, _) = &mut d.loc {
+                *s = map(*s).unwrap_or(u32::MAX);
+            }
+        }
+    }
+}
+
+/// Source positions are `(file << 32) | byte`, with the inline context in bits 48..61 (0: the
+/// function's own body; k: inlined through `Func::inl[k - 1]`), bit 62 set on a guarded inline
+/// copy's slow call (`POS_GUARD`) and bit 63 on the code of a split body's patched path
+/// (`POS_PATCHED`). File indices stay below 1 << 16.
+pub const POS_CTX_SHIFT: u32 = 48;
+/// An inline chain deeper / wider than 14 bits: the context is lost (positions still name lines).
+pub const POS_CTX_LOST: u64 = 0x3fff;
+/// The position bit of a guarded inline copy's slow call (`Func::guard_calls`, `codegen::opt`
+/// `inline_site`). The front lowers some source places more than once (a match guard of an
+/// or-pattern, once per alternative): a call there of the same callee is a plain call, which the
+/// call position alone would take for the slow call (never inlined, and its block's branch read as
+/// a guard test: `codegen::patched` sent the fast half to the panic side of a bounds check).
+pub const POS_GUARD: u64 = 1 << 62;
+/// The position bit of an instruction in a split body's patched path (`codegen::patched`): the
+/// pc map tells a frame there from one in the fast half (makepad inspect, the patch report).
+pub const POS_PATCHED: u64 = 1 << 63;
+
+/// The inline context of a position.
+pub fn pos_ctx(p: u64) -> u64 {
+    (p >> POS_CTX_SHIFT) & POS_CTX_LOST
+}
+
+/// Whether a position lies in a split body's patched path.
+pub fn pos_patched(p: u64) -> bool {
+    p & POS_PATCHED != 0
+}
+
+/// A position without its inline context: what names a source place (keys, lookups).
+pub fn pos_plain(p: u64) -> u64 {
+    p & ((1u64 << POS_CTX_SHIFT) - 1)
+}
+
+/// The file index of a position.
+pub fn pos_file(p: u64) -> u32 {
+    ((p >> 32) & 0xffff) as u32
+}
+
+/// `p` with inline context `ctx` (a slow call, in the patched path, when `p` is).
+pub fn pos_with_ctx(p: u64, ctx: u64) -> u64 {
+    (p & (POS_PATCHED | POS_GUARD)) | pos_plain(p) | (ctx.min(POS_CTX_LOST) << POS_CTX_SHIFT)
+}
+
+/// The pc-map entries carrying `f`'s inline stack: two per context, at code offset u32::MAX
+/// (after every instruction's entry; a lookup never reaches them): the call position, then the
+/// position naming the inlined fn. Positions both, so caches translate their files as any other.
+pub fn inline_pc_entries(f: &Func) -> impl Iterator<Item = (u32, u64)> + '_ {
+    f.inl.iter().flat_map(|&(call, callee)| [(u32::MAX, call), (u32::MAX, callee)])
+}
+
+// An ordinary dbgloc table begins with a canonical varint (variable count), so it
+// never starts with this two-byte encoding of zero. Joined tables use the same outer
+// PC_VARS length/chunks as ordinary ones, including in mapped images.
+const PART_LOCALS: [u8; 2] = [0x80, 0];
+
+/// Select the local table for a lookup PC and return its function-relative PC.
+pub fn part_local_table(bytes: &[u8], off: u32) -> Option<(&[u8], u32)> {
+    let Some(b) = bytes.strip_prefix(&PART_LOCALS) else { return Some((bytes, off)) };
+    let p_off = u32::from_le_bytes(b.get(..4)?.try_into().ok()?);
+    let host_len = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
+    let part_len = u32::from_le_bytes(b.get(8..12)?.try_into().ok()?) as usize;
+    let tables = b.get(12..)?;
+    if host_len.checked_add(part_len)? != tables.len() { return None; }
+    let (host, part) = tables.split_at(host_len);
+    Some(if off < p_off { (host, off) } else { (part, off - p_off) })
+}
+
+fn join_part_pc_maps(host: &mut Vec<(u32, u64)>, part: &[(u32, u64)], p_off: u32, text_len: u32) -> Result<(), String> {
+    use crate::dbgloc::{self, PC_VARS};
+    let hm = host.split_off(host.partition_point(|e| e.0 < PC_VARS));
+    let (part_rows, pm) = part.split_at(part.partition_point(|e| e.0 < PC_VARS));
+    let (hv, hi) = hm.split_at(hm.partition_point(|e| e.0 == PC_VARS));
+    let (pv, pi) = pm.split_at(pm.partition_point(|e| e.0 == PC_VARS));
+    if hi.len() % 2 != 0 || pi.len() % 2 != 0 {
+        return Err("incomplete inline context in outlined body".into());
+    }
+    // The split may have inherited a common prefix. Keep those IDs, then place P's
+    // remaining call/anchor pairs after the host's. Never alias an unrepresentable ID.
+    let shared = hi.chunks_exact(2).zip(pi.chunks_exact(2)).take_while(|(h, p)| h == p).count();
+    let ctx = |c: u64| -> Result<u64, &'static str> {
+        if c <= shared as u64 || c == POS_CTX_LOST { return Ok(c); }
+        let new = c + (hi.len() / 2 - shared) as u64;
+        if new >= POS_CTX_LOST { return Err("joined inline context exceeds the position format"); }
+        Ok(new)
+    };
+    let pos = |p| ctx(pos_ctx(p)).map(|c| pos_with_ctx(p, c));
+    host.push((p_off, pos(part_rows.first().map_or(0, |e| e.1))?));
+    for &(off, p) in part_rows {
+        host.push((p_off.checked_add(off).ok_or("part source offset overflow")?, pos(p)?));
+    }
+    if let Some(&(_, file_pos)) = hv.first().or(pv.first()) {
+        let h = dbgloc::from_pc_entries(hv.iter().copied());
+        let mut p = dbgloc::from_pc_entries(pv.iter().copied());
+        if !p.is_empty() && hi.len() / 2 > shared && pi.len() / 2 > shared {
+            let mut t = dbgloc::decode(&p).ok_or("invalid part local table")?;
+            for v in &mut t.vars { v.ctx = ctx(v.ctx.into())? as u16; }
+            p = dbgloc::encode(&t);
+        }
+        let mut bytes = Vec::from(PART_LOCALS);
+        bytes.extend_from_slice(&p_off.to_le_bytes());
+        for n in [h.len(), p.len()] {
+            bytes.extend_from_slice(&u32::try_from(n).map_err(|_| "local table exceeds PC_VARS length")?.to_le_bytes());
+        }
+        bytes.extend(h);
+        bytes.extend(p);
+        u32::try_from(bytes.len()).map_err(|_| "joined local tables exceed PC_VARS length")?;
+        // A patched source run ends within text. A byte-counting reader must never
+        // extend the last patched run to the synthetic PC_VARS offset.
+        if host.last().is_some_and(|e| pos_patched(e.1)) { host.push((text_len, 0)); }
+        host.extend(dbgloc::pc_entries(&bytes, pos_file(file_pos)));
+    }
+    host.extend_from_slice(hi);
+    for &(_, p) in &pi[2 * shared..] { host.push((u32::MAX, pos(p)?)); }
+    Ok(())
+}
+
+impl Func {
+    pub fn new(name: String, file: u32) -> Func {
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), notes: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, lowering: None, pending: Vec::new(), full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new(), copy_ver: None, guard_size: GuardSize::default(), patched_path: false, keep_frames: false, digest: None, inl_digest: Vec::new(), inl_waits: Vec::new() }
+    }
+    pub fn vreg(&mut self, c: Cls) -> VReg {
+        self.vregs.push(c);
+        VReg(self.vregs.len() as u32 - 1)
+    }
+    pub fn block(&mut self) -> u32 {
+        self.blocks.push(Block { insts: Vec::new(), pos: Vec::new(), term: Term::Unreachable, term_pos: 0, count: -1.0 });
+        self.blocks.len() as u32 - 1
+    }
+    pub fn slot(&mut self, size: u32, align: u32) -> u32 {
+        self.slots.push(Slot { size: size.max(1), align: align.max(1), arg: false, born: false, ret: false });
+        self.slots.len() as u32 - 1
+    }
+
+    /// Is the call at `blocks[bi].insts[ii]` a guarded inline copy's slow call (`guard_calls`)?
+    /// It runs only once a live patch replaced its callee.
+    pub fn guard_call(&self, bi: usize, ii: usize) -> bool {
+        if self.guard_calls.is_empty() {
+            return false;
+        }
+        let Some(Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _)) = self.blocks[bi].insts.get(ii) else { return false };
+        // (a copy's call in a split body's patched path: its position carries POS_PATCHED)
+        let p = self.blocks[bi].pos.get(ii).copied().unwrap_or(0) & !POS_PATCHED;
+        self.guard_calls.iter().any(|&(q, s)| q == p && s == *id)
+    }
+
+    /// Text dump for debugging and the crash report.
+    pub fn dump(&self) -> String {
+        let mut s = format!("fn {} params {:?} rets {:?}\n", self.name, self.params, self.rets);
+        if !self.param_ints.is_empty() {
+            let d: Vec<String> = self.param_ints.iter().map(|(v, n, sg)| format!("{:?}:{}{}", v, if *sg { "i" } else { "u" }, *n as u32 * 8)).collect();
+            s.push_str(&format!("; declared params: {}\n", d.join(" ")));
+        }
+        if !self.noalias.is_empty() || !self.withheld_noalias.is_empty() {
+            s.push_str(&format!("; noalias {:?} withheld {:?}\n", self.noalias, self.withheld_noalias));
+        }
+        if self.slots.iter().any(|x| x.size >= 1024) {
+            let big: Vec<String> = self.slots.iter().enumerate().filter(|(_, x)| x.size >= 1024).map(|(i, x)| format!("{}:{}", i, x.size)).collect();
+            s.push_str(&format!("; slots >= 1 KB: {}\n", big.join(" ")));
+        }
+        for (i, b) in self.blocks.iter().enumerate() {
+            s.push_str(&format!("b{}:\n", i));
+            for x in &b.insts {
+                s.push_str(&format!("  {:?}\n", x));
+            }
+            s.push_str(&format!("  {:?}\n", b.term));
+        }
+        s
+    }
+
+    /// A compare's operands against its kind.
+    fn check_cmp(&self, c: &Cmp, what: &str) -> Result<(), String> {
+        let want = match c {
+            Cmp::R(..) | Cmp::K(..) | Cmp::O(..) => Cls::I,
+            Cmp::F(_, true, ..) => Cls::F64,
+            Cmp::F(_, false, ..) => Cls::F32,
+        };
+        let mut bad = false;
+        c.uses(|u| bad |= self.vregs[u.0 as usize] != want);
+        if bad {
+            return Err(format!("{}: {} compare class mismatch: {:?}", self.name, what, c));
+        }
+        Ok(())
+    }
+
+    /// C ABI vregs (call arguments or body params) against their CSig.
+    fn check_csig(&self, sig: &CSig, vs: &[VReg], what: &str) -> Result<(), String> {
+        let skip = sig.ret.is_some() as usize;
+        if vs.len() != sig.args.len() + skip {
+            return Err(format!("{}: {} ABI values for a C signature of {} (+{} result address)", what, vs.len(), sig.args.len(), skip));
+        }
+        if skip == 1 && self.vregs[vs[0].0 as usize] != Cls::I {
+            return Err(format!("{}: result address is not an integer vreg", what));
+        }
+        for (k, a) in sig.args.iter().enumerate() {
+            let c = self.vregs[vs[skip + k].0 as usize];
+            let want = match a {
+                CArg::Scalar(Mem::F32) => Cls::F32,
+                CArg::Scalar(Mem::F64) => Cls::F64,
+                _ => Cls::I,
+            };
+            if c != want {
+                return Err(format!("{}: argument {} is {:?}, its C type needs {:?}", what, k, c, want));
+            }
+        }
+        Ok(())
+    }
+
+    /// Structural verifier: every use has a class-correct vreg, every target exists.
+    /// Hard verification after a rewrite that runs past the last `verify` (JITSAFE 19): always in
+    /// debug builds; in release with RELAX_VERIFY_PASSES (the gates' diff_fast legs set it).
+    /// A broken function is an error naming the pass -- never compiled.
+    pub fn verify_after(&self, pass: &str) -> Result<(), String> {
+        if !verify_passes_on() {
+            return Ok(());
+        }
+        self.verify().map_err(|e| format!("RIR broken by {} in {}: {}", pass, self.name, e))
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        // a naked fn's body is its asm: it has no parameter vregs
+        if let Some(sig) = self.cabi.as_ref().filter(|_| !self.naked) {
+            for p in &self.params {
+                if p.0 as usize >= self.vregs.len() {
+                    return Err(format!("{}: param vreg out of range", self.name));
+                }
+            }
+            self.check_csig(sig, &self.params, &format!("{}: extern \"C\" params", self.name))?;
+            if sig.ret.is_some() && !self.rets.is_empty() {
+                return Err(format!("{}: aggregate C result and result registers", self.name));
+            }
+        }
+        let nb = self.blocks.len() as u32;
+        let nv = self.vregs.len() as u32;
+        let chk = |v: VReg| -> Result<(), String> {
+            if v.0 >= nv {
+                return Err(format!("{}: vreg v{} out of range", self.name, v.0));
+            }
+            Ok(())
+        };
+        for (bi, b) in self.blocks.iter().enumerate() {
+            for x in &b.insts {
+                let mut regs: Vec<VReg> = Vec::new();
+                match x {
+                    Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::VConst(d, _) => regs.push(*d),
+                    Inst::Mov(d, a) | Inst::INeg(_, d, a) | Inst::INot(_, d, a) | Inst::IBit(_, d, a) | Inst::FUnary(_, _, d, a) | Inst::Conv(_, d, a) | Inst::IBinI(_, _, d, a, _) | Inst::ICmpI(_, _, d, a, _) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                    }
+                    Inst::IBin(_, _, d, a, b) | Inst::ICmp(_, _, d, a, b) | Inst::FBin(_, _, d, a, b) | Inst::FCmp(_, _, d, a, b) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                        regs.push(*b);
+                    }
+                    Inst::Load(_, d, b, _) => {
+                        regs.push(*d);
+                        regs.push(*b);
+                    }
+                    Inst::Store(_, b, _, s) => {
+                        regs.push(*b);
+                        regs.push(*s);
+                    }
+                    Inst::LoadX(_, d, b, x, _, _) | Inst::VLoadX(d, b, x, _, _) => {
+                        regs.push(*d);
+                        regs.push(*b);
+                        regs.push(*x);
+                    }
+                    Inst::StoreX(_, b, x, _, _, s) | Inst::VStoreX(b, x, _, _, s) => {
+                        regs.push(*b);
+                        regs.push(*x);
+                        regs.push(*s);
+                    }
+                    Inst::Call(c, a, r) => {
+                        if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
+                            regs.push(*v);
+                        }
+                        regs.extend_from_slice(a);
+                        regs.extend_from_slice(r);
+                    }
+                    Inst::Copy(a, b, _) => {
+                        regs.push(*a);
+                        regs.push(*b);
+                    }
+                    Inst::Fence(..) | Inst::Coverage { .. } | Inst::StorageDead(..) => {}
+                    Inst::FpEnv(_, v) => regs.push(*v),
+                    Inst::Cpuid(ds, a, b) => { regs.extend_from_slice(ds); regs.push(*a); regs.push(*b); }
+                    Inst::Xgetbv(d, a) => { regs.push(*d); regs.push(*a); }
+                    Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) => regs.push(*d),
+                    Inst::VSplat(d, a) | Inst::VExtract(d, a, _) | Inst::VLoad(d, a, _) | Inst::VStore(d, _, a) | Inst::VAny(d, a) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                    }
+                    Inst::VGather(d, a, b) | Inst::VTbl(d, a, b, _) | Inst::VShuffle(d, a, b, _) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                        regs.push(*b);
+                    }
+                    Inst::VX(_, d, a, b) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                        regs.push(*b);
+                    }
+                    Inst::VX3(_, d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, _, _, d, a, b, c) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                        regs.push(*b);
+                        regs.push(*c);
+                    }
+                    Inst::VInsert(d, v, _, s2) => {
+                        regs.push(*d);
+                        regs.push(*v);
+                        regs.push(*s2);
+                    }
+                    Inst::Sel(d, c, a, b) => {
+                        regs.push(*d);
+                        regs.push(*c);
+                        regs.push(*a);
+                        regs.push(*b);
+                    }
+                    Inst::SelCmp(d, c, a, b) => {
+                        regs.push(*d);
+                        c.uses(|u| regs.push(u));
+                        regs.push(*a);
+                        regs.push(*b);
+                    }
+                    Inst::FMulAdd(_, _, _, d, a, b, c) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                        regs.push(*b);
+                        regs.push(*c);
+                    }
+                    Inst::AtomicLoad(_, _, d, a) | Inst::AtomicStore(_, _, d, a) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                    }
+                    Inst::AtomicRmw(_, _, _, d, a, b) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                        regs.push(*b);
+                    }
+                    Inst::AtomicCas(_, _, _, d, a, b, c) => {
+                        regs.push(*d);
+                        regs.push(*a);
+                        regs.push(*b);
+                        regs.push(*c);
+                    }
+                }
+                for r in regs {
+                    chk(r)?;
+                }
+                if let Inst::Call(Callee::CHost(_, sig) | Callee::CIndirect(_, sig) | Callee::CFn(_, sig), a, r) = x {
+                    let what = format!("{}: b{} C call", self.name, bi);
+                    self.check_csig(sig, a, &what)?;
+                    if sig.ret.is_some() && !r.is_empty() {
+                        return Err(format!("{}: aggregate result and result vregs", what));
+                    }
+                }
+                match x {
+                    Inst::IBin(_, _, d, a, b) | Inst::ICmp(_, _, d, a, b) => {
+                        if self.vregs[a.0 as usize] != Cls::I || self.vregs[b.0 as usize] != Cls::I || self.vregs[d.0 as usize] != Cls::I {
+                            return Err(format!("{}: b{} int op on non-int vreg: {:?}", self.name, bi, x));
+                        }
+                    }
+                    Inst::FBin(_, f64_, d, a, b) => {
+                        let c = if *f64_ { Cls::F64 } else { Cls::F32 };
+                        if self.vregs[a.0 as usize] != c || self.vregs[b.0 as usize] != c || self.vregs[d.0 as usize] != c {
+                            return Err(format!("{}: b{} float op class mismatch: {:?}", self.name, bi, x));
+                        }
+                    }
+                    Inst::Sel(d, c, a, b2) => {
+                        let cd = self.vregs[d.0 as usize];
+                        if self.vregs[c.0 as usize] != Cls::I || self.vregs[a.0 as usize] != cd || self.vregs[b2.0 as usize] != cd {
+                            return Err(format!("{}: b{} select class mismatch: {:?}", self.name, bi, x));
+                        }
+                    }
+                    Inst::SelCmp(d, c, a, b2) => {
+                        let cd = self.vregs[d.0 as usize];
+                        if self.vregs[a.0 as usize] != cd || self.vregs[b2.0 as usize] != cd {
+                            return Err(format!("{}: b{} select class mismatch: {:?}", self.name, bi, x));
+                        }
+                        self.check_cmp(c, &format!("b{} select", bi))?;
+                    }
+                    _ => {}
+                }
+            }
+            match &b.term {
+                Term::Jump(t) => {
+                    if *t >= nb {
+                        return Err(format!("{}: bad jump target", self.name));
+                    }
+                }
+                Term::Branch(c, t, f) => {
+                    chk(*c)?;
+                    if *t >= nb || *f >= nb {
+                        return Err(format!("{}: bad branch target", self.name));
+                    }
+                }
+                Term::BranchCmp(c, t, f) => {
+                    let mut ops: Vec<VReg> = Vec::new();
+                    c.uses(|u| ops.push(u));
+                    for u in ops {
+                        chk(u)?;
+                    }
+                    self.check_cmp(c, &format!("b{} branch", bi))?;
+                    if *t >= nb || *f >= nb {
+                        return Err(format!("{}: bad branch target", self.name));
+                    }
+                }
+                Term::Ret(v) => {
+                    if v.len() != self.rets.len() {
+                        return Err(format!("{}: b{} returns {} values, expected {}", self.name, bi, v.len(), self.rets.len()));
+                    }
+                    for (i, r) in v.iter().enumerate() {
+                        chk(*r)?;
+                        if self.vregs[r.0 as usize] != self.rets[i] {
+                            return Err(format!("{}: b{} return class mismatch", self.name, bi));
+                        }
+                    }
+                }
+                Term::Unreachable | Term::Resume => {}
+                Term::Switch(c, t) => {
+                    chk(*c)?;
+                    if t.succ.iter().any(|s| *s >= nb) {
+                        return Err(format!("{}: bad switch target", self.name));
+                    }
+                }
+                Term::Invoke(t, u) => {
+                    if *t >= nb || *u >= nb {
+                        return Err(format!("{}: bad invoke target", self.name));
+                    }
+                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Part(_) | Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
+                        return Err(format!("{}: b{} invoke without a call that may unwind as its last instruction", self.name, bi));
+                    }
+                }
+            }
+        }
+        // Copy is memcpy: its source and destination never overlap unless they are the same
+        // bytes (a slot copied onto its own storage, which moves nothing). A pass that forwards
+        // one slot into another must not leave a copy between two offsets of one slot whose
+        // ranges meet: the backends copy forward in chunks (DFREE: a moved key shifted a word).
+        if let Some((bi, x)) = self.overlapping_copy() {
+            return Err(format!("{}: b{} copy between overlapping bytes of one slot: {:?}", self.name, bi, x));
+        }
+        Ok(())
+    }
+
+    /// The first `Copy` whose destination and source are addresses of one slot (single-definition
+    /// SlotAddr / Mov / constant-Add chains) at different offsets with overlapping ranges.
+    pub fn overlapping_copy(&self) -> Option<(usize, Inst)> {
+        if !self.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Copy(..)))) {
+            return None;
+        }
+        let at = slot_offsets(self);
+        for (bi, b) in self.blocks.iter().enumerate() {
+            for x in &b.insts {
+                if let Inst::Copy(d, s, n) = x {
+                    if let (Some((ds, doff)), Some((ss, soff))) = (at[d.0 as usize], at[s.0 as usize]) {
+                        if ds == ss && doff != soff && doff < soff + *n as i64 && soff < doff + *n as i64 {
+                            return Some((bi, x.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Per vreg: (slot, constant byte offset) when its one definition is a SlotAddr, or a
+/// single-definition Mov / 64-bit constant Add of such a value.
+pub fn slot_offsets(f: &Func) -> Vec<Option<(u32, i64)>> {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        if (p.0 as usize) < nv {
+            ndef[p.0 as usize] += 1;
+        }
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            crate::regalloc::for_defs(i, |d| {
+                if (d.0 as usize) < nv {
+                    ndef[d.0 as usize] += 1
+                }
+            });
+        }
+    }
+    let mut at: Vec<Option<(u32, i64)>> = vec![None; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::SlotAddr(d, s) = i {
+                if (d.0 as usize) < nv && ndef[d.0 as usize] == 1 {
+                    at[d.0 as usize] = Some((*s, 0));
+                }
+            }
+        }
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let (d, s, k) = match i {
+                    Inst::Mov(d, s) => (*d, *s, 0),
+                    Inst::IBinI(IOp::Add, IntTy { bits: 64, .. }, d, s, k) => (*d, *s, *k),
+                    _ => continue,
+                };
+                if (d.0 as usize) < nv && (s.0 as usize) < nv && ndef[d.0 as usize] == 1 && at[d.0 as usize].is_none() {
+                    if let Some((sl, o)) = at[s.0 as usize] {
+                        at[d.0 as usize] = Some((sl, o + k));
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    at
+}
+
+/// `v` re-extended to integer type `it` (how RIR keeps narrow integers in registers).
+/// The NaN result of `FMulAdd` / `VFma` lanes: `fma(a, b, c)` with the operands already negated
+/// (`neg_prod` / `neg_add`; under `keep_nan` a NaN operand stays as it is), on this host (Rust leaves it unspecified; the back ends fix it so
+/// that every tier and register assignment gives the same bits, and compute kernels match their
+/// interpreter, makepad_script_compute::ir::fma_nan):
+/// - x86-64: the first NaN of b, a, c, quieted (vfmadd213 with a in the destination, b in vvvv,
+///   c in r/m -- glibc's fma/fmaf, what rustc calls without the fma feature; the vf*231/132 forms
+///   keep b first too); no NaN operand (inf * 0, inf - inf): the negative default NaN.
+/// - AArch64 (fmadd/fmla: Rn = a, Rm = b, addend c; Arm's FPMulAdd): the first signaling NaN of
+///   c, a, b, else the first quiet NaN of c, a, b, quieted -- except that a quiet NaN c with
+///   inf * 0 gives the default NaN; none: the positive default NaN.
+/// - wasm: as the engine's f64 multiply then add pass NaNs on (`b * a + c`, the x86-64 order on
+///   x86-64 engines); wasm itself leaves NaN signs nondeterministic.
+/// `None` when the result is not a NaN.
+pub fn fma_nan_f32(a: f32, b: f32, c: f32) -> Option<u32> {
+    let r = a.mul_add(b, c);
+    fma_nan(a.to_bits() as u64, b.to_bits() as u64, c.to_bits() as u64, 23, 8, r.is_nan()).map(|x| x as u32)
+}
+
+/// [`fma_nan_f32`] for f64.
+pub fn fma_nan_f64(a: f64, b: f64, c: f64) -> Option<u64> {
+    let r = a.mul_add(b, c);
+    fma_nan(a.to_bits(), b.to_bits(), c.to_bits(), 52, 11, r.is_nan())
+}
+
+/// m mantissa and e exponent bits; `is_nan`: the result's value is a NaN
+fn fma_nan(a: u64, b: u64, c: u64, m: u32, e: u32, is_nan: bool) -> Option<u64> {
+    if !is_nan {
+        return None;
+    }
+    let exp = ((1u64 << e) - 1) << m;
+    let abs = |x: u64| x & (exp | ((1 << m) - 1));
+    let nan = |x: u64| abs(x) > exp;
+    let quiet = 1u64 << (m - 1);
+    let default = exp | quiet;
+    #[cfg(target_arch = "aarch64")]
+    {
+        let snan = |x: u64| nan(x) && x & quiet == 0;
+        if let Some(&x) = [c, a, b].iter().find(|&&x| snan(x)) {
+            return Some(x | quiet);
+        }
+        let (inf, zero) = (|x: u64| abs(x) == exp, |x: u64| abs(x) == 0);
+        if nan(c) && ((inf(a) && zero(b)) || (zero(a) && inf(b))) {
+            return Some(default);
+        }
+        Some([c, a, b].iter().find(|&&x| nan(x)).map_or(default, |&x| x | quiet))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let sign = 1u64 << (m + e);
+        let default = if cfg!(target_arch = "x86_64") { sign | default } else { default };
+        Some([b, a, c].iter().find(|&&x| nan(x)).map_or(default, |&x| x | quiet))
+    }
+}
+
+/// `v` as a value of `it`: its low `it.bits` bits, extended by the type's sign. Any width below 64,
+/// not only the integer types': the select-tree compare fold narrows through low masks
+/// (`n % 2 == 0` reads `n & 1`, one bit wide), and a constant kept unmasked there compared both
+/// arms of `if c { 130 } else { 131 }` as odd. 64 bits and wider are the value itself.
+pub fn extend_const(v: i64, it: IntTy) -> i64 {
+    match it.bits {
+        1..=63 => {
+            let sh = 64 - it.bits as u32;
+            if it.signed { (v << sh) >> sh } else { ((v as u64) << sh >> sh) as i64 }
+        }
+        _ => v,
+    }
+}
+
+/// Trailer every compiled function ends with, for the runtime's frame walk when a panic
+/// unwinds (rustc/LLVM keep the same facts in the LSDA and CFI): the callee-saved registers the
+/// prologue saved below the frame pointer ([fp - 8k], k = 1.. in this order; 0x100 | n for
+/// float register n), the frame pointer minus the stack pointer in the body, and the landing
+/// stub of each invoked call by its return address (byte offsets in the code). Layout (u32
+/// words, read backwards from the end): (ret, stub).., saved registers as bytes (n | 0x80 for
+/// a float register) four per word, sp_off, then UNWIND_MAGIC << 24 | n_saved << 19 | n_pads.
+pub const UNWIND_MAGIC: u32 = 0xA5;
+/// The same trailer for a function with staged calls (calls that move the stack pointer below the
+/// body's for their stack arguments, x86-64): (ret, bytes) of each after the pads, their count
+/// before sp_off. With them the frame pointer of a frame is known from its stack pointer alone at
+/// any of its calls (`UnwindInfo::fp_from_sp`): a thread walked without its registers (blocked in
+/// a syscall). A function without staged calls keeps UNWIND_MAGIC and costs nothing more.
+pub const UNWIND_MAGIC_STAGED: u32 = 0xA6;
+/// Two ordinary trailers (host, then part), followed by the part's code offset and this magic
+/// with the part trailer's word count in the low 24 bits. Each trailer is function-relative.
+pub const UNWIND_MAGIC_PART: u32 = 0xA7;
+
+pub fn part_trailer_words(p_off: u32, p_words: usize) -> [u32; 2] {
+    assert!(p_words <= 0xff_ffff, "part trailer word count must fit the head");
+    [p_off, UNWIND_MAGIC_PART << 24 | p_words as u32]
+}
+
+pub fn unwind_info_words(saved: &[u32], pads: &[(u32, u32)], staged: &[(u32, u32)], sp_off: u32) -> Vec<u32> {
+    let mut w = Vec::with_capacity(2 * pads.len() + 2 * staged.len() + saved.len() / 4 + 4);
+    for (r, s) in pads.iter().chain(staged) {
+        w.push(*r);
+        w.push(*s);
+    }
+    for chunk in saved.chunks(4) {
+        let mut x = 0u32;
+        for (k, r) in chunk.iter().enumerate() {
+            let b = if *r & 0x100 != 0 { 0x80 | (*r & 0x7f) } else { *r & 0x7f };
+            x |= b << (8 * k);
+        }
+        w.push(x);
+    }
+    let magic = if staged.is_empty() { UNWIND_MAGIC } else { w.push(staged.len() as u32); UNWIND_MAGIC_STAGED };
+    w.push(sp_off);
+    w.push(magic << 24 | (saved.len() as u32) << 19 | pads.len() as u32);
+    w
+}
+
+/// Parsed trailer of a function's code (see `unwind_info_words`). Boxed slices: the code tables
+/// keep one per installed function.
+#[derive(Clone)]
+pub struct UnwindInfo {
+    pub saved: Box<[u32]>,
+    pub pads: Box<[(u32, u32)]>,
+    pub sp_off: u32,
+    /// (return offset, bytes below the body's stack pointer) of each staged call
+    pub staged: Box<[(u32, u32)]>,
+}
+
+impl UnwindInfo {
+    /// The frame pointer of this function's frame from its stack pointer at the call whose
+    /// return address is `ret_off` bytes into the code: the body's frame below it, and the
+    /// call's stack arguments when it staged them.
+    pub fn fp_from_sp(&self, ret_off: u32, sp: u64) -> u64 {
+        let staged = self.staged.iter().find(|s| s.0 == ret_off).map_or(0, |s| s.1);
+        sp + self.sp_off as u64 + staged as u64
+    }
+}
+
+fn unwind_word(bytes: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
+}
+
+/// The ordinary trailer at the end of a word-aligned slice. Locating it reads just the header
+/// fields, so the startup image can keep the register and call tables mapped until a walk.
+struct UnwindTrailer<'a> {
+    bytes: &'a [u8],
+    n_pads: usize,
+    n_staged: usize,
+    n_saved: usize,
+}
+
+impl<'a> UnwindTrailer<'a> {
+    fn at_end(bytes: &'a [u8], joined: bool) -> Option<Self> {
+        let end = bytes.len();
+        let head = unwind_word(bytes, end.checked_sub(4)?);
+        let n_staged = match head >> 24 {
+            UNWIND_MAGIC => 0,
+            UNWIND_MAGIC_STAGED => {
+                let n = unwind_word(bytes, end.checked_sub(12)?);
+                if joined && n == 0 { return None; }
+                n
+            }
+            _ => return None,
+        };
+        let n_saved = (head >> 19) & 0x1f;
+        let n_pads = head & 0x7_ffff;
+        let words = 2 * (n_pads as u64 + n_staged as u64) + ((n_saved + 3) / 4) as u64 + 2 + u64::from(n_staged != 0);
+        let start = end.checked_sub(usize::try_from(words * 4).ok()?)?;
+        Some(Self { bytes: &bytes[start..], n_pads: n_pads as usize, n_staged: n_staged as usize, n_saved: n_saved as usize })
+    }
+
+    fn info(&self) -> UnwindInfo {
+        let pair = |k: usize| (unwind_word(self.bytes, 8 * k), unwind_word(self.bytes, 8 * k + 4));
+        let pads = (0..self.n_pads).map(pair).collect();
+        let staged = (self.n_pads..self.n_pads + self.n_staged).map(pair).collect();
+        let sbase = 8 * (self.n_pads + self.n_staged);
+        let saved = self.bytes[sbase..sbase + self.n_saved].iter().map(|&b| {
+            if b & 0x80 != 0 { 0x100 | (b & 0x7f) as u32 } else { b as u32 }
+        }).collect();
+        let sp_off = unwind_word(self.bytes, self.bytes.len() - 8);
+        UnwindInfo { saved, pads, sp_off, staged }
+    }
+}
+
+/// Reads one ordinary trailer at the end of `code`. A joined body's head describes two
+/// functions and must go through `split_unwind_info`.
+///
+/// # Safety
+/// `code..code + len` must be readable.
+pub unsafe fn read_unwind_info(code: u64, len: u64) -> Option<UnwindInfo> {
+    if len < 8 { return None; }
+    let bytes = std::slice::from_raw_parts(code as *const u8, (len & !3) as usize);
+    Some(UnwindTrailer::at_end(bytes, false)?.info())
+}
+
+pub struct SplitUnwindInfo {
+    pub code_len: usize,
+    pub host: Option<UnwindInfo>,
+    pub part: Option<(u32, UnwindInfo)>,
+}
+
+impl SplitUnwindInfo {
+    pub fn no_trailer(code_len: usize) -> Self {
+        Self { code_len, host: None, part: None }
+    }
+}
+
+/// Walk backwards from the head. For a mapped image the code is separate and the host
+/// trailer must consume everything before the part trailer.
+fn unwind_trailers(bytes: &[u8], image_code_len: Option<usize>) -> Option<(usize, UnwindTrailer<'_>, Option<(u32, UnwindTrailer<'_>)>)> {
+    let end = bytes.len() & !3;
+    let head = unwind_word(bytes, end.checked_sub(4)?);
+    let joined = head >> 24 == UNWIND_MAGIC_PART;
+    let (host_end, part) = if joined {
+        if end != bytes.len() { return None; }
+        let p_end = end.checked_sub(8)?;
+        let p_start = p_end.checked_sub((head & 0xff_ffff) as usize * 4)?;
+        let p = UnwindTrailer::at_end(&bytes[p_start..p_end], true)?;
+        if p.bytes.len() != p_end - p_start { return None; }
+        (p_start, Some((unwind_word(bytes, p_end), p)))
+    } else {
+        (end, None)
+    };
+    let host = UnwindTrailer::at_end(&bytes[..host_end], joined)?;
+    let start = host_end - host.bytes.len();
+    if image_code_len.is_some() && start != 0 { return None; }
+    let code_len = image_code_len.unwrap_or(start);
+    if let Some((off, _)) = &part {
+        if *off == 0 || *off as usize >= code_len { return None; }
+    }
+    Some((code_len, host, part))
+}
+
+/// Splits the emitted body into its code length and the unwind info of each function.
+pub fn split_unwind_info(code: &[u8]) -> SplitUnwindInfo {
+    match unwind_trailers(code, None) {
+        Some((code_len, host, part)) => SplitUnwindInfo { code_len, host: Some(host.info()), part: part.map(|(off, p)| (off, p.info())) },
+        None => SplitUnwindInfo::no_trailer(code.len()),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+use crate::arm64 as native;
+#[cfg(not(target_arch = "aarch64"))]
+use crate::x64 as native;
+
+/// Both backends install the same layout. Only the four-byte private call field differs.
+pub(crate) fn join_native_part(mut host: native::Compiled, part: native::Compiled, call_word: fn(u32, u32) -> Result<u32, &'static str>) -> Result<native::Compiled, String> {
+    if !part.part_calls.is_empty() { return Err("outlined part calls another part".into()); }
+    let code_len = |c: &native::Compiled| {
+        let s = split_unwind_info(&c.code);
+        if s.host.is_none() || s.part.is_some() || c.code.len() % 4 != 0 || c.text_len == 0 || c.text_len as usize > s.code_len {
+            return Err("expected native function text, pool and one unwind trailer");
+        }
+        Ok(s.code_len)
+    };
+    let h_len = code_len(&host)?;
+    let p_len = code_len(&part)?;
+    let p_off = u32::try_from((h_len as u64 + 15) & !15).map_err(|_| "outlined part offset overflow")?;
+    let joined_len = u64::from(p_off) + part.code.len() as u64 + (host.code.len() - h_len) as u64 + 8;
+    if joined_len > u32::MAX as u64 { return Err("joined body exceeds code offset range".into()); }
+    let p_words = (part.code.len() - p_len) / 4;
+    if p_words > 0xff_ffff { return Err("part unwind trailer exceeds word count range".into()); }
+
+    let text = &mut host.code[..host.text_len as usize];
+    for site in host.part_calls.drain(..) {
+        let word = call_word(site, p_off)?;
+        let field = text.get_mut(site as usize..).and_then(|b| b.get_mut(..4)).ok_or("private call outside host text")?;
+        field.copy_from_slice(&word.to_le_bytes());
+    }
+    let trailer = host.code.split_off(h_len);
+    host.code.reserve(joined_len as usize - h_len);
+    host.code.resize(p_off as usize, 0);
+    host.code.extend_from_slice(&part.code[..p_len]);
+    host.code.extend(trailer);
+    host.code.extend_from_slice(&part.code[p_len..]);
+    for w in part_trailer_words(p_off, p_words) { host.code.extend_from_slice(&w.to_le_bytes()); }
+    for mut r in part.relocs {
+        r.at = p_off.checked_add(r.at).ok_or("part relocation offset overflow")?;
+        host.relocs.push(r);
+    }
+    host.text_len = p_off + part.text_len;
+    join_part_pc_maps(&mut host.pc_map, &part.pc_map, p_off, host.text_len)?;
+
+    // The assembly dump indexes instructions by block number alone. Give P's emitted
+    // blocks distinct labels there, keeping their function-local numbers for reading jumps.
+    let mut block_base = 0;
+    if !part.rir_emitted.is_empty() {
+        let block_label = |line: &str| line.strip_prefix('b')?.strip_suffix(':')?.parse::<u32>().ok();
+        block_base = host.rir_emitted.lines().filter_map(block_label).count() as u32;
+        for line in part.rir_emitted.lines() {
+            if let Some(b) = block_label(line) {
+                host.rir_emitted.push_str(&format!("b{}:  (part b{})\n", block_base + b, b));
+            } else {
+                host.rir_emitted.push_str(line);
+                host.rir_emitted.push('\n');
+            }
+        }
+    }
+    host.rir_map.extend(part.rir_map.into_iter().map(|(off, b, i)| (p_off + off, block_base + b, i)));
+    Ok(host)
+}
+
+/// Borrows each function's ordinary trailer from the image's trailer region.
+pub fn split_unwind_region(trailer: &[u8], code_len: u32) -> Option<(&[u8], Option<(u32, &[u8])>)> {
+    let (_, host, part) = unwind_trailers(trailer, Some(code_len as usize))?;
+    Some((host.bytes, part.map(|(off, p)| (off, p.bytes))))
+}
+
+/// RELAX_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
+pub static UNWIND_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+pub fn unwind_stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RELAX_UNWIND_STATS").is_ok())
+}
+
+/// Per stack slot: whether any SlotAddr names it (the only way to reach a slot).
+pub fn used_slots(f: &Func) -> Vec<bool> {
+    let mut used = vec![false; f.slots.len()];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::SlotAddr(_, s) = i {
+                if let Some(u) = used.get_mut(*s as usize) {
+                    *u = true;
+                }
+            }
+        }
+    }
+    used
+}
+
+#[cfg(test)]
+mod join_part_tests {
+    use super::*;
+
+    // Both functions add their own constant to the argument. The host then calls P
+    // with its sum. With relocations the two constants come from distinct pool words.
+    fn body(host: bool, relocated: bool) -> native::Compiled {
+        let mut f = Func::new(if host { "host" } else { "part" }.into(), 0);
+        let (x, k, sum) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.push(x);
+        f.rets.push(Cls::I);
+        f.block();
+        let n = if host { 3 } else { 7 };
+        let constant = if relocated { Inst::Addr(k, Sym::new(n)) } else { Inst::Iconst(k, n as i64) };
+        let add = Inst::IBin(IOp::Add, IntTy { bits: 64, signed: false }, sum, x, k);
+        f.blocks[0].insts = vec![constant, add];
+        f.blocks[0].pos = vec![n as u64; 2];
+        f.blocks[0].term = Term::Ret(vec![sum]);
+        if host {
+            let result = f.vreg(Cls::I);
+            f.blocks[0].insts.push(Inst::Call(Callee::Part(None), vec![sum], vec![result]));
+            f.blocks[0].pos.push(4);
+            if relocated {
+                let (normal, pad) = (f.block(), f.block());
+                f.blocks[0].term = Term::Invoke(normal, pad);
+                f.blocks[normal as usize].term = Term::Ret(vec![result]);
+                f.blocks[pad as usize].term = Term::Ret(vec![x]);
+            } else {
+                f.blocks[0].term = Term::Ret(vec![result]);
+            }
+        }
+        native::compile(&relax_session::Options::default(), &f, &native::Env::standalone(false)).unwrap()
+    }
+
+    #[test]
+    fn join_part_call_returns_and_keeps_both_frames() {
+        assert!(native::join_part(body(true, false), body(true, false)).is_err(), "recursive private call");
+        for relocated in [false, true] {
+            let mut h = body(true, relocated);
+            let mut p = body(false, relocated);
+            let [site] = h.part_calls[..] else { panic!("expected one private call") };
+            let (hs, ps) = (split_unwind_info(&h.code), split_unwind_info(&p.code));
+            let p_off = ((hs.code_len + 15) & !15) as u32;
+            let p_first = p.pc_map[0].1;
+            assert_eq!(h.relocs.is_empty(), !relocated);
+            assert_eq!(p.relocs.is_empty(), !relocated);
+            let mut relocs = h.relocs.clone();
+            relocs.extend(p.relocs.iter().map(|r| RelocAt { at: r.at + p_off, ..*r }));
+            let (frame, end) = (h.frame_size, p_off + p.text_len);
+            let site = site as usize;
+            // Exercise dump and map joining without changing the process-wide dump flag.
+            h.rir_map = vec![(0, 0, 0)];
+            p.rir_map = vec![(4, 0, u32::MAX)];
+            h.rir_emitted = "fn host\nb0:\n".into();
+            p.rir_emitted = if relocated { "fn part\nb0:\n".into() } else { String::new() };
+            let mut joined = native::join_part(h, p).unwrap();
+            assert_eq!(joined.rir_map, [(0, 0, 0), (p_off + 4, u32::from(relocated), u32::MAX)]);
+            if relocated { assert!(joined.rir_emitted.contains("b1:  (part b0)")); }
+            assert!(joined.part_calls.is_empty());
+            assert_eq!((joined.frame_size, joined.text_len), (frame, end));
+            assert_eq!(joined.relocs, relocs, "ordered relocated fields");
+            assert!(joined.pc_map.contains(&(p_off, p_first)), "source at the part entry");
+            let w = i32::from_le_bytes(joined.code[site..site + 4].try_into().unwrap());
+            #[cfg(target_arch = "aarch64")]
+            {
+                assert_eq!(w as u32 >> 26, 0b100101);
+                assert_eq!(site as i64 + ((w << 6 >> 6) as i64) * 4, p_off as i64);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                assert_eq!(joined.code[site - 1], 0xe8);
+                assert_eq!(site as i64 + 4 + w as i64, p_off as i64);
+            }
+            let s = split_unwind_info(&joined.code);
+            assert_eq!(s.code_len, p_off as usize + ps.code_len);
+            let (base, pu) = s.part.unwrap();
+            assert_eq!(base, p_off);
+            for (got, orig) in [(s.host.unwrap(), hs.host.unwrap()), (pu, ps.host.unwrap())] {
+                assert_eq!((got.sp_off, got.saved, got.staged, got.pads), (orig.sp_off, orig.saved, orig.staged, orig.pads));
+            }
+            link(&mut joined.code, 0, &joined.relocs, &|r| match r {
+                Reloc::Sym(s) => s.id.into(),
+                _ => panic!("unexpected relocation {r:?}"),
+            }).unwrap();
+            let code = crate::exec::Code::new(&joined.code).unwrap();
+            let f: crate::host_fn_ptr!(fn(u64) -> u64) = unsafe { std::mem::transmute(code.ptr()) };
+            assert_eq!(unsafe { f(32) }, 42, "argument and return through the private call");
+        }
+    }
+
+    #[test]
+    fn join_part_locals_and_inline_contexts() {
+        use crate::dbgloc::{self, Home, Table, Var, VarKind};
+        let table = |disp| Table {
+            vars: vec![Var { ctx: 0, local: 3, kind: VarKind::Frame(disp), consts: vec![] },
+                       Var { ctx: 2, local: 4, kind: VarKind::Regs(1), consts: vec![] }],
+            sites: vec![(4, vec![(1, 0, Home::Fp(disp))])],
+        };
+        let shared = [(u32::MAX, 11), (u32::MAX, 12)];
+        let mut h = vec![(0, 10)];
+        h.extend(dbgloc::pc_entries(&dbgloc::encode(&table(-16)), 1));
+        h.extend(shared);
+        h.extend([(u32::MAX, 13), (u32::MAX, 14)]);
+        let flagged = POS_GUARD | POS_PATCHED | 21;
+        let lost = pos_with_ctx(flagged, POS_CTX_LOST);
+        let mut p = vec![(4, 0), (8, pos_with_ctx(flagged, 2)), (12, lost)];
+        p.extend(dbgloc::pc_entries(&dbgloc::encode(&table(-48)), 2));
+        p.extend(shared);
+        p.extend([(u32::MAX, pos_with_ctx(15, 1)), (u32::MAX, 16),
+                  (u32::MAX, pos_with_ctx(flagged, 2)), (u32::MAX, 17)]);
+        join_part_pc_maps(&mut h, &p, 32, 48).unwrap();
+        assert_eq!(&h[..5], &[(0, 10), (32, 0), (36, 0), (40, pos_with_ctx(flagged, 3)), (44, lost)]);
+        assert_eq!(&h[h.len() - 4..], &[(u32::MAX, pos_with_ctx(15, 1)), (u32::MAX, 16),
+                                         (u32::MAX, pos_with_ctx(flagged, 3)), (u32::MAX, 17)]);
+        let bytes = dbgloc::from_pc_entries(h.into_iter());
+        for (pc, disp, ctx) in [(3, -16, 2), (35, -48, 3)] {
+            let (b, off) = part_local_table(&bytes, pc).unwrap();
+            let t = dbgloc::decode(b).unwrap();
+            assert_eq!(t.vars[0].kind, VarKind::Frame(disp), "root local in this frame");
+            assert_eq!(t.vars[1].ctx, ctx);
+            assert_eq!(t.site(off + 1).unwrap(), &[(1, 0, Home::Fp(disp))]);
+        }
+        assert_eq!(part_local_table(&bytes, 31).unwrap().1, 31);
+        assert_eq!(part_local_table(&bytes, 32).unwrap().1, 0);
+        assert!(part_local_table(&bytes[..bytes.len() - 1], 32).is_none());
+    }
+}
+
+#[cfg(test)]
+mod slot_table_tests {
+    use super::SlotTable;
+
+    #[test]
+    fn locate_covers_every_id_once() {
+        // segment boundaries: the last id of a segment and the first of the next
+        let mut next = 0u64;
+        for seg in 0..super::SLOT_SEGS {
+            assert_eq!(SlotTable::seg_first(seg), next);
+            let n = SlotTable::seg_slots(seg) as u64;
+            for id in [next, next + 1, next + n - 1] {
+                assert_eq!(SlotTable::locate(id as u32), (seg, (id - next) as usize), "id {}", id);
+            }
+            next += n;
+        }
+        assert_eq!(next, 1 << 32);
+    }
+
+    #[test]
+    fn addresses_and_reverse_lookup() {
+        let t = SlotTable::new(32, 32, 8, 48);
+        let (a, b) = (0x10_0000u64, 0x4000_0000u64);
+        t.install(0, a, a + (1 << 18) * 32, a + (1 << 19) * 32, a + (1 << 19) * 32 + (1 << 18) * 8);
+        t.install(1, b, b + (1 << 18) * 32, b + (1 << 19) * 32, b + (1 << 19) * 32 + (1 << 18) * 8);
+        assert_eq!(t.thunk(5), a + 5 * 32);
+        assert_eq!(t.thunk(1 << 18), b);
+        assert_eq!(t.table((1 << 18) + 3), b + (1 << 19) * 32 + 24);
+        assert_eq!(t.find(2, t.table((1 << 18) + 3)), Some(((1 << 18) + 3, 0)));
+        assert_eq!(t.find(0, a + 5 * 32 + 4), Some((5, 4)));
+        assert_eq!(t.find(0, 0x2000_0000), None);
+    }
+}
+
+#[cfg(test)]
+mod succs_tests {
+    use super::{SwitchTable, Term, VReg};
+
+    /// A switch lists each distinct successor once and then ends, however long its table is.
+    #[test]
+    fn a_switch_with_more_than_255_successors_ends() {
+        for n in [1u32, 2, 255, 256, 257, 300, 70_000] {
+            let t = Term::Switch(VReg(0), std::sync::Arc::new(SwitchTable::new(0, (1..=n).collect(), 0)));
+            // bounded, so that a position that wraps fails the test instead of filling memory
+            let got: Vec<u32> = t.succs().take(n as usize + 10).collect();
+            let mut want: Vec<u32> = (1..=n).collect();
+            want.push(0);
+            assert_eq!(got, want, "{} table entries", n);
+        }
+    }
+}
+
+#[cfg(test)]
+mod unwind_trailer_tests {
+    use super::*;
+
+    fn append_words(bytes: &mut Vec<u8>, words: &[u32]) {
+        for w in words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+
+    /// A trailer reads back as written behind its code, with and without staged calls; a frame's
+    /// pointer from sp adds the staged bytes at that call only. Without staged calls the trailer
+    /// keeps the plain magic (and its size).
+    #[test]
+    fn trailer_round_trip_and_fp_from_sp() {
+        let code = [0x90u8; 12];
+        let saved = [3u32, 12, 0x108];
+        let pads = [(8u32, 40u32)];
+        for staged in [&[][..], &[(8u32, 16u32), (12, 32)][..]] {
+            let mut bytes = code.to_vec();
+            append_words(&mut bytes, &unwind_info_words(&saved, &pads, staged, 48));
+            let split = split_unwind_info(&bytes);
+            let info = split.host.expect("a trailer");
+            assert_eq!(split.code_len, code.len());
+            assert!(split.part.is_none());
+            let region = &bytes[split.code_len..];
+            let (host, part) = split_unwind_region(region, split.code_len as u32).unwrap();
+            assert!(std::ptr::eq(host, region) && part.is_none());
+            assert_eq!((&info.saved[..], &info.pads[..], &info.staged[..], info.sp_off), (&saved[..], &pads[..], staged, 48));
+            let extra = staged.iter().find(|s| s.0 == 12).map_or(0, |s| s.1 as u64);
+            assert_eq!(info.fp_from_sp(12, 0x1000), 0x1000 + 48 + extra);
+            assert_eq!(info.fp_from_sp(4, 0x1000), 0x1000 + 48);
+        }
+        assert_eq!(super::unwind_info_words(&saved, &pads, &[], 48).last().map(|h| h >> 24), Some(super::UNWIND_MAGIC));
+    }
+
+    #[test]
+    fn joined_unwind_trailers_keep_function_relative_offsets() {
+        let (code_len, p_off) = (64, 32);
+        for h_staged in [&[][..], &[(8, 16)][..]] {
+            for p_staged in [&[][..], &[(8, 32)][..]] {
+                let mut bytes = vec![0x90; code_len];
+                append_words(&mut bytes, &unwind_info_words(&[3], &[(8, 20)], h_staged, 48));
+                let p_start = bytes.len();
+                let p_words = unwind_info_words(&[12, 0x108], &[(8, 24)], p_staged, 80);
+                append_words(&mut bytes, &p_words);
+                let p_end = bytes.len();
+                append_words(&mut bytes, &part_trailer_words(p_off, p_words.len()));
+                assert!(unsafe { read_unwind_info(bytes.as_ptr() as u64, bytes.len() as u64) }.is_none());
+
+                let split = split_unwind_info(&bytes);
+                assert_eq!(split.code_len, code_len);
+                let h = split.host.unwrap();
+                let (off, p) = split.part.unwrap();
+                assert_eq!(off, p_off);
+                assert_eq!((&*h.saved, &*h.pads, &*h.staged, h.sp_off), (&[3][..], &[(8, 20)][..], h_staged, 48));
+                assert_eq!((&*p.saved, &*p.pads, &*p.staged, p.sp_off), (&[12, 0x108][..], &[(8, 24)][..], p_staged, 80));
+
+                let (h, part) = split_unwind_region(&bytes[split.code_len..], code_len as u32).unwrap();
+                let (off, p) = part.unwrap();
+                assert_eq!(off, p_off);
+                assert!(std::ptr::eq(h, &bytes[code_len..p_start]), "mapped host trailer");
+                assert!(std::ptr::eq(p, &bytes[p_start..p_end]), "mapped part trailer");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_part_discards_both_unwind_trailers() {
+        let plain = [16, UNWIND_MAGIC << 24];
+        let staged = [4, 16, 1, 32, UNWIND_MAGIC_STAGED << 24];
+        for (host, part, count, off) in [
+            (&plain[..], &plain[..], 0, 4),               // no part trailer
+            (&plain[..], &plain[..], 0xff_ffff, 4),       // count exceeds body
+            (&plain[..], &plain[..], 3, 4),               // count includes host head
+            (&plain[..], &staged[..], 4, 4),              // count omits a staged word
+            (&plain[..], &staged[2..], 3, 4),             // truncated staged table
+            (&plain[..], &[0, 32, UNWIND_MAGIC_STAGED << 24][..], 3, 4),
+            (&plain[..1], &plain[..], 2, 4),              // missing host head
+            (&plain[..], &plain[..], 2, 0),               // no host code
+            (&plain[..], &plain[..], 2, 8),               // no part code
+            (&plain[..], &plain[..], 2, 12),              // offset lies in trailers
+        ] {
+            let mut bytes = vec![0x90; 8];
+            append_words(&mut bytes, host);
+            append_words(&mut bytes, part);
+            append_words(&mut bytes, &part_trailer_words(off, count));
+            let split = split_unwind_info(&bytes);
+            assert_eq!(split.code_len, bytes.len(), "bad trailer stripped code");
+            assert!(split.host.is_none() && split.part.is_none(), "bad trailer supplied frame info");
+            assert!(split_unwind_region(&bytes[8..], 8).is_none(), "bad mapped trailer");
+        }
+        let head = (UNWIND_MAGIC_PART << 24 | 2).to_le_bytes();
+        assert!(split_unwind_info(&head).host.is_none(), "part head without offset");
+    }
+}
+
+/// RELAX_VERIFY_PASSES (any value), `force_verify_passes`, or a debug build:
+/// `Func::verify_after` checks.
+pub fn verify_passes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(debug_assertions) || FORCE_VERIFY.load(std::sync::atomic::Ordering::Relaxed) || *ON.get_or_init(|| std::env::var_os("RELAX_VERIFY_PASSES").is_some())
+}
+
+static FORCE_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns `verify_after` on for the rest of the process (tests: the environment switch is read once
+/// per process, and test targets may share one).
+pub fn force_verify_passes() {
+    FORCE_VERIFY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
+pub(crate) unsafe fn reset_statics() {
+    use relax_session::reset_static as reset;
+    reset(&UNWIND_STATS, [const { std::sync::atomic::AtomicU64::new(0) }; 4]);
+}

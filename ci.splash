@@ -1,0 +1,11 @@
+// The shared UI crates on the other platforms: devhub ci reads this call for its cross-target
+// check shards, beside each app's own `ci.splash`. The workspace's other checks and its tests are
+// the CI's own shards (libs/devhub/src/orch/ci.rs), so devhub never runs this script as a smoke.
+use mod.std.*
+use mod.ci;
+
+ci.check_targets({
+    packages: ["makepad-platform", "makepad-draw", "makepad-widgets"]
+    targets: ci.host.targets
+})
+nil

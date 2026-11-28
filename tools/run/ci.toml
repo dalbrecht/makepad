@@ -1,0 +1,229 @@
+# CI (devhub ci): [ci] is hand-written settings; the other sections are proofs devhub writes.
+
+[job.arm64.macos]
+date = "2026-11-22"
+digest = "e0319553297b25a32f8974059597036d953d9ac6255b8aa38ee2b62bf643ed27"
+main = "efe8c2c649aa0c8711c2bddb8eee8bcaec7a6130"
+work = "ab9d51ee12bc4b2def3d304a06d20006183163fb"
+
+[job.jit_16.linux]
+date = "2026-11-04"
+digest = "5aa540ece367681055b532e41fde3bd9dc53cbb570f62a471e4b19f2edb053b5"
+main = "5f4597d2fb65f354696542829214d4c6b99c39ab"
+work = "7d8695372c6cd232c174a43ee12e1ee51ba72023"
+
+[job.live_allow-c-cached.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_allow-c-dylib.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_allow-c-script-native.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_allow-c.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_boot-panic.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_caught-report.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_check-rustc.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_check-server.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_edit-undone.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_gates.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_hold-back.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_hot-fail-windows.windows]
+date = "2026-11-26"
+digest = "b31fde285f83b55a937e67b9af48518fc90e3b116735630264a77cc843668b71"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_hot-fail.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_kinds.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_landing-hold.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_landing-whole.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_reach.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_rebuild.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_relax-app.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_replay.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_restart.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_run-env.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_runner-windows.windows]
+date = "2026-11-26"
+digest = "b31fde285f83b55a937e67b9af48518fc90e3b116735630264a77cc843668b71"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_shared-std.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_test-dep-gaps.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_test-dep-keys.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_test-results.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_test-warnings.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_test-workspace.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_two-module-file.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_warm-image-patch.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_warm-image-union.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_warm-manifest-layout.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.live_wm-rest.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[job.nocodegen.macos]
+date = "2026-11-22"
+digest = "e0319553297b25a32f8974059597036d953d9ac6255b8aa38ee2b62bf643ed27"
+main = "efe8c2c649aa0c8711c2bddb8eee8bcaec7a6130"
+work = "ab9d51ee12bc4b2def3d304a06d20006183163fb"
+
+[tests.linux]
+date = "2026-11-26"
+digest = "6dd4ef41c23bf6ce1577b8eb975b90c0d2f053372b1ac87337156497436be8e6"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"

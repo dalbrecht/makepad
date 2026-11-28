@@ -5,9 +5,12 @@ authors = ["Makepad <info@makepad.nl>"]
 edition = "2021"
 description = "Makepad shell functions"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/makepad/makepad/"
 repository = "https://github.com/makepad/makepad/"
 metadata.makepad-auto-version = "m7axzkghrdOa6GR1SQQZ-atSk3s="
 
 [features] 
 [dependencies]
+# The wasm decoder and validator.
+makepad-stitch = { path = "../stitch", version = "0.1.0" }
+
+# The spec testsuite runner is libs/wasm_strip/spec (outside the workspace: it needs the wast crate).

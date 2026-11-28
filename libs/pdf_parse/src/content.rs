@@ -72,14 +72,17 @@ pub enum PdfOp {
 
     // XObject
     PaintXObject(String), // Do
+    /// Paint a shading resource (`sh`).
+    PaintShading(String),
 
     // Inline image (decoded separately)
     InlineImage { dict: PdfDict, data: Vec<u8> },
 
-    // Marked content (we skip these but parse them to not break)
-    BeginMarkedContent(String),      // BMC
-    BeginMarkedContentProps(String), // BDC
-    EndMarkedContent,                // EMC
+    // Marked content, including the original property-list operand.
+    BeginMarkedContent(String), // BMC
+    /// Begin marked content with a tag and an inline dictionary or property name.
+    BeginMarkedContentProps(String, PdfObj), // BDC
+    EndMarkedContent, // EMC
 }
 
 /// Item in a TJ array: either a string or a position adjustment.
@@ -324,15 +327,19 @@ fn build_op(kw: &str, operands: &[PdfObj]) -> Option<PdfOp> {
 
         // XObject
         "Do" => Some(PdfOp::PaintXObject(get_name(operands, 0)?)),
+        "sh" => Some(PdfOp::PaintShading(get_name(operands, 0)?)),
 
-        // Marked content (skip but parse)
+        // Marked content
         "BMC" => {
             let tag = get_name(operands, 0).unwrap_or_default();
             Some(PdfOp::BeginMarkedContent(tag))
         }
         "BDC" => {
             let tag = get_name(operands, 0).unwrap_or_default();
-            Some(PdfOp::BeginMarkedContentProps(tag))
+            Some(PdfOp::BeginMarkedContentProps(
+                tag,
+                operands.get(1).cloned().unwrap_or(PdfObj::Null),
+            ))
         }
         "EMC" => Some(PdfOp::EndMarkedContent),
 
@@ -402,6 +409,48 @@ fn expand_inline_image_key(key: &str) -> String {
         "W" => "Width".to_string(),
         other => other.to_string(),
     }
+}
+
+// ---- Text-space matrix math (PDF 32000-1 §9.4.2/§9.4.4) ----
+//
+// All text positioning composes THROUGH the text/line matrix: `tx ty Td` is
+// a pre-translation (the line matrix's own scale and rotation apply to the
+// offset), and every glyph advance moves the text matrix along its own
+// baseline vector. A renderer that adds these numbers straight to the
+// matrix's e/f is only correct when the matrix is [1 0 0 1 e f] — the
+// common `Tf 1` + `Tm [s 0 0 s x y]` export style (InDesign, Chrome print)
+// then collapses every run of a line onto one point.
+
+/// `tx ty Td` (and `T*` = `0 -TL Td`): pre-translate a text line matrix by
+/// a text-space offset.
+pub fn tm_pre_translate(m: &mut [f64; 6], tx: f64, ty: f64) {
+    m[4] += tx * m[0] + ty * m[2];
+    m[5] += tx * m[1] + ty * m[3];
+}
+
+/// Move the text matrix `adv` text-space units along its baseline (the
+/// displacement after showing text, §9.4.4).
+pub fn tm_advance(m: &mut [f64; 6], adv: f64) {
+    m[4] += adv * m[0];
+    m[5] += adv * m[1];
+}
+
+/// A TJ array adjustment `a` (thousandths of text space; positive moves the
+/// next glyph LEFT), as a baseline advance in text space.
+pub fn tj_adjustment_advance(a: f64, font_size: f64, horiz_scaling_percent: f64) -> f64 {
+    -a / 1000.0 * font_size * (horiz_scaling_percent / 100.0)
+}
+
+/// The matrix's x-axis length: what one text-space unit along the baseline
+/// measures in device space (for run widths on screen).
+pub fn mat_x_scale(m: &[f64; 6]) -> f64 {
+    (m[0] * m[0] + m[1] * m[1]).sqrt()
+}
+
+/// The matrix's y-axis length: what one text-space unit of height measures
+/// in device space (for the rendered font size).
+pub fn mat_y_scale(m: &[f64; 6]) -> f64 {
+    (m[2] * m[2] + m[3] * m[3]).sqrt()
 }
 
 // Helper functions for extracting operands

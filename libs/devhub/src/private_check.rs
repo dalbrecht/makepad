@@ -1,0 +1,400 @@
+//! The private-data check at devhub's own commit points. A land merge is written with
+//! commit-tree, so no git hook sees it; this runs the same matcher the hooks and CI run,
+//! `tools/private_check/scan.sh` (rules: that directory's `rules` and `allow`, plus the
+//! untracked `~/.makepad/private_patterns`). A hit names `<file>:<line>: <rule>`, never the text.
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// The scanner of the checkout devhub is built from, as the hooks use the common checkout's: the
+/// repository a check reads may be any (a lane's, a test's), the rules are this checkout's.
+fn scanner_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/private_check")
+}
+
+/// The scanner's files (scan.sh, its rules and allow list) copied to a fresh folder `sh` can run
+/// them from, for one check: devhub reads them through its own std, and under the JIT's overlay
+/// the checkout is a virtual tree that no other process sees. Fresh per check, so the rules are
+/// the checkout's as they stand. Removed when dropped.
+struct Staged(PathBuf);
+
+impl Staged {
+    fn new() -> Result<Self, Vec<String>> {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let staged = Staged(std::env::temp_dir().join(format!("devhub-private-check-{}-{n}", std::process::id())));
+        let fail = |what: &Path, e: std::io::Error| vec![format!("private check: staging {}: {e}", what.display())];
+        std::fs::create_dir_all(&staged.0).map_err(|e| fail(&staged.0, e))?;
+        let src = scanner_dir();
+        for entry in std::fs::read_dir(&src).map_err(|e| fail(&src, e))? {
+            let entry = entry.map_err(|e| fail(&src, e))?;
+            if entry.file_type().map_err(|e| fail(&entry.path(), e))?.is_file() {
+                let body = std::fs::read(entry.path()).map_err(|e| fail(&entry.path(), e))?;
+                std::fs::write(staged.0.join(entry.file_name()), body).map_err(|e| fail(&entry.path(), e))?;
+            }
+        }
+        Ok(staged)
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Checks the added lines of `diff` (unified, `git diff -U0` shape) and the `messages`, given as
+/// (label, text). Err holds every hit and a last `private: <N> hit(s): ...` line, or why the
+/// check could not run.
+pub fn private_check(root: &Path, diff: &str, messages: &[(String, String)]) -> Result<(), Vec<String>> {
+    if diff.is_empty() && messages.is_empty() {
+        return Ok(());
+    }
+    let staged = Staged::new()?;
+    let mut hits = Vec::new();
+    if !diff.is_empty() {
+        hits.extend(scan(&staged, root, "diff", diff)?);
+    }
+    if !messages.is_empty() {
+        let mut text = String::new();
+        for (label, body) in messages {
+            text.push('\u{1}');
+            text.push_str(label);
+            text.push('\n');
+            text.push_str(body);
+            if !body.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        hits.extend(scan(&staged, root, "messages", &text)?);
+    }
+    if hits.is_empty() {
+        return Ok(());
+    }
+    hits.push(format!("private: {} hit(s): write \"a Linux node\", \"the Mac\", \"a 24 GB GPU\" or 192.0.2.x and repo-relative paths (AGENTS.md)", hits.len()));
+    Err(hits)
+}
+
+/// The land gate: what merging `sha` onto `base` as `tree` adds, and the messages it brings.
+pub fn merge_gate(root: &Path, base: &str, sha: &str, tree: &str) -> Result<(), Vec<String>> {
+    let diff = git(root, &["diff", "-U0", "--no-color", "--no-ext-diff", "--no-renames", base, tree])?;
+    let log = git(root, &["log", "--format=%x01%h%n%B", &format!("{base}..{sha}")])?;
+    let messages: Vec<(String, String)> = log
+        .split('\u{1}')
+        .filter(|m| !m.is_empty())
+        .map(|m| {
+            let (sha, body) = m.split_once('\n').unwrap_or((m, ""));
+            (format!("message of {sha}"), body.to_string())
+        })
+        .collect();
+    private_check(root, &diff, &messages)
+}
+
+fn git(root: &Path, args: &[&str]) -> Result<String, Vec<String>> {
+    let out = Command::new(crate::os::tool("git")).arg("-C").arg(root).args(args).output().map_err(|e| vec![format!("private check: git: {e}")])?;
+    if !out.status.success() {
+        return Err(vec![format!("private check: git {} failed: {}", args[0], String::from_utf8_lossy(&out.stderr).trim())]);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The commit-msg hook of `repo`'s shared git dir (every worktree of it: a lane's makepad and
+/// commercial halves alike) runs the private check on each message as it is written: one
+/// naming a machine, an address or a user path is refused at the commit, never first at the
+/// land (11-03: three such commits spread into 10 lane branches). `scan` is the makepad
+/// checkout's `tools/private_check/scan.sh`. The tracked hook (tools/private_check/hooks) is kept,
+/// devhub's own is brought up to `scan`; any other hook is an error, never overwritten.
+pub fn install_message_check(repo: &Path, scan: &Path) -> Result<(), String> {
+    const CHECK: &str = "# The private-data check on the commit message (AGENTS.md)";
+    const OURS: &str = "installed by devhub";
+    let p = crate::gitread::paths(repo).ok_or_else(|| format!("message check: no repository at {}", repo.display()))?;
+    let hook = p.common_dir.join("hooks/commit-msg");
+    let scan = scan.to_string_lossy();
+    if scan.contains('\'') {
+        return Err(format!("message check: {scan}: a quote in the path"));
+    }
+    let body = format!("#!/bin/sh\n{CHECK}, {OURS} for every\n# worktree of this repository. Never commit with --no-verify.\nexec sh '{scan}' msg \"$1\"\n");
+    match std::fs::read_to_string(&hook) {
+        Ok(text) if text == body || (text.contains(CHECK) && !text.contains(OURS)) => return Ok(()),
+        Ok(text) if !text.contains(CHECK) => return Err(format!("message check: {} is a commit-msg hook of its own; the private check needs that hook", hook.display())),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("message check: {}: {e}", hook.display())),
+    }
+    let fail = |e: std::io::Error| format!("message check: {}: {e}", hook.display());
+    std::fs::create_dir_all(p.common_dir.join("hooks")).map_err(fail)?;
+    let next = hook.with_extension("next");
+    std::fs::write(&next, body).map_err(fail)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&next, std::os::unix::fs::PermissionsExt::from_mode(0o755)).map_err(fail)?;
+    std::fs::rename(&next, &hook).map_err(fail)
+}
+
+/// The private check's other hooks in `repo`'s shared git dir, beside its message check
+/// ([`install_message_check`]), for every worktree of it: the staged diff (pre-commit) and what a
+/// push sends (pre-push: each pushed commit's diff and message, `<sha> --not --remotes`), each
+/// running `scan`, the makepad checkout's. The tracked hooks (tools/private_check/hooks) find the
+/// scanner beside the git dir, which a nested repository has none of: one copied into makepad/apps
+/// would refuse every commit (11-22), and commercial's pushes went out unscanned. A tracked hook is
+/// kept, devhub's own is brought up to `scan`. Another pre-commit is said and left as it is; a
+/// repository's own pre-push policy (commercial's) moves to `pre-push.own` once, and runs after the
+/// check with the same refs and arguments. What it could not install, said (empty: all in place).
+pub fn install_checks(repo: &Path, scan: &Path) -> Vec<String> {
+    let Some(p) = crate::gitread::paths(repo) else { return vec![format!("private check hooks: no repository at {}", repo.display())] };
+    let s = scan.to_string_lossy();
+    if s.contains('\'') {
+        return vec![format!("private check hooks: {s}: a quote in the path")];
+    }
+    let hooks = p.common_dir.join("hooks");
+    let mut said = Vec::new();
+    let pre_commit = format!("#!/bin/sh\n{STAGED_CHECK}, {BY_DEVHUB} for every\n# worktree of this repository. Never commit with --no-verify.\nexec sh '{s}' staged\n");
+    let pre_push = format!("#!/bin/sh\n{PUSH_CHECK}, {BY_DEVHUB} for every\n# worktree of this repository: each pushed commit's diff and message. The repository's own\n# policy, pre-push.own beside this, runs after it with the same refs. Never push with --no-verify.\nz=0000000000000000000000000000000000000000\nrefs=$(cat)\nprintf '%s\\n' \"$refs\" | while read -r lref lsha rref rsha; do\n    {{ [ -z \"$lsha\" ] || [ \"$lsha\" = \"$z\" ]; }} && continue\n    sh '{s}' commits \"$lsha\" --not --remotes >&2 || {{ echo \"pre-push: REFUSED $lref -> $rref: private data (above)\" >&2; exit 1; }}\ndone || exit 1\nown=\"$(dirname \"$0\")/pre-push.own\"\nif [ -x \"$own\" ]; then printf '%s\\n' \"$refs\" | \"$own\" \"$@\"; exit $?; fi\nexit 0\n");
+    for (name, check, body) in [("pre-commit", STAGED_CHECK, pre_commit), ("pre-push", PUSH_CHECK, pre_push)] {
+        let hook = hooks.join(name);
+        let fail = |e: std::io::Error| format!("private check hooks: {}: {e}", hook.display());
+        match std::fs::read_to_string(&hook) {
+            Ok(text) if text == body || (text.contains(check) && !text.contains(BY_DEVHUB)) => continue,
+            Ok(text) if !text.contains(check) => {
+                let own = hooks.join(format!("{name}.own"));
+                if name != "pre-push" || own.exists() {
+                    said.push(format!("private check hooks: {} is a {name} hook of its own; the private check needs that hook", hook.display()));
+                    continue;
+                }
+                if let Err(e) = std::fs::rename(&hook, &own) {
+                    said.push(fail(e));
+                    continue;
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => { said.push(fail(e)); continue; }
+        }
+        let next = hook.with_extension("next");
+        let wrote = std::fs::create_dir_all(&hooks).and_then(|_| std::fs::write(&next, &body));
+        #[cfg(unix)]
+        let wrote = wrote.and_then(|_| std::fs::set_permissions(&next, std::os::unix::fs::PermissionsExt::from_mode(0o755)));
+        if let Err(e) = wrote.and_then(|_| std::fs::rename(&next, &hook)) {
+            said.push(fail(e));
+        }
+    }
+    said
+}
+
+/// The first line of the tracked pre-commit hook's comment, and of devhub's.
+const STAGED_CHECK: &str = "# The private-data check on the staged diff (AGENTS.md)";
+/// The first line of the tracked pre-push hook's comment, and of devhub's.
+const PUSH_CHECK: &str = "# The private-data check on everything a push sends";
+/// What marks a hook as devhub's (brought up to the scanner it names).
+const BY_DEVHUB: &str = "installed by devhub";
+
+/// The makepad checkout's scanner, for [`install_message_check`].
+pub fn scan_in(makepad_root: &Path) -> PathBuf {
+    makepad_root.join("tools/private_check/scan.sh")
+}
+
+/// One scan.sh run over `input`; Ok holds its hit lines (none when clean).
+fn scan(staged: &Staged, root: &Path, mode: &str, input: &str) -> Result<Vec<String>, Vec<String>> {
+    let script = staged.0.join("scan.sh");
+    let mut child = Command::new(crate::os::tool("sh"))
+        .arg(&script)
+        .arg(mode)
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| vec![format!("private check: cannot run {}: {e}", script.display())])?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let input = input.to_string();
+    // the scan writes hits while it reads: feed it from a thread so neither pipe fills up
+    let feed = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let out = child.wait_with_output().map_err(|e| vec![format!("private check: {mode}: {e}")])?;
+    let _ = feed.join();
+    match out.status.code() {
+        Some(0) => Ok(Vec::new()),
+        Some(1) => Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.starts_with("private: ")).map(str::to_string).collect()),
+        _ => Err(vec![format!("private check: {} {mode} failed: {}", script.display(), String::from_utf8_lossy(&out.stderr).trim())]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn root() -> PathBuf {
+        std::env::temp_dir()
+    }
+
+    // (the scan is a shell script; landings run on the master, a Windows box may have no `sh`)
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_diff_and_message_pass_and_hits_name_file_line_and_rule() {
+        let clean = "+++ b/a.rs\n@@ -0,0 +1,2 @@\n+fn main() {}\n+// on 192.0.2.10 and 10.77.0.3\n";
+        assert_eq!(private_check(&root(), clean, &[("message of x".into(), "a clean subject\n".into())]), Ok(()));
+        // built at run time, so this file never holds the shapes it tests
+        let dirty = format!("+++ b/a.rs\n@@ -0,0 +1,2 @@\n+ok\n+let host = \"10.{}.2.3\";\n", 1);
+        let message = format!("subject\n\nfrom /{}/somebody/x\n", "home");
+        let hits = private_check(&root(), &dirty, &[("message of y".into(), message)]).unwrap_err();
+        assert_eq!(hits[..2], ["a.rs:2: lan-address".to_string(), "message of y:3: home-path".to_string()]);
+        assert!(hits[2].starts_with("private: 2 hit(s)"), "{hits:?}");
+    }
+
+    /// An address written as Rust's byte array or with Ipv4Addr::new is an address too: a test's
+    /// `[10, 0, 0, N].into()` went public unseen (11-05). The documentation and test ranges, and
+    /// arrays that are no address, stay fine.
+    #[cfg(unix)]
+    #[test]
+    fn an_address_as_a_byte_array_or_an_ipv4addr_is_one() {
+        let hit = |s: &str| private_check(&root(), &format!("+++ b/a.rs\n@@ -0,0 +1 @@\n+{s}\n"), &[]).err().is_some_and(|h| h[0] == "a.rs:1: lan-address");
+        // built at run time, so this file never holds the shapes it tests
+        for s in [format!("Some([{}, 0, 0, 222].into())", 10), format!("Ipv4Addr::new({}, 1, 2, 3)", 10), format!("Ipv4Addr::new({},0,0,9)", 10), format!("[{}, 168, 1, 20]", 192), format!("Ipv4Addr::new(172, {}, 0, 1)", 20), format!("[172, {}, 4, 5]", 16)] {
+            assert!(hit(&s), "{s}");
+        }
+        for s in ["Some([192, 0, 2, 1].into())", "Ipv4Addr::new(127, 0, 0, 1)", "[10, 20, 30, 40]", "Ipv4Addr::new(10, 77, 0, 3)", "[192, 168, 77, 1]", "[172, 16, 77, 2]", "[172, 15, 0, 1]"] {
+            assert!(!hit(s), "{s}");
+        }
+    }
+
+    /// A node's number used as its machine's name is one: "<N>'s", "<N>, <date>", "<N> sat", and in
+    /// parentheses with a date, "(<N>: ...)" and "held <N> at" (a test string and two comments got
+    /// past the other shapes, 11-07), and a job named after its box, "prebuild-<N>" (two doc
+    /// comments, 11-08). Seven such comments reached work through the hooks (11-06), and "<N>
+    /// held" and a test's `Node::new("<name>", ...)` with its session `"<name>.0"` got past them
+    /// (11-21): a Mac's name quoted beside node or host, or with an instance number, is one too,
+    /// and the same short name quoted alone (a screw's size) is none. An exit code, a count, a
+    /// lease or a line number is none, and without the untracked file's numbers and names the
+    /// shapes are off. Fake numbers and a fake name here, defined as the untracked file defines
+    /// the real ones; the tree scan takes the same rules. A message also names none of the fleet's
+    /// machines as a bare word, from devhub's own list of them ("then avoided <name>" reached
+    /// work, 11-24); a diff or the tree may (a matrix's or a size's name), and so may a capital (a
+    /// product's), a longer word or a number (a count).
+    #[cfg(unix)]
+    #[test]
+    fn a_node_number_as_a_machine_is_one_and_a_count_is_not() {
+        let staged = Staged::new().unwrap();
+        let defs = staged.0.join("fake-patterns");
+        std::fs::write(&defs, "define node-number 90[1-7]\ndefine mac-name qz9\n").unwrap();
+        // (and its fleet beside it, as nodes.conf lists one)
+        std::fs::write(defs.with_extension("nodes"), "# the fleet\n901 addr=192.0.2.1\nqz9 addr=192.0.2.9 # a Mac\nzorp.lan addr=192.0.2.7\n").unwrap();
+        let scan = |dir: &Path, patterns: &Path, args: &[&str], input: &str| {
+            let mut child = Command::new("sh").arg(staged.0.join("scan.sh")).args(args).current_dir(dir).env("MAKEPAD_PRIVATE_PATTERNS", patterns).env("MAKEPAD_NODES_CONF", patterns.with_extension("nodes")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+        };
+        let hit = |s: &str| scan(&root(), &defs, &["text", "t"], &format!("{s}\n")).contains("t:1: node-number");
+        for s in ["L1796519 903: cargo builds this tree's JIT first", "  L42 905: granted", "(903 sat as a bench box, 11-06)", "an override ended L515981, 905's lease", "(L515981, 905's, 11-06)", "the baseline: 901, 2026-11-06)", "(902, the bench box, 11-06)", "(11-06, 904)", "(11-06 on 901 and 902)", "906 crashed twice", "the build log 905's tail", "L5 gate: 1st in queue (901: waits)", "a landing gate held 902 at \"node busy\"", "gate held 902 behind four leases", "started on 903.", "on 903 and 904", "holds 905, the gate", "moved to 906)", "the box's prebuild-903 waited", "(warm-905)", "upkeep-901.", "kept by hash past them, 904 held", "905 holds the gate"] {
+            assert!(hit(s), "{s}");
+        }
+        for s in ["L903: granted", "L12 9031: x", "col12 903: y", "exit 901", "took(\"L2\", 902, 8)", "(exit 901, 11-06)", "L901's lease", "W903 sat", "#905's", "a.rs:901, 11-06", "line 902 is short", "903 ms (11-06)", "(11-06, 905 ms)", "test result: ok. 905 passed; 0 failed", "exit code 901 was its panic", "(took 902 ms, 11-06)", "v1.903's", "(901 ms, 11-06)", "the 9015's", "height: 904 is_multiline", "// 901 is indivisible by 3", "field 901 has trailing bytes", "sun_path holds 904 bytes", "on 901 files", "(901:3)", "from 900 to 907 ms", "exit 901: a::b", "OSC 904: reset", "above 905: limits", "held 9021 at", "the centre (WR-903)", "baked field-901 hits", "rfc-9035", "prebuild-9031", "test-902 fails", "lease 904 held", "9041 held"] {
+            assert!(!hit(s), "{s}");
+        }
+        let named = |s: &str| scan(&root(), &defs, &["text", "t"], &format!("{s}\n")).contains("t:1: node-name");
+        for s in ["L1796519 qz9: cargo builds", "(Node::new(\"qz9\", fake.clone(), clock, store), fake)", "n.open_session(\"qz9.0\", true)", "--host 'QZ9'", "the box `qz9` hung"] {
+            assert!(named(s), "{s}");
+        }
+        for s in ["L12 qz90: x", "HeatSet { name: \"QZ9\", diameter: 3.0 }", "g(\"qz9\", p)", "node(\"qz90\")", "node(\"aqz9\")", "\"qz9.x\"", "match n { -3 => \"qz9\" }"] {
+            assert!(!named(s), "{s}");
+        }
+        let fleet = |args: &[&str], s: &str| scan(&root(), &defs, args, &format!("{s}\n")).contains(": fleet-name");
+        for s in ["The lane then avoided qz9, the GPU target", "qz9's hub restarted", "(ran on zorp.lan)", "--node qz9"] {
+            assert!(fleet(&["text", "t"], s), "{s}");
+        }
+        assert!(fleet(&["messages"], "\u{1}message of a\nsubject\n\nran on qz9"), "a landing's messages");
+        for s in ["a QZ9 heat-set insert", "Qz9 screws", "qz90", "aqz9", "qz9x", "zorpXlan", "901 tests passed"] {
+            assert!(!fleet(&["text", "t"], s), "{s}");
+        }
+        assert!(!fleet(&["diff"], "+++ b/a.rs\n@@ -0,0 +1 @@\n+let m = qz9;"), "a diff's code is no message");
+        let none = staged.0.join("no-patterns");
+        std::fs::write(&none, "").unwrap();
+        assert_eq!(scan(&root(), &none, &["text", "t"], "(901, 11-06)\nNode::new(\"qz9.0\")\navoided qz9\n"), "", "no numbers, names or fleet list: the shapes are off");
+        // the tree scan: its candidate lines come from the same rules, defines put in
+        let repo = staged.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.txt"), "exit 903\n(903 sat, 11-06)\navoided qz9\n").unwrap();
+        let git = |args: &[&str]| crate::git_exec::command().arg("-C").arg(&repo).args(args).output().unwrap();
+        assert!(git(&["init", "-q", "--template="]).status.success() && git(&["add", "a.txt"]).status.success());
+        let tree = scan(&repo, &defs, &["tree"], "");
+        assert_eq!(tree.lines().next(), Some("a.txt:2: node-number"));
+        assert!(!tree.contains("fleet-name"), "the tree is no message: {tree}");
+    }
+
+    /// A lane's commit with a private shape in its message is refused as it is written, in both
+    /// repositories; a clean one goes in, and the hook stays as it is when installed again.
+    #[test]
+    fn a_commit_message_is_checked_when_it_is_written() {
+        let staged = Staged::new().unwrap();
+        let d = std::env::temp_dir().join(format!("devhub-msg-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let git = |dir: &Path, args: &[&str]| crate::git_exec::command().arg("-C").arg(dir).args(args).output().unwrap();
+        for repo in ["makepad", "commercial"] {
+            let r = d.join(repo);
+            std::fs::create_dir_all(&r).unwrap();
+            // (no template: a machine's own template hooks are not this test's)
+            assert!(git(&r, &["init", "-q", "--template=", "-b", "work"]).status.success());
+            install_message_check(&r, &d.join("moved/scan.sh")).unwrap();
+            install_message_check(&r, &staged.0.join("scan.sh")).unwrap();
+            install_message_check(&r, &staged.0.join("scan.sh")).unwrap();
+            let lane = d.join(format!("{repo}-lane"));
+            assert!(git(&r, &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "base"]).status.success());
+            assert!(git(&r, &["worktree", "add", "-q", "-b", "rc-lane", lane.to_str().unwrap()]).status.success());
+            let dirty = format!("subject\n\nfrom /{}/somebody/x\n", "home");
+            let refused = git(&lane, &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", &dirty]);
+            assert!(!refused.status.success(), "{repo}: {}", String::from_utf8_lossy(&refused.stderr));
+            let said = format!("{}{}", String::from_utf8_lossy(&refused.stdout), String::from_utf8_lossy(&refused.stderr));
+            assert!(said.contains("home-path"), "{repo}: {said}");
+            assert!(git(&lane, &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "a clean subject"]).status.success(), "{repo}");
+        }
+        std::fs::write(d.join("makepad/.git/hooks/commit-msg"), "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(install_message_check(&d.join("makepad"), &staged.0.join("scan.sh")).is_err(), "a hook of its own is never overwritten");
+        // a nested repository's staged diffs and pushes too (makepad/apps, 11-22): the scanner by its
+        // path, the repository's own pre-push policy kept and run after the check with the same refs
+        let apps = d.join("apps");
+        std::fs::create_dir_all(&apps).unwrap();
+        assert!(git(&apps, &["init", "-q", "--template=", "-b", "main"]).status.success());
+        std::fs::create_dir_all(apps.join(".git/hooks")).unwrap();
+        let own = "#!/bin/sh\ncat > \"$(dirname \"$0\")/../own-saw\"\n";
+        std::fs::write(apps.join(".git/hooks/pre-push"), own).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(apps.join(".git/hooks/pre-push"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(install_checks(&apps, &d.join("moved/scan.sh")), Vec::<String>::new());
+        assert_eq!(install_checks(&apps, &staged.0.join("scan.sh")), Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(apps.join(".git/hooks/pre-push.own")).unwrap(), own, "its own policy moved aside whole");
+        let commit = |args: &[&str]| git(&apps, &[&["-c", "user.name=t", "-c", "user.email=t@example.com"][..], args].concat());
+        std::fs::write(apps.join("a.txt"), format!("from /{}/somebody/x\n", "home")).unwrap();
+        assert!(git(&apps, &["add", "a.txt"]).status.success());
+        let refused = commit(&["commit", "-q", "-m", "a"]);
+        assert!(!refused.status.success() && format!("{}{}", String::from_utf8_lossy(&refused.stdout), String::from_utf8_lossy(&refused.stderr)).contains("home-path"), "the staged diff is checked: {refused:?}");
+        std::fs::write(apps.join("a.txt"), "clean\n").unwrap();
+        assert!(git(&apps, &["add", "a.txt"]).status.success() && commit(&["commit", "-q", "-m", "clean"]).status.success());
+        // a commit made past the hooks (as plumbing makes one): its push is refused, before the own policy runs
+        std::fs::write(apps.join("b.txt"), format!("/{}/somebody/y\n", "home")).unwrap();
+        assert!(git(&apps, &["add", "b.txt"]).status.success() && commit(&["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "b"]).status.success());
+        let remote = d.join("remote.git");
+        assert!(git(&d, &["init", "-q", "--bare", "--template=", remote.to_str().unwrap()]).status.success());
+        let pushed = git(&apps, &["push", "-q", remote.to_str().unwrap(), "main"]);
+        assert!(!pushed.status.success() && String::from_utf8_lossy(&pushed.stderr).contains("pre-push: REFUSED refs/heads/main"), "{pushed:?}");
+        assert!(!apps.join(".git/own-saw").exists(), "the own policy runs only after the check passed");
+        assert!(git(&apps, &["reset", "-q", "--hard", "HEAD~1"]).status.success());
+        assert!(git(&apps, &["push", "-q", remote.to_str().unwrap(), "main"]).status.success());
+        assert!(std::fs::read_to_string(apps.join(".git/own-saw")).unwrap().starts_with("refs/heads/main "), "the own policy read the same refs");
+        // a pre-commit of its own is said and left as it is
+        std::fs::write(apps.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+        let said = install_checks(&apps, &staged.0.join("scan.sh"));
+        assert!(said.len() == 1 && said[0].contains("a pre-commit hook of its own"), "{said:?}");
+        assert_eq!(std::fs::read_to_string(apps.join(".git/hooks/pre-commit")).unwrap(), "#!/bin/sh\nexit 0\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The scanner runs from a staged copy that is gone after the check.
+    #[test]
+    fn the_staged_scanner_is_the_checkouts_and_is_removed_after() {
+        let staged = Staged::new().unwrap();
+        let dir = staged.0.clone();
+        for f in ["scan.sh", "rules", "allow"] {
+            assert_eq!(std::fs::read(dir.join(f)).unwrap(), std::fs::read(scanner_dir().join(f)).unwrap(), "{f}");
+        }
+        drop(staged);
+        assert!(!dir.exists());
+    }
+}

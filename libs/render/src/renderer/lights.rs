@@ -1,0 +1,775 @@
+//! Static and frame lights: lamp harvest, daylight rails, light-map bake kick.
+
+use super::*;
+
+/// HDR lane light gains (see `Renderer::scale_frame_lights_hdr`).
+const HDR_LAMP_GAIN: f32 = 4.0;
+const HDR_CANDELA_GAIN: f32 = 0.02;
+
+type Bounds = (Vec3f, Vec3f);
+
+/// Present only on a level with required layers. A missing footprint means
+/// that pass has no ordinary geometry left to submit.
+pub(super) struct OrdinaryShadowBounds {
+    fixed: Option<Bounds>,
+    pub(super) contact: Option<Bounds>,
+    /// Indexed geometry bounds measured at marking, in each layer's own coordinates.
+    traced: Vec<(TracedLayer, GeometryId, Bounds)>,
+}
+
+enum TracedLayer {
+    Main,
+    Extra(usize),
+    Animated(usize, usize),
+    Driven(usize, usize),
+}
+
+fn include(bounds: &mut Option<Bounds>, (lo, hi): Bounds) {
+    *bounds = Some(match *bounds {
+        Some((a, b)) => (Vec3f::min_componentwise(a, lo), Vec3f::max_componentwise(b, hi)),
+        None => (lo, hi),
+    });
+}
+
+fn position(v: &[f32]) -> Vec3f { vec3f(v[0], v[1], v[2]) }
+
+/// Visit referenced corners only. A layer's index buffer can address a
+/// larger shared vertex stream, including positions owned by another layer.
+fn layer_corners<'a>(cx: &'a Cx, geometry: &Geometry) -> impl Iterator<Item = &'a [f32]> {
+    let (indices, vertices) = geometry.cpu_buffers(cx);
+    let stride = crate::model::MODEL_VERTEX_FLOATS;
+    let indices = indices.as_u32().expect("uploaded model indices");
+    let vertices = vertices.as_f32().expect("uploaded model vertices");
+    indices.iter().map(move |&i| &vertices[i as usize * stride..(i as usize + 1) * stride])
+}
+
+/// Match the prepared chart's flat winding normals. All other packed
+/// lanes retain the bits of the ordinary draw.
+fn flat_bake_stream(mut vertices: Vec<f32>) -> (Vec<u32>, Vec<f32>) {
+    let stride = crate::model::MODEL_VERTEX_FLOATS;
+    for tri in vertices.chunks_exact_mut(3 * stride) {
+        let a = position(tri);
+        let n = Vec3f::cross(position(&tri[stride..]) - a, position(&tri[2 * stride..]) - a);
+        let len = n.length();
+        let n = if len > 1.0e-12 { n * (1.0 / len) } else { vec3f(0.0, 1.0, 0.0) };
+        let (x, y) = crate::skin::oct_encode(n);
+        let packed = makepad_draw::pack_pair_f16(x, y);
+        for corner in tri.chunks_exact_mut(stride) { corner[3] = packed; }
+    }
+    ((0..(vertices.len() / stride) as u32).collect(), vertices)
+}
+
+impl UploadedStaticPreview {
+    /// Rebuild shared lighting inputs once at marking, before installation.
+    /// Geometry and collision handles on other clones still refer to the
+    /// original asset. Frame submission only reads the resulting handles.
+    pub(super) fn exclude_traced_from_shadows(&mut self, cx: &mut Cx) {
+        let chart = self.lm_source.as_ref().map(|s| (s.ao_w, s.ao_h));
+        let mut corners = Vec::new();
+        let mut fixed = None;
+        for (g, mat) in std::iter::once((&self.geometry, &self.material))
+            .chain(self.extra_draws.iter().map(|l| (&l.0, &l.4))) {
+            if mat.traced_required.is_some() { continue; }
+            for v in layer_corners(cx, g) {
+                let p = position(v);
+                include(&mut fixed, (p, p));
+                if chart.is_some() { corners.extend_from_slice(v); }
+            }
+        }
+        if let Some((w, h)) = chart {
+            self.lm_source = None;
+            self.bake_geometry = None;
+            if let Some((lo, hi)) = fixed {
+                let (indices, corners) = flat_bake_stream(corners);
+                let vertices = corners.chunks_exact(crate::model::MODEL_VERTEX_FLOATS);
+                let caster = crate::ao::MeshRaycaster::new(vertices.clone().map(position).collect(), indices.clone(), lo, hi);
+                let ao_uv = vertices.clone().map(|v| crate::model::unpack_ao_uv(v[6])).collect();
+                let albedo = vertices.map(|v| {
+                    let [r, g, b, _] = v[5].to_bits().to_le_bytes();
+                    vec3f(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+                }).collect();
+                self.lm_source = Some(std::sync::Arc::new(crate::lightmap::LmMeshSource::new(caster, ao_uv, albedo, w, h)));
+                let geometry = Geometry::new(cx);
+                geometry.update(cx, indices, corners);
+                self.bake_geometry = Some(std::rc::Rc::new(geometry));
+            }
+        }
+        let mut contact = fixed;
+        let part_bounds = |draws: &[(std::rc::Rc<Geometry>, Texture, Texture, [f32; 2], LayerMaterial)]| {
+            let mut bounds = None;
+            for (g, _, _, _, mat) in draws {
+                if mat.traced_required.is_some() { continue; }
+                for v in layer_corners(cx, g) {
+                    let p = position(v);
+                    include(&mut bounds, (p, p));
+                }
+            }
+            bounds
+        };
+        for part in &self.anim_parts {
+            if let Some(bounds) = part_bounds(&part.draws) {
+                for pose in std::iter::once(part.def.rest_transform())
+                    .chain(part.def.clip.times.iter().map(|t| part.def.transform_at(*t))) {
+                    include(&mut contact, crate::lightmap::world_bounds(&pose, bounds));
+                }
+            }
+        }
+        for part in &self.driven_parts {
+            if let Some(bounds) = part_bounds(&part.draws) {
+                include(&mut contact, crate::lightmap::world_bounds(&part.def.rest_transform(), bounds));
+            }
+        }
+        let mut traced = Vec::new();
+        let mut measure = |layer, geometry: &Geometry, material: &LayerMaterial| {
+            if material.traced_required.is_none() { return; }
+            let mut bounds = None;
+            for p in layer_corners(cx, geometry).map(position) { include(&mut bounds, (p, p)); }
+            if let Some(bounds) = bounds { traced.push((layer, geometry.geometry_id(), bounds)); }
+        };
+        if self.triangles > 0 { measure(TracedLayer::Main, &self.geometry, &self.material); }
+        for (i, layer) in self.extra_draws.iter().enumerate() {
+            measure(TracedLayer::Extra(i), &layer.0, &layer.4);
+        }
+        for (i, part) in self.anim_parts.iter().enumerate() {
+            for (j, layer) in part.draws.iter().enumerate() {
+                measure(TracedLayer::Animated(i, j), &layer.0, &layer.4);
+            }
+        }
+        for (i, part) in self.driven_parts.iter().enumerate() {
+            for (j, layer) in part.draws.iter().enumerate() {
+                measure(TracedLayer::Driven(i, j), &layer.0, &layer.4);
+            }
+        }
+        self.ordinary_shadow_bounds = Some(std::rc::Rc::new(OrdinaryShadowBounds { fixed, contact, traced }));
+    }
+}
+
+impl LoadedModel {
+    pub(super) fn visible_shadow_level(&self, distance: f32) -> &Self {
+        let level = self.lods.partition_point(|(threshold, _)| *threshold <= distance);
+        if level == 0 { self } else { &self.lods[level - 1].1 }
+    }
+
+    pub(super) fn collect_traced_groups(&self, inst: &ModelInstance, target: &ModelTarget, states: &ModelStates,
+        programs: &std::collections::BTreeMap<String, TracedProgram>,
+    ) {
+        let Some(bounds) = &self.ordinary_shadow_bounds else { return };
+        for (layer, geometry, local) in &bounds.traced {
+            let material = match *layer {
+                TracedLayer::Main => &self.material,
+                TracedLayer::Extra(i) => &self.extra_draws[i].4,
+                TracedLayer::Animated(i, j) => &self.anim_parts[i].draws[j].4,
+                TracedLayer::Driven(i, j) => &self.driven_parts[i].draws[j].4,
+            };
+            let Some((name, TracedLayerRole::Outside)) = &material.traced_required else { continue };
+            let Some(batch) = programs.get(name.as_ref()).and_then(|p| p.sun_batch.as_ref()) else { continue };
+            let transform = match *layer {
+                TracedLayer::Main | TracedLayer::Extra(_) => inst.transform,
+                TracedLayer::Animated(i, _) => Mat4f::mul(&inst.transform, &states.transform(target, &inst.model, &self.anim_parts[i].def)),
+                TracedLayer::Driven(i, _) => {
+                    let def = &self.driven_parts[i].def;
+                    let pose = inst.part_poses.iter().find(|p| p.connection == def.connection)
+                        .map_or_else(|| def.rest_transform(), |p| p.transform);
+                    Mat4f::mul(&inst.transform, &pose)
+                }
+            };
+            let (min, max) = crate::lightmap::world_bounds(&transform, *local);
+            batch.borrow_mut().groups.push(crate::gpu_lightmap::TracedGroup { geometry: *geometry, transform, min, max });
+        }
+    }
+
+    pub(super) fn fixed_shadow_bounds(&self) -> Option<Bounds> {
+        self.ordinary_shadow_bounds.as_ref().map_or(Some((self.min, self.max)), |s| s.fixed)
+    }
+
+    pub(super) fn same_shadow_layers(&self, other: &Self) -> bool {
+        self.ordinary_shadow_bounds.as_ref().map(std::rc::Rc::as_ptr)
+            == other.ordinary_shadow_bounds.as_ref().map(std::rc::Rc::as_ptr)
+            && self.lods.len() == other.lods.len()
+            && self.lods.iter().zip(&other.lods).all(|((_, a), (_, b))| a.same_shadow_layers(b))
+    }
+}
+
+impl Renderer {
+    pub(super) fn harvests_lamp(model: &str) -> bool {
+        let name = model.rsplit('/').next().unwrap_or(model);
+        name.contains("lamp") || name.contains("lantern") || name.contains("light")
+    }
+
+    /// Last frame's dynamic shadow-mesh triangles (entity hull drapes +
+    /// pre-sidecar blobs) — the budget the unattended debug cycle watches.
+    pub fn dynamic_shadow_triangles(&self) -> usize {
+        self.last_dynamic_shadow_tris
+    }
+
+    /// Explicit static lights for the light baker. Empty (the default)
+    /// harvests lamp props automatically at bake time.
+    pub fn set_static_lights(&mut self, lights: Vec<crate::lightmap::LmLight>) {
+        self.lm_lights = lights;
+        // The lamp cache and its selection grid mirror this set.
+        self.lamp_cache_rev = None;
+    }
+
+    /// Street lights from the placed props: any static model whose id reads
+    /// as a lamp gets a warm downlight at its head — the bulb sits near the
+    /// top of the model, so the anchor is measured from its bounds rather
+    /// than assumed.
+    ///
+    /// # Photometry comes from the FIXTURE, not from the mesh scale
+    ///
+    /// Only the bulb's POSITION follows the placement transform: the mesh was
+    /// scaled, so the bulb really did move. Strength and reach are solved
+    /// from the mount height instead
+    /// ([`lamp_photometry`](crate::lightmap::lamp_photometry)) so the pool on
+    /// the street is the same size and the same brightness whether the kit
+    /// was placed at ×1, ×2 or the road kits' canonical ×8.
+    ///
+    /// The flat `color: 2.0, radius: 8.0` this replaced looked
+    /// scale-independent and was not: the gather's falloff is
+    /// `(1 - d/radius)²`, so pinning the reach while the transform lifted the
+    /// bulb made delivered brightness a function of mesh scale. A 1.56 m
+    /// lantern at ×2 put 0.87 on the ground — MORE than the noon sun's 0.72
+    /// direct term — which is the white plaza pool this rewrite fixes; the
+    /// same lantern at ×8 lit nothing at all, its bulb hanging outside its
+    /// own 8 m reach.
+    pub(super) fn harvest_lamps(&self) -> Vec<crate::lightmap::LmLight> {
+        use crate::lightmap::lamp_photometry;
+        /// Warm street-lamp tint, normalised so its brightest component is 1
+        /// — `lamp_photometry` supplies the strength it is scaled by.
+        const TINT: Vec3f = Vec3f { x: 1.0, y: 0.775, z: 0.475 };
+        let mut out = Vec::new();
+        for (_, inst) in self.placed_models.live() {
+            if inst.dynamic {
+                continue;
+            }
+            if !Self::harvests_lamp(&inst.model) {
+                continue;
+            }
+            let Some(at) = self.static_models.iter().position(|(k, _)| *k == inst.model)
+            else {
+                continue;
+            };
+            let m = &self.static_models[at].1;
+            let mid_x = (m.min.x + m.max.x) * 0.5;
+            let mid_z = (m.min.z + m.max.z) * 0.5;
+            let head = m.max.y - (m.max.y - m.min.y) * 0.12;
+            let at_world = |y: f32| {
+                inst.transform
+                    .transform_vec4(Vec4f { x: mid_x, y, z: mid_z, w: 1.0 })
+                    .to_vec3f()
+            };
+            let p = at_world(head);
+            // The pole's own foot IS the ground it stands on, whatever the
+            // terrain does — measured under the same transform, so the mount
+            // height is exact for any scale, yaw or tilt.
+            let mount = p.y - at_world(m.min.y).y;
+            let (radius, strength) = lamp_photometry(mount);
+            out.push(crate::lightmap::LmLight {
+                pos: p,
+                color: TINT * strength,
+                radius,
+                // A street light is a downlight: full spot kills the glow
+                // it was painting on the roof BESIDE its own head.
+                dir: vec3f(0.0, -1.0, 0.0),
+                spot: 1.0,
+                ..Default::default()
+            });
+        }
+        out
+    }
+
+    /// THE static light list for this sun: harvested fixtures (or the
+    /// host's hand-set lights) with both rails applied, exactly once.
+    ///
+    /// One entry point on purpose — [`Self::rail_lamp_pools`]'s daylight
+    /// scale is a MULTIPLIER, so applying it twice would square it. The
+    /// bake and the per-frame analytic list must both come through here, or
+    /// a static and a character standing on the same texel disagree about
+    /// how bright the lamp above them is.
+    pub(super) fn static_lights_for(&self, sun: &SunLight) -> Vec<crate::lightmap::LmLight> {
+        let mut lights = if self.lm_lights.is_empty() {
+            self.harvest_lamps()
+        } else {
+            self.lm_lights.clone()
+        };
+        if self.clustered_enabled {
+            // Preserve authored day/night dimming, but there is no 8-bit
+            // lamp atlas whose saturation should cap a realtime light. The
+            // HDR lane has no headroom to protect at all: a lamp is simply
+            // switched by daylight, like a photocell, by the frame's own
+            // sun (`light_daylight`), not by whatever key lights the rig.
+            let day = if self.hdr_output { Self::lamp_photocell(self.light_daylight) } else { Self::lamp_daylight_scale(sun) };
+            for light in &mut lights { light.color = light.color * day; }
+        } else {
+            Self::rail_lamp_pools(&mut lights, sun);
+        }
+        lights
+    }
+
+    /// The sanity rails on static lights, applied wherever a lamp list is
+    /// built so the baked atlas and the analytic per-frame term never
+    /// disagree. Two of them, in order:
+    ///
+    /// 1. **Daylight headroom** — a lamp may only add the light the sky is
+    ///    not already delivering
+    ///    ([`lamp_daylight_scale`](crate::lightmap::lamp_daylight_scale)).
+    ///    This is the rail on the SUM that reaches the screen, and the one
+    ///    that stops a 0.30 pool painting a near-white plaza to 1.26 under a
+    ///    noon sun.
+    /// 2. **Atlas saturation** — no single light may clip the light atlas
+    ///    over more than
+    ///    [`LM_LAMP_SAT_TEXELS`](crate::lightmap::LM_LAMP_SAT_TEXELS) ground
+    ///    texels. `harvest_lamps` sizes its fixtures so this never fires;
+    ///    hand-set lights (`set_static_lights`) go through no such solve, and
+    ///    one of those must still not be able to paint a plaza white.
+    ///
+    /// A light's implied mount is what its reach leaves over the pool it is
+    /// meant to cover — exact for anything `lamp_photometry` sized.
+    pub(super) fn rail_lamp_pools(lights: &mut [crate::lightmap::LmLight], sun: &SunLight) {
+        use crate::lightmap::{cap_lamp_pool, LM_LAMP_POOL_RADIUS, LM_LAMP_SAT_DENSITY};
+        let day = Self::lamp_daylight_scale(sun);
+        if day < 1.0 {
+            for l in lights.iter_mut() {
+                l.color = l.color * day;
+            }
+        }
+        let mut capped = 0usize;
+        for l in lights.iter_mut() {
+            let mount = (l.radius - LM_LAMP_POOL_RADIUS).max(0.25);
+            if cap_lamp_pool(l, mount, LM_LAMP_SAT_DENSITY) < 1.0 {
+                capped += 1;
+            }
+        }
+        if capped > 0 {
+            log!(
+                "lamp bake: {capped} of {} static lights dimmed — their pool clipped the light atlas over more than {} texels",
+                lights.len(),
+                crate::lightmap::LM_LAMP_SAT_TEXELS as u32
+            );
+        }
+    }
+
+    /// This sun's daylight headroom factor for every static lamp — the one
+    /// number that ties the lamp list to the sky. Read by the rail and by
+    /// the bake/lamp-cache keys, so a sun change that MOVES it re-kicks the
+    /// bake and a sun change that does not costs nothing.
+    pub(super) fn lamp_daylight_scale(sun: &SunLight) -> f32 {
+        crate::lightmap::lamp_daylight_scale(crate::lightmap::daylight_on_ground(
+            sun.dir, sun.color, sun.sky,
+        ))
+    }
+
+    /// The daylight scale as a cache key: quantized to 1/32 so a day cycle
+    /// re-bakes when the lamps CHANGE STRENGTH and never on a
+    /// floating-point wobble of the sun. One step is 3% of the pool peak —
+    /// 0.009 of light, under a byte on the brightest albedo there is.
+    pub(super) fn lamp_daylight_key(&self, sun: &SunLight) -> u32 {
+        if self.hdr_output && self.clustered_enabled {
+            return 1000 + (Self::lamp_photocell(self.light_daylight) * 32.0).round() as u32;
+        }
+        Self::legacy_daylight_key(sun)
+    }
+
+    pub(super) fn legacy_daylight_key(sun: &SunLight) -> u32 {
+        (Self::lamp_daylight_scale(sun) * 32.0).round() as u32
+    }
+
+    /// The HDR lane's street-lamp switch: fully on once the sun is 2 degrees
+    /// below the horizon, off by 8 degrees above it, a smooth dusk ramp
+    /// between — the photocell behaviour of a real lamp. `daylight` points
+    /// at the SUN (renderer/env_sun.rs `daylight_dir`), never at a moon that
+    /// lights the frame: under a moonlit sky the lamps are on.
+    pub(super) fn lamp_photocell(daylight: Vec3f) -> f32 {
+        let elev = daylight.y.clamp(-1.0, 1.0).asin().to_degrees();
+        let x = ((8.0 - elev) / 10.0).clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    }
+
+    /// HDR lane: lift this frame's light list into linear, scene-referred
+    /// units. Street lamps, entity lights and flashes were sized as
+    /// display-space pools (a 0.30 ground peak); glTF punctual lights are
+    /// candela (inverse-square) and are brought onto the same scale.
+    pub(super) fn scale_frame_lights_hdr(&mut self) {
+        for l in &mut self.frame_lights {
+            let gain = if l.spot < 0.0 { HDR_CANDELA_GAIN } else { HDR_LAMP_GAIN };
+            l.color = l.color * gain;
+        }
+    }
+
+    /// Transient lights for THIS frame, on top of the per-frame list the
+    /// renderer builds itself (street lamps + firework flashes). For hosts:
+    /// muzzle flashes, spell impacts, anything that lives a few frames.
+    /// Consumed by the next `draw_scene` call; never baked, so statics
+    /// receive these analytically too.
+    pub fn add_asset_frame_lights(&mut self,lights:Vec<crate::lightmap::LmLight>)->Result<(),String>{
+        // Never refused: the frame budget keeps the lights that matter.
+        self.host_asset_lights.extend(lights);Ok(())
+    }
+    pub fn add_frame_lights(&mut self, lights: Vec<crate::lightmap::LmLight>) {
+        self.host_lights.extend(lights);
+    }
+
+    /// Rebuild this frame's dynamic light list: harvested lamps first (they
+    /// are the `frame_baked_count` prefix — already in the baked atlas, so
+    /// only dynamic geometry may add them analytically), then transients.
+    pub(super) fn build_frame_lights(&mut self, sun: &SunLight) {
+        // The SUN is part of the key: the daylight-headroom rail makes a
+        // lamp's strength a function of the sky, so a day cycle that dims
+        // the pools must dim them for dynamics too — the analytic term and
+        // the baked atlas are the same lamp seen twice and may never
+        // disagree.
+        let key = (self.models_rev, self.lamp_daylight_key(sun));
+        if self.lamp_cache_rev != Some(key) {
+            // The same list the bake snapshots, through the same rails.
+            self.lamp_cache = self.static_lights_for(sun);
+            self.lamp_cache_rev = Some(key);
+            // The static-light selection grid lives and dies with the lamp
+            // set — rebuilt HERE, on the settle path, never per frame. This
+            // is what keeps runtime selection O(1) at any light count.
+            if !self.clustered_enabled {
+                self.light_grid = LightGrid::build(&self.lamp_cache, LIGHT_GRID_CELL);
+            }
+            self.light_cell_memory.clear();
+        }
+        self.frame_lights.clear();
+        self.frame_lights.extend(self.lamp_cache.iter().cloned());
+        self.frame_baked_count = self.frame_lights.len();
+        for f in &self.firework_instances {
+            if let Some(l) = firework_flash_light(f) {
+                self.frame_lights.push(l);
+            }
+        }
+        // Authored emitters are analytic lights even on static geometry;
+        // their glTF intensity is not part of the legacy AO bake.
+        let authored_start=self.frame_lights.len();
+        if self.clustered_enabled{
+        // Only models that carry emitters are looked up (most carry none,
+        // and a scattered forest is thousands of copies a frame).
+        let emitting: Vec<&(String, LoadedModel)> = self.static_models.iter().filter(|(_, m)| !m.emitters.is_empty()).collect();
+        if !emitting.is_empty() {
+        for(target,instance)in self.placed_models.live().map(|(i,m)|(ModelTarget::Instance(i),m)).chain(self.world_attachments.iter().enumerate().map(|(i,m)|(ModelTarget::Attachment(i),m))){
+            if let Some((_, model)) = emitting.iter().copied().find(|(id,_)|id == &instance.model) {
+                for emitter in model.emitters.iter() {
+                    let node=emitter.animation.as_ref().and_then(|hierarchy|self.model_anim_state.clip(&target,&instance.model).map(|playback|hierarchy.transform_named_weighted(playback.name.as_deref(),playback.name.as_ref().map(|_|playback.time),playback.looping,playback.weight)));
+                    self.frame_lights.push(emitter.placed_at(&instance.transform,node,self.model_anim_state.idle_time));
+                }
+            }
+        }
+        }
+        self.frame_lights.append(&mut self.host_asset_lights);
+        }else{self.host_asset_lights.clear();}
+        let authored=self.frame_lights.len()-authored_start;
+        match self.check_asset_light_count(authored) {
+            Err(error)=>self.report_asset_light_error(error),
+            Ok(())=>self.asset_light_error=None,
+        }
+        budget_authored_lights(&mut self.frame_lights, authored_start, self.light_eye, crate::asset_lights::MAX_ASSET_FRAME_LIGHTS);
+        // The streamed city's own lights (street lamps, stand-in cars'
+        // headlights) that survived the budget, for the host's cost report.
+        self.frame_stream_lights = self.stream_light_count.min(self.frame_lights.len() - authored_start);
+        self.frame_lights.append(&mut self.host_lights);
+    }
+
+    /// Snapshot the static scene and schedule the GPU bake. Called on the
+    /// same settle-debounced cadence as the static shadow rebuild — a burst
+    /// of edits pays one bake, after the world goes still. A newer kick
+    /// replaces a pending one wholesale (the baker re-plans the layout).
+    pub(super) fn kick_lightmap_bake(
+        &mut self,
+        world: &World,
+        sun: &SunLight,
+        trigger: crate::gpu_lightmap::BakeTrigger,
+    ) {
+        if self.atlas_borrowed || !self.world_atlas_required() { return; }
+        self.gpu_baker.caster_ready_kick = false;
+        if let Some(job) = self.lightmap_bake_job(world, sun, trigger) {
+            self.gpu_baker.schedule(job);
+        } else {
+            self.clear_delivered_lightmap();
+        }
+    }
+
+    pub(super) fn lightmap_bake_job(
+        &self, world: &World, sun: &SunLight, trigger: crate::gpu_lightmap::BakeTrigger,
+    ) -> Option<crate::gpu_lightmap::GpuBakeJob> {
+        let mut meshes = Vec::new();
+        let mut mesh_map = Vec::new();
+        let mut mesh_geometry = Vec::new();
+        let mut mesh_materials = Vec::new();
+        let mut casters_only = Vec::new();
+        let mut extra_layers = Vec::new();
+        for (pi, inst) in self.placed_models.live() {
+            if inst.dynamic {
+                continue;
+            }
+            let Some(at) = self.static_models.iter().position(|(k, _)| *k == inst.model)
+            else {
+                continue;
+            };
+            if self.static_models[at].1.morph.is_some() { continue; }
+            let Some(src) = &self.static_models[at].1.lm_source else {
+                // No AO layout, no region — but it still casts: sun-depth
+                // passes take its render geometry at its transform.
+                let m = &self.static_models[at].1;
+                let first = casters_only.len();
+                if let Some(bounds) = m.fixed_shadow_bounds() {
+                    let (lo, hi) = crate::lightmap::world_bounds(&inst.transform, bounds);
+                    if !casts_as_caster_only(self.model_casts_shadow.get(&inst.model).copied(), m.prelit, lo, hi) {
+                        continue;
+                    }
+                    Self::push_static_caster_layers(
+                        &self.custom_draws, m, inst, (lo, hi), &mut casters_only, None,
+                    );
+                }
+                // At most one footprint per copy. A required-only copy contributes none.
+                if casters_only.len() > first + 1 {
+                    extra_layers.extend(casters_only.drain(first + 1..));
+                }
+                continue;
+            };
+            if std::env::var_os("MAKEPAD_GPU_LM_REGIONS").is_some() {
+                // TEMP instrumentation: name each region's model and give the
+                // exact chart uv -> world map of its two largest up-facing
+                // triangles, so an atlas dump's texels map back to world.
+                let k = meshes.len();
+                let mut tris: Vec<(f32, u32)> = Vec::new();
+                for t in 0..src.caster.tri_count() as u32 {
+                    let (a, b, c) = src.caster.triangle(t);
+                    let ab = b - a;
+                    let ac = c - a;
+                    let n = Vec3f {
+                        x: ab.y * ac.z - ab.z * ac.y,
+                        y: ab.z * ac.x - ab.x * ac.z,
+                        z: ab.x * ac.y - ab.y * ac.x,
+                    };
+                    let area2 = (n.x * n.x + n.y * n.y + n.z * n.z).sqrt();
+                    if area2 > 1e-9 && n.y / area2 > 0.9 {
+                        tris.push((area2, t));
+                    }
+                }
+                tris.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+                for (_, t) in tris.iter().take(24) {
+                    let vs = src.caster.triangle_verts(*t);
+                    let (a, b, c) = src.caster.triangle(*t);
+                    let w = |p: Vec3f| {
+                        let q = inst.transform.transform_vec4(Vec4f { x: p.x, y: p.y, z: p.z, w: 1.0 });
+                        (q.x, q.y, q.z)
+                    };
+                    let uvs: Vec<[f32; 2]> =
+                        vs.iter().map(|i| src.ao_uv[*i as usize]).collect();
+                    let (wa, wb, wc) = (w(a), w(b), w(c));
+                    log!(
+                        "lmtri {} {} uv({:.4},{:.4})({:.4},{:.4})({:.4},{:.4}) w({:.2},{:.2},{:.2})({:.2},{:.2},{:.2})({:.2},{:.2},{:.2})",
+                        k, inst.model,
+                        uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1], uvs[2][0], uvs[2][1],
+                        wa.0, wa.1, wa.2, wb.0, wb.1, wb.2, wc.0, wc.1, wc.2,
+                    );
+                }
+            }
+            meshes.push(crate::lightmap::LmMeshInstance {
+                source: src.clone(),
+                transform: inst.transform,
+            });
+            mesh_map.push(pi);
+            // The FLAT-WINDING-normal variant: the gather's backface test
+            // must see what the CPU rays saw (lm_source implies it exists).
+            let m = &self.static_models[at].1;
+            let material = if inst.layer_materials.is_empty() {
+                inst.material_of("").and_then(|b| Self::caster_for(&self.custom_draws, b))
+                    .and_then(|caster| {
+                        std::iter::once((&m.texture, &m.material))
+                            .chain(m.extra_draws.iter().map(|draw| (&draw.1, &draw.4)))
+                            .find(|(_, layer)| layer.traced_required.is_none())
+                            .map(|(base, _)| caster.material(base))
+                    })
+            } else {
+                None
+            };
+            mesh_materials.push(material);
+            mesh_geometry.push(
+                m.bake_geometry
+                    .as_ref()
+                    .map(|g| g.geometry_id())
+                    .unwrap_or_else(|| m.geometry.geometry_id()),
+            );
+        }
+        // ONE ground light field for the whole scene: a synthetic heightfield
+        // of terrain ∪ static box tops (roads, slabs, platforms), addressed
+        // by world xz. Terrain tiles and every cube top sample this same
+        // region, which is what lets a box road receive a house's shadow
+        // without cubes carrying any lightmap data at all.
+        let mut terrain_world = None;
+        let mut planars = Vec::new();
+        {
+            // Bounds from the STATICS, not the terrain: a big terrain would
+            // stretch the single ground region over empty grass and starve
+            // the shadows of texels (the village measured ~40cm/texel that
+            // way). Terrain outside the field renders fully lit — the
+            // shaders test the rect rather than clamp-smearing its border.
+            // Every static the bake knows: the boxes that receive, the charted
+            // regions and the caster-only copies (their shadows land on the
+            // ground beside them).
+            let statics = self.receiver_boxes.iter().copied()
+                .chain(meshes.iter().map(|m| m.world_bounds()))
+                .chain(casters_only.iter().map(|m| (m.min, m.max)));
+            if let Some((lo_x, lo_z, span, full)) = ground_field_window(statics) {
+                if full > span {
+                    log!(
+                        "ground light field: the statics span {full:.0} m, past the {GROUND_FIELD_MAX_SPAN:.0} m field; it covers x {lo_x:.0}..{:.0}, z {lo_z:.0}..{:.0} around their footprint-weighted centre, and ground outside it reads sunlit",
+                        lo_x + span,
+                        lo_z + span,
+                    );
+                }
+                let n = ((span * crate::lightmap::LM_PLANAR_TEXELS_PER_UNIT) as usize + 2)
+                    .clamp(2, 1025);
+                let cell = span / (n - 1) as f32;
+                let mut heights = vec![0.0f32; n * n];
+                for gz in 0..n {
+                    for gx in 0..n {
+                        let x = lo_x + gx as f32 * cell;
+                        let z = lo_z + gz as f32 * cell;
+                        let mut h = world
+                            .terrain
+                            .as_ref()
+                            .and_then(|t| t.height_at(x, z))
+                            .unwrap_or(0.0);
+                        for (bmin, bmax) in &self.receiver_boxes {
+                            if x >= bmin.x - cell
+                                && x <= bmax.x + cell
+                                && z >= bmin.z - cell
+                                && z <= bmax.z + cell
+                                // GROUNDED boxes only: a road slab or crate
+                                // resting on the terrain IS the ground there
+                                // and should receive shadows at its top. A
+                                // FLOATING platform is not — hoisting the
+                                // field to its top swallowed the shadow it
+                                // casts on the grass below, leaving hollow
+                                // rim shadows around a lit footprint.
+                                && bmin.y - h <= 0.75
+                            {
+                                h = h.max(bmax.y);
+                            }
+                        }
+                        heights[gz * n + gx] = h;
+                    }
+                }
+                terrain_world = Some(Vec4f { x: lo_x, y: lo_z, z: span, w: span });
+                planars.push(crate::lightmap::LmPlanar {
+                    x0: lo_x,
+                    z0: lo_z,
+                    x1: lo_x + span,
+                    z1: lo_z + span,
+                    y: 0.0,
+                    field: Some(crate::lightmap::LmHeightField {
+                        origin_x: lo_x,
+                        origin_z: lo_z,
+                        cell,
+                        n,
+                        heights: std::sync::Arc::new(heights),
+                    }),
+                });
+            }
+        }
+        if meshes.is_empty() && planars.is_empty() {
+            return None;
+        }
+        // Clustered lights are evaluated at the receiving fragment. The
+        // optional OnChange atlas stores SUN visibility only, never lamps.
+        let lights = if self.clustered_enabled { Vec::new() } else { self.static_lights_for(sun) };
+        let scene = crate::lightmap::LmScene {
+            meshes,
+            planars,
+            boxes: self.occluder_boxes.clone(),
+            lights,
+            sun_dir: sun.dir,
+            sun_color: sun.color,
+            sun_sky: sun.sky,
+            // Bounce is the slow luxury tier; off unless asked for until the
+            // disk cache lands.
+            bounce: std::env::var("LM_BOUNCE").is_ok(),
+        };
+        // The snapshot becomes render passes on the next frame
+        // (gpu_lightmap.rs); delivery is a texture handle swap, no upload.
+        casters_only.append(&mut extra_layers);
+        Some(crate::gpu_lightmap::GpuBakeJob {
+            world_revision: (world.render_rev, self.bake_models_revision()),
+            scene,
+            mesh_geometry,
+            mesh_materials,
+            mesh_map,
+            casters_only,
+            terrain_world,
+            trigger,
+        })
+    }
+}
+
+/// The widest ground light field, in metres: one field for the whole scene
+/// keeps its density (texels per metre) only up to here; chunked ground
+/// regions are the fix at larger scales.
+pub(super) const GROUND_FIELD_MAX_SPAN: f32 = 240.0;
+
+/// The ground light field's square window over the statics' `(min, max)`
+/// boxes: their footprint plus a pad so shadows can run past the outermost
+/// caster, or, wider than [`GROUND_FIELD_MAX_SPAN`], that span centred on the
+/// footprint-weighted centre and kept inside the padded bounds. Returns
+/// `(x0, z0, span, full)`; `full` is the uncapped span, so a caller sees when
+/// the cap bit. None without a footprint.
+pub(super) fn ground_field_window(boxes: impl IntoIterator<Item = (Vec3f, Vec3f)>) -> Option<(f32, f32, f32, f32)> {
+    const PAD: f32 = 6.0;
+    let (mut lo_x, mut lo_z) = (f32::MAX, f32::MAX);
+    let (mut hi_x, mut hi_z) = (f32::MIN, f32::MIN);
+    let (mut wx, mut wz, mut weight) = (0.0f64, 0.0f64, 0.0f64);
+    for (bmin, bmax) in boxes {
+        lo_x = lo_x.min(bmin.x);
+        lo_z = lo_z.min(bmin.z);
+        hi_x = hi_x.max(bmax.x);
+        hi_z = hi_z.max(bmax.z);
+        // A post or a thin wall still counts, as one square metre.
+        let area = (((bmax.x - bmin.x) * (bmax.z - bmin.z)) as f64).max(1.0);
+        wx += area * (bmin.x + bmax.x) as f64 * 0.5;
+        wz += area * (bmin.z + bmax.z) as f64 * 0.5;
+        weight += area;
+    }
+    if !(lo_x < hi_x && lo_z < hi_z) {
+        return None;
+    }
+    let full = (hi_x - lo_x).max(hi_z - lo_z) + 2.0 * PAD;
+    if full <= GROUND_FIELD_MAX_SPAN {
+        return Some((lo_x - PAD, lo_z - PAD, full, full));
+    }
+    let span = GROUND_FIELD_MAX_SPAN;
+    // Centred on the weight, then slid back inside the bounds; along an axis
+    // narrower than the span it starts at the low edge and covers it all.
+    let fit = |centre: f64, lo: f32, hi: f32| (centre as f32 - span * 0.5).min(hi + PAD - span).max(lo - PAD);
+    Some((fit(wx / weight, lo_x, hi_x), fit(wz / weight, lo_z, hi_z), span, full))
+}
+
+/// How many ranks at the end of the authored-light budget fade out, so a
+/// light crossing the cut dims instead of switching off.
+const LIGHT_BUDGET_FADE: usize = 32;
+
+/// Keep at most `max` of `lights[start..]`: the ones delivering the most
+/// light at `eye` (strength over squared distance, reach-limited). The last
+/// [`LIGHT_BUDGET_FADE`] ranks kept are dimmed linearly toward the cut, so
+/// as the eye moves and ranks swap, a light fades rather than pops.
+pub(super) fn budget_authored_lights(lights: &mut Vec<crate::lightmap::LmLight>, start: usize, eye: Vec3f, max: usize) {
+    let n = lights.len().saturating_sub(start);
+    if n <= max { return; }
+    let score = |l: &crate::lightmap::LmLight| {
+        let d2 = (l.pos - eye).length_squared();
+        let strength = l.color.x.max(l.color.y).max(l.color.z).max(0.0);
+        let reach = if l.radius > 0.0 { (1.0 - d2.sqrt() / (l.radius * 4.0)).max(0.05) } else { 1.0 };
+        strength * reach / (1.0 + d2)
+    };
+    let mut ranked: Vec<(f32, crate::lightmap::LmLight)> = lights.drain(start..).map(|l| (score(&l), l)).collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ranked.truncate(max);
+    let fade_from = max.saturating_sub(LIGHT_BUDGET_FADE);
+    for (rank, (_, mut l)) in ranked.into_iter().enumerate() {
+        if rank >= fade_from {
+            l.color = l.color * ((max - rank) as f32 / (LIGHT_BUDGET_FADE + 1) as f32);
+        }
+        lights.push(l);
+    }
+}

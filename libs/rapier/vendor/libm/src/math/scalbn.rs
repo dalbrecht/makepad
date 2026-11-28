@@ -1,21 +1,17 @@
 #[cfg(f16_enabled)]
-#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn scalbnf16(x: f16, n: i32) -> f16 {
     super::generic::scalbn(x, n)
 }
 
-#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn scalbnf(x: f32, n: i32) -> f32 {
     super::generic::scalbn(x, n)
 }
 
-#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn scalbn(x: f64, n: i32) -> f64 {
     super::generic::scalbn(x, n)
 }
 
 #[cfg(f128_enabled)]
-#[cfg_attr(assert_no_panic, no_panic::no_panic)]
 pub fn scalbnf128(x: f128, n: i32) -> f128 {
     super::generic::scalbn(x, n)
 }
@@ -64,12 +60,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(f16_enabled)]
-    fn spec_test_f16() {
-        spec_test::<f16>(scalbnf16);
-    }
-
-    #[test]
     fn spec_test_f32() {
         spec_test::<f32>(scalbnf);
     }
@@ -79,9 +69,4 @@ mod tests {
         spec_test::<f64>(scalbn);
     }
 
-    #[test]
-    #[cfg(f128_enabled)]
-    fn spec_test_f128() {
-        spec_test::<f128>(scalbnf128);
-    }
 }

@@ -2,9 +2,11 @@
 name = "makepad-csg-math"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [features]
 nightly = []
-threads = []
+threads = ["dep:makepad-cpu-budget"]
 
 [dependencies]
+makepad-cpu-budget = { path = "../../cpu_budget", optional = true }

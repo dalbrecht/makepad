@@ -9,6 +9,7 @@ use crate::window::MacosWindowKind;
 use crate::window::MacosWindowLevel;
 use crate::window::ScriptWindowHandle;
 use crate::window::WindowBackdrop;
+use crate::window::WaylandDecorationPreference;
 use crate::*;
 
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
@@ -20,20 +21,19 @@ pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     set_script_value_to_pod!(vm, draw.DrawPassUniforms);
     set_script_value_to_api!(vm, draw.MouseCursor);
     set_script_value_to_api!(vm, draw.WindowBackdrop);
+    set_script_value_to_api!(vm, draw.WaylandDecorationPreference);
     set_script_value_to_api!(vm, draw.MacosWindowKind);
     set_script_value_to_api!(vm, draw.MacosWindowChrome);
     set_script_value_to_api!(vm, draw.MacosWindowLevel);
     set_script_value_to_api!(vm, draw.MacosWindowConfig);
 
     let pass_default = ScriptDrawPass::script_api(vm);
-    vm.bx
-        .heap
+    vm.heap_mut()
         .set_type_default(pass_default.as_object().unwrap());
     set_script_value!(vm, draw.ScriptDrawPass = pass_default);
 
     let window_default = ScriptWindowHandle::script_api(vm);
-    vm.bx
-        .heap
+    vm.heap_mut()
         .set_type_default(window_default.as_object().unwrap());
     set_script_value!(vm, draw.ScriptWindowHandle = window_default);
 

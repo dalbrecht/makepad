@@ -1,0 +1,33 @@
+//! Shared shader IR, reflection and native backend emission. Splash owns its frontend.
+#![allow(clippy::approx_constant)]
+
+relax_api::option_layouts! {
+    (u32, usize),
+    shader_ids::ShaderDef,
+    shader_schema::PodSwizzle,
+}
+
+pub use makepad_live_id;
+pub mod return_facts;
+pub use return_facts::{FnReturnFacts, ReturnComponent, return_facts};
+pub mod shader_ids;
+pub mod shader_schema;
+pub mod shader_backend;
+pub mod uniform_packing;
+pub mod shader_ir;
+mod shader_ir_short_circuit;
+pub mod shader_ir_draw;
+pub mod shader_ir_precise;
+pub mod shader_ir_glsl;
+pub mod shader_ir_hlsl;
+pub mod shader_ir_metal;
+pub mod shader_ir_rust;
+pub mod shader_ir_compute;
+pub mod shader_ir_compute_text;
+pub mod shader_ir_spirv;
+pub mod shader_ir_text;
+pub mod shader_ir_wgsl;
+pub mod spirv;
+pub mod shader_types;
+pub mod shader_output;
+

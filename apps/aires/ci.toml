@@ -1,0 +1,22 @@
+# CI (devhub ci): [ci] is hand-written settings; the other sections are proofs devhub writes.
+
+[app.linux]
+capture = ""
+date = "2026-11-26"
+digest = "fd4efbefcdac4ed8ded3b608765b16a53c1eccc8572c0c40c0d508575ef8279a"
+main = "f0a2ef91c7ae77fb351dad4870fecffc13ce6863"
+work = "c87cdfc86d6ff85dc54a9425ec4853867560b460"
+
+[app.macos]
+capture = ""
+date = "2026-11-25"
+digest = "a93c3df1dcdf2d8291f773f3fbf974e89b46e3818611c9057d5878a892831bd6"
+main = "85b18a3b4d6d028db6e4e0d681a64cb77e2d4437"
+work = "e7b1b66c2be1ed4074725b0fbac5e9c39945566f"
+
+[app.windows]
+capture = ""
+date = "2026-11-24"
+digest = "cfe0047d29073d15c9291e4c6edfcc91a1e254ab35c135aa90e514b15db62321"
+main = "1107161d14ec80325fcd5a51a62c447f2b3d7fc9"
+work = "4a13797c9fc87cadb1dfe30ea00772190a0ec68b"

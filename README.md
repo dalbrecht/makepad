@@ -4,10 +4,10 @@
 
 - Discord: https://discord.gg/adqBRq7Ece
 - Rik Arends: https://twitter.com/rikarends
-- Eddy Bruel: -
-- Sebastian Michailidis: https://bsky.app/profile/okpokpokp.bsky.social
 
-Makepad is an AI-accelerated application development environment for Rust. It combines a high-performance UI runtime, a live-editable design language, and a fast iteration loop so you can build native and web apps with a tight feedback cycle.
+Makepad is an AI-accelerated application and game development environment for Rust. It combines a high-performance UI runtime, a live-editable design language, and a fast iteration loop so you can build native and web apps with a tight feedback cycle.
+
+It also has a large set of AI backends integrated for embedding llms or generative AI models inside applications or run them easily on local hardware
 
 This repository contains the core engine, widgets, tools, and examples.
 
@@ -17,6 +17,7 @@ This repository contains the core engine, widgets, tools, and examples.
 - A Rust-first framework with a scriptable UI DSL.
 - A studio app for running, inspecting, and iterating on examples and projects.
 - An AI-accelerated workflow: structure and tooling aimed at making code generation, refactoring, and iteration faster and safer.
+- Simple forward 3D renderer for making games on Quest and all other supported platforms
 
 ## Features
 
@@ -52,21 +53,24 @@ Linux build/runtime dependencies are listed in `./tools/linux_deps.sh`:
 Use the apt-get command below, or run the script on Ubuntu/WSL2:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config clang ca-certificates libssl-dev libx11-dev libxcursor-dev libxkbcommon-dev libxrandr-dev libxi-dev libxinerama-dev libasound2-dev libpulse-dev libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libglx-dev libdrm-dev libgbm-dev libgl1-mesa-dri mesa-vulkan-drivers mesa-utils mesa-utils-extra x11-apps
+sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config clang ca-certificates libssl-dev libx11-dev libxcursor-dev libxkbcommon-dev libxrandr-dev libxi-dev libxinerama-dev libasound2-dev libpulse-dev libwayland-dev wayland-protocols libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev libglx-dev libdrm-dev libgbm-dev libgl1-mesa-dri mesa-vulkan-drivers mesa-utils mesa-utils-extra x11-apps gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-gl gstreamer1.0-alsa gstreamer1.0-pipewire libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 libgstreamer-gl1.0-0
 ```
 
-## Build And Run Makepad Studio
+## Build And Run The Makepad Desktop
 
-Makepad Studio is the main entry point for exploring examples and iterating on UI.
+The Makepad desktop (window manager) is the main entry point for exploring the apps in this repository.
 
 ```bash
-cargo run -p makepad-studio --release
+cargo run -p makepad-app-wm --release
 ```
 
-If you want a local install (note: may lag the repo):
+## Build And Run The Widget Catalogue
+
+The widget catalogue shows every widget in the library, organised,
+documented and previewed live.
 
 ```bash
-cargo install makepad-studio
+cargo run -p makepad-app-storybook --release
 ```
 
 ## Examples
@@ -89,8 +93,8 @@ cargo run -p makepad-example-map --release
 For built-in maps and voice support, download the assets first:
 
 ```bash
-./download_map.sh
-./download_voice.sh
+./tools/download_map.sh
+./tools/download_voice.sh
 ```
 
 ## Run A WASM App
@@ -164,3 +168,9 @@ cargo run -p cargo-makepad --release -- android run -p makepad-example-ironfish
 ## Notes
 
 - Studio uses `cargo-makepad` internally for non-standard targets.
+
+## Contributing
+
+Open pull requests against `main`. `main` holds validated milestones; `work` is the fast-moving
+development branch, squashed onto `main` and re-pointed at its tip about every week, so rebase
+any branch based on `work` after a re-point.

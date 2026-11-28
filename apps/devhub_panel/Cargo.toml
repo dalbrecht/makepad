@@ -1,0 +1,29 @@
+# The devhub control panel: a client-only view of the running master (every node's leases on one
+# time axis, their pressure, the queue and the landing train). It only reads the master's control
+# socket. A library of widgets: apps/devhub shows it in a window of its own (one app, one menu-bar
+# item).
+
+[package]
+name = "makepad-app-devhub-panel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "devhub control panel widgets: the fleet's occupancy timeline, pressure, queue and landing train, read from the running master"
+
+# The platforms the devhub panel is built for (devhub ci reads this; one place): the desktop.
+# apps/devhub's panel widgets (a desktop app); they read the master's control socket through makepad-
+# remote, which is native only (unix sockets, TLS).
+[package.metadata.makepad]
+platforms = ["desktop"]
+
+[lib]
+name = "makepad_app_devhub_panel"
+path = "src/lib.rs"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets", default-features = false }
+makepad-devhub = { path = "../../libs/devhub", default-features = false }
+makepad-remote = { workspace = true }
+makepad-strict-json = { workspace = true }
+makepad-civil-time = { path = "../../libs/civil_time" }
